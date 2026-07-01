@@ -862,6 +862,65 @@ class AdversarialParsingTests(unittest.TestCase):
         self.assertEqual(len(calls2), 2)
 
 
+class BareObjectLinesTests(unittest.TestCase):
+    """Nameless call spelling observed live from gpt-5.3-codex-spark in the single-tool G6
+    scenario: the entire message is bare JSON argument objects, one per line, NO function name
+    (the model 'saved' the redundant tool name -- ~400 spawns scored tools=0 before this).
+    Deterministic gate: every non-blank line must be a JSON object and the keys must fit exactly
+    ONE tool -- prose or ambiguity rejects the whole message."""
+
+    TOOLS = [
+        {"type": "function", "function": {"name": "world_command",
+         "parameters": {"type": "object", "properties": {
+             "action": {}, "targetName": {}, "prefabKey": {}, "x": {}, "y": {}, "z": {},
+             "scaleX": {}, "scaleY": {}, "scaleZ": {}, "fx": {}, "fy": {}, "fz": {}}}}},
+        {"type": "function", "function": {"name": "execute_lua",
+         "parameters": {"type": "object", "properties": {"code": {}}}}},
+    ]
+    NAMES = {"world_command", "execute_lua"}
+
+    def test_verbatim_live_failure_shape_recovers_every_line(self):
+        # Two lines exactly as the failing spark run wrote them (of ~400).
+        text = ('{"action":"spawn","targetName":"ground","prefabKey":"cube","x":0,"y":0,"z":0,'
+                '"scaleX":18,"scaleY":0.2,"scaleZ":18,"fx":0,"fy":0,"fz":0}\n'
+                '{"action":"spawn","targetName":"tower_nw","prefabKey":"cylinder","x":-6,"y":1.5,'
+                '"z":-6,"scaleX":1.45,"scaleY":1.55,"scaleZ":1.45,"fx":0,"fy":0,"fz":0}')
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(c["function"]["name"] == "world_command" for c in calls))
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "ground")
+        self.assertEqual(cleaned, "")
+
+    def test_fence_wrapped_object_lines_still_recover(self):
+        text = '```\n{"action":"spawn","targetName":"a","x":1}\n{"action":"spawn","targetName":"b","x":2}\n```'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 2)
+
+    def test_any_prose_line_rejects_the_whole_message(self):
+        text = 'Here are the spawns:\n{"action":"spawn","targetName":"a","x":1}'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertIsNone(calls)
+
+    def test_keys_fitting_more_than_one_tool_are_ambiguous_and_rejected(self):
+        tools = [
+            {"type": "function", "function": {"name": "a", "parameters": {"properties": {"x": {}}}}},
+            {"type": "function", "function": {"name": "b", "parameters": {"properties": {"x": {}, "y": {}}}}},
+        ]
+        calls, _ = srv.extract_tool_calls('{"x": 1}', {"a", "b"}, tools)
+        self.assertIsNone(calls)
+
+    def test_keys_outside_every_schema_reject(self):
+        calls, _ = srv.extract_tool_calls(
+            '{"totally_unknown_key": 1}', self.NAMES, self.TOOLS)
+        self.assertIsNone(calls)
+
+    def test_named_format2_still_wins_over_bare_interpretation(self):
+        text = 'world_command({"action": "spawn", "x": 1})'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "world_command")
+
+
 class DeliberateRepeatContractTests(unittest.TestCase):
     """The documented contract for re-running an identical call (echo-dedup's one false
     positive): a Format-2 line that exactly repeats an executed call is ALWAYS summary prose;

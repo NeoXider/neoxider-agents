@@ -6,6 +6,23 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- openai-server: recognize the NAMELESS call spelling — the entire message is bare JSON argument
+  objects, one per line, with no function name at all. Observed live from gpt-5.3-codex-spark in
+  the single-tool G6 scenario ({"action":"spawn","targetName":...} x~400 — the model "saved" the
+  redundant tool name; the run scored tools=0/Fail 15.2 with a fully designed castle in the
+  transcript). Deterministic gate, deliberately strict: EVERY non-blank, non-fence-marker line
+  must parse as a non-empty JSON object AND the keys must fit (subset of schema parameter names)
+  exactly ONE tool across all lines — any prose line or ambiguity rejects the whole message, so
+  ordinary answers can never trigger it. Echo dedup applies. +6 tests (115 total), including the
+  verbatim live-failure lines.
+
+- doctor/GUI: the Claude limits panel now shows a LOCAL USAGE ESTIMATE instead of "no data" —
+  tokens burned in the current 5h window and the last 7 days (in+out and cache separately),
+  summed ccusage-style from the CLI's own transcript files (~/.claude/projects/**/*.jsonl usage
+  blocks). The Claude CLI exposes no remaining-limit API, so this reports what was SPENT, not
+  what remains (the plan cap isn't available locally); wired through the existing doctor `note`
+  field, so the GUI needed no changes.
+
 - openai-server: 8 parser/robustness defects fixed after an independent adversarial audit (every
   one reproduced live against the real functions before fixing):
   - **String argument ending in a backslash silently killed the whole call** (a JSON-escaped

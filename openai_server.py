@@ -588,6 +588,45 @@ def extract_func_calls(text, names, params=None):
     return found, spans
 
 
+def extract_bare_object_lines(text, tools):
+    """Last-resort spelling, observed live from gpt-5.3-codex-spark in a single-tool scenario:
+    the ENTIRE message is bare JSON argument objects, one per line, with no function name at all
+    ({"action":"spawn","targetName":...} x400 -- the model 'saved' the redundant tool name).
+    Deterministic recovery gate, deliberately strict so prose can never trigger it:
+      - EVERY non-blank, non-fence-marker line must parse as a non-empty JSON object;
+      - the union of every object's keys must fit (subset of parameter names) EXACTLY ONE tool
+        across all lines -- ambiguity or any non-matching key rejects the whole message.
+    Returns [(name, args), ...] or [] when the message is not this shape."""
+    props_by_tool = tool_param_names(tools)
+    objs = []
+    for raw_line in text.split("\n"):
+        ln = raw_line.strip()
+        if not ln or ln.startswith("```"):
+            continue  # blank / fence markers around the block don't disqualify it
+        if not (ln.startswith("{") and ln.endswith("}")):
+            return []
+        try:
+            o = json.loads(ln)
+        except ValueError:
+            return []
+        if not isinstance(o, dict) or not o:
+            return []
+        objs.append(o)
+    if not objs:
+        return []
+    candidates = None
+    for o in objs:
+        keys = {k for k in o if isinstance(k, str)}
+        fits = {name for name, props in props_by_tool.items() if keys <= set(props)}
+        candidates = fits if candidates is None else candidates & fits
+        if not candidates:
+            return []
+    if len(candidates) != 1:
+        return []
+    name = next(iter(candidates))
+    return [(name, o) for o in objs]
+
+
 def _to_calls(raw_calls):
     out = []
     for c in raw_calls:
@@ -669,6 +708,16 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
                      if (n, _canonical_args(a)) not in prior]
             spans = [spans[i] for i, _ in fresh]
             found = [fa for _, fa in fresh]
+        if not found:
+            # Nameless spelling: the whole message is bare JSON argument objects, one per line,
+            # keys fitting exactly one tool (see extract_bare_object_lines). The whole message IS
+            # the calls, so the display text ends up empty after span-stripping.
+            bare = extract_bare_object_lines(scan_text, tools)
+            if bare and prior:
+                bare = [(n, a) for n, a in bare if (n, _canonical_args(a)) not in prior]
+            if bare:
+                found = bare
+                spans = [(0, len(cleaned))] * len(bare)
         if found:
             calls = [{"id": "call_%s" % uuid.uuid4().hex[:24], "type": "function",
                       "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}}
