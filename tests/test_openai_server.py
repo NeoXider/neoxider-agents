@@ -418,6 +418,84 @@ class PositionalJsonArgTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class EchoDedupTests(unittest.TestCase):
+    """After a tool-result round-trip, models restate the calls they already made -- in exactly
+    the `name({...})` spelling the rendered history shows them -- as part of a summary.
+    Re-parsing those as NEW calls re-executed them every round (observed live: a 5-spawn
+    scenario ballooned to 15 tool calls). Func-syntax calls that exactly repeat an
+    already-executed call are echoes and must be dropped; genuinely new calls in the same
+    message must survive."""
+
+    NAMES = {"world_command"}
+
+    @staticmethod
+    def _history(*args_list):
+        return [{"role": "assistant", "tool_calls": [
+            {"id": "x", "type": "function",
+             "function": {"name": "world_command", "arguments": json.dumps(a)}}
+            for a in args_list]}]
+
+    def test_exact_repeat_of_prior_call_is_dropped_as_echo(self):
+        prior = srv.prior_call_keys(self._history({"action": "spawn", "targetName": "Player"}))
+        text = 'world_command({"action":"spawn","targetName":"Player"})'
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, None, prior)
+        self.assertIsNone(calls)
+        self.assertEqual(cleaned, text)  # the echo stays in the display text as prose
+
+    def test_key_order_does_not_defeat_the_echo_check(self):
+        prior = srv.prior_call_keys(self._history({"action": "spawn", "targetName": "Player"}))
+        text = 'world_command({"targetName":"Player","action":"spawn"})'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, None, prior)
+        self.assertIsNone(calls)
+
+    def test_new_call_survives_next_to_an_echo(self):
+        prior = srv.prior_call_keys(self._history({"action": "spawn", "targetName": "Player"}))
+        text = ('world_command({"action":"spawn","targetName":"Player"})\n'
+                'world_command({"action":"spawn","targetName":"Goal"})')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, None, prior)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "Goal")
+
+    def test_no_prior_history_means_no_dedup(self):
+        text = 'world_command({"action":"spawn","targetName":"Player"})'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, None, set())
+        self.assertEqual(len(calls), 1)
+
+    def test_fenced_json_block_is_exempt_from_echo_dedup(self):
+        # Format 1 is an explicit calling format, not a summary style -- a deliberate repeat
+        # through it must still execute.
+        prior = srv.prior_call_keys(self._history({"action": "spawn", "targetName": "Player"}))
+        text = ('```json\n{"tool_calls":[{"name":"world_command",'
+                '"arguments":{"action":"spawn","targetName":"Player"}}]}\n```')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, None, prior)
+        self.assertEqual(len(calls), 1)
+
+    def test_duplicates_within_one_message_are_kept(self):
+        # Only PRIOR turns dedupe; two identical calls in one fresh message could be a
+        # deliberate batch and are not the echo pattern this guards against.
+        text = ('world_command({"action":"spawn","targetName":"A"})\n'
+                'world_command({"action":"spawn","targetName":"A"})')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, None, set())
+        self.assertEqual(len(calls), 2)
+
+
+class PriorCallKeysTests(unittest.TestCase):
+    def test_collects_names_and_canonical_args_from_assistant_messages(self):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "1", "type": "function",
+                 "function": {"name": "f", "arguments": '{"b":2,"a":1}'}}]},
+            {"role": "tool", "content": "ok"},
+        ]
+        keys = srv.prior_call_keys(msgs)
+        self.assertEqual(keys, {("f", '{"a": 1, "b": 2}')})
+
+    def test_empty_or_junk_messages_yield_empty_set(self):
+        self.assertEqual(srv.prior_call_keys(None), set())
+        self.assertEqual(srv.prior_call_keys([{"role": "user", "content": "x"}, "junk"]), set())
+
+
 class ToolParamNamesTests(unittest.TestCase):
     def test_extracts_property_names_per_function(self):
         tools = [{"type": "function", "function": {

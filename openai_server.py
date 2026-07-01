@@ -379,6 +379,39 @@ def tool_names(tools):
     return names
 
 
+def _canonical_args(args):
+    """Stable comparison key for a call's arguments: parse if a JSON string, then dump with
+    sorted keys -- so {"a":1,"b":2} and {"b":2,"a":1} (or the same dict re-serialized) compare
+    equal. Unparsable strings fall back to their stripped raw text."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except ValueError:
+            return args.strip()
+    try:
+        return json.dumps(args, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(args)
+
+
+def prior_call_keys(messages):
+    """The set of (name, canonical-args) for every tool call ALREADY MADE earlier in this
+    conversation (assistant messages carrying `tool_calls`). Used to drop ECHOES: after a
+    tool-result round-trip, models tend to restate the calls they already made -- in exactly
+    the `name({...})` spelling this conversation's history shows them (render_messages
+    serializes prior calls that way) -- as part of a summary. Re-parsing those restated lines
+    as NEW calls re-executed them each round (observed live: a 5-spawn scenario ballooned to
+    15 tool calls across echo round-trips). Format-1 fenced JSON is exempt -- that block is an
+    explicit, deliberate calling format, not a summary style."""
+    keys = set()
+    for m in messages or []:
+        for tc in (m.get("tool_calls") or []) if isinstance(m, dict) else []:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if isinstance(fn, dict) and fn.get("name"):
+                keys.add((fn["name"], _canonical_args(fn.get("arguments", ""))))
+    return keys
+
+
 def tool_param_names(tools):
     """{function name: [parameter property names...]} from an OpenAI `tools` array's JSON
     schemas. Used by extract_func_calls to map a SINGLE positional scalar argument onto a
@@ -531,14 +564,17 @@ def _to_calls(raw_calls):
     return out or None
 
 
-def extract_tool_calls(text, names=None, tools=None):
+def extract_tool_calls(text, names=None, tools=None, prior=None):
     """Best-effort: look for fenced ```json {"tool_calls":[...]} ``` block(s) (the LAST one
     that yields a non-empty call list wins, in case the agent narrates before committing to
     its final answer), falling back to a bare (unfenced) JSON object if that's the whole
     trailing message, and finally to literal `name(arg=value, ...)` / `name({...})` call
     syntax for any known tool `names` (see extract_func_calls -- codex CLI emits these
     instead of the JSON block). Pass the original `tools` array too when available: its JSON
-    schemas let a single positional scalar map onto a one-parameter function.
+    schemas let a single positional scalar map onto a one-parameter function. `prior` is the
+    set from prior_call_keys(messages): func-syntax lines that exactly repeat an
+    already-executed call are ECHOES of the conversation history's own rendering style, not
+    new requests, and are dropped (kept in the display text) -- see prior_call_keys.
     Returns (tool_calls_or_None, display_text).
 
     Every fenced block that parses as a dict containing a "tool_calls" key is stripped from
@@ -575,6 +611,14 @@ def extract_tool_calls(text, names=None, tools=None):
                 pass
     if calls is None and names:
         found, spans = extract_func_calls(cleaned, names, tool_param_names(tools))
+        if found and prior:
+            # Drop exact repeats of already-executed calls (echoes of the history's own
+            # rendering style, not new requests -- see prior_call_keys). Their text spans stay
+            # in the display text: an echo is part of the model's summary prose.
+            fresh = [(i, (n, a)) for i, (n, a) in enumerate(found)
+                     if (n, _canonical_args(a)) not in prior]
+            spans = [spans[i] for i, _ in fresh]
+            found = [fa for _, fa in fresh]
         if found:
             calls = [{"id": "call_%s" % uuid.uuid4().hex[:24], "type": "function",
                       "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}}
@@ -675,7 +719,8 @@ class H(BaseHTTPRequestHandler):
             SESSION["task_name"] = name
             SESSION["messages"] = messages
             SESSION["last_activity"] = time.time()
-        tool_calls, text = extract_tool_calls(raw_text, tool_names(tools), tools)
+        tool_calls, text = extract_tool_calls(raw_text, tool_names(tools), tools,
+                                              prior_call_keys(messages))
         return text, tool_calls
 
     def _reset_session(self):
