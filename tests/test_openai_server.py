@@ -948,6 +948,31 @@ class DeliberateRepeatContractTests(unittest.TestCase):
         self.assertIn("Format 1", srv.TOOLCALL_INSTRUCTIONS)
 
 
+class LimitBannerTests(unittest.TestCase):
+    """A CLI answer that IS the provider's usage-limit banner must become an OpenAI-style 429
+    (ProviderLimitError), never a normal 200 completion — a live Sonnet 5 benchmark run scored
+    every scenario ~0 because 'You've hit your session limit · resets 7:40am' was returned as
+    the model's answer. Narrow gate: short text that matches the banner wording; an answer that
+    merely DISCUSSES rate limits stays a normal completion."""
+
+    def test_claude_session_limit_banner_detected(self):
+        self.assertTrue(srv.looks_like_limit_banner(
+            "You've hit your session limit · resets 7:40am (Asia/Yekaterinburg)"))
+
+    def test_usage_and_rate_limit_wordings_detected(self):
+        self.assertTrue(srv.looks_like_limit_banner("Usage limit reached. Try again later."))
+        self.assertTrue(srv.looks_like_limit_banner("Rate limit exceeded"))
+
+    def test_long_prose_mentioning_limits_is_not_a_banner(self):
+        prose = ("Rate limiting is a technique servers use. " * 12 +
+                 "If you hit your session limit, the API returns 429.")
+        self.assertFalse(srv.looks_like_limit_banner(prose))
+
+    def test_normal_answer_is_not_a_banner(self):
+        self.assertFalse(srv.looks_like_limit_banner("The castle has four towers."))
+        self.assertFalse(srv.looks_like_limit_banner(""))
+
+
 class RoughTokensTests(unittest.TestCase):
     """usage counts are ESTIMATES (~4 chars/token) -- non-zero for any real text, 0 only for
     empty/None, so cost panels see something useful instead of the old hardcoded 0/0/0."""

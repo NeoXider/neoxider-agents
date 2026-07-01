@@ -737,6 +737,26 @@ SESSION_LOCK = threading.Lock()
 SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
 
 
+class ProviderLimitError(Exception):
+    """Raised when the CLI's answer is actually the provider's own usage-limit banner (e.g.
+    Claude Code's "You've hit your session limit · resets 7:40am"). Returning that text as a
+    normal 200 completion poisoned live benchmark runs — every scenario scored ~0 as if the
+    MODEL failed, when the account was simply rate-limited. Surfaced as an OpenAI-style 429 so
+    the caller can attribute it to the environment (and retrying inside the bridge is pointless
+    -- the limit outlives any retry)."""
+
+
+# Deliberately narrow: the whole answer must BE the banner (short), not merely mention limits.
+LIMIT_BANNER_RE = re.compile(
+    r"hit your (session|usage|weekly) limit|usage limit (reached|exceeded)|rate limit (reached|exceeded)",
+    re.IGNORECASE)
+
+
+def looks_like_limit_banner(text):
+    t = (text or "").strip()
+    return bool(t) and len(t) < 300 and bool(LIMIT_BANNER_RE.search(t))
+
+
 def _rough_tokens(s):
     """Crude ~4-chars-per-token estimate. The wrapped CLIs expose no structured token counts,
     but a rough non-zero `usage` is far more useful to dashboards/benchmark cost panels than the
@@ -846,6 +866,8 @@ class H(BaseHTTPRequestHandler):
             SESSION["task_name"] = name
             SESSION["messages"] = messages
             SESSION["last_activity"] = time.time()
+        if looks_like_limit_banner(raw_text):
+            raise ProviderLimitError(raw_text.strip())
         tool_calls, text = extract_tool_calls(raw_text, tool_names(tools), tools,
                                               prior_call_keys(messages))
         usage_prompt = _rough_tokens(build_prompt(messages, tools))
@@ -944,6 +966,12 @@ class H(BaseHTTPRequestHandler):
                 self._sync_response(messages, tools)
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             pass  # client went away -- nothing to answer
+        except ProviderLimitError as e:
+            try:
+                self._send_json(429, {"error": {"message": str(e), "type": "rate_limit_error",
+                                                 "code": "rate_limit_exceeded"}})
+            except OSError:
+                pass
         except Exception as e:  # noqa: BLE001 -- a bridge bug must surface as an OpenAI-style
             # error response, not a bare connection reset the client can't distinguish from a
             # network failure. (_run finishes before any response bytes go out, including in the
