@@ -264,12 +264,17 @@ about this before pointing anything at it:
   plain HTTP clients that don't know that sentinel convention don't hang.
 - **`tools`/function-calling is emulated via prompting**, not native: when a request
   includes an OpenAI `tools` array, the bridge instructs the agent (in the prompt) to
-  reply with either plain prose or a fenced JSON tool-call block, then parses that
-  block into a real `tool_calls` response. Best-effort — verified working, but it can
-  occasionally misformat or ignore the instruction. The instructions are re-sent on
-  every call that includes `tools`, including a continuation turn on an already-resumed
-  session — not just the first call — a deliberate simplicity/robustness choice over
-  tracking whether the schema already "stuck".
+  reply with either plain prose or a tool call, then parses the call into a real
+  `tool_calls` response. It accepts the call in **two** formats and parses them
+  identically: a fenced/bare JSON `{"tool_calls":[...]}` block, OR literal
+  `name(arg=value, ...)` call lines (one per line) — the latter because CLI agents
+  (codex especially) tend to WRITE calls that way rather than emit JSON, and the prompt
+  now explicitly warns that *describing* an action in prose ("I called X", "Execution
+  succeeded") does nothing and is treated as a failure. Best-effort still — a model can
+  occasionally misformat — but recognizing both formats plus the stronger prompt cut the
+  main real-world failure mode (prose-instead-of-call). The instructions are re-sent on
+  every call that includes `tools`, including a continuation turn — a deliberate
+  simplicity/robustness choice over tracking whether the schema already "stuck".
 - **`usage` token counts are always `0/0/0`** — the wrapped CLIs don't expose real
   token counts in a structured form.
 - Image content in messages is not rendered to the agent (replaced with a

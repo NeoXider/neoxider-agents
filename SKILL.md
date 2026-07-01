@@ -84,9 +84,11 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
 - **`stream: true` is emulated** — the full answer is generated first, then replayed
   as word-sized SSE chunks. It is NOT real per-token streaming from the underlying
   provider.
-- **`tools`/function-calling is emulated via prompting**, not native — best-effort,
-  can occasionally misformat or ignore the instruction; the instructions are re-sent on
-  every call that includes `tools`, even a continuation turn.
+- **`tools`/function-calling is emulated via prompting**, not native — best-effort. The
+  bridge accepts the call as EITHER a JSON `{"tool_calls":[...]}` block OR literal
+  `name(arg=value, ...)` lines (codex tends to write the latter), and the prompt warns
+  that describing an action in prose is ignored/failed. Re-sent on every `tools` call,
+  even a continuation turn.
 - **`usage` token counts are always `0/0/0`** — don't trust them for cost tracking.
 - **`content` is a clean answer for every bundled engine.** `codex` would otherwise mix
   its startup banner/session-id/error-log/"tokens used" chrome (and a cp866-mojibake line

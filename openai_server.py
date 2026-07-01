@@ -289,25 +289,35 @@ def render_messages(messages):
 
 TOOLCALL_INSTRUCTIONS = """
 [Function-calling mode] You are acting as a plain text/function-calling completion backend for an
-external application -- NOT as an autonomous coding agent. Do NOT use your own shell, file, or
-edit tools for this request; do not modify any files on disk. You have exactly this set of
-callable functions available to the CALLING APPLICATION (OpenAI function-calling schema):
+external application -- NOT as an autonomous coding agent. You have NO shell, no file system, and
+no way to execute anything yourself here: the ONLY way to make something happen is to EMIT a
+function call in one of the exact formats below, which the calling application then runs. You have
+exactly this set of callable functions available to that application (OpenAI function-calling
+schema):
 
 %s
 
-Decide ONE of:
-(a) Answer directly in plain prose (no function call needed -- this is ALSO the right
-    choice when a previous function call's result is already visible above and you are
-    now just explaining/using that result), or
-(b) Call exactly one function from the list above.
+CRITICAL: describing an action in prose does NOTHING. Sentences like "I called world_command...",
+"Defined the slot via ...", "Execution succeeded", or "Done." are IGNORED -- the application never
+sees a call and treats the turn as a failure. If you intend an action, you MUST emit an actual
+call. Emit as MANY calls as the task needs (e.g. one per object to spawn), not just one.
 
-Your FINAL message must be ONLY one of:
-- Plain prose with your answer, and NOTHING else -- no JSON, no code fence, not even an
-  empty one (case a), or
-- A single fenced block below and NOTHING else before or after it (case b):
+Decide ONE of:
+(a) No action needed -- answer directly in plain prose (this is ALSO the right choice when a
+    previous call's result is already visible above and you are now just using/explaining it), or
+(b) Take action -- emit one or more function calls, using EITHER of these two formats (pick one
+    and use it consistently), and nothing else in the message except the calls:
+
+    Format 1 -- a single fenced JSON block listing every call:
 ```json
-{"tool_calls":[{"name":"<function name>","arguments":{...arguments matching its parameters schema...}}]}
+{"tool_calls":[{"name":"<fn>","arguments":{...}},{"name":"<fn>","arguments":{...}}]}
 ```
+    Format 2 -- one literal call per line (arguments as name=value, strings quoted):
+    <fn>(arg="text", num=1.5, flag=true)
+    <fn>(arg="other", num=2)
+
+Both formats are parsed identically; use whichever is natural. Do NOT wrap Format 2 prose around
+the calls -- just the call lines.
 """
 
 
@@ -319,6 +329,122 @@ def build_prompt(messages, tools):
 
 
 FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+FUNC_HEAD_RE = re.compile(r"([A-Za-z_]\w*)\s*\(")
+IDENT_RE = re.compile(r"^\w+$")
+
+
+def tool_names(tools):
+    """The set of callable function names in an OpenAI `tools` array (both the modern
+    {"type":"function","function":{"name":...}} and a bare {"name":...} shape)."""
+    names = set()
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else None
+        n = (fn or {}).get("name") or t.get("name")
+        if n:
+            names.add(n)
+    return names
+
+
+def _parse_arg_value(v):
+    """Best-effort convert one function-call argument's raw text to a JSON value: strict JSON
+    first (numbers, booleans, null, "quoted", [lists], {objects}), then a Python literal
+    (single-quoted strings, True/False/None), then a bare unquoted string as a last resort."""
+    v = v.strip()
+    if not v:
+        return ""
+    try:
+        return json.loads(v)
+    except ValueError:
+        pass
+    try:
+        import ast
+        return ast.literal_eval(v)
+    except (ValueError, SyntaxError):
+        pass
+    if len(v) >= 2 and v[0] in "\"'" and v[-1] == v[0]:
+        return v[1:-1]
+    return v
+
+
+def _split_top_level(s, sep=","):
+    """Split on `sep` only at the top level -- not inside quotes or ()/[]/{} nesting -- so an
+    argument value that itself contains commas/brackets/quotes stays in one piece."""
+    out, buf, depth, quote = [], [], 0, None
+    for i, c in enumerate(s):
+        if quote:
+            buf.append(c)
+            if c == quote and s[i - 1] != "\\":
+                quote = None
+        elif c in "\"'":
+            quote = c
+            buf.append(c)
+        elif c in "([{":
+            depth += 1
+            buf.append(c)
+        elif c in ")]}":
+            depth -= 1
+            buf.append(c)
+        elif c == sep and depth == 0:
+            out.append("".join(buf))
+            buf = []
+        else:
+            buf.append(c)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def extract_func_calls(text, names):
+    """Fallback tool-call syntax: CLI agents (codex especially) tend to emit calls as literal
+    `name(arg=value, arg=value)` lines -- the way they'd WRITE a call in code -- instead of the
+    prompted `{"tool_calls":[...]}` JSON block, so the JSON reparser missed a model that had
+    actually solved the task. This recognizes every `name(...)` whose name is one of the known
+    tool `names` (gate against false positives on prose), parenthesis-balanced and quote-aware,
+    and returns [(name, args_dict), ...] plus the (start,end) span of each so the caller can
+    strip them from the display text. Empty-paren mentions (`world_command()`) are treated as
+    prose, not calls."""
+    if not names:
+        return [], []
+    found, spans = [], []
+    for m in FUNC_HEAD_RE.finditer(text):
+        name = m.group(1)
+        if name not in names:
+            continue
+        open_paren = m.end() - 1
+        depth, quote, j = 0, None, open_paren
+        while j < len(text):
+            c = text[j]
+            if quote:
+                if c == quote and text[j - 1] != "\\":
+                    quote = None
+            elif c in "\"'":
+                quote = c
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            continue  # unbalanced parens -> not a clean call
+        inner = text[open_paren + 1:j]
+        if not inner.strip():
+            continue  # `name()` with no args reads as prose, not a real call
+        args = {}
+        for seg in _split_top_level(inner):
+            k, eq, val = seg.partition("=")
+            k = k.strip()
+            if not eq or not IDENT_RE.match(k):
+                continue  # positional/garbled segment -> skip rather than guess
+            args[k] = _parse_arg_value(val)
+        if not args:
+            continue  # nothing parsed cleanly -> most likely prose that happened to match
+        found.append((name, args))
+        spans.append((m.start(), j + 1))
+    return found, spans
 
 
 def _to_calls(raw_calls):
@@ -335,11 +461,13 @@ def _to_calls(raw_calls):
     return out or None
 
 
-def extract_tool_calls(text):
+def extract_tool_calls(text, names=None):
     """Best-effort: look for fenced ```json {"tool_calls":[...]} ``` block(s) (the LAST one
     that yields a non-empty call list wins, in case the agent narrates before committing to
     its final answer), falling back to a bare (unfenced) JSON object if that's the whole
-    trailing message. Returns (tool_calls_or_None, display_text).
+    trailing message, and finally to literal `name(arg=value, ...)` call syntax for any known
+    tool `names` (see extract_func_calls -- codex CLI emits this instead of the JSON block).
+    Returns (tool_calls_or_None, display_text).
 
     Every fenced block that parses as a dict containing a "tool_calls" key is stripped from
     display_text regardless of whether it produced a real call -- despite the prompt telling
@@ -373,6 +501,15 @@ def extract_tool_calls(text):
                         calls, cleaned = found, ""
             except ValueError:
                 pass
+    if calls is None and names:
+        found, spans = extract_func_calls(cleaned, names)
+        if found:
+            calls = [{"id": "call_%s" % uuid.uuid4().hex[:24], "type": "function",
+                      "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}}
+                     for n, a in found]
+            for s, e in reversed(spans):          # strip the call spans from the display text
+                cleaned = cleaned[:s] + cleaned[e:]
+            cleaned = cleaned.strip()
     return calls, cleaned.strip()
 
 
@@ -466,7 +603,7 @@ class H(BaseHTTPRequestHandler):
             SESSION["task_name"] = name
             SESSION["messages"] = messages
             SESSION["last_activity"] = time.time()
-        tool_calls, text = extract_tool_calls(raw_text)
+        tool_calls, text = extract_tool_calls(raw_text, tool_names(tools))
         return text, tool_calls
 
     def _reset_session(self):

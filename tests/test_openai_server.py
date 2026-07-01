@@ -175,7 +175,10 @@ class BuildPromptTests(unittest.TestCase):
         out = srv.build_prompt(messages, tools)
         self.assertIn("Function-calling mode", out)
         self.assertIn('"name": "f"', out)
-        self.assertIn("Do NOT use your own shell", out)
+        # both accepted call formats must be advertised, and prose-only must be discouraged
+        self.assertIn("tool_calls", out)                 # Format 1 (JSON block)
+        self.assertIn("one literal call per line", out)  # Format 2 (name(arg=value))
+        self.assertIn("IGNORED", out)                    # prose-describes-an-action warning
 
 
 class ExtractToolCallsTests(unittest.TestCase):
@@ -244,6 +247,71 @@ class ExtractToolCallsTests(unittest.TestCase):
         calls, cleaned = srv.extract_tool_calls('```json\n{"tool_calls":[]}\n```')
         self.assertIsNone(calls)
         self.assertEqual(cleaned, "")
+
+
+class FuncCallSyntaxTests(unittest.TestCase):
+    """The `name(arg=value, ...)` fallback: codex CLI tends to emit tool calls as literal
+    function-call lines (the way it would WRITE a call) instead of the prompted JSON block.
+    extract_func_calls / extract_tool_calls recover those, gated on the known tool names."""
+
+    NAMES = {"world_command", "execute_lua"}
+
+    def test_single_func_call_line_recovered(self):
+        text = 'execute_lua(code="x = 1", label="setup")'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES)
+        self.assertIsNotNone(calls)
+        self.assertEqual(calls[0]["function"]["name"], "execute_lua")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"code": "x = 1", "label": "setup"})
+
+    def test_multiple_calls_all_recovered_with_typed_args(self):
+        text = (
+            "Here is the castle:\n"
+            'world_command(action="spawn", targetName="Tower_NW", prefabKey="cylinder", x=-6, y=1.55, z=-6)\n'
+            'world_command(action="spawn", targetName="Flag", prefabKey="quad", color=[1,0,0], solid=true)\n'
+            "Execution succeeded."
+        )
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES)
+        self.assertEqual(len(calls), 2)
+        a0 = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(a0["x"], -6)            # negative int
+        self.assertEqual(a0["y"], 1.55)          # float
+        self.assertEqual(a0["prefabKey"], "cylinder")
+        a1 = json.loads(calls[1]["function"]["arguments"])
+        self.assertEqual(a1["color"], [1, 0, 0])  # list value
+        self.assertIs(a1["solid"], True)          # boolean
+        # the call lines are stripped from the display text (surrounding prose kept)
+        self.assertNotIn("world_command(", cleaned)
+        self.assertIn("Execution succeeded.", cleaned)
+
+    def test_string_value_containing_commas_and_braces_stays_intact(self):
+        text = 'execute_lua(code="slot.price = {10,20,30}", label="prices")'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["code"],
+                         "slot.price = {10,20,30}")
+
+    def test_json_block_takes_precedence_over_func_syntax(self):
+        text = ('```json\n{"tool_calls":[{"name":"execute_lua","arguments":{"code":"a"}}]}\n```\n'
+                'world_command(action="spawn", x=1)')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "execute_lua")
+
+    def test_unknown_name_is_not_treated_as_a_call(self):
+        calls, _ = srv.extract_tool_calls('helper(x=1) and foo(bar=2)', self.NAMES)
+        self.assertIsNone(calls)
+
+    def test_empty_parens_mention_is_prose_not_a_call(self):
+        calls, cleaned = srv.extract_tool_calls("I will use world_command() next.", self.NAMES)
+        self.assertIsNone(calls)
+        self.assertEqual(cleaned, "I will use world_command() next.")
+
+    def test_no_names_means_no_func_call_fallback(self):
+        # Backward compatible: called without names (the old signature), the func-call fallback
+        # is disabled and plain prose stays plain prose.
+        calls, text = srv.extract_tool_calls('world_command(action="spawn", x=1)')
+        self.assertIsNone(calls)
+        self.assertEqual(text, 'world_command(action="spawn", x=1)')
 
 
 class IsExtensionTests(unittest.TestCase):

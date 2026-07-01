@@ -6,6 +6,31 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- Fix (tool-calling recognition — the big benchmark win): the bridge's tool-call reparser now
+  ALSO recognizes literal `name(arg=value, ...)` call syntax, not only a JSON
+  `{"tool_calls":[...]}` block. Root cause surfaced by running CoreAI's Game-Creation Benchmark
+  through the bridge on `gpt-5.3-codex-spark`: the model actually SOLVED scenarios (e.g. a full
+  50+ object castle in G6, `world_command`/`execute_lua` calls in G1–G5) but wrote the calls the
+  way a CLI agent naturally would — `world_command(action="spawn", targetName="Tower_NW", x=-6,
+  ...)` as plain text — instead of the prompted JSON, so the JSON-only reparser saw zero tool
+  calls and scored those scenarios 0%. `extract_func_calls` parses every `name(...)` whose name
+  is a known tool (parenthesis-balanced, quote-aware, top-level arg split so a value containing
+  commas/braces like `"{10,20,30}"` stays intact; values typed via JSON→literal→bare-string), and
+  `extract_tool_calls(text, names)` falls back to it after the JSON paths. Engine-agnostic (helps
+  claude/opencode/gemini too). Verified live: a multi-object `world_command` build returned 3
+  correct `tool_calls`. Covered by new `FuncCallSyntaxTests`.
+- Stronger tool-calling prompt: it now states the model has no shell/filesystem and the ONLY way
+  to act is to emit a call; that *describing* an action in prose ("I called X", "Execution
+  succeeded") is IGNORED and treated as a failed turn; that it may emit as MANY calls as the task
+  needs; and it advertises BOTH accepted formats (JSON block or `name(arg=value)` lines). Observed
+  live steering codex to emit clean JSON on its own.
+- Note on speed (asked about while benchmarking): each bridge turn is a full cold `codex`/`claude`
+  CLI process (no warm daemon exists to reuse), so per-turn latency (~15–50s) is inference +
+  process start, not something the bridge can cache away — measured `-c mcp_servers={}` made no
+  difference. The existing session model already resumes (sends only the new tail) within one
+  conversation; across the benchmark's many independent scenarios a fresh session per scenario is
+  correct, not waste. The real throughput win here is fewer FAILED scenarios (hence fewer retries)
+  from the tool-call fix above.
 - Hardening (from a second independent codex audit of the fixes below):
   - The codex provider resolves a working `python3`/`python`/`py` (with a real smoke test, so a
     Windows WindowsApps alias stub is skipped; override via `AGENT_PYTHON`) and, if none works,
