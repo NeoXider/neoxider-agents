@@ -37,7 +37,9 @@ this project fills.
   keep its own `PROGRESS.md` checklist in the working directory too.
 - **`doctor`**: which CLIs are installed, codex login state, and live rate-limit bars
   (primary/secondary window, % used, time to reset) before you fan out a batch of
-  subagents.
+  subagents. Claude exposes no remaining-limit API, so its panel shows a **local usage
+  estimate** instead — tokens burned in the current 5h window and the last 7 days
+  (in+out and cache separately), summed from the CLI's own transcript files, ccusage-style.
 - **Web GUI** (`neoxider` / `agent.sh gui`): a project tree of subagents (activity +
   topic emoji, no redundant status dot), a chat-style thread view with basic markdown,
   a provider/model/**effort** picker whose cached, manually-refreshable rate-limit

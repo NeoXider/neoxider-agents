@@ -75,15 +75,58 @@ provider_claude_resume_cmd() {
     ( cd "$dir" && claude -p "${cargs[@]}" --permission-mode acceptEdits "$answer" </dev/null 2>&1 )
 }
 
-# provider_claude_doctor — prints a single-line JSON object to stdout.
+# provider_claude_doctor — prints a single-line JSON object to stdout. The Claude CLI exposes no
+# remaining-limit API, so instead of "no data" the note carries a LOCAL USAGE ESTIMATE summed from
+# the CLI's own transcript files (~/.claude/projects/**/*.jsonl carry a per-assistant-message
+# `usage` block + timestamp): tokens burned in the current 5h window and the last 7 days — the two
+# windows Anthropic actually rate-limits on. An estimate of what was SPENT, not what REMAINS
+# (the cap depends on the plan and isn't exposed anywhere locally).
 provider_claude_doctor() {
-    local ver login note
+    local ver
     if command -v claude >/dev/null 2>&1; then
         ver="$(claude --version 2>&1 | head -1)"
-        login="CLI ok"
-        note="Claude CLI does not expose remaining limits via API - version/availability only."
-        printf '{"engine":"claude","version":%s,"available":true,"login":%s,"limits":null,"note":%s}\n' \
-            "$(_json_str "$ver")" "$(_json_str "$login")" "$(_json_str "$note")"
+        PYTHONIOENCODING=utf-8 python - "$ver" <<'PY'
+import glob, io, json, os, sys, time
+ver = sys.argv[1]
+now = time.time()
+h5, d7 = now - 5 * 3600, now - 7 * 86400
+sums = {"5h": [0, 0], "7d": [0, 0]}  # [in+out, cache read+creation]
+for f in glob.glob(os.path.expanduser('~/.claude/projects/**/*.jsonl'), recursive=True):
+    try:
+        if os.path.getmtime(f) < d7:
+            continue
+        for line in io.open(f, encoding='utf-8', errors='ignore'):
+            if '"usage"' not in line or '"assistant"' not in line:
+                continue
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            u = (o.get('message') or {}).get('usage') or {}
+            ts = o.get('timestamp') or ''
+            try:
+                t = time.mktime(time.strptime(ts[:19], '%Y-%m-%dT%H:%M:%S')) - time.timezone
+            except ValueError:
+                continue
+            if t < d7:
+                continue
+            io_tok = (u.get('input_tokens') or 0) + (u.get('output_tokens') or 0)
+            cache = (u.get('cache_read_input_tokens') or 0) + (u.get('cache_creation_input_tokens') or 0)
+            sums['7d'][0] += io_tok; sums['7d'][1] += cache
+            if t >= h5:
+                sums['5h'][0] += io_tok; sums['5h'][1] += cache
+    except OSError:
+        continue
+def fmt(n):
+    if n >= 1e9:
+        return '%.1fB' % (n / 1e9)
+    return '%.1fM' % (n / 1e6) if n >= 1e6 else ('%.0fk' % (n / 1e3) if n >= 1e3 else str(n))
+note = ('usage burned (local transcript estimate): 5h window ~%s in+out (+%s cache) / '
+        'last 7d ~%s in+out (+%s cache). Claude CLI exposes no remaining-limit %%.'
+        % (fmt(sums['5h'][0]), fmt(sums['5h'][1]), fmt(sums['7d'][0]), fmt(sums['7d'][1])))
+print(json.dumps({"engine": "claude", "version": ver, "available": True,
+                   "login": "CLI ok", "limits": None, "note": note}, separators=(",", ":")))
+PY
     else
         printf '{"engine":"claude","version":"NOT_FOUND","available":false,"login":"","limits":null,"note":""}\n'
     fi
