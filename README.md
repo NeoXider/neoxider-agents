@@ -2,7 +2,10 @@
 
 A tiny local control room for AI coding subagents across multiple CLI providers —
 **Codex, Claude Code, opencode, Gemini CLI** (and any future CLI you add) — from one
-non-interactive bash wrapper plus an optional zero-dependency web GUI.
+non-interactive bash wrapper, an optional zero-dependency web GUI, and an
+**OpenAI-compatible HTTP bridge** that turns any of those CLI subscriptions into a
+`/v1/chat/completions` endpoint (so a benchmark or test harness can consume a CLI
+model exactly like a real provider API, tool-calling included).
 
 No daemon, no database, no npm/cargo build step. `agent.sh` is plain POSIX shell;
 `gui.py` is Python stdlib only; the frontend is plain classic `<script>` files (no
