@@ -6,6 +6,13 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- New `tests/live_smoke_openai_server.py`: a standalone, deliberately-manual end-to-end
+  smoke test for `openai_server.py` against a real CLI subagent (not part of the fast
+  unit suites, since it costs real subscription usage) — health/error responses, a
+  fresh completion, session continuation with real context recall, a tool-call round
+  trip, divergence, `/reset`, idle-timeout expiry, streaming, and concurrency, all
+  against a scratch `AGENT_CLI_LOGS` that never touches the real one. Verified live:
+  23/23 checks passed against `claude`.
 - Stable, documented GUI port: `gui.py` resolves explicit CLI arg > `$AGENT_GUI_PORT`
   env var > `8765` default, instead of drifting across manual invocations.
 - `neoxider` bare invocation now prints a usage summary instead of auto-opening the

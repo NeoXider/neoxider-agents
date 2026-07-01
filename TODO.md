@@ -212,6 +212,14 @@ Roughly in priority order. PRs welcome.
   `--session-ttl 8`: an extension sent 12s after the last call correctly triggered a
   fresh `[run]` (not `[reply]`) with the full history, task count incremented, same
   correct answer either way.
+- [x] **Live end-to-end smoke test.** Done — `tests/live_smoke_openai_server.py`, a
+  standalone script (not part of the fast/free `test_*.py`/`test_agent_sh.sh` suites,
+  since it drives a real CLI subagent) exercising a live `openai_server.py` instance
+  against a scratch `AGENT_CLI_LOGS`: health/models/error responses, a fresh
+  completion, session continuation with real context recall, a tool-call round trip,
+  divergence, `/reset`, idle-timeout expiry, streaming, and concurrency — 23 checks in
+  one run. Verified live: 23/23 passed against `claude`, real `~/.claude/agent-cli-logs`
+  and temp dirs confirmed untouched afterward.
 
 ## Distribution
 

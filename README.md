@@ -208,6 +208,15 @@ machinery as everything else in this file). Point any OpenAI-compatible client's
 `base_url` at it and it drives your CLI-agent subscription as the "model" — no
 separate provider API key needed.
 
+**Verifying it end to end**: `tests/test_openai_server.py` covers the pure logic
+(message rendering, tool-call parsing, session-extension detection, model labels) with
+zero real CLI calls — fast and free, safe to run on every commit. For an actual
+end-to-end check against a real CLI subagent (fresh completion, session continuation,
+tool round-trip, divergence, `/reset`, idle-timeout expiry, streaming, concurrency —
+23 checks), run `python tests/live_smoke_openai_server.py [--engine claude]` — this
+costs real time and real usage against your subscription, so it's deliberately not
+part of the automatic test suites.
+
 **This is a wire-compatible shim, not a low-latency native LLM backend** — be clear
 about this before pointing anything at it:
 
