@@ -662,7 +662,7 @@ class SessionExpiryTests(unittest.TestCase):
         self.assertGreaterEqual(idle, 100)
         self.assertLess(idle, 105)  # generous slack for test execution time
 
-    def test_exactly_at_ttl_boundary_is_not_yet_expired(self):
+    def test_one_second_under_the_ttl_is_not_yet_expired(self):
         import time
         srv.SESSION["task_name"] = "some-task"
         srv.SESSION["last_activity"] = time.time() - 1799  # 1s under the 1800s ttl
@@ -767,6 +767,126 @@ class ReplyAgentStaleGuardTests(unittest.TestCase):
         srv.read_meta = lambda name: {"state": "waiting"}
         self.assertEqual(srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60),
                          "NEW ANSWER\n")
+
+
+class AdversarialParsingTests(unittest.TestCase):
+    """Hostile inputs surfaced by an adversarial audit -- every case here reproduced a REAL
+    parsing defect before its fix (silent call loss, phantom double-execution, display-text
+    corruption, valid-fence swallowing). Each test name states the defect it locks."""
+
+    TOOLS = [
+        {"type": "function", "function": {"name": "world_command",
+         "parameters": {"type": "object", "properties": {"action": {}, "text": {}, "x": {}}}}},
+        {"type": "function", "function": {"name": "execute_lua",
+         "parameters": {"type": "object", "properties": {"code": {}}}}},
+    ]
+    NAMES = {"world_command", "execute_lua"}
+
+    def test_string_arg_ending_in_backslash_still_parses(self):
+        # A JSON-escaped Windows path ending in "\" -- the old single-char lookbehind read the
+        # closing quote as escaped, the parens never balanced, and the WHOLE call was dropped.
+        calls, _ = srv.extract_tool_calls(
+            'world_command(action="say", text="C:\\\\Games\\\\")', self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 1)
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["action"], "say")
+
+    def test_backslash_tail_in_positional_json_spelling(self):
+        calls, _ = srv.extract_tool_calls(
+            'world_command({"action": "say", "text": "C:\\\\Games\\\\"})', self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["text"], "C:\\Games\\")
+
+    def test_known_tool_name_inside_string_argument_is_not_a_second_call(self):
+        # Lua code that MENTIONS world_command must not be extracted as a phantom second call
+        # (double-execution corrupted benchmark exact-count scenarios).
+        calls, _ = srv.extract_tool_calls(
+            'execute_lua(code="world_command(action=1)")', self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "execute_lua")
+
+    def test_malformed_fence_does_not_swallow_a_following_valid_one(self):
+        text = ('```json\n{"tool_calls":[{"name":"world_command","arguments":{"x":1}}]} junk\n```\n'
+                'prose\n'
+                '```json\n{"tool_calls":[{"name":"world_command","arguments":{"x":2}}]}\n```')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertIsNotNone(calls)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"x": 2})
+
+    def test_multiple_fences_with_leading_whitespace_leave_clean_display_text(self):
+        text = ('  \nbefore\n'
+                '```json\n{"tool_calls":[]}\n```\n'
+                'middle prose\n'
+                '```json\n{"tool_calls":[]}\n```\n'
+                'after')
+        _calls, cleaned = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertNotIn("```", cleaned)
+        self.assertIn("middle prose", cleaned)
+        self.assertIn("before", cleaned)
+        self.assertIn("after", cleaned)
+
+    def test_call_syntax_inside_a_tagged_code_fence_is_example_not_a_call(self):
+        text = ('Here is how you could do it:\n'
+                '```lua\nworld_command(action="spawn", x=1)\n```\n'
+                'But I am not calling it.')
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertIsNone(calls)
+        self.assertIn("not calling it", cleaned)
+
+    def test_call_lines_in_an_untagged_fence_still_execute(self):
+        # Models often wrap their GENUINE Format-2 call lines in a bare ``` fence -- only
+        # language-tagged fences are treated as examples.
+        text = '```\nworld_command(action="spawn", x=1)\n```'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 1)
+
+    def test_uppercase_json_fence_tag_is_recognized(self):
+        text = '```JSON\n{"tool_calls":[{"name":"world_command","arguments":{"x":1}}]}\n```'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 1)
+
+    def test_bare_json_with_trailing_prose_is_not_lost(self):
+        text = '{"tool_calls":[{"name":"world_command","arguments":{"x":1}}]}\nDone.'
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(cleaned, "Done.")
+
+    def test_multiline_format2_call_and_two_calls_on_one_line_still_work(self):
+        # These worked before the audit -- pinned so hardening never regresses them.
+        calls, _ = srv.extract_tool_calls(
+            'execute_lua({"code": "line1\\nline2"})', self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 1)
+        calls2, _ = srv.extract_tool_calls(
+            'world_command(action="a", x=1) world_command(action="b", x=2)',
+            self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls2), 2)
+
+
+class DeliberateRepeatContractTests(unittest.TestCase):
+    """The documented contract for re-running an identical call (echo-dedup's one false
+    positive): a Format-2 line that exactly repeats an executed call is ALWAYS summary prose;
+    a deliberate repeat must use Format 1 (fenced JSON), which is exempt from dedup. The prompt
+    states this escape hatch explicitly -- both halves locked here."""
+
+    PRIOR = [{"role": "assistant", "tool_calls": [
+        {"function": {"name": "execute_lua", "arguments": '{"code": "score = score + 1"}'}}]}]
+
+    def test_format2_identical_repeat_is_dropped_as_echo(self):
+        prior = srv.prior_call_keys(self.PRIOR)
+        calls, _ = srv.extract_tool_calls(
+            'execute_lua({"code": "score = score + 1"})',
+            {"execute_lua"}, None, prior)
+        self.assertIsNone(calls)
+
+    def test_format1_identical_repeat_is_executed(self):
+        prior = srv.prior_call_keys(self.PRIOR)
+        text = '```json\n{"tool_calls":[{"name":"execute_lua","arguments":{"code":"score = score + 1"}}]}\n```'
+        calls, _ = srv.extract_tool_calls(text, {"execute_lua"}, None, prior)
+        self.assertEqual(len(calls), 1)
+
+    def test_prompt_documents_the_format1_escape_hatch(self):
+        self.assertIn("IDENTICAL", srv.TOOLCALL_INSTRUCTIONS)
+        self.assertIn("Format 1", srv.TOOLCALL_INSTRUCTIONS)
 
 
 class RoughTokensTests(unittest.TestCase):

@@ -6,6 +6,36 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- openai-server: 8 parser/robustness defects fixed after an independent adversarial audit (every
+  one reproduced live against the real functions before fixing):
+  - **String argument ending in a backslash silently killed the whole call** (a JSON-escaped
+    Windows path like `"C:\\Games\\"`): the quote scanner's single-char lookbehind couldn't tell
+    `\"` from `\\"`, so the string "never closed" and the call was dropped. Now an odd/even
+    backslash-run check (`_is_escaped`) in both the call scanner and `_split_top_level`.
+  - **A known-tool name inside another call's string argument became a phantom second call**
+    (`execute_lua(code="world_command(action=1)")` executed BOTH) — scan cursor now skips
+    matches inside an already-accepted call's span.
+  - **A malformed `tool_calls` fence swallowed a following valid one** (non-greedy DOTALL match
+    ran past its own closing fence) — fence bodies now exclude backticks.
+  - **Display-text corruption when stripping multiple fences** with leading whitespace (a
+    mid-loop `.strip()` shifted the remaining reversed-match offsets) — strip once at the end.
+  - **Format-2 call syntax inside a language-tagged code fence was executed** (a ```lua example
+    mentioning `world_command(...)` ran for real) — tagged fences are masked (same-length, so
+    spans stay valid) before the func-syntax scan; untagged fences still parse, since models
+    often wrap genuine call lines in a bare fence.
+  - **```JSON (uppercase tag) fences were not recognized** — fence regex is case-insensitive.
+  - **Bare unfenced `{"tool_calls":...}` followed by trailing prose was lost** (`endswith("}")`
+    gate) — `raw_decode` now takes the JSON object and keeps the prose as display text.
+  - **Resume-after-timeout hole**: a session whose meta state was still `running` (wrapper
+    killed by timeout, orphaned CLI grandchild possibly still appending to the log) counted as
+    "healthy" and could be resumed, misattributing orphan output — healthy now means positively
+    finished (`done`/`waiting`).
+  - Dedup false-positive contract made explicit: a Format-2 line identical to an executed call
+    is ALWAYS summary prose; the prompt now documents Format 1 (fenced JSON, dedup-exempt) as
+    the deliberate-repeat escape hatch. `--retries` is clamped non-negative. +13 tests
+    (109 total in test_openai_server.py) covering every defect above plus pins for
+    multiline/two-per-line calls that already worked.
+
 - openai-server stability (toward "almost a real OpenAI API" for benchmark use):
   - **Retry-on-empty**: a completion whose CLI invocation came back empty or in an `error` meta
     state is re-run (`--retries`, default 1, 2s backoff) before the bridge gives up — a real

@@ -360,7 +360,9 @@ Both formats are parsed identically. Do NOT wrap Format 2 in prose -- just the c
 
 After a [TOOL RESULT] round-trip, report progress in plain words. Do NOT restate calls you
 already made in call syntax -- an exact repeat of an earlier call reads as summary prose, not a
-new request. Write call syntax only for NEW calls you want executed now.
+new request. Write call syntax only for NEW calls you want executed now. To deliberately run a
+call IDENTICAL to one already executed above, use Format 1 (the fenced JSON block) -- that is
+always executed as written.
 """
 
 
@@ -371,9 +373,31 @@ def build_prompt(messages, tools):
     return text
 
 
-FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+# The fence body deliberately excludes backticks ([^`]): with DOTALL-".*?" a malformed
+# tool_calls fence ("{...} trailing junk") made the match run PAST its own closing fence into
+# the next one, so one bad fence swallowed a following perfectly valid one (calls lost).
+# (?i) so a ```JSON tag (observed from models) is recognized too.
+FENCE_RE = re.compile(r"(?i)```(?:json)?\s*(\{[^`]*\})\s*```")
+# A fenced code block with an explicit language tag (```lua, ```python, ...) is example/code
+# content, not a place the model writes real Format-2 calls -- masked out before the func-syntax
+# fallback so `world_command(...)` inside a lua example is not executed (see extract_tool_calls).
+TAGGED_FENCE_RE = re.compile(r"```([A-Za-z][\w+-]*)[^\n]*\n.*?```", re.DOTALL)
 FUNC_HEAD_RE = re.compile(r"([A-Za-z_]\w*)\s*\(")
 IDENT_RE = re.compile(r"^\w+$")
+
+
+def _is_escaped(s, i):
+    """True when s[i] is escaped by an ODD run of backslashes immediately before it. A single
+    lookbehind (`s[i-1] == "\\"`) can't tell `\\"` (escaped quote) from `\\\\"` (escaped
+    backslash + REAL closing quote) -- a string argument ending in a backslash (a Windows path
+    like "C:\\Games\\") made the quote scanner think the string never closed and silently
+    dropped the whole call."""
+    n = 0
+    k = i - 1
+    while k >= 0 and s[k] == "\\":
+        n += 1
+        k -= 1
+    return n % 2 == 1
 
 
 def tool_names(tools):
@@ -469,7 +493,7 @@ def _split_top_level(s, sep=","):
     for i, c in enumerate(s):
         if quote:
             buf.append(c)
-            if c == quote and s[i - 1] != "\\":
+            if c == quote and not _is_escaped(s, i):
                 quote = None
         elif c in "\"'":
             quote = c
@@ -512,16 +536,18 @@ def extract_func_calls(text, names, params=None):
     if not names:
         return [], []
     found, spans = [], []
+    consumed_end = -1  # a known-tool name INSIDE another call's string argument (e.g. lua code
+    #                    mentioning world_command) must not become a second, phantom call
     for m in FUNC_HEAD_RE.finditer(text):
         name = m.group(1)
-        if name not in names:
+        if name not in names or m.start() < consumed_end:
             continue
         open_paren = m.end() - 1
         depth, quote, j = 0, None, open_paren
         while j < len(text):
             c = text[j]
             if quote:
-                if c == quote and text[j - 1] != "\\":
+                if c == quote and not _is_escaped(text, j):
                     quote = None
             elif c in "\"'":
                 quote = c
@@ -558,6 +584,7 @@ def extract_func_calls(text, names, params=None):
             continue  # nothing parsed cleanly -> most likely prose that happened to match
         found.append((name, args))
         spans.append((m.start(), j + 1))
+        consumed_end = j + 1
     return found, spans
 
 
@@ -607,21 +634,33 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
             raw = obj.get("tool_calls")
             if isinstance(raw, list) and raw:
                 calls = _to_calls(raw)
-        cleaned = (cleaned[:m.start()] + cleaned[m.end():]).strip()
+        # No .strip() here: matches iterate in reverse over ORIGINAL offsets, and stripping
+        # leading whitespace mid-loop shifted every earlier match's span, garbling the display
+        # text when more than one fence was stripped. One strip at the end is enough.
+        cleaned = cleaned[:m.start()] + cleaned[m.end():]
     if calls is None:
         stripped = cleaned.strip()
-        if stripped.startswith("{") and stripped.endswith("}") and '"tool_calls"' in stripped:
+        if stripped.startswith("{") and '"tool_calls"' in stripped:
+            # raw_decode instead of loads: a bare (unfenced) JSON object followed by trailing
+            # prose ("{...}\nDone.") is still a real call block -- the prose becomes the display
+            # text instead of the whole turn being lost.
             try:
-                obj = json.loads(stripped)
-                raw = obj.get("tool_calls")
+                obj, end = json.JSONDecoder().raw_decode(stripped)
+                raw = obj.get("tool_calls") if isinstance(obj, dict) else None
                 if isinstance(raw, list) and raw:
                     found = _to_calls(raw)
                     if found:
-                        calls, cleaned = found, ""
+                        calls, cleaned = found, stripped[end:]
             except ValueError:
                 pass
     if calls is None and names:
-        found, spans = extract_func_calls(cleaned, names, tool_param_names(tools))
+        # Mask language-tagged code fences (```lua, ```python, ...) with same-length whitespace
+        # before scanning: call syntax inside them is example/code content, not a real request
+        # (a lua example mentioning world_command(...) was executed before this). Same-length
+        # replacement keeps every span valid in the REAL `cleaned` text. Untagged fences are
+        # scanned normally -- models often wrap their genuine Format-2 call lines in a bare fence.
+        scan_text = TAGGED_FENCE_RE.sub(lambda m: " " * len(m.group(0)), cleaned)
+        found, spans = extract_func_calls(scan_text, names, tool_param_names(tools))
         if found and prior:
             # Drop exact repeats of already-executed calls (echoes of the history's own
             # rendering style, not new requests -- see prior_call_keys). Their text spans stay
@@ -716,10 +755,14 @@ class H(BaseHTTPRequestHandler):
         with SESSION_LOCK:
             supports_resume = bool((PROVIDERS.get(CFG.engine) or {}).get("supports_resume"))
             prev_name = SESSION["task_name"]
+            # Healthy means POSITIVELY finished ("done"/"waiting"), not merely "not errored":
+            # after a subprocess timeout the wrapper's meta can stay "running" while an orphaned
+            # CLI grandchild keeps appending to the log -- resuming onto that session could
+            # misattribute the orphan's late output as the next reply's answer.
             healthy = (
                 bool(prev_name)
                 and not session_expired()
-                and read_meta(prev_name).get("state") not in (None, "", "error", "stalled")
+                and read_meta(prev_name).get("state") in ("done", "waiting")
             )
             raw_text = None
             if supports_resume and healthy and is_extension(SESSION["messages"], messages):
@@ -886,6 +929,7 @@ def main():
                      help="seconds of inactivity before the ongoing session is treated as expired and the "
                           "next call starts fresh instead of resuming it (default: 1800 = 30 minutes)")
     CFG = ap.parse_args()
+    CFG.retries = max(0, CFG.retries)  # a negative value would skip the run loop entirely
 
     try:
         srv = ThreadingHTTPServer((CFG.host, CFG.port), H)
