@@ -412,27 +412,46 @@ class ReplyAgentStaleGuardTests(unittest.TestCase):
     def setUp(self):
         self._real_run = srv.subprocess.run
         self._real_read_log = srv.read_log
+        self._real_read_meta = srv.read_meta
         srv.subprocess.run = lambda *a, **k: None  # never actually shell out
+        srv.read_meta = lambda name: {"state": "done"}  # default: a healthy finished task
 
     def tearDown(self):
         srv.subprocess.run = self._real_run
         srv.read_log = self._real_read_log
+        srv.read_meta = self._real_read_meta
+
+    def _grow(self):
+        """Make read_log return `before` on the 1st call and `after` (grown) on later calls."""
+        state = {"n": 0}
+        before = "========== [run] ...\n---------- output ----------\nOLD ANSWER\n"
+        after = before + "========== [reply] ...\n---------- output ----------\nNEW ANSWER\n"
+        def fake_read_log(name):
+            state["n"] += 1
+            return before if state["n"] == 1 else after
+        srv.read_log = fake_read_log
 
     def test_returns_none_when_log_did_not_grow(self):
         # read_log returns the same content before and after -> nothing was appended.
         srv.read_log = lambda name: "========== [run] ...\n---------- output ----------\nOLD ANSWER\n"
         self.assertIsNone(srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60))
 
-    def test_returns_new_answer_when_log_grew(self):
-        state = {"n": 0}
-        before = "========== [run] ...\n---------- output ----------\nOLD ANSWER\n"
-        after = before + "========== [reply] ...\n---------- output ----------\nNEW ANSWER\n"
+    def test_returns_new_answer_when_log_grew_and_state_done(self):
+        self._grow()
+        srv.read_meta = lambda name: {"state": "done"}
+        self.assertEqual(srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60),
+                         "NEW ANSWER\n")
 
-        def fake_read_log(name):
-            state["n"] += 1
-            return before if state["n"] == 1 else after  # 1st call = before, later = after
+    def test_returns_none_when_log_grew_but_state_error(self):
+        # A provider that fails AFTER the reply header still grows the log; the meta-state guard
+        # must reject it so _run falls back to a fresh run instead of returning the error block.
+        self._grow()
+        srv.read_meta = lambda name: {"state": "error"}
+        self.assertIsNone(srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60))
 
-        srv.read_log = fake_read_log
+    def test_accepts_waiting_state(self):
+        self._grow()
+        srv.read_meta = lambda name: {"state": "waiting"}
         self.assertEqual(srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60),
                          "NEW ANSWER\n")
 

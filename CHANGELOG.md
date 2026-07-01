@@ -6,6 +6,25 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- Hardening (from a second independent codex audit of the fixes below):
+  - The codex provider resolves a working `python3`/`python`/`py` (with a real smoke test, so a
+    Windows WindowsApps alias stub is skipped; override via `AGENT_PYTHON`) and, if none works,
+    degrades to a raw `cat` passthrough instead of hard-failing the whole codex run.
+  - `_provider_codex_emit` now exits non-zero when there is no `agent_message` (auth/rate-limit/
+    schema drift), so the `PIPESTATUS[1]` guard marks the task failed instead of "done with junk";
+    and it neutralizes the pathological case where the answer itself contains a line exactly equal
+    to `---------- output ----------` (a trailing space stops `last_output` truncating there).
+  - `reply_agent` (bridge) additionally rejects a reply whose task did not end in a good state
+    (`done`/`waiting`): agent.sh writes the reply header before dispatch, so a provider that fails
+    AFTER the header grows the log — the earlier length-only guard would have returned that failed
+    block as the answer. Now `_run` falls back to a fresh run.
+  - `openai_server.last_output` is line-anchored (whole-line marker match) like agent.sh's awk,
+    instead of a substring `rfind` that could truncate an answer containing the marker text
+    mid-sentence.
+  - Verified live after these changes against `gpt-5.3-codex-spark`: a 6-turn growing-history
+    chain stayed ONE underlying session (1 `[run]` + 5 `[reply]` blocks) and recalled facts from
+    turns 1–3 at turn 6; fresh/continuation/tool-calling all still clean. Tests: 84 python + 58
+    bash.
 - Fix (codex clean output): the `codex` provider now runs `codex exec --json` and extracts
   ONLY the final agent message (`_provider_codex_emit` in `providers/codex/provider.sh`),
   instead of letting codex's plaintext `exec` dump its startup banner / session id / ERROR-log

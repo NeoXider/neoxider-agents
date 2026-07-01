@@ -113,10 +113,18 @@ def read_log(name):
 
 def last_output(text):
     """Same block agent.sh's own `last_output` awk one-liner extracts: everything after the
-    LAST "---------- output ----------" marker (a run may append a reply's marker too)."""
+    LAST "---------- output ----------" marker (a run may append a reply's marker too).
+    Line-anchored (the marker must be a WHOLE line), matching agent.sh's awk `/^...$/` -- a
+    substring match would truncate an answer that merely contains the marker text mid-sentence."""
     marker = "---------- output ----------"
-    idx = text.rfind(marker)
-    return text[idx + len(marker):].lstrip("\n") if idx != -1 else text
+    lines = text.split("\n")
+    last = -1
+    for i, ln in enumerate(lines):
+        if ln == marker:
+            last = i
+    if last == -1:
+        return text
+    return "\n".join(lines[last + 1:]).lstrip("\n")
 
 
 def read_meta(name):
@@ -208,7 +216,14 @@ def reply_agent(engine, model, effort, workdir, name, answer, timeout):
         pass
     after = read_log(name)
     if len(after) == before:
-        return None  # nothing was appended -> the resume failed; don't return the stale prior answer
+        return None  # nothing was appended -> the resume died before its block; don't echo stale
+    # agent.sh writes the reply HEADER before dispatching, so a provider that fails AFTER the header
+    # (error/timeout/rate-limit) DOES grow the log -- and last_output would then return that failed
+    # block as if it were the answer. Only accept a reply whose task ended in a good state; anything
+    # else (error/stalled, or a timeout that left it still "running") -> None so _run falls back fresh.
+    state = read_meta(name).get("state")
+    if state not in ("done", "waiting"):
+        return None
     return last_output(after)
 
 

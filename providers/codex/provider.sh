@@ -19,6 +19,22 @@ provider_codex_resolve() {
     esac
 }
 
+# _provider_codex_python — first of python3/python/py that actually runs (a bare `python` on
+# Windows can be a WindowsApps alias stub that exits non-zero), or empty if none work. Cached.
+_PROVIDER_CODEX_PY=""
+_PROVIDER_CODEX_PY_RESOLVED=""
+_provider_codex_python() {
+    if [ -z "$_PROVIDER_CODEX_PY_RESOLVED" ]; then
+        _PROVIDER_CODEX_PY_RESOLVED=1
+        local c
+        for c in "${AGENT_PYTHON:-}" python3 python py; do
+            [ -n "$c" ] || continue
+            if "$c" -c "import sys" >/dev/null 2>&1; then _PROVIDER_CODEX_PY="$c"; break; fi
+        done
+    fi
+    [ -n "$_PROVIDER_CODEX_PY" ]
+}
+
 # _provider_codex_emit — reads codex `--json` JSONL on stdin and emits agent.sh-friendly output:
 #   1. a `session id: <uuid>` line (parsed from the `thread.started` event) so agent.sh's own
 #      session-id grep keeps working for resume, exactly as it did with codex's plaintext banner;
@@ -26,17 +42,25 @@ provider_codex_resolve() {
 #      (the last `agent_message` item) — since `last_output` returns everything after the LAST
 #      such marker, downstream (`agent.sh last`, the GUI, the openai-server bridge) sees a clean
 #      answer with none of codex's banner/session-id/ERROR-log/"tokens used"/cp866-mojibake chrome.
-# On any failure (auth/rate-limit/no agent_message) it echoes the full raw stream instead, so the
-# error stays visible for debugging. This is why we use `--json` rather than plaintext `exec`.
+# If no agent message is present (auth/rate-limit/schema drift) it echoes the raw stream AND exits
+# non-zero, so the PIPESTATUS[1] guard below marks the task failed instead of "done with junk".
+# If NO python is available at all, it degrades to a raw `cat` (functional, just with codex chrome)
+# rather than hard-failing the whole codex run -- the openai-server bridge itself is python, so when
+# the bridge is what's calling, python is guaranteed present and the clean path is always taken.
 # NB: the parser is passed via `python -c`, NOT a `python - <<HEREDOC`: a heredoc would itself
 # occupy stdin, so the piped codex JSONL would never reach sys.stdin.
 _provider_codex_emit() {
-    PYTHONIOENCODING=utf-8 python -c '
+    if ! _provider_codex_python; then
+        cat   # no usable python -> raw passthrough (degraded but not broken)
+        return 0
+    fi
+    PYTHONIOENCODING=utf-8 "$_PROVIDER_CODEX_PY" -c '
 import sys, json
 try:
     sys.stdin.reconfigure(errors="ignore")   # codex prints a cp866 OS-notification line that is not UTF-8
 except Exception:
     pass
+MARK = "---------- output ----------"
 sid = None; msg = None; raw = []
 for line in sys.stdin:
     raw.append(line)
@@ -56,10 +80,13 @@ for line in sys.stdin:
             msg = it["text"]
 if msg is None:
     sys.stdout.write("".join(raw))          # surface the raw error stream, nothing clean to show
-    raise SystemExit(0)
+    raise SystemExit(3)                      # non-zero -> PIPESTATUS[1] guard marks the task failed
+# Defuse the (pathological) case where the answer itself contains a line exactly equal to MARK:
+# a trailing space stops last_output from treating it as the answer-boundary and truncating there.
+msg = "\n".join((ln + " ") if ln == MARK else ln for ln in msg.split("\n"))
 if sid:
     print("session id: %s" % sid)           # captured by agent.sh grep for resume
-print("---------- output ----------")       # last_output slices to AFTER this -> clean answer only
+print(MARK)                                  # last_output slices to AFTER this -> clean answer only
 sys.stdout.write(msg)
 if not msg.endswith("\n"):
     sys.stdout.write("\n")

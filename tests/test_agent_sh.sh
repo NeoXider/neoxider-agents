@@ -255,17 +255,30 @@ emit_multi="$(printf '%s\n' \
 assert_eq "multiple agent_message items -> the last (final) one wins" "final" "$emit_multi"
 
 # No agent_message at all (e.g. an auth/rate-limit failure) -> pass the raw stream through so the
-# error stays visible, and do NOT fabricate an empty answer or a bogus marker.
+# error stays visible, do NOT fabricate an empty answer or a bogus marker, AND exit non-zero so the
+# provider's PIPESTATUS[1] guard marks the task failed rather than "done with junk".
 emit_err="$(printf '%s\n' \
     'stream error: You have hit your usage limit.' \
     '{"type":"thread.started","thread_id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}' \
     '{"type":"turn.failed","error":{"message":"usage limit"}}' | _provider_codex_emit)"
+emit_err_rc=$?
 assert_match "no agent_message -> raw error stream is surfaced" 'usage limit' "$emit_err"
+assert_eq "no agent_message -> parser exits non-zero" "3" "$emit_err_rc"
 if printf '%s' "$emit_err" | grep -q '^---------- output ----------$'; then
     fail "error passthrough should NOT emit a synthetic output marker"
 else
     pass "error passthrough does not emit a synthetic output marker"
 fi
+
+# Pathological: the answer itself contains a line exactly equal to the marker. It must NOT truncate
+# -- the emitter neutralizes such lines (trailing space) so last_output returns the WHOLE answer.
+# Quoted heredoc keeps the JSON `\n` literal (a valid JSON escape) instead of a real line break.
+emit_collide="$(_provider_codex_emit <<'COLLIDE_JSON' | awk '/^---------- output ----------$/{buf=""; next}{buf=buf $0 ORS} END{printf "%s", buf}'
+{"type":"item.completed","item":{"type":"agent_message","text":"line one\n---------- output ----------\nline three"}}
+COLLIDE_JSON
+)"
+assert_match "answer containing the marker line keeps its first line" 'line one' "$emit_collide"
+assert_match "answer containing the marker line keeps its last line" 'line three' "$emit_collide"
 
 # A cp866 OS-notification line (non-UTF-8 bytes) must not crash the parser (errors=ignore).
 emit_mojibake="$(printf '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n\x93\xe0\xaf\xa5\n' | _provider_codex_emit \
