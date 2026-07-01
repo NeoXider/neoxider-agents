@@ -50,8 +50,11 @@ serialized into one prompt and sent to a brand-new `agent.sh run` each time, not
 resumed server-side); latency is a **full CLI subprocess invocation** (seconds to low
 minutes, not a token stream); `stream: true` **replays an already-finished answer** as
 word-sized SSE chunks, it is not real per-token streaming; `tools`/function-calling is
-**emulated via prompting** (best-effort, can misformat); and `usage` token counts are
-**always `0/0/0`**. One process = one fixed engine/model/effort — run it again on
+**emulated via prompting** (best-effort, can misformat); `usage` token counts are
+**always `0/0/0`**; and **`content` can include raw CLI chrome for `codex`** (its
+`exec` mode mixes startup-banner/session-id/error-log lines into the answer, same as
+`agent.sh last` shows for codex tasks) — prefer `claude`/`opencode`/`gemini` for a
+clean answer string. One process = one fixed engine/model/effort — run it again on
 another port to compare models.
 
 ## Rules for using this tool as a subagent orchestrator

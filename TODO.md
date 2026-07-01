@@ -123,7 +123,23 @@ Roughly in priority order. PRs welcome.
   bridge prompts the agent to reply with a fenced JSON tool-call block instead of
   using its own shell/file tools, then parses it into a real OpenAI `tool_calls`
   response (`finish_reason: "tool_calls"`, `content: null`). Verified live: a
-  `get_weather(city)` tool call round-tripped correctly against Claude.
+  `get_weather(city)` tool call round-tripped correctly against Claude, including a
+  full call → tool-result → final-answer round trip.
+- [x] **Fixed: leaked empty tool-call fence.** Done — found live during a tool-result
+  round-trip: the model correctly gave a plain-prose final answer but also echoed a
+  stray `{"tool_calls":[]}` fence alongside it, which leaked into `content` verbatim.
+  `extract_tool_calls` now strips any recognized tool-call JSON fence from the
+  displayed text regardless of whether it produced a real call; prompt instructions
+  tightened to discourage emitting it. Re-verified live: clean prose, no leaked JSON.
+- [x] **`messages` validation.** Done — empty or missing `messages` now returns `400`
+  instead of silently running an agent with an empty prompt. Verified live, along with
+  invalid-JSON-body `400` and wrong-path `404`.
+- [x] **Manual verification pass.** Done — multi-turn history (model correctly recalled
+  a fact from 2 turns back), a full tool-call round trip, two concurrent requests (no
+  task-name collision), and a second engine (`codex`) all tested live. Surfaced one
+  real, pre-existing caveat: `codex`'s `exec` mode mixes CLI banner/error-log noise
+  into `content` (documented, not fixed — same raw text `agent.sh last` already shows
+  for codex tasks, out of scope for this bridge to clean up).
 - [x] **Multi-instance support (compare models/providers).** Done by design, not new
   code — one process is one fixed engine/model/effort for its lifetime; running
   `agent.sh openai-server` again with different `-e/-m/-f/-p` starts an independent

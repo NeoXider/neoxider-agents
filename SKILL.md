@@ -74,6 +74,9 @@ getting — it is a wire-compatible shim, not a real low-latency LLM API:
 - **`tools`/function-calling is emulated via prompting**, not native — best-effort,
   can occasionally misformat or ignore the instruction.
 - **`usage` token counts are always `0/0/0`** — don't trust them for cost tracking.
+- **`content` can include raw CLI chrome for `codex`** (startup banner/session-id/
+  error-log lines mixed into the answer, same as `agent.sh last` shows for codex
+  tasks) — prefer `claude`/`opencode`/`gemini` when a clean answer string matters.
 - One process = one fixed engine/model/effort for its whole lifetime. To compare
   models, run the command again with different `-e/-m/-f/-p` on another port.
 

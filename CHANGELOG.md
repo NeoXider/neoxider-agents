@@ -37,10 +37,30 @@ All notable changes to this project are documented here. Format follows
   response.
 - One bridge process = one fixed engine/model/effort; run several instances on
   different ports to compare models/providers side by side.
-- Verified live: non-streaming, streaming, and tool-calling round-trips against a real
-  CLI subagent (Claude) all confirmed working end-to-end via curl. Wire-compatibility
-  with CoreAI's Game-Creation Benchmark integration point (`COREAI_TEST_BASE_URL`) was
-  confirmed by design/code-reading, not by running the actual Unity benchmark suite.
+- Verified live: non-streaming, streaming, tool-calling, multi-turn history, and a
+  full tool-call → tool-result → final-answer round-trip against a real CLI subagent
+  (Claude) all confirmed working end-to-end via curl, including two concurrent
+  requests with no task-name collision. Wire-compatibility with CoreAI's
+  Game-Creation Benchmark integration point (`COREAI_TEST_BASE_URL`) was confirmed by
+  design/code-reading, not by running the actual Unity benchmark suite.
+- Fix: the bridge could leak a stray fenced ```` ```json {"tool_calls":[]} ```` ````
+  block into a plain-prose `content` string — observed live when a tool result was
+  fed back and the model (correctly) decided no further call was needed but still
+  echoed an empty tool-call block out of habit. `extract_tool_calls` now strips any
+  recognized tool-call JSON fence from the displayed text regardless of whether it
+  produced a real (non-empty) call, and the prompt instructions were tightened to
+  discourage emitting it in the first place.
+- Added a `messages` array required/non-empty validation (`400` instead of silently
+  running an agent with an empty prompt).
+- `/v1/chat/completions` requests now correctly return `400` for both an empty and a
+  missing `messages` field, and `404` for any path that doesn't end in
+  `/chat/completions` — verified live.
+- Documented a real, pre-existing caveat surfaced by manual testing: `codex`'s
+  non-interactive `exec` mode mixes its own startup banner/session-id/error-log lines
+  into the same output stream as the answer (same raw text `agent.sh last`/the GUI's
+  chat view already show for codex tasks) — this bridge does not attempt
+  engine-specific cleanup, so `claude`/`opencode`/`gemini` are recommended when a
+  clean `content` string matters to the caller.
 
 ## [0.1.0] - 2026-07-01
 

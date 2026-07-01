@@ -23,6 +23,12 @@ WHAT THIS IS -- a wire-compatible shim, NOT a low-latency native LLM backend:
     reformatted into a real OpenAI `tool_calls` response. This is best-effort prompting, not a
     protocol the CLI natively speaks -- it can occasionally ignore the instruction or misformat it.
   - `usage` token counts are always 0/0/0 -- the wrapped CLIs don't expose them in a structured form.
+  - `content` can include raw CLI chrome for some engines -- e.g. codex's non-interactive `exec`
+    mode prints its own startup banner/session-id/error-log lines to the same stream as the
+    answer, and this bridge (like every other feature in this project -- `agent.sh last`, the
+    GUI's chat view -- reads the CLI's raw captured output verbatim, with no engine-specific
+    cleanup. `claude` was observed to return clean answers in testing; `codex` was not. Prefer
+    `claude`/`opencode`/`gemini` when a clean `content` string matters to the caller.
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
 (does not import gui.py) so the two servers can run/fail independently.
 """
@@ -167,11 +173,14 @@ callable functions available to the CALLING APPLICATION (OpenAI function-calling
 %s
 
 Decide ONE of:
-(a) Answer directly in plain prose (no function call needed), or
+(a) Answer directly in plain prose (no function call needed -- this is ALSO the right
+    choice when a previous function call's result is already visible above and you are
+    now just explaining/using that result), or
 (b) Call exactly one function from the list above.
 
 Your FINAL message must be ONLY one of:
-- Plain prose with your answer (case a), or
+- Plain prose with your answer, and NOTHING else -- no JSON, no code fence, not even an
+  empty one (case a), or
 - A single fenced block below and NOTHING else before or after it (case b):
 ```json
 {"tool_calls":[{"name":"<function name>","arguments":{...arguments matching its parameters schema...}}]}
@@ -204,30 +213,44 @@ def _to_calls(raw_calls):
 
 
 def extract_tool_calls(text):
-    """Best-effort: look for a fenced ```json {"tool_calls":[...]} ``` block (last one wins, in
-    case the agent narrates before committing to its final answer), falling back to a bare
-    (unfenced) JSON object if that's the whole trailing message. Returns None when the agent just
-    answered in prose, which is the common/expected case when no tool call was needed."""
+    """Best-effort: look for fenced ```json {"tool_calls":[...]} ``` block(s) (the LAST one
+    that yields a non-empty call list wins, in case the agent narrates before committing to
+    its final answer), falling back to a bare (unfenced) JSON object if that's the whole
+    trailing message. Returns (tool_calls_or_None, display_text).
+
+    Every fenced block that parses as a dict containing a "tool_calls" key is stripped from
+    display_text regardless of whether it produced a real call -- despite the prompt telling
+    it not to, a model sometimes still echoes a stray `{"tool_calls":[]}` alongside its real
+    prose answer (observed live against Claude after a tool-result round-trip); leaving that
+    JSON noise in a user-facing `content` string would be wrong even though no real call was
+    intended."""
+    calls = None
+    cleaned = text
     for m in reversed(list(FENCE_RE.finditer(text))):
         try:
             obj = json.loads(m.group(1))
         except ValueError:
             continue
-        calls = obj.get("tool_calls")
-        if isinstance(calls, list) and calls:
-            found = _to_calls(calls)
-            if found:
-                return found
-    stripped = text.strip()
-    if stripped.startswith("{") and stripped.endswith("}") and '"tool_calls"' in stripped:
-        try:
-            obj = json.loads(stripped)
-            calls = obj.get("tool_calls")
-            if isinstance(calls, list) and calls:
-                return _to_calls(calls)
-        except ValueError:
-            pass
-    return None
+        if not isinstance(obj, dict) or "tool_calls" not in obj:
+            continue
+        if calls is None:
+            raw = obj.get("tool_calls")
+            if isinstance(raw, list) and raw:
+                calls = _to_calls(raw)
+        cleaned = (cleaned[:m.start()] + cleaned[m.end():]).strip()
+    if calls is None:
+        stripped = cleaned.strip()
+        if stripped.startswith("{") and stripped.endswith("}") and '"tool_calls"' in stripped:
+            try:
+                obj = json.loads(stripped)
+                raw = obj.get("tool_calls")
+                if isinstance(raw, list) and raw:
+                    found = _to_calls(raw)
+                    if found:
+                        calls, cleaned = found, ""
+            except ValueError:
+                pass
+    return calls, cleaned.strip()
 
 
 CFG = None  # set in main(); read by the request handler
@@ -263,11 +286,12 @@ class H(BaseHTTPRequestHandler):
         name = "openai-%d-%s" % (CFG.port, uuid.uuid4().hex[:12])
         workdir = CFG.dir or scratch_dir(name)
         try:
-            text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt, name, CFG.timeout)
+            raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt, name, CFG.timeout)
         finally:
             if not CFG.dir:
                 shutil.rmtree(workdir, ignore_errors=True)
-        return text, extract_tool_calls(text)
+        tool_calls, text = extract_tool_calls(raw_text)
+        return text, tool_calls
 
     def _sync_response(self, messages, tools):
         text, tool_calls = self._run(messages, tools)
@@ -335,6 +359,8 @@ class H(BaseHTTPRequestHandler):
         except ValueError:
             return self._send_json(400, {"error": {"message": "invalid JSON body"}})
         messages = body.get("messages") or []
+        if not messages:
+            return self._send_json(400, {"error": {"message": "'messages' is required and must be a non-empty array"}})
         tools = body.get("tools") or None
         if body.get("stream"):
             self._stream_response(messages, tools)

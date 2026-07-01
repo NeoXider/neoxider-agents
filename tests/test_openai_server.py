@@ -141,12 +141,16 @@ class BuildPromptTests(unittest.TestCase):
 
 
 class ExtractToolCallsTests(unittest.TestCase):
-    def test_no_tool_call_returns_none(self):
-        self.assertIsNone(srv.extract_tool_calls("Just a plain prose answer."))
+    """extract_tool_calls returns (tool_calls_or_None, display_text)."""
+
+    def test_no_tool_call_returns_none_and_original_text(self):
+        calls, text = srv.extract_tool_calls("Just a plain prose answer.")
+        self.assertIsNone(calls)
+        self.assertEqual(text, "Just a plain prose answer.")
 
     def test_fenced_json_tool_call(self):
         text = 'Sure, calling it now.\n```json\n{"tool_calls":[{"name":"get_weather","arguments":{"city":"Paris"}}]}\n```'
-        calls = srv.extract_tool_calls(text)
+        calls, _ = srv.extract_tool_calls(text)
         self.assertIsNotNone(calls)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["type"], "function")
@@ -156,7 +160,7 @@ class ExtractToolCallsTests(unittest.TestCase):
 
     def test_bare_unfenced_json_tool_call(self):
         text = '{"tool_calls":[{"name":"ping","arguments":{}}]}'
-        calls = srv.extract_tool_calls(text)
+        calls, _ = srv.extract_tool_calls(text)
         self.assertIsNotNone(calls)
         self.assertEqual(calls[0]["function"]["name"], "ping")
 
@@ -166,23 +170,42 @@ class ExtractToolCallsTests(unittest.TestCase):
             'actually let me reconsider...\n'
             '```json\n{"tool_calls":[{"name":"second","arguments":{}}]}\n```'
         )
-        calls = srv.extract_tool_calls(text)
+        calls, _ = srv.extract_tool_calls(text)
         self.assertEqual(calls[0]["function"]["name"], "second")
 
     def test_malformed_json_in_fence_is_ignored(self):
         text = '```json\n{not valid json\n```'
-        self.assertIsNone(srv.extract_tool_calls(text))
+        calls, cleaned = srv.extract_tool_calls(text)
+        self.assertIsNone(calls)
+        # unparseable fence is left as-is -- only recognized {"tool_calls":...} blocks get stripped
+        self.assertEqual(cleaned, text)
 
     def test_multiple_tool_calls_in_one_block(self):
         text = '```json\n{"tool_calls":[{"name":"a","arguments":{}},{"name":"b","arguments":{"x":1}}]}\n```'
-        calls = srv.extract_tool_calls(text)
+        calls, _ = srv.extract_tool_calls(text)
         self.assertEqual(len(calls), 2)
         self.assertEqual([c["function"]["name"] for c in calls], ["a", "b"])
 
     def test_string_arguments_are_passed_through_unmodified(self):
         text = '```json\n{"tool_calls":[{"name":"a","arguments":"{\\"already\\":\\"a string\\"}"}]}\n```'
-        calls = srv.extract_tool_calls(text)
+        calls, _ = srv.extract_tool_calls(text)
         self.assertEqual(calls[0]["function"]["arguments"], '{"already":"a string"}')
+
+    def test_empty_tool_calls_fence_is_stripped_from_display_text(self):
+        # Regression test: observed live against Claude after a tool-result round-trip -- the
+        # model gave its real prose answer but ALSO echoed a stray empty {"tool_calls":[]}
+        # fence beforehand, despite being instructed not to. That noise must not leak into the
+        # user-facing `content` string, and an empty list must not be treated as a real call.
+        text = '```json\n{"tool_calls":[]}\n```\n\nTokyo is currently 22C, sunny, with a light breeze.'
+        calls, cleaned = srv.extract_tool_calls(text)
+        self.assertIsNone(calls)
+        self.assertEqual(cleaned, "Tokyo is currently 22C, sunny, with a light breeze.")
+        self.assertNotIn("tool_calls", cleaned)
+
+    def test_empty_tool_calls_fence_alone_yields_empty_string(self):
+        calls, cleaned = srv.extract_tool_calls('```json\n{"tool_calls":[]}\n```')
+        self.assertIsNone(calls)
+        self.assertEqual(cleaned, "")
 
 
 class ScratchDirTests(unittest.TestCase):
