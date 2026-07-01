@@ -204,6 +204,14 @@ Roughly in priority order. PRs welcome.
   silently run at a different reasoning effort than the one it started with. Pre-
   existing `agent.sh`/codex characteristic, not a bug in this bridge — documented, no
   fix needed or possible from the bridge's side.
+- [x] **Idle session expiry (`--session-ttl`).** Done — a session untouched longer than
+  `--session-ttl` seconds (default 1800 = 30 min) is treated exactly like a dead one:
+  the next call falls back to a fresh `agent.sh run` with the full history instead of
+  resuming, so an abandoned conversation can't be resumed forever or grow unbounded.
+  `GET /health` reports `session_idle_seconds`/`session_ttl_seconds`. Verified live with
+  `--session-ttl 8`: an extension sent 12s after the last call correctly triggered a
+  fresh `[run]` (not `[reply]`) with the full history, task count incremented, same
+  correct answer either way.
 
 ## Distribution
 

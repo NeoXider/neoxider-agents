@@ -55,7 +55,9 @@ resume (`opencode`/`gemini` always take the fresh-run path). Consequence: **one 
 process serves one conversation at a time** — a lock serializes every request, so don't
 point multiple unrelated tasks at the same port expecting independence (run one process
 per port per conversation instead); `POST .../reset` clears the remembered session,
-and `GET /health` reports `session_active`/`session_turns`. Beyond that: latency is a
+and `GET /health` reports `session_active`/`session_turns`. An idle session also
+auto-expires after `--session-ttl` seconds (default 1800 = 30 min) — the next call
+after that just starts fresh instead of resuming. Beyond that: latency is a
 **full CLI subprocess invocation** (seconds to low minutes, not a token stream);
 `stream: true` **replays an already-finished answer** as word-sized SSE chunks, it is
 not real per-token streaming; `tools`/function-calling is **emulated via prompting**

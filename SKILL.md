@@ -76,7 +76,9 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   serializes every request, so don't point multiple unrelated tasks at the same bridge
   port expecting them to stay independent (start one process per port per conversation
   instead). `POST .../reset` clears the remembered session so the next call starts
-  completely fresh; `GET /health` reports `session_active`/`session_turns`.
+  completely fresh; `GET /health` reports `session_active`/`session_turns`. An idle
+  session also auto-expires after `--session-ttl` seconds (default 1800 = 30 min) —
+  the next call after that just starts fresh instead of resuming.
 - **Slow** — each call is a full CLI subprocess invocation (seconds to low minutes),
   not a token stream. Don't use it anywhere real-time latency matters.
 - **`stream: true` is emulated** — the full answer is generated first, then replayed

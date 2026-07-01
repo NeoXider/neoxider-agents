@@ -239,6 +239,14 @@ about this before pointing anything at it:
   `messages`/task, wipes the scratch working dir unless `--dir` pinned a real project)
   so the next call starts completely fresh. `GET /health` and `GET /` report
   `session_active` (bool) and `session_turns` (message count in the remembered array).
+- **Idle sessions expire** (`--session-ttl`, default `1800` seconds = 30 minutes): a
+  session untouched longer than that is treated exactly like a dead one — the next
+  call falls back to a fresh run (full history resent) instead of resuming it. Keeps
+  an abandoned conversation's context from growing forever, mirroring how a real
+  chat/API session times out. `GET /health` also reports `session_idle_seconds` and
+  `session_ttl_seconds`. Verified live with `--session-ttl 8`: an extension sent after
+  12s idle correctly fell back to a fresh `agent.sh run` with the full history (task
+  count incremented) instead of resuming — the answer was still correct either way.
 - **Latency is a full CLI subprocess invocation** — seconds to low minutes, not a token
   stream.
 - **`stream: true` is emulated**: the full answer is generated first, then replayed as

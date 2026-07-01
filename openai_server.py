@@ -31,6 +31,11 @@ THE SESSION MODEL -- one API process = one ongoing chat session, not a fresh age
     the same port expecting them to stay independent.
   - `POST .../reset` clears the session (drops the remembered `messages`/task, wipes the scratch
     working dir unless `--dir` was pinned) so the next call starts completely fresh.
+  - **Idle sessions expire** (`--session-ttl`, default 1800s = 30 minutes): a session that hasn't
+    been called in longer than that is treated exactly like a dead one -- the next call falls
+    back to a fresh run instead of resuming it. Mirrors how a real chat/API session would time
+    out rather than stay resumable forever, and keeps an abandoned conversation's context from
+    growing unbounded. `GET /health` reports `session_idle_seconds`/`session_ttl_seconds`.
   - The session's working directory persists for the session's lifetime (unlike a one-shot
     completion server that could safely use a disposable per-call temp dir) -- it is wiped and
     recreated whenever a brand-new session starts, unless `--dir` pins a real project path.
@@ -351,7 +356,22 @@ CFG = None  # set in main(); read by the request handler
 # MODEL"). SESSION_LOCK serializes every request that touches it -- by design, only one
 # conversation is ever in flight against a given bridge instance at a time.
 SESSION_LOCK = threading.Lock()
-SESSION = {"task_name": None, "messages": [], "dir": None}
+SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
+
+
+def session_idle_seconds():
+    if not SESSION["task_name"]:
+        return None
+    return time.time() - SESSION["last_activity"]
+
+
+def session_expired():
+    """True when the remembered session has gone unused longer than --session-ttl seconds --
+    treated exactly like a dead session (falls back to a fresh run), so an abandoned
+    conversation can't be resumed indefinitely and its context can't grow forever. Mirrors how
+    a real chat/API session would time out rather than stay resumable forever."""
+    idle = session_idle_seconds()
+    return idle is None or idle > CFG.session_ttl
 
 
 class H(BaseHTTPRequestHandler):
@@ -372,8 +392,11 @@ class H(BaseHTTPRequestHandler):
         if p == "/health":
             with SESSION_LOCK:
                 active, turns = bool(SESSION["task_name"]), len(SESSION["messages"])
+                idle = session_idle_seconds()
             self._send_json(200, {"ok": True, "engine": CFG.engine, "model": label,
-                                   "session_active": active, "session_turns": turns})
+                                   "session_active": active, "session_turns": turns,
+                                   "session_idle_seconds": None if idle is None else int(idle),
+                                   "session_ttl_seconds": CFG.session_ttl})
         elif p.endswith("/models"):
             self._send_json(200, {"object": "list", "data": [{"id": label, "object": "model", "owned_by": "neoxider-agents"}]})
         elif p == "/":
@@ -394,7 +417,11 @@ class H(BaseHTTPRequestHandler):
         with SESSION_LOCK:
             supports_resume = bool((PROVIDERS.get(CFG.engine) or {}).get("supports_resume"))
             prev_name = SESSION["task_name"]
-            healthy = bool(prev_name) and read_meta(prev_name).get("state") not in (None, "", "error", "stalled")
+            healthy = (
+                bool(prev_name)
+                and not session_expired()
+                and read_meta(prev_name).get("state") not in (None, "", "error", "stalled")
+            )
             if supports_resume and healthy and is_extension(SESSION["messages"], messages):
                 new_turns = messages[len(SESSION["messages"]):]
                 answer = build_prompt(new_turns, tools)
@@ -408,6 +435,7 @@ class H(BaseHTTPRequestHandler):
                 raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt, name, CFG.timeout)
             SESSION["task_name"] = name
             SESSION["messages"] = messages
+            SESSION["last_activity"] = time.time()
         tool_calls, text = extract_tool_calls(raw_text)
         return text, tool_calls
 
@@ -417,6 +445,7 @@ class H(BaseHTTPRequestHandler):
             SESSION["task_name"] = None
             SESSION["messages"] = []
             SESSION["dir"] = None
+            SESSION["last_activity"] = 0.0
             if old_dir and not CFG.dir:
                 shutil.rmtree(old_dir, ignore_errors=True)
         self._send_json(200, {"ok": True, "reset": True})
@@ -514,6 +543,9 @@ def main():
     ap.add_argument("-p", "--port", type=int, default=int(os.environ.get("AGENT_OPENAI_PORT") or 8801))
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--timeout", type=int, default=240, help="max seconds to wait for one completion (default: 240)")
+    ap.add_argument("--session-ttl", type=int, default=1800,
+                     help="seconds of inactivity before the ongoing session is treated as expired and the "
+                          "next call starts fresh instead of resuming it (default: 1800 = 30 minutes)")
     CFG = ap.parse_args()
 
     try:

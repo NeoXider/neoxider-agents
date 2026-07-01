@@ -204,6 +204,10 @@ when two truly independent conversations share a port is that the second one jus
 starts its own fresh session, verified live to produce zero cross-contamination. If a
 caller genuinely needs many independent parallel conversations, the answer is the same
 as for comparing models: run more processes on more ports, not one smarter shared one.
+An abandoned conversation is handled the same way a real API session would be: past
+`--session-ttl` seconds of inactivity (default 30 min) the remembered session simply
+expires and the next call starts fresh, rather than staying resumable (and growing)
+forever.
 
 **A second thing worth being explicit about, since both sections use the word
 "streaming" for different things**: `/api/stream` (above) tails the *real*, live,

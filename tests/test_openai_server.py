@@ -352,5 +352,57 @@ class SessionDirTests(unittest.TestCase):
             shutil.rmtree(pinned, ignore_errors=True)
 
 
+class SessionExpiryTests(unittest.TestCase):
+    """An idle session must expire (session_expired() -> True) after --session-ttl seconds of
+    no activity, so an abandoned conversation can't be resumed forever or grow unbounded --
+    this is the 30-minute idle-timeout behavior."""
+
+    def setUp(self):
+        import time
+        self._orig_session = srv.SESSION
+        self._orig_cfg = srv.CFG
+        self._now = time.time()
+
+        class FakeCfg:
+            session_ttl = 1800
+
+        srv.CFG = FakeCfg()
+        srv.SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
+
+    def tearDown(self):
+        srv.SESSION = self._orig_session
+        srv.CFG = self._orig_cfg
+
+    def test_no_session_yet_counts_as_expired(self):
+        self.assertIsNone(srv.session_idle_seconds())
+        self.assertTrue(srv.session_expired())
+
+    def test_recently_active_session_is_not_expired(self):
+        import time
+        srv.SESSION["task_name"] = "some-task"
+        srv.SESSION["last_activity"] = time.time() - 5  # 5s ago, well under the 1800s ttl
+        self.assertFalse(srv.session_expired())
+
+    def test_idle_longer_than_ttl_is_expired(self):
+        import time
+        srv.SESSION["task_name"] = "some-task"
+        srv.SESSION["last_activity"] = time.time() - 3600  # 1h ago, past the 1800s ttl
+        self.assertTrue(srv.session_expired())
+
+    def test_idle_seconds_reports_elapsed_time(self):
+        import time
+        srv.SESSION["task_name"] = "some-task"
+        srv.SESSION["last_activity"] = time.time() - 100
+        idle = srv.session_idle_seconds()
+        self.assertGreaterEqual(idle, 100)
+        self.assertLess(idle, 105)  # generous slack for test execution time
+
+    def test_exactly_at_ttl_boundary_is_not_yet_expired(self):
+        import time
+        srv.SESSION["task_name"] = "some-task"
+        srv.SESSION["last_activity"] = time.time() - 1799  # 1s under the 1800s ttl
+        self.assertFalse(srv.session_expired())
+
+
 if __name__ == "__main__":
     unittest.main()

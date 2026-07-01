@@ -98,6 +98,14 @@ All notable changes to this project are documented here. Format follows
   project) so the next call starts completely fresh. `GET /health` and `GET /` now also
   report `session_active` (bool) and `session_turns` (message count in the remembered
   array).
+- New `--session-ttl` flag (default `1800` = 30 minutes): an idle session is treated
+  exactly like a dead one once it's gone unused longer than this, so an abandoned
+  conversation can't be resumed forever or grow unbounded. `GET /health` now also
+  reports `session_idle_seconds`/`session_ttl_seconds`. Verified live with
+  `--session-ttl 8`: an extension call sent 12s after the last one correctly fell back
+  to a fresh `agent.sh run` with the full history instead of resuming (task count
+  incremented, log showed a `[run]` block, not `[reply]`) — same correct answer either
+  way, just without the token-saving continuation.
 - The session's working directory now persists for the session's whole lifetime
   (previously a disposable per-call scratch dir) — wiped and recreated only when a
   brand-new session starts (divergence, reset, or first-ever call), never touched when
