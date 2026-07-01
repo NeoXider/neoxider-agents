@@ -21,8 +21,19 @@ bash $SK reply <name> "<answer>"                 # continue a task by name
 bash $SK log  -f <name>                          # follow a task live
 bash $SK status <name>                           # state / current step / needs a reply?
 bash $SK doctor                                   # engines + codex rate limits, before a batch
-bash $SK gui                                      # web GUI (or: ./bin/neoxider)
+bash $SK gui                                      # web GUI (stable default port 8765; or: ./bin/neoxider gui)
 ```
+
+**Self-testing your own work.** If you (the agent reading this) just built or modified
+a local web service/API, you can verify it yourself before declaring the task done:
+
+```bash
+bash agent.sh test-api --base-url http://127.0.0.1:<port> \
+  --goal "<what to verify>" --out result.json
+```
+
+This spawns another agent that exercises your API with real HTTP calls and reports
+structured pass/fail JSON — a quick self-check before you say a task is finished.
 
 ## Rules for using this tool as a subagent orchestrator
 

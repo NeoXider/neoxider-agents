@@ -61,7 +61,7 @@ done
 unset _p
 
 cmd="${1:-}"
-[ -n "$cmd" ] || die "usage: agent.sh run|reply|log|last|status|list|doctor|provider-info ... (see file header)"
+[ -n "$cmd" ] || die "usage: agent.sh run|reply|log|last|status|list|doctor|provider-info|gui|help ... (run 'agent.sh help' for the full reference)"
 shift
 
 engine="codex"; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=0
@@ -466,8 +466,20 @@ PY
     gui)
         # lightweight local web dashboard over all providers: http://127.0.0.1:<port>
         # native python (win) resolves `bash` to WSL -> pass it the EXACT git-bash path.
+        # Only forward an explicit port arg -- if none is given, let gui.py itself fall back
+        # to $AGENT_GUI_PORT or its own stable 8765 default (previously this always injected
+        # "${1:-8765}", which silently defeated AGENT_GUI_PORT since python always saw an argv).
         export AGENT_SH_BASH="$(cygpath -w "$BASH" 2>/dev/null || echo bash)"
-        exec python "$(dirname "$0")/gui.py" "${1:-8765}"
+        if [ -n "${1:-}" ]; then
+            exec python "$(dirname "$0")/gui.py" "$1"
+        else
+            exec python "$(dirname "$0")/gui.py"
+        fi
         ;;
-    *) die "unknown command: $cmd" ;;
+    help|--help|-h)
+        # print this file's own header comment as the command reference -- one source of
+        # truth instead of a duplicated usage string that can drift out of sync.
+        sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *) die "unknown command: $cmd (see: agent.sh help)" ;;
 esac

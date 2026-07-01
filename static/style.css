@@ -16,17 +16,19 @@
   *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;scroll-behavior:auto!important}
 }
 body{margin:0;font:13px/1.55 ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif;
-     background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+     background:radial-gradient(ellipse 1200px 800px at 50% -10%,#161b22 0%,var(--bg) 55%) fixed,var(--bg);
+     color:var(--fg);height:100vh;display:flex;flex-direction:column;overflow:hidden}
 code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-header{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
-header h1{font-size:14px;margin:0;font-weight:700;letter-spacing:.4px}
+header{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,var(--panel2),var(--panel))}
+header h1{font-size:14px;margin:0;font-weight:700;letter-spacing:.4px;display:flex;align-items:center;gap:6px}
+header h1 .logo{width:20px;height:20px;border-radius:5px;vertical-align:middle}
 header h1 a{color:var(--fg);text-decoration:none} header h1 a:hover{color:var(--accent)}
 .sp{flex:1}
 button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit;
   transition:border-color var(--dur-fast) var(--ease-apple),background-color var(--dur-fast) var(--ease-apple),transform var(--dur-fast) var(--ease-apple)}
 button:hover{border-color:var(--accent)} button:disabled{opacity:.55;cursor:default}
 button:active:not(:disabled){transform:scale(.96)}
-button.primary{background:var(--accent);border-color:var(--accent);color:#04101f;font-weight:600}
+button.primary{background:linear-gradient(180deg,#6bb0f9,var(--accent));border-color:var(--accent);color:#04101f;font-weight:600}
 button.mini{padding:1px 7px;font-size:12px;line-height:1.4}
 button.icon{padding:4px 8px;position:relative}
 input,select,textarea{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;width:100%}
@@ -133,8 +135,9 @@ main{flex:1;display:flex;min-height:0}
 .fld{margin-bottom:8px} .fld label{display:block;font-size:11px;color:var(--dim);margin-bottom:2px}
 .lim{margin:8px 0} .lim .t{display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px}
 .bar{height:8px;border-radius:5px;background:#0b0f16;overflow:hidden}
-.bar>i{display:block;height:100%;background:var(--done)}
-.bar>i.mid{background:var(--wait)} .bar>i.hi{background:var(--err)}
+.bar>i{display:block;height:100%;background:linear-gradient(180deg,#5fd97b,var(--done))}
+.bar>i.mid{background:linear-gradient(180deg,#e6b64f,var(--wait))}
+.bar>i.hi{background:linear-gradient(180deg,#fa7d72,var(--err))}
 .kv{display:flex;justify-content:space-between;font-size:12px;padding:2px 0;color:var(--dim)}
 .kv b{color:var(--fg);font-weight:600}
 .note{font-size:11px;color:var(--dim);margin-top:6px}
@@ -147,7 +150,7 @@ main{flex:1;display:flex;min-height:0}
 .modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:20;
   animation:modalBgIn var(--dur-modal) var(--ease-apple)}
 .modal.on{display:flex}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;width:640px;max-width:92vw;max-height:82vh;display:flex;flex-direction:column;
+.card{background:linear-gradient(165deg,var(--panel2),var(--panel) 55%);border:1px solid var(--line);border-radius:10px;padding:16px;width:640px;max-width:92vw;max-height:82vh;display:flex;flex-direction:column;
   animation:modalCardIn var(--dur-modal) var(--ease-apple)}
 @keyframes modalBgIn{from{opacity:0}to{opacity:1}}
 @keyframes modalCardIn{from{opacity:0;transform:translateY(28px) scale(.97)}to{opacity:1;transform:translateY(0) scale(1)}}

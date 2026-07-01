@@ -74,6 +74,40 @@ Roughly in priority order. PRs welcome.
   design) could have hung forever on an approval prompt it could never answer. README
   now has a table of the flag each provider uses, in the "Adding a provider" section.
 
+## API
+
+- [x] **Stable, documented GUI port.** Done — `gui.py` resolves its port as explicit
+  CLI arg > `$AGENT_GUI_PORT` env var > `8765` default. `agent.sh`'s `gui)` case now
+  only forwards an explicit port arg through to `gui.py` (previously it always
+  injected `${1:-8765}`, which silently defeated the env var since python always saw
+  an argv[1]). Verified: `AGENT_GUI_PORT=9000 agent.sh gui` binds 9000 with no CLI
+  arg; `agent.sh gui 9100` overrides both.
+- [x] **`neoxider` bare-invocation convention changed.** Done — bare `neoxider` (no
+  args) now prints a short usage summary instead of silently auto-opening the browser
+  GUI (surprising side effect, inconsistent with how most CLIs treat a bare
+  invocation). `neoxider gui [port]` explicitly opens the web dashboard;
+  `neoxider help` prints the full `agent.sh` command reference via a new `agent.sh
+  help` case. Everything else (`neoxider run ...`, `neoxider doctor`, `neoxider
+  test-api ...`) is unchanged, passed straight through to `agent.sh`.
+- [x] **`/api/stream?task=<name>` (SSE).** Done — a `text/event-stream` endpoint that
+  tails a task's `.log` file and pushes each new line as a `data: ...` event as the
+  agent produces output, instead of requiring the client to poll `/api/thread`. Ends
+  with `event: done` once the task's state leaves `running`, or after a fixed idle
+  timeout with no new lines.
+- [x] **`/api/wait?task=<name>&timeout=<sec>`.** Done — a blocking-poll convenience
+  endpoint: holds the response open (server-side polling `.meta` every ~0.5s) until
+  state leaves `running` or `timeout` seconds elapse (capped at 300s), then returns
+  one JSON object `{"name":..., "state":..., "model":..., "log":...}`. Makes the API
+  usable synchronously from a test harness or a Unity/C# test with a single call
+  instead of a manual polling loop.
+- [x] **"Does the API feel like a real API?" (history/tool-calls/streaming) and
+  "one shared server vs. one-per-provider" — both answered.** Design write-up in
+  [`docs/IDEAS.md`](docs/IDEAS.md#local-http-api-test-driver-api-test-mode): history
+  is just the existing `.log` file, tool calls are the wrapped CLI's own real
+  shell/file actions (no new schema), streaming/waiting are the two endpoints above;
+  and the server design stays a single shared `gui.py` instance where every request
+  carries its own `engine`/`model`/`effort`, not a server-per-provider.
+
 ## Distribution
 
 - [x] **Package as an installable Claude Code plugin.** Done —

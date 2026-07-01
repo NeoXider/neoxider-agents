@@ -4,5 +4,6 @@
   "efforts": [],
   "default_model": "",
   "default_effort": "",
-  "limits": null
+  "limits": null,
+  "resolved_label": ""
 }

@@ -4,5 +4,6 @@
   "efforts": ["low", "medium", "high", "xhigh", "max"],
   "default_model": "sonnet",
   "default_effort": "high",
-  "limits": null
+  "limits": null,
+  "resolved_label": "Sonnet 5 (high)"
 }

@@ -6,6 +6,14 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- Stable, documented GUI port: `gui.py` resolves explicit CLI arg > `$AGENT_GUI_PORT`
+  env var > `8765` default, instead of drifting across manual invocations.
+- `neoxider` bare invocation now prints a usage summary instead of auto-opening the
+  browser GUI; `neoxider gui [port]` opens it explicitly, `neoxider help` prints the
+  full `agent.sh` command reference.
+- New `/api/stream?task=<name>` (Server-Sent Events) and `/api/wait?task=<name>&timeout=<sec>`
+  endpoints — real-time log tailing and a synchronous blocking-poll convenience call,
+  so the API can be consumed without a manual polling loop.
 - Provider plugin architecture: `providers/<name>/provider.sh` + `provider.json`,
   `agent.sh provider-info <engine>` — adding a provider is now one new directory, zero
   edits to `agent.sh`/`gui.py`.

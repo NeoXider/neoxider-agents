@@ -67,7 +67,7 @@ async function refresh() {
         return `<div class="task ${x.name === SEL ? "sel" : ""} ${isStrike(x.state) ? "strike" : ""}" onclick="select('${x.name}',event)">
         <span class="em ${x.state === "running" ? "running" : ""}" title="${x.state}">${x.act || ""}${x.topic || ""}</span>
         <span class="nm" title="${esc(x.name)}">${esc(x.title || x.name)}</span>
-        <span class="pill pe-${x.engine}">${x.engine}</span>
+        <span class="pill pe-${x.engine}">${x.engine}/${esc(x.model)}</span>
       </div>${sub}`;
       };
       const rows = sortU(roots).map(renderTask).join("") || `<div class="task empty-row">${t("tree.no_tasks")}</div>`;

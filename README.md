@@ -55,6 +55,29 @@ this project fills.
   its own shell/curl capability, no new architecture needed. The GUI's API tab wraps
   the same `/api/test-api` endpoint with a form + results view, and shows ready-made
   curl/C# (Unity `UnityWebRequest`) snippets for calling it from your own test suite.
+- **A real API, not just a GUI backend.** History = the task's own `<name>.log` file,
+  already the full multi-turn conversation (every `run`/`reply` appends to the same
+  log with a timestamped header) — `/api/thread?task=<name>` exposes it as-is, nothing
+  extra to build. Tool calls = the underlying CLI's own real shell/file actions (each
+  provider — Codex/Claude/opencode/Gemini — already executes real commands and edits
+  when it runs a task; those show up verbatim in the log, there's no separate
+  "tool call" schema layered on top). Streaming = `/api/stream` below, and synchronous
+  waiting = `/api/wait` below — both consume that same log/state, they don't add a new
+  data model.
+- **`/api/stream?task=<name>`** — a Server-Sent Events (`text/event-stream`) endpoint
+  that tails a task's `.log` file in real time and pushes each new line as a `data:
+  ...` event as the agent produces output, instead of requiring the client to poll
+  `/api/thread`. It ends (an `event: done` message, then closes) once the task's state
+  leaves `running`, or after a fixed idle timeout with no new lines. Consumable from
+  any language that can read an SSE/chunked HTTP stream — `EventSource` in JS, or a
+  simple line-buffered HTTP GET in curl/Python/C#.
+- **`/api/wait?task=<name>&timeout=<sec>`** — a convenience blocking-poll endpoint:
+  holds the HTTP response open (polling the task's `.meta` state server-side every
+  ~0.5s) until the task's state leaves `running` or `timeout` seconds elapse (capped
+  at 300s), then returns one JSON object `{"name":..., "state":..., "model":...,
+  "log":...}`. Turns a kick-off call (`/api/test-api` or `/api/run`) plus one
+  `/api/wait` call into a synchronous round-trip, for callers like a test harness or a
+  Unity/C# test that don't want to hand-roll a polling loop.
 
 ## Installation
 
@@ -114,15 +137,27 @@ bash agent.sh test-api --base-url http://127.0.0.1:8080 \
   --goal "check /health returns ok, then POST /item and GET it back" --out result.json
 
 # or drive all of the above from a browser
-neoxider
+neoxider gui
 ```
 
 ### The `neoxider` command
 
-`neoxider` with no arguments opens the web GUI in your browser. Any other argument is
-passed straight through to `agent.sh`, so `neoxider run ...`, `neoxider doctor`, etc.
-all work exactly like `bash agent.sh run ...`. See [`bin/README.md`](bin/README.md)
-for one-time setup (installer scripts for PowerShell/bash, or manual PATH edit).
+Bare `neoxider` (no arguments) prints a short usage summary — it does **not** open
+the GUI, on the theory that a bare CLI invocation should be help, not a side effect.
+`neoxider gui [port]` explicitly opens the web dashboard in your browser.
+`neoxider help` prints the full `agent.sh` command reference. Everything else —
+`neoxider run ...`, `neoxider doctor`, `neoxider test-api ...`, etc. — is passed
+straight through to `agent.sh`, so it all works exactly like `bash agent.sh run ...`.
+See [`bin/README.md`](bin/README.md) for one-time setup (installer scripts for
+PowerShell/bash, or manual PATH edit).
+
+### GUI port
+
+`gui.py`'s web server listens on a stable, documented port: an explicit CLI arg, else
+`$AGENT_GUI_PORT`, else `8765` — resolved in that order, so the same URL is
+bookmarkable across restarts instead of drifting between manual invocations. Set a
+different fixed port once via `export AGENT_GUI_PORT=9000`, or override it for a
+single launch with `neoxider gui 9000` (equivalently `agent.sh gui 9000`).
 
 ### Multiple installs / shared machines
 

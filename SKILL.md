@@ -30,8 +30,22 @@ bash $SK last fix-readme                            # only the agent's last answ
 bash $SK status fix-readme                          # state: state/stage/changed files/whether a reply is needed
 bash $SK list                                       # table: state / engine / model / age / files / session
 bash $SK doctor                                     # pre-flight: engines + codex limits (before fanning out!)
-bash $SK gui [port]                                 # web control panel over all providers (default :8765)
+bash $SK gui [port]                                 # web control panel over all providers (stable default :8765,
+                                                     # or $AGENT_GUI_PORT, or a one-off port arg)
 ```
+
+**Self-testing your own work.** If you just built or modified a local web service/API
+(e.g. a Unity `HttpListener` debug endpoint, a small backend), you can verify it works
+yourself before declaring the task done:
+
+```bash
+bash $SK test-api --base-url http://127.0.0.1:<port> \
+  --goal "check /health returns ok, then POST /item and GET it back" --out result.json
+```
+
+This spawns another agent that exercises the API with real HTTP calls (its own
+curl/shell, no MCP needed) and reports one strict pass/fail JSON object — a quick,
+cheap self-check before you tell the user it's done.
 
 **GUI (`agent.sh gui`).** A lightweight local web control panel (python-stdlib, zero dependencies): a
 project→subagents tree on the left, a chat with the agent (markdown + bubbles) in the center, launching
@@ -40,6 +54,8 @@ Status is conveyed by the activity/topic emoji (✅⏳❌⚠️📖✏️🔧�
 tasks — no separate colored dot (that was a redundant third encoding of the same signal, removed).
 Files: `gui.py` (backend) + `gui.html` (thin shell) + `static/*.js`/`static/style.css` (modular
 frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) + `locales/*.json`.
+- **Stable port**: resolved as explicit CLI arg > `$AGENT_GUI_PORT` env var > `8765` default, so the
+  URL is bookmarkable across restarts instead of drifting between manual invocations.
 - **Idempotency**: one GUI for all providers, `LOGDIR` is shared. If a server is already up on the port —
   a repeated `gui` doesn't crash or duplicate it, it just opens the browser. Parallel workers each write
   to their own `<name>.meta/.log`, so a shared overview is safe (and now concurrency-safe at the file

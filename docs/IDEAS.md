@@ -145,4 +145,43 @@ entirely — just `--base-url` + `--goal`, let the agent introspect the API itse
 endpoints) and report back in the JSON shape above. Add spec-file support once that
 loop is proven out.
 
-Not implemented yet — this is a scoped, ready-to-build design, not code.
+The core of this (`test-api` subcommand + GUI API tab) has since shipped — see
+`TODO.md`'s "Local HTTP API test-driver" entry. The follow-up design questions below
+were resolved alongside it.
+
+### One shared API server, not one-per-provider
+
+Resolved design: a single `gui.py` server instance, where every request
+(`/api/run`, `/api/test-api`, etc.) carries its own `engine`/`model`/`effort` fields —
+not a separate server process per provider/model combo. Rationale: simpler (one port,
+one process, one cache), and the CLI (`agent.sh test-api -e claude -m sonnet -f high
+--base-url ... --goal ...`) already gives full per-call provider/model control from
+the terminal with zero GUI involved, so a multi-server design would add complexity
+without adding capability.
+
+### "Does this feel like a real API?" — history, tool calls, streaming
+
+- **History** = the task's own `<name>.log` file, already the full multi-turn
+  conversation (every `run`/`reply` appends to the same log with a timestamped
+  header) — nothing new needed there; `/api/thread?task=<name>` already exposed it,
+  and `/api/stream`/`/api/wait` (below) just make consuming it easier.
+- **Tool calls** = the underlying CLI's own real shell/file actions. Each provider
+  CLI (Codex/Claude/opencode/Gemini) already executes real commands and file edits
+  when it runs a task — that's not a separate abstraction this project adds, it's
+  inherent to how the wrapped CLI works, and it shows up verbatim in the log. There is
+  no separate "tool call" schema to build — the log *is* the tool-call transcript.
+- **Streaming** = new `/api/stream?task=<name>` — a Server-Sent Events
+  (`text/event-stream`) endpoint that tails the task's `.log` file and pushes each new
+  line as a `data: ...` event as it's produced, instead of requiring the client to
+  poll `/api/thread`. Ends with an `event: done` message once the task's state leaves
+  `running`, or after a fixed idle timeout with no new lines.
+- **Synchronous waiting** = new `/api/wait?task=<name>&timeout=<sec>` — holds the
+  response open (server-side polling `.meta` every ~0.5s) until state leaves
+  `running` or `timeout` seconds elapse (capped at 300s), then returns one JSON object
+  `{"name":..., "state":..., "model":..., "log":...}`. This is what makes the API
+  usable synchronously (e.g. from a test harness or a Unity/C# test) instead of a
+  manual polling loop: kick off with `/api/test-api` or `/api/run`, then one
+  `/api/wait` call gets the final result.
+
+Not implemented yet: `--spec`/OpenAPI parsing (still the smallest-viable-first-version
+scope note above still applies).

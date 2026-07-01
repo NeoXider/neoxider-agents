@@ -2,7 +2,9 @@
 """Minimalist local web GUI over agent.sh — one dashboard for all CLI providers.
 
 Run:  agent.sh gui [port]   (or: python gui.py [port])
-Opens http://127.0.0.1:8765 . Localhost only. Zero dependencies (stdlib).
+Opens http://127.0.0.1:8765 by default -- a stable port so a browser tab can stay pinned
+across restarts. Override with $AGENT_GUI_PORT or an explicit [port] arg. Localhost only.
+Zero dependencies (stdlib).
 
 The backend reads <name>.meta / <name>.log directly (fast, no parsing of `list`'s text),
 while actions (run/reply/doctor) shell out to agent.sh so all the logic lives in one place.
@@ -94,6 +96,16 @@ def save_projects(lst):
             json.dump(lst, f, ensure_ascii=False)
     except OSError:
         pass
+
+def task_state(name):
+    """Effective state + raw meta for one task, for the /api/wait convenience endpoint --
+    a lighter-weight lookup than list_tasks() since it only needs a single named task."""
+    meta = read_meta(name)
+    try:
+        lm = os.path.getmtime(os.path.join(LOGDIR, name + ".log"))
+    except OSError:
+        lm = 0
+    return eff_state(meta, lm, time.time()), meta
 
 def read_meta(name):
     d = {}
@@ -347,6 +359,23 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps(provider_info(eng, force)))
         elif u.path == "/api/locales":
             self._send(200, json.dumps({"locales": list_locales()}))
+        elif u.path == "/api/wait":
+            name = (q.get("task") or [""])[0]
+            if not name:
+                return self._send(400, json.dumps({"error": "task required"}))
+            timeout = min(float((q.get("timeout") or ["60"])[0] or 60), 300)
+            deadline = time.time() + timeout
+            st, meta = task_state(name)
+            while st == "running" and time.time() < deadline:
+                time.sleep(0.5)
+                st, meta = task_state(name)
+            self._send(200, json.dumps({"name": name, "state": st, "model": meta.get("model", "?"),
+                                        "log": read_log(name)}))
+        elif u.path == "/api/stream":
+            name = (q.get("task") or [""])[0]
+            if not name:
+                return self._send(400, json.dumps({"error": "task required"}))
+            self._stream_log(name)
         elif u.path.startswith("/locales/") and u.path.endswith(".json"):
             self._serve_static(LOCALES_DIR, u.path[len("/locales/"):], "application/json")
         elif u.path.startswith("/static/"):
@@ -369,8 +398,40 @@ class H(BaseHTTPRequestHandler):
         if not ctype:
             ext = os.path.splitext(full)[1]
             ctype = {".js": "text/javascript", ".css": "text/css",
-                     ".json": "application/json"}.get(ext, "application/octet-stream")
+                     ".json": "application/json", ".png": "image/png"}.get(ext, "application/octet-stream")
         self._send(200, data, ctype)
+
+    def _stream_log(self, name):
+        """Server-Sent Events: tail a task's .log in real time instead of making the client
+        poll /api/thread. Sends each new line as its own `data:` event as soon as it's written,
+        and a final `event: done` once the task leaves the "running" state (or after ~60s of
+        no new output, so a stream never hangs open forever on a stuck/forgotten task)."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        sent = 0
+        idle = 0
+        try:
+            while idle < 120:  # 120 * 0.5s = 60s of silence -> give up and close
+                text = read_log(name)
+                if len(text) > sent:
+                    for line in text[sent:].splitlines():
+                        self.wfile.write(("data: " + json.dumps(line) + "\n\n").encode("utf-8"))
+                    sent = len(text)
+                    idle = 0
+                    self.wfile.flush()
+                else:
+                    idle += 1
+                st, _ = task_state(name)
+                if st != "running":
+                    self.wfile.write(b"event: done\ndata: {}\n\n")
+                    self.wfile.flush()
+                    break
+                time.sleep(0.5)
+        except (BrokenPipeError, ConnectionAbortedError, OSError):
+            pass
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
@@ -447,7 +508,10 @@ def prewarm_cache():
     threading.Thread(target=run, daemon=True).start()
 
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+    # explicit CLI arg > $AGENT_GUI_PORT env var > 8765 default -- keeping the port stable
+    # across restarts (rather than only ever accepting a positional arg) is what lets a
+    # browser tab stay pinned to the same URL run after run.
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("AGENT_GUI_PORT") or 8765)
     url = "http://127.0.0.1:%d" % port
     # Idempotency: the GUI/logic are shared across all providers. If a server is already up
     # (another agent/the user themself), DO NOT fail or duplicate it — just open the browser on it.

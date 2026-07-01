@@ -5,7 +5,7 @@ function syncModels() {
   const e = $("#f-engine").value;
   const p = PROVIDERS[e] || {};
   $("#models").innerHTML = (p.models || []).map(m => `<option value="${m}">`).join("");
-  $("#f-model").placeholder = p.default_model ? t("form.auto") + " (" + p.default_model + ")" : t("form.auto");
+  $("#f-model").placeholder = p.resolved_label ? t("form.auto") + " → " + p.resolved_label : p.default_model ? t("form.auto") + " (" + p.default_model + ")" : t("form.auto");
 
   const effSel = $("#f-effort");
   const efforts = p.efforts || [];

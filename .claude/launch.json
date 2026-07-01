@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "neoxider-gui",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["gui.py", "8765"],
+      "port": 8765
+    }
+  ]
+}

@@ -1,10 +1,13 @@
 # The `neoxider` command
 
-`neoxider` with no arguments opens the neoxider-agents web GUI in your browser.
-Any other argument is passed straight through to `agent.sh` — `neoxider run ...`,
-`neoxider doctor`, `neoxider log -f <name>`, etc. all work exactly like
-`bash agent.sh run ...`. It resolves its own location, so it works no matter where
-you cloned the repo.
+`neoxider` with no arguments prints a short usage summary — it does not open the GUI
+as a side effect of a bare invocation. `neoxider gui [port]` explicitly opens the
+neoxider-agents web GUI in your browser (default port 8765, overridable via
+`$AGENT_GUI_PORT` or a one-off `neoxider gui <port>`). `neoxider help` prints the
+full `agent.sh` command reference. Any other argument is passed straight through to
+`agent.sh` — `neoxider run ...`, `neoxider doctor`, `neoxider log -f <name>`, etc. all
+work exactly like `bash agent.sh run ...`. It resolves its own location, so it works
+no matter where you cloned the repo.
 
 ## Recommended: run the installer once (adds `bin/` to your `PATH`)
 

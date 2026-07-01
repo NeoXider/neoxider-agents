@@ -4,5 +4,6 @@
   "efforts": ["medium", "high"],
   "default_model": "5.5",
   "default_effort": "medium",
-  "limits": "codex"
+  "limits": "codex",
+  "resolved_label": "GPT-5.5 (medium)"
 }

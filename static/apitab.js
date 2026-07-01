@@ -53,6 +53,7 @@ function syncApiModels() {
   const e = $("#api-engine").value;
   const p = PROVIDERS[e] || {};
   $("#api-models").innerHTML = (p.models || []).map(m => `<option value="${m}">`).join("");
+  $("#api-model").placeholder = p.resolved_label ? t("form.auto") + " → " + p.resolved_label : p.default_model ? t("form.auto") + " (" + p.default_model + ")" : t("form.auto");
   const eff = $("#api-effort");
   const efforts = p.efforts || [];
   eff.innerHTML = `<option value="">${t("form.auto")}</option>` + efforts.map(f => `<option value="${f}">${f}</option>`).join("");
