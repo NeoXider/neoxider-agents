@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent · subagents</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3140;
+    --fg:#e6edf3; --dim:#8b98a8; --accent:#4d9cf6;
+    --run:#4d9cf6; --done:#3fb950; --wait:#d29922; --err:#f85149; --stall:#6e7681;
+    --codex:#10a37f; --claude:#d97757; --opencode:#a371f7; --gemini:#4d9cf6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:13px/1.55 ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif;
+       background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{font-size:14px;margin:0;font-weight:700;letter-spacing:.4px}
+  .sp{flex:1}
+  button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}
+  button:hover{border-color:var(--accent)} button:disabled{opacity:.55;cursor:default}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#04101f;font-weight:600}
+  button.mini{padding:1px 7px;font-size:12px;line-height:1.4}
+  button.icon{padding:4px 8px;position:relative}
+  input,select,textarea{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;width:100%}
+  textarea{resize:vertical}
+  label.chk{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dim);cursor:pointer}
+  label.chk input{width:auto}
+  /* ---- universal async spinner ---- */
+  .spinner{width:13px;height:13px;border:2px solid rgba(255,255,255,.25);border-top-color:currentColor;
+    border-radius:50%;display:inline-block;animation:spin .7s linear infinite;vertical-align:-2px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  /* ---- layout with resizable panels ---- */
+  main{flex:1;display:flex;min-height:0}
+  #left{width:300px;flex:none;border-right:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0;min-width:160px;max-width:640px}
+  #right{width:300px;flex:none;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;overflow:auto;min-width:220px;max-width:640px}
+  .resizer{width:5px;flex:none;cursor:col-resize;background:transparent;position:relative;z-index:5}
+  .resizer:hover,.resizer.drag{background:var(--accent)}
+  .resizer::after{content:"";position:absolute;left:-3px;right:-3px;top:0;bottom:0}
+  /* ---- left tree ---- */
+  #left .hd{padding:8px 12px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:6px}
+  #tree{overflow:auto;flex:1}
+  .proj>.ph{display:flex;align-items:center;gap:6px;padding:6px 10px;cursor:pointer;user-select:none;color:var(--fg);font-weight:600}
+  .proj>.ph:hover{background:var(--panel2)}
+  .proj.active>.ph{background:var(--panel2)}
+  .proj>.ph .caret{width:10px;color:var(--dim);transition:transform .1s} .proj.col>.ph .caret{transform:rotate(-90deg)}
+  .proj>.ph .pname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .proj>.ph .cnt{color:var(--dim);font-size:11px;font-weight:400}
+  .proj.col .tasks{display:none}
+  .task{display:flex;gap:8px;align-items:baseline;padding:5px 10px 5px 24px;cursor:pointer}
+  .task:hover{background:var(--panel2)} .task.sel{background:#223049;box-shadow:inset 3px 0 0 var(--accent)}
+  .task .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .task.strike .nm{text-decoration:line-through;opacity:.7}
+  .task.empty-row{color:var(--dim);cursor:default;font-size:12px}
+  .dot{width:9px;height:9px;border-radius:50%;flex:none;transform:translateY(1px)}
+  .s-running{background:var(--run);box-shadow:0 0 6px var(--run);animation:pulse 1.2s infinite}
+  .s-done{background:var(--done)} .s-waiting{background:var(--wait);box-shadow:0 0 6px var(--wait)}
+  .s-error{background:var(--err)} .s-stalled{background:var(--stall)} .s-\?{background:var(--dim)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  .pill{font-size:10px;padding:0 6px;border-radius:8px;border:1px solid var(--line);color:var(--dim);flex:none}
+  .pe-codex{color:var(--codex);border-color:var(--codex)} .pe-claude{color:var(--claude);border-color:var(--claude)}
+  .pe-opencode{color:var(--opencode);border-color:var(--opencode)} .pe-gemini{color:var(--gemini);border-color:var(--gemini)}
+  .task .em{flex:none} .tasks .tasks{margin-left:14px;border-left:1px solid var(--line)}
+  /* ---- center chat ---- */
+  #center{display:flex;flex-direction:column;min-width:0;min-height:0;flex:1}
+  #chead{padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);display:flex;gap:8px;align-items:center;flex-wrap:wrap;min-height:38px}
+  #chat{flex:1;overflow:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}
+  .msg{max-width:88%} .msg.user{align-self:flex-end}
+  .who{font-size:11px;color:var(--dim);margin-bottom:3px}
+  .bubble{border:1px solid var(--line);border-radius:10px;padding:8px 12px;background:var(--panel)}
+  .msg.user .bubble{background:#1b2a44;border-color:#2b3f63}
+  .msg.agent .bubble{background:var(--panel2)}
+  .bubble>div{margin:2px 0} .bubble ul{margin:4px 0;padding-left:20px}
+  .bubble code{background:#0009;padding:1px 5px;border-radius:4px;font-size:12px}
+  .bubble pre.code{background:#0b0f16;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;margin:6px 0}
+  .bubble pre.code code{background:none;padding:0}
+  .mh1,.mh2,.mh3{font-weight:700;margin:8px 0 2px} .mh1{font-size:15px}.mh2{font-size:14px}.mh3{font-size:13px}
+  #replybar{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);background:var(--panel);align-items:flex-end}
+  #replybar textarea{flex:1;height:40px}
+  #replybar .rcol{display:flex;flex-direction:column;gap:6px;align-items:stretch}
+  .empty{color:var(--dim);margin:auto;text-align:center}
+  /* ---- right panel ---- */
+  .box{padding:12px;border-bottom:1px solid var(--line)}
+  .box h3{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim)}
+  .fld{margin-bottom:8px} .fld label{display:block;font-size:11px;color:var(--dim);margin-bottom:2px}
+  .lim{margin:8px 0} .lim .t{display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px}
+  .bar{height:8px;border-radius:5px;background:#0b0f16;overflow:hidden}
+  .bar>i{display:block;height:100%;background:var(--done)}
+  .bar>i.mid{background:var(--wait)} .bar>i.hi{background:var(--err)}
+  .kv{display:flex;justify-content:space-between;font-size:12px;padding:2px 0;color:var(--dim)}
+  .kv b{color:var(--fg);font-weight:600}
+  .note{font-size:11px;color:var(--dim);margin-top:6px}
+  .dirfld{display:flex;gap:6px}
+  /* ---- modals ---- */
+  .modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:20}
+  .modal.on{display:flex}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;width:640px;max-width:92vw;max-height:82vh;display:flex;flex-direction:column}
+  .card h2{margin:0 0 10px;font-size:14px;display:flex;align-items:center;gap:8px}
+  .card pre{margin:0;overflow:auto;white-space:pre-wrap;font-size:12px;flex:1}
+  /* ---- folder browser ---- */
+  .crumbs{display:flex;flex-wrap:wrap;gap:2px;font-size:12px;margin-bottom:8px;color:var(--dim)}
+  .crumbs span{cursor:pointer} .crumbs span:hover{color:var(--accent)}
+  .shortcuts{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+  .dirlist{flex:1;overflow:auto;border:1px solid var(--line);border-radius:8px}
+  .direntry{padding:6px 10px;cursor:pointer;display:flex;gap:8px;align-items:center}
+  .direntry:hover{background:var(--panel2)}
+  /* ---- toasts ---- */
+  #toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50;width:320px}
+  .toast{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;
+    padding:9px 12px;font-size:12px;box-shadow:0 6px 20px #0008;animation:toastin .18s ease-out;opacity:1;transition:opacity .3s,transform .3s}
+  .toast.out{opacity:0;transform:translateX(20px)}
+  .toast.success{border-left-color:var(--done)} .toast.error{border-left-color:var(--err)}
+  .toast.warning{border-left-color:var(--wait)} .toast .tt{font-weight:600;margin-bottom:2px}
+  @keyframes toastin{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+  #hist-list .hrow{padding:8px 4px;border-bottom:1px solid var(--line);font-size:12px;display:flex;gap:8px}
+  #hist-list .hrow .dot{margin-top:3px}
+  #hist-list .time{color:var(--dim);font-size:11px}
+</style>
+</head>
+<body>
+<header>
+  <h1>◆ agent</h1>
+  <span class="pill" id="cwd"></span>
+  <span class="sp"></span>
+  <button onclick="openDoctor()">🩺 doctor · все лимиты</button>
+  <button class="icon" onclick="openHistory()" title="история уведомлений">🔔<span class="pill" id="hist-badge" style="display:none;position:absolute;top:-4px;right:-4px;background:var(--accent);color:#04101f;border:none"></span></button>
+  <button class="mini" onclick="refresh()">⟳</button>
+</header>
+<main>
+  <!-- LEFT: project → subagent tree -->
+  <div id="left">
+    <div class="hd"><span style="flex:1">Проекты · сабагенты</span>
+      <button class="mini" onclick="openBrowse('add-project')" title="открыть/добавить папку проекта">📂＋</button></div>
+    <div id="tree"></div>
+  </div>
+  <div class="resizer" id="rez-left"></div>
+
+  <!-- CENTER: chat -->
+  <div id="center">
+    <div id="chead"><span class="empty" style="margin:0">← выбери сабагента</span></div>
+    <div id="chat"><div class="empty">Нет выбранной задачи.<br>Справа можно запустить новую.</div></div>
+    <div id="replybar" style="display:none">
+      <textarea id="answer" placeholder="ответ агенту / сообщение… (Ctrl+Enter)"></textarea>
+      <div class="rcol">
+        <label class="chk"><input type="checkbox" id="r-term"> терминал</label>
+        <button class="primary" id="btn-reply" onclick="sendReply()">reply ▸</button>
+      </div>
+    </div>
+  </div>
+  <div class="resizer" id="rez-right"></div>
+
+  <!-- RIGHT: new task + limits -->
+  <div id="right">
+    <div class="box">
+      <h3>Новая задача</h3>
+      <div class="fld"><label>проект (working dir)</label>
+        <div class="dirfld"><input id="f-dir"><button class="mini" onclick="openBrowse('pick-field')">📂</button></div>
+      </div>
+      <div class="fld" style="display:flex;gap:8px">
+        <div style="flex:1"><label>провайдер</label><select id="f-engine" onchange="syncModels()"></select></div>
+        <div style="flex:1"><label>модель</label><input id="f-model" list="models" placeholder="авто"></div>
+      </div>
+      <datalist id="models"></datalist>
+      <div class="fld"><label>prompt</label><textarea id="f-prompt" rows="5" placeholder="сделай ровно это…"></textarea></div>
+      <div class="fld" style="display:flex;flex-direction:column;gap:6px">
+        <label class="chk"><input type="checkbox" id="f-prog"> вести PROGRESS.md (-p)</label>
+        <label class="chk"><input type="checkbox" id="f-term"> открыть в терминале (видно живой чат)</label>
+      </div>
+      <button class="primary" id="btn-run" style="width:100%" onclick="submitRun()">▶ запустить</button>
+    </div>
+    <div class="box">
+      <h3 id="lim-title">Лимиты</h3>
+      <div id="limits"><span class="empty"><span class="spinner"></span> загрузка…</span></div>
+    </div>
+  </div>
+</main>
+
+<!-- doctor modal: все провайдеры + лимиты -->
+<div class="modal" id="m-doc"><div class="card">
+  <h2>🩺 doctor — движки и лимиты<span class="sp"></span>
+    <button class="mini" onclick="closeModal('m-doc')">✕</button></h2>
+  <pre id="doc" class="mono"><span class="spinner"></span> запуск doctor…</pre>
+</div></div>
+
+<!-- toast history modal -->
+<div class="modal" id="m-hist"><div class="card" style="width:420px">
+  <h2>🔔 история уведомлений<span class="sp"></span>
+    <button class="mini" onclick="clearHistory()">очистить</button>
+    <button class="mini" onclick="closeModal('m-hist')">✕</button></h2>
+  <div id="hist-list" style="overflow:auto"></div>
+</div></div>
+
+<!-- folder browser modal -->
+<div class="modal" id="m-browse"><div class="card" style="width:520px">
+  <h2>📂 выбор папки<span class="sp"></span>
+    <button class="mini" onclick="closeModal('m-browse')">✕</button></h2>
+  <div class="shortcuts" id="br-shortcuts"></div>
+  <div class="crumbs" id="br-crumbs"></div>
+  <div class="dirlist" id="br-list"><div class="direntry"><span class="spinner"></span>&nbsp;загрузка…</div></div>
+  <div style="display:flex;gap:8px;margin-top:10px">
+    <input id="br-path" style="flex:1" readonly>
+    <button class="primary" onclick="chooseBrowsed()">Выбрать эту папку</button>
+  </div>
+</div></div>
+
+<div id="toasts"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+let PROVIDERS={}, ENGINES=[], CWD="", SEL=null, activeDir=null, collapsed=new Set(), lastLog="";
+let prevStates={}, firstLoad=true;
+let BROWSE_MODE="pick-field";
+const TOAST_HISTORY = JSON.parse(localStorage.getItem("agentgui_toast_history")||"[]");
+
+async function jget(u){return (await fetch(u)).json();}
+async function jpost(u,b){return (await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)})).json();}
+const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const base=p=>!p?"(без проекта)":p.replace(/[\/\\]+$/,"").split(/[\/\\]/).pop()||p;
+const isStrike=st=>st==="done"||st==="stalled"||st==="error";
+
+/* ---------- universal spinner helper ---------- */
+const spin=(text)=>`<span class="spinner"></span>${text?(' '+esc(text)):''}`;
+
+/* ---------- toasts + history ---------- */
+function toast(kind, title, text){
+  const rec={kind,title,text,ts:Date.now()};
+  TOAST_HISTORY.unshift(rec); TOAST_HISTORY.splice(80);
+  localStorage.setItem("agentgui_toast_history", JSON.stringify(TOAST_HISTORY));
+  updateHistBadge();
+  const el=document.createElement("div");
+  el.className="toast "+kind;
+  el.innerHTML=`<div class="tt">${esc(title)}</div><div>${esc(text||'')}</div>`;
+  $("#toasts").appendChild(el);
+  setTimeout(()=>{ el.classList.add("out"); setTimeout(()=>el.remove(),320); },3000);
+}
+function updateHistBadge(){
+  const b=$("#hist-badge"); const n=TOAST_HISTORY.filter(h=>!h.seen).length;
+  if(n>0){ b.style.display="inline-block"; b.textContent=n>9?"9+":n; } else b.style.display="none";
+}
+function openHistory(){
+  TOAST_HISTORY.forEach(h=>h.seen=true);
+  localStorage.setItem("agentgui_toast_history", JSON.stringify(TOAST_HISTORY));
+  updateHistBadge();
+  $("#hist-list").innerHTML = TOAST_HISTORY.length? TOAST_HISTORY.map(h=>`
+    <div class="hrow"><span class="dot s-${h.kind==='success'?'done':h.kind==='error'?'error':'waiting'}"></span>
+      <div><div><b>${esc(h.title)}</b> ${esc(h.text||'')}</div>
+      <div class="time">${new Date(h.ts).toLocaleString()}</div></div></div>`).join("")
+    : '<div class="empty">пусто</div>';
+  $("#m-hist").classList.add("on");
+}
+function clearHistory(){ TOAST_HISTORY.length=0; localStorage.setItem("agentgui_toast_history","[]"); openHistory(); }
+
+/* ---------- markdown (компактный, без зависимостей) ---------- */
+function md(src){
+  const blocks=[];
+  src=(src||"").replace(/```(\w*)\n?([\s\S]*?)```/g,(m,l,c)=>{blocks.push('<pre class="code"><code>'+esc(c)+'</code></pre>');return '§'+(blocks.length-1)+'§';});
+  let out=[],inList=false;
+  for(let raw of src.split('\n')){
+    let t=raw.trim();
+    if(/^§\d+§$/.test(t)){ if(inList){out.push('</ul>');inList=false;} out.push(t); continue; }
+    let l=esc(raw).replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>');
+    let h=l.match(/^(#{1,6})\s+(.*)/);
+    if(h){ if(inList){out.push('</ul>');inList=false;} out.push('<div class="mh'+Math.min(h[1].length,3)+'">'+h[2]+'</div>'); continue; }
+    let li=l.match(/^\s*[-*]\s+(.*)/);
+    if(li){ if(!inList){out.push('<ul>');inList=true;} out.push('<li>'+li[1]+'</li>'); continue; }
+    if(inList){out.push('</ul>');inList=false;}
+    out.push(t===''?'<br>':'<div>'+l+'</div>');
+  }
+  if(inList)out.push('</ul>');
+  return out.join('').replace(/§(\d+)§/g,(m,i)=>blocks[+i]);
+}
+/* ---------- парсинг лога в сообщения ---------- */
+function parseThread(log){
+  const msgs=[]; let cur=null,mode=null;
+  for(let line of (log||"").split('\n')){
+    let hd=line.match(/^=+\s*\[(\w+)\]\s*(.*?)\s*\|/);
+    if(hd){ cur={kind:hd[1],time:hd[2],inp:[],out:[]}; msgs.push(cur); mode=null; continue; }
+    if(!cur) continue;
+    if(line==='> PROMPT:'||line==='> ANSWER:'){mode='in';continue;}
+    if(/^-+\s*output\s*-+$/.test(line)){mode='out';continue;}
+    if(mode==='in')cur.inp.push(line); else if(mode==='out')cur.out.push(line);
+  }
+  return msgs;
+}
+
+/* ---------- state-transition -> toast ---------- */
+function notifyTransitions(tasks){
+  for(const t of tasks){
+    const prev=prevStates[t.name];
+    if(!firstLoad && prev && prev!==t.state){
+      if(t.state==="done")    toast("success","✔ "+t.name,"задача завершена"+(t.files&&t.files!=="0"?` · ${t.files} files`:""));
+      else if(t.state==="error")   toast("error","✖ "+t.name,"ошибка, exit "+(t.exit||"?"));
+      else if(t.state==="waiting") toast("warning","⏳ "+t.name,"агент задал вопрос — нужен reply");
+      else if(t.state==="stalled") toast("warning","⚠ "+t.name,"процесс завис — reply continue");
+    }
+    prevStates[t.name]=t.state;
+  }
+  firstLoad=false;
+}
+
+/* ---------- tree ---------- */
+async function refresh(){
+  const d=await jget("/api/tasks"); ENGINES=d.engines; CWD=d.cwd; PROVIDERS=d.providers||{};
+  $("#cwd").textContent=d.cwd;
+  if(activeDir===null) activeDir=d.cwd;
+  if(!$("#f-engine").options.length){
+    $("#f-engine").innerHTML=ENGINES.map(e=>`<option value="${e}">${esc((PROVIDERS[e]||{}).label||e)}</option>`).join("");
+    syncModels();
+  }
+  if(!$("#f-dir").value) $("#f-dir").value=activeDir;
+  notifyTransitions(d.tasks);
+
+  // группировка по проекту: задачи ∪ явно зарегистрированные (даже без задач) проекты
+  const groups={};
+  for(const t of d.tasks){ (groups[t.dir]=groups[t.dir]||[]).push(t); }
+  for(const p of (d.projects||[])){ groups[p]=groups[p]||[]; }
+  if(!Object.keys(groups).length) groups[d.cwd]=[];
+  const dirs=Object.keys(groups).sort((a,b)=>{
+    const ua=groups[a].length?Math.max(...groups[a].map(t=>t.updated||0)):0;
+    const ub=groups[b].length?Math.max(...groups[b].map(t=>t.updated||0)):0;
+    return ub-ua;
+  });
+  const sortU=a=>a.sort((x,y)=>(y.updated||0)-(x.updated||0));
+  $("#tree").innerHTML=dirs.map(dir=>{
+    const all=groups[dir]; const byName={}; all.forEach(t=>byName[t.name]=t);
+    const kids={}, roots=[];
+    all.forEach(t=>{ if(t.parent && byName[t.parent]) (kids[t.parent]=kids[t.parent]||[]).push(t); else roots.push(t); });
+    const renderTask=t=>{
+      const sub=kids[t.name]?`<div class="tasks">${sortU(kids[t.name]).map(renderTask).join("")}</div>`:"";
+      return `<div class="task ${t.name===SEL?'sel':''} ${isStrike(t.state)?'strike':''}" onclick="select('${t.name}',event)">
+        <span class="dot s-${t.state}" title="${t.state}"></span>
+        <span class="em" title="${t.state}">${t.act||''}${t.topic||''}</span>
+        <span class="nm" title="${esc(t.name)}">${esc(t.title||t.name)}</span>
+        <span class="pill pe-${t.engine}">${t.engine}</span>
+      </div>${sub}`;
+    };
+    const rows=sortU(roots).map(renderTask).join("") || '<div class="task empty-row">нет задач — жми ➕</div>';
+    const col=collapsed.has(dir)?"col":"";
+    const act=dir===activeDir?"active":"";
+    return `<div class="proj ${col} ${act}" data-dir="${esc(dir)}">
+      <div class="ph" onclick="toggleProj('${esc(dir)}',event)">
+        <span class="caret">▾</span>
+        <span class="pname" title="${esc(dir||'')}">📁 ${esc(base(dir))}</span>
+        <span class="cnt">${all.length}</span>
+        <button class="mini" onclick="newHere('${esc(dir)}',event)" title="новая задача здесь">＋</button>
+      </div>
+      <div class="tasks">${rows}</div></div>`;
+  }).join("");
+
+  if(SEL){ const t=d.tasks.find(x=>x.name===SEL); if(t) loadThread(t); }
+}
+function toggleProj(dir,e){ e&&e.stopPropagation(); activeDir=dir; $("#f-dir").value=dir;
+  if(collapsed.has(dir))collapsed.delete(dir); else collapsed.add(dir); refresh(); }
+function newHere(dir,e){ e&&e.stopPropagation(); activeDir=dir; $("#f-dir").value=dir; $("#f-prompt").focus(); }
+function select(n,e){ e&&e.stopPropagation(); SEL=n; lastLog=""; refresh(); }
+
+async function loadThread(t){
+  const d=await jget("/api/thread?task="+encodeURIComponent(t.name));
+  $("#chead").innerHTML=`<span class="dot s-${t.state}"></span>
+    <b>${esc(t.name)}</b>
+    <span class="pill pe-${t.engine}">${t.engine}/${esc(t.model)}</span>
+    <span class="pill">${t.files} files</span>
+    ${t.state==="waiting"?'<span class="pill" style="color:var(--wait);border-color:var(--wait)">⏳ ждёт ответа</span>':""}
+    ${t.state==="stalled"?'<span class="pill" style="color:var(--stall)">⚠ завис → reply continue</span>':""}
+    ${t.state==="running"?'<span class="pill" style="color:var(--run);border-color:var(--run)">'+spin('работает')+'</span>':""}
+    <span class="sp"></span><span class="pill" title="dir">${esc(base(t.dir))}</span>`;
+  $("#replybar").style.display="flex";
+  if(d.log===lastLog) return;  // не дёргаем DOM/скролл если без изменений
+  lastLog=d.log;
+  const box=$("#chat");
+  const near=(box.scrollTop+box.clientHeight)>(box.scrollHeight-60);
+  const msgs=parseThread(d.log);
+  box.innerHTML = msgs.length? msgs.map(m=>`
+    <div class="msg user"><div class="who">${m.kind} · ${esc(m.time)}</div>
+      <div class="bubble">${md(m.inp.join('\n').trim())}</div></div>
+    ${m.out.join('').trim()?`<div class="msg agent"><div class="who">${t.engine}</div>
+      <div class="bubble">${md(m.out.join('\n').trim())}</div></div>`:""}
+  `).join("") : '<div class="empty">(пусто)</div>';
+  if(near) box.scrollTop=box.scrollHeight;
+}
+
+/* ---------- run / reply ---------- */
+function syncModels(){ const e=$("#f-engine").value; const p=PROVIDERS[e]||{};
+  $("#models").innerHTML=(p.models||[]).map(m=>`<option value="${m}">`).join("");
+  $("#f-model").placeholder=p.default_model?("авто ("+p.default_model+")"):"авто";
+  loadProvider();
+}
+async function submitRun(){
+  const body={engine:$("#f-engine").value,model:$("#f-model").value.trim(),
+    dir:$("#f-dir").value.trim(),progress:$("#f-prog").checked,terminal:$("#f-term").checked,
+    prompt:$("#f-prompt").value.trim()};
+  if(!body.prompt){toast("error","пустой prompt","напиши задачу перед запуском");return;}
+  const btn=$("#btn-run"); const old=btn.innerHTML; btn.disabled=true; btn.innerHTML=spin("запуск…");
+  try{
+    const r=await jpost("/api/run",body);
+    if(r.error){toast("error","не запущено",r.error);return;}
+    toast("success","▶ задача запущена",body.dir?base(body.dir):"");
+    $("#f-prompt").value=""; setTimeout(refresh,600);
+  } finally { btn.disabled=false; btn.innerHTML=old; }
+}
+async function sendReply(){
+  const a=$("#answer").value.trim(); if(!a||!SEL)return;
+  const btn=$("#btn-reply"); const old=btn.innerHTML; btn.disabled=true; btn.innerHTML=spin();
+  try{
+    const r=await jpost("/api/reply",{task:SEL,answer:a,terminal:$("#r-term").checked});
+    if(r.error){toast("error","reply не отправлен",r.error);return;}
+    $("#answer").value=""; setTimeout(refresh,600);
+  } finally { btn.disabled=false; btn.innerHTML=old; }
+}
+$("#answer").addEventListener("keydown",e=>{if(e.ctrlKey&&e.key==="Enter")sendReply();});
+
+/* ---------- limits (под выбранный провайдер) ---------- */
+async function loadProvider(){
+  const e=($("#f-engine").value)||"codex";
+  $("#lim-title").textContent="Лимиты · "+((PROVIDERS[e]||{}).label||e);
+  $("#limits").innerHTML=`<span class="empty">${spin("загрузка…")}</span>`;
+  const d=await jget("/api/provider?engine="+encodeURIComponent(e));
+  if(!d.available){ $("#limits").innerHTML=`<span class="empty">${esc(e)} не найден в PATH</span>`; return; }
+  let html=`<div class="kv"><span>версия</span><b>${esc((d.version||'?').slice(0,32))}</b></div>`;
+  if(d.login) html+=`<div class="kv"><span>логин</span><b>${esc(d.login)}</b></div>`;
+  if(d.limits){
+    const rl=d.limits, now=d.now;
+    const w=(win,lbl)=>{ if(!win)return"";
+      const up=win.used_percent||0, cls=up>=80?"hi":up>=50?"mid":"";
+      let left=""; if(win.resets_at){const s=win.resets_at-now; left=s>0?`${Math.floor(s/3600)}ч${Math.floor(s%3600/60)}м`:"скоро";}
+      const wl=win.window_minutes? (win.window_minutes%1440===0?win.window_minutes/1440+"д":Math.round(win.window_minutes/60)+"ч"):"";
+      return `<div class="lim"><div class="t"><span>${lbl} (${wl})</span><span>${up}% · ${left}</span></div>
+        <div class="bar"><i class="${cls}" style="width:${up}%"></i></div></div>`; };
+    html+=`<div class="kv"><span>план</span><b>${rl.plan_type||"?"}</b></div>`+w(rl.primary,"primary")+w(rl.secondary,"secondary");
+  } else if(d.note){ html+=`<div class="note">${esc(d.note)}</div>`; }
+  $("#limits").innerHTML=html;
+}
+async function openDoctor(){ $("#m-doc").classList.add("on"); const p=$("#doc"); p.innerHTML=spin("запуск doctor…");
+  p.textContent=(await jget("/api/doctor")).text; }
+function closeModal(id){ $("#"+id).classList.remove("on"); }
+document.addEventListener("keydown",e=>{if(e.key==="Escape"){closeModal("m-doc");closeModal("m-hist");closeModal("m-browse");}});
+
+/* ---------- folder browser ---------- */
+async function openBrowse(mode){
+  BROWSE_MODE=mode;
+  $("#m-browse").classList.add("on");
+  await goBrowse(mode==="pick-field"?($("#f-dir").value||CWD):activeDir);
+}
+async function goBrowse(path){
+  $("#br-list").innerHTML=`<div class="direntry">${spin("загрузка…")}</div>`;
+  const d=await jget("/api/browse?path="+encodeURIComponent(path||""));
+  $("#br-path").value=d.path;
+  $("#br-shortcuts").innerHTML=(d.shortcuts||[]).map(s=>`<button class="mini" onclick="goBrowse('${esc(s).replace(/'/g,"\\'")}')">${esc(base(s))}</button>`).join("");
+  const parts=d.path.split("/").filter(Boolean);
+  let acc = d.path.match(/^[A-Za-z]:/) ? "" : "/";
+  $("#br-crumbs").innerHTML=parts.map((p,i)=>{
+    acc += (i===0?p:"/"+p); const full=acc;
+    return `<span onclick="goBrowse('${esc(full).replace(/'/g,"\\'")}')">${esc(p)}</span>${i<parts.length-1?' / ':''}`;
+  }).join("");
+  const up = d.parent? `<div class="direntry" onclick="goBrowse('${esc(d.parent).replace(/'/g,"\\'")}')">⬆ .. (вверх)</div>` : "";
+  $("#br-list").innerHTML = up + (d.dirs.length? d.dirs.map(x=>{
+    const full=d.path.replace(/\/$/,"")+"/"+x;
+    return `<div class="direntry" onclick="goBrowse('${esc(full).replace(/'/g,"\\'")}')">📁 ${esc(x)}</div>`;
+  }).join("") : '<div class="direntry" style="cursor:default;color:var(--dim)">(нет подпапок)</div>');
+}
+async function chooseBrowsed(){
+  const path=$("#br-path").value;
+  if(BROWSE_MODE==="add-project"){
+    const r=await jpost("/api/project",{dir:path});
+    if(r.error){toast("error","не добавлено",r.error);} else { activeDir=path; toast("success","проект добавлен",base(path)); }
+    setTimeout(refresh,300);
+  } else {
+    $("#f-dir").value=path;
+  }
+  closeModal("m-browse");
+}
+
+/* ---------- draggable splitters (persisted) ---------- */
+function makeResizer(handleId, panelId, side){
+  const handle=$("#"+handleId), panel=$("#"+panelId);
+  const saved=localStorage.getItem("agentgui_w_"+panelId);
+  if(saved) panel.style.width=saved+"px";
+  handle.addEventListener("mousedown",e=>{
+    e.preventDefault();
+    const startX=e.clientX, startW=panel.getBoundingClientRect().width;
+    handle.classList.add("drag"); document.body.style.cursor="col-resize"; document.body.style.userSelect="none";
+    const onMove=ev=>{
+      let dx=ev.clientX-startX; if(side==="right") dx=-dx;
+      const w=Math.max(160,Math.min(640,Math.round(startW+dx)));
+      panel.style.width=w+"px";
+    };
+    const onUp=()=>{
+      document.removeEventListener("mousemove",onMove); document.removeEventListener("mouseup",onUp);
+      handle.classList.remove("drag"); document.body.style.cursor=""; document.body.style.userSelect="";
+      localStorage.setItem("agentgui_w_"+panelId, parseInt(panel.style.width,10));
+    };
+    document.addEventListener("mousemove",onMove); document.addEventListener("mouseup",onUp);
+  });
+}
+makeResizer("rez-left","left","left");
+makeResizer("rez-right","right","right");
+
+updateHistBadge();
+refresh(); loadProvider();
+setInterval(refresh,3000);
+setInterval(loadProvider,15000);
+</script>
+</body>
+</html>
