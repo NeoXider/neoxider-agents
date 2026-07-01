@@ -769,5 +769,126 @@ class ReplyAgentStaleGuardTests(unittest.TestCase):
                          "NEW ANSWER\n")
 
 
+class RoughTokensTests(unittest.TestCase):
+    """usage counts are ESTIMATES (~4 chars/token) -- non-zero for any real text, 0 only for
+    empty/None, so cost panels see something useful instead of the old hardcoded 0/0/0."""
+
+    def test_empty_and_none_are_zero(self):
+        self.assertEqual(srv._rough_tokens(""), 0)
+        self.assertEqual(srv._rough_tokens(None), 0)
+
+    def test_four_chars_is_one_token(self):
+        self.assertEqual(srv._rough_tokens("abcd"), 1)
+
+    def test_rounds_up(self):
+        self.assertEqual(srv._rough_tokens("abcde"), 2)
+
+
+class PromptAntiEchoTests(unittest.TestCase):
+    """The tool-calling instructions must tell the model NOT to restate already-executed calls in
+    call syntax after a tool result -- the prompt-side half of the echo defense (the parser-side
+    half is prior_call_keys dedup; see EchoDedupTests). Guard against the paragraph being lost in
+    a future prompt rewrite."""
+
+    def test_instructions_forbid_restating_executed_calls(self):
+        self.assertIn("Do NOT restate calls", srv.TOOLCALL_INSTRUCTIONS)
+        self.assertIn("NEW calls", srv.TOOLCALL_INSTRUCTIONS)
+
+
+class RunRetryAndFallbackTests(unittest.TestCase):
+    """_run must behave like a real API endpoint about empty answers:
+      - a fresh run whose CLI came back empty (or state=error) is retried up to CFG.retries times;
+      - a resume that 'succeeded' but produced an EMPTY answer falls back to a fresh run;
+      - the returned usage is a non-zero estimate flagged neoxider_estimated.
+    H._run never touches `self`, so it is called unbound with a dummy object -- no HTTP server
+    needed."""
+
+    def setUp(self):
+        self._saved = (srv.run_agent, srv.reply_agent, srv.read_meta, srv.SESSION, srv.CFG,
+                       srv.PROVIDERS, srv.time.sleep)
+
+        class FakeCfg:
+            engine = "fakeeng"
+            model = "m"
+            effort = ""
+            dir = "/pinned/project"  # pinned -> fresh_session_dir returns it, no rmtree
+            port = 8999
+            timeout = 60
+            session_ttl = 1800
+            retries = 1
+
+        srv.CFG = FakeCfg()
+        srv.PROVIDERS = {"fakeeng": {"supports_resume": True}}
+        srv.SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
+        srv.read_meta = lambda name: {"state": "done"}
+        srv.time.sleep = lambda s: None  # retries must not actually wait in tests
+
+    def tearDown(self):
+        (srv.run_agent, srv.reply_agent, srv.read_meta, srv.SESSION, srv.CFG,
+         srv.PROVIDERS, srv.time.sleep) = self._saved
+
+    def _call(self, messages, tools=None):
+        return srv.H._run(object(), messages, tools)
+
+    def test_empty_fresh_run_is_retried_once_and_recovers(self):
+        attempts = []
+
+        def fake_run(engine, model, effort, workdir, prompt, name, timeout):
+            attempts.append(name)
+            return "" if len(attempts) == 1 else "REAL ANSWER"
+
+        srv.run_agent = fake_run
+        text, calls, usage = self._call([{"role": "user", "content": "hi"}])
+        self.assertEqual(text, "REAL ANSWER")
+        self.assertIsNone(calls)
+        self.assertEqual(len(attempts), 2)
+
+    def test_error_state_run_is_retried_even_with_nonempty_text(self):
+        attempts = []
+        states = iter(["error", "done"])
+        srv.read_meta = lambda name: {"state": next(states, "done")}
+
+        def fake_run(engine, model, effort, workdir, prompt, name, timeout):
+            attempts.append(name)
+            return "provider error banner" if len(attempts) == 1 else "REAL ANSWER"
+
+        srv.run_agent = fake_run
+        text, _calls, _usage = self._call([{"role": "user", "content": "hi"}])
+        self.assertEqual(text, "REAL ANSWER")
+        self.assertEqual(len(attempts), 2)
+
+    def test_retries_exhausted_returns_last_result_without_raising(self):
+        attempts = []
+
+        def fake_run(engine, model, effort, workdir, prompt, name, timeout):
+            attempts.append(name)
+            return ""
+
+        srv.run_agent = fake_run
+        text, calls, _usage = self._call([{"role": "user", "content": "hi"}])
+        self.assertEqual(text, "")
+        self.assertIsNone(calls)
+        self.assertEqual(len(attempts), 2)  # retries=1 -> 2 total attempts, then give up
+
+    def test_empty_resume_answer_falls_back_to_fresh_run(self):
+        import time
+        first = [{"role": "user", "content": "hi"}]
+        srv.SESSION = {"task_name": "prior-task", "messages": list(first),
+                       "dir": "/pinned/project", "last_activity": time.time()}
+        srv.reply_agent = lambda *a, **k: ""  # resume "succeeds" but says nothing
+        srv.run_agent = lambda *a, **k: "FRESH ANSWER"
+        text, _calls, _usage = self._call(first + [{"role": "user", "content": "and?"}])
+        self.assertEqual(text, "FRESH ANSWER")
+
+    def test_usage_is_a_flagged_nonzero_estimate(self):
+        srv.run_agent = lambda *a, **k: "four token answer here"
+        _text, _calls, usage = self._call([{"role": "user", "content": "hi"}])
+        self.assertTrue(usage["neoxider_estimated"])
+        self.assertGreater(usage["prompt_tokens"], 0)
+        self.assertGreater(usage["completion_tokens"], 0)
+        self.assertEqual(usage["total_tokens"],
+                         usage["prompt_tokens"] + usage["completion_tokens"])
+
+
 if __name__ == "__main__":
     unittest.main()

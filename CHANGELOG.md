@@ -6,6 +6,26 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- openai-server stability (toward "almost a real OpenAI API" for benchmark use):
+  - **Retry-on-empty**: a completion whose CLI invocation came back empty or in an `error` meta
+    state is re-run (`--retries`, default 1, 2s backoff) before the bridge gives up — a real
+    OpenAI endpoint effectively never returns an empty 200, and one transient CLI hiccup
+    (rate-limit blip, session startup race) should not zero a whole benchmark scenario. A resume
+    that "succeeds" but produces an EMPTY answer now also falls back to a fresh run instead of
+    returning `""`.
+  - **OpenAI-style error surface**: an unexpected exception inside the bridge now returns
+    `{"error": {"message": ..., "type": "server_error"}}` with HTTP 500 instead of a bare
+    connection reset the client can't distinguish from a network failure.
+  - **Estimated `usage`**: responses now carry ~4-chars/token estimates (flagged
+    `"neoxider_estimated": true`) instead of hardcoded `0/0/0` — useful for cost panels, not
+    billing-grade.
+  - **Anti-echo prompt**: `TOOLCALL_INSTRUCTIONS` now explicitly tells the model not to restate
+    already-executed calls in call syntax after a tool result — the prompt-side half of the echo
+    defense (the parser-side dedup landed earlier).
+  - `GET /health` additionally reports `timeout_seconds`/`retries`. +9 tests (96 total in
+    test_openai_server.py): retry/fallback behavior (H._run exercised unbound with fakes),
+    usage estimates, anti-echo prompt regression guard.
+
 - openai-server: the Format-2 call parser now accepts a single positional JSON object argument —
   `world_command({"action":"spawn","targetName":"Enemy1"})` — in addition to `name=value` pairs.
   This is gpt-5.5's DOMINANT spelling (literally how an OpenAI SDK call is written); before this,

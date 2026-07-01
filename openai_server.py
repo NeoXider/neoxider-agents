@@ -51,7 +51,14 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
     protocol the CLI natively speaks -- it can occasionally ignore the instruction or misformat it.
     The instructions are re-sent on every call that includes `tools` (even a continuation), not
     just the first -- simpler and more robust than tracking whether the schema already "stuck".
-  - `usage` token counts are always 0/0/0 -- the wrapped CLIs don't expose them in a structured form.
+  - `usage` token counts are ESTIMATES (~4 chars/token, flagged with "neoxider_estimated": true)
+    -- the wrapped CLIs don't expose real counts in a structured form. Good enough for cost
+    panels/dashboards; not billing-grade.
+  - A completion whose CLI invocation came back empty or in an error state is retried
+    (`--retries`, default 1) before the bridge gives up -- a real OpenAI endpoint effectively
+    never returns an empty 200, and one transient CLI hiccup should not zero a whole scenario.
+    An unexpected bridge exception surfaces as an OpenAI-style {"error": ...} HTTP 500, never a
+    bare connection reset.
   - `content` is a clean answer for every bundled engine. codex's non-interactive `exec` mode
     otherwise mixes its own startup banner/session-id/error-log/"tokens used" chrome (and, on
     Windows, a cp866-mojibake OS-notification line) into the same stream as the answer, so the
@@ -350,6 +357,10 @@ Decide ONE of:
     <fn>({"arg": "other", "num": 2})
 
 Both formats are parsed identically. Do NOT wrap Format 2 in prose -- just the call line(s).
+
+After a [TOOL RESULT] round-trip, report progress in plain words. Do NOT restate calls you
+already made in call syntax -- an exact repeat of an earlier call reads as summary prose, not a
+new request. Write call syntax only for NEW calls you want executed now.
 """
 
 
@@ -638,6 +649,14 @@ SESSION_LOCK = threading.Lock()
 SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
 
 
+def _rough_tokens(s):
+    """Crude ~4-chars-per-token estimate. The wrapped CLIs expose no structured token counts,
+    but a rough non-zero `usage` is far more useful to dashboards/benchmark cost panels than the
+    0/0/0 this bridge used to return -- callers that need exact billing numbers should not be
+    pointed at a CLI bridge in the first place."""
+    return (len(s or "") + 3) // 4
+
+
 def session_idle_seconds():
     if not SESSION["task_name"]:
         return None
@@ -675,7 +694,8 @@ class H(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "engine": CFG.engine, "model": label,
                                    "session_active": active, "session_turns": turns,
                                    "session_idle_seconds": None if idle is None else int(idle),
-                                   "session_ttl_seconds": CFG.session_ttl})
+                                   "session_ttl_seconds": CFG.session_ttl,
+                                   "timeout_seconds": CFG.timeout, "retries": CFG.retries})
         elif p.endswith("/models"):
             self._send_json(200, {"object": "list", "data": [{"id": label, "object": "model", "owned_by": "neoxider-agents"}]})
         elif p == "/":
@@ -706,22 +726,42 @@ class H(BaseHTTPRequestHandler):
                 new_turns = messages[len(SESSION["messages"]):]
                 answer = build_prompt(new_turns, tools)
                 raw_text = reply_agent(CFG.engine, CFG.model, CFG.effort, SESSION["dir"], prev_name, answer, CFG.timeout)
+                if raw_text is not None and not raw_text.strip():
+                    # A resume that "succeeded" but produced an EMPTY answer is as useless to the
+                    # caller as one that died -- fall back to a fresh run rather than returning "".
+                    raw_text = None
                 name = prev_name
-            if raw_text is None:
+            if raw_text is None or not raw_text.strip():
                 # First call, a non-extension, an unhealthy session, OR a resume that appended
                 # nothing (reply_agent returned None). Any of these -> a clean fresh run with the
-                # FULL history, never a stale echo of the previous answer.
+                # FULL history, never a stale echo of the previous answer. Empty/errored fresh
+                # runs are retried (--retries, default 1): a real OpenAI endpoint effectively
+                # never returns an empty 200, and a transient CLI hiccup (rate-limit blip, session
+                # startup race) should not zero a whole benchmark scenario.
                 prompt = build_prompt(messages, tools)
-                name = new_task_name()
                 workdir = fresh_session_dir()
                 SESSION["dir"] = workdir
-                raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt, name, CFG.timeout)
+                for attempt in range(CFG.retries + 1):
+                    name = new_task_name()
+                    raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt, name, CFG.timeout)
+                    state = read_meta(name).get("state")
+                    if raw_text.strip() and state != "error":
+                        break
+                    if attempt < CFG.retries:
+                        print("[openai-bridge] empty/errored completion (state=%s), retry %d/%d"
+                              % (state, attempt + 1, CFG.retries), file=sys.stderr)
+                        time.sleep(2)
             SESSION["task_name"] = name
             SESSION["messages"] = messages
             SESSION["last_activity"] = time.time()
         tool_calls, text = extract_tool_calls(raw_text, tool_names(tools), tools,
                                               prior_call_keys(messages))
-        return text, tool_calls
+        usage_prompt = _rough_tokens(build_prompt(messages, tools))
+        usage_completion = _rough_tokens(raw_text)
+        usage = {"prompt_tokens": usage_prompt, "completion_tokens": usage_completion,
+                 "total_tokens": usage_prompt + usage_completion,
+                 "neoxider_estimated": True}
+        return text, tool_calls, usage
 
     def _reset_session(self):
         with SESSION_LOCK:
@@ -735,7 +775,7 @@ class H(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True, "reset": True})
 
     def _sync_response(self, messages, tools):
-        text, tool_calls = self._run(messages, tools)
+        text, tool_calls, usage = self._run(messages, tools)
         message = {"role": "assistant", "content": None if tool_calls else text.strip()}
         if tool_calls:
             message["tool_calls"] = tool_calls
@@ -745,11 +785,11 @@ class H(BaseHTTPRequestHandler):
             "created": int(time.time()),
             "model": model_label(CFG.engine, CFG.model, CFG.effort),
             "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": usage,
         })
 
     def _stream_response(self, messages, tools):
-        text, tool_calls = self._run(messages, tools)
+        text, tool_calls, _usage = self._run(messages, tools)
         cid = "chatcmpl-%s" % uuid.uuid4().hex
         created = int(time.time())
         label = model_label(CFG.engine, CFG.model, CFG.effort)
@@ -805,10 +845,22 @@ class H(BaseHTTPRequestHandler):
         if not messages:
             return self._send_json(400, {"error": {"message": "'messages' is required and must be a non-empty array"}})
         tools = body.get("tools") or None
-        if body.get("stream"):
-            self._stream_response(messages, tools)
-        else:
-            self._sync_response(messages, tools)
+        try:
+            if body.get("stream"):
+                self._stream_response(messages, tools)
+            else:
+                self._sync_response(messages, tools)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            pass  # client went away -- nothing to answer
+        except Exception as e:  # noqa: BLE001 -- a bridge bug must surface as an OpenAI-style
+            # error response, not a bare connection reset the client can't distinguish from a
+            # network failure. (_run finishes before any response bytes go out, including in the
+            # streaming path, so sending a 500 here is always still possible.)
+            try:
+                self._send_json(500, {"error": {"message": "bridge failure: %s" % e,
+                                                 "type": "server_error"}})
+            except OSError:
+                pass
 
 
 def main():
@@ -827,6 +879,9 @@ def main():
     ap.add_argument("-p", "--port", type=int, default=int(os.environ.get("AGENT_OPENAI_PORT") or 8801))
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--timeout", type=int, default=240, help="max seconds to wait for one completion (default: 240)")
+    ap.add_argument("--retries", type=int, default=1,
+                     help="how many times to re-run a completion whose CLI invocation came back "
+                          "empty or in an error state before giving up (default: 1)")
     ap.add_argument("--session-ttl", type=int, default=1800,
                      help="seconds of inactivity before the ongoing session is treated as expired and the "
                           "next call starts fresh instead of resuming it (default: 1800 = 30 minutes)")
