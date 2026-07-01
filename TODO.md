@@ -17,7 +17,8 @@ Today adding a provider means editing `providers.json` (display) *and* a `case` 
 `agent.sh` (invocation) *and* (for rate limits) a branch in `gui.py`'s `provider_info()`.
 Goal: **one new file, zero edits to existing files.**
 
-Proposed design (not yet implemented):
+Status: **in progress** (`providers/<name>/provider.sh` + `provider.json`,
+`agent.sh provider-info <engine>` — being migrated now). Design below for reference.
 - `providers/<name>/provider.sh` — sourced by `agent.sh` at startup (`for f in
   providers/*/provider.sh; do source "$f"; done`). Defines a small contract of functions
   per provider: `provider_<name>_args` (alias→model+effort resolution), `provider_<name>_run_cmd`,
@@ -59,6 +60,33 @@ Proposed design (not yet implemented):
 - [ ] Re-look at the task-list interaction after CliDeck/agent-of-empires comparison
   (see below) — e.g. a compact "running now" summary strip, or a Claude-Code-style
   background-tasks flyout, if it turns out to be clearer than the current tree.
+- [ ] **Separate model + effort selectors, for every provider.** Today effort is baked
+  into the model alias string (`sonnet-high`, `5.5-high`) — the picker should offer two
+  independent dropdowns (model, then effort: auto/low/medium/high/xhigh/max, only the
+  levels a given provider actually supports) whenever a provider exposes an effort
+  concept, falling back to "auto" (provider/CLI default) when not selected or not
+  applicable (e.g. opencode/gemini today have no effort concept at all).
+- [ ] **Audit full-auto/non-interactive flags for every provider, document in README.**
+  The whole point of this tool is zero prompts/confirmations blocking a subagent run.
+  codex (`--sandbox workspace-write --skip-git-repo-check`) and claude
+  (`--permission-mode acceptEdits`) are already wired for this. Double-check opencode
+  and gemini have an equivalent "don't ask for approval" flag and that it's actually
+  passed (they may currently rely on CLI defaults that could still prompt in some
+  configs) — then add a clear README section stating explicitly that every provider is
+  expected to run fully unattended (auto/full mode), so a user setting up a new CLI
+  knows what flag to add if it isn't there yet.
+
+## Distribution
+
+- [x] **Package as an installable Claude Code plugin.** Done —
+  `.claude-plugin/plugin.json` + `.claude-plugin/marketplace.json` at the repo root.
+  `SKILL.md` stays flat at the root (no `skills/` subfolder needed — Claude Code
+  v2.1.142+ auto-detects a root-level `SKILL.md` with no `skills/` dir and no `skills`
+  manifest field as a single-skill plugin). Install via
+  `/plugin marketplace add NeoXider/neoxider-agents` then
+  `/plugin install neoxider-agents@neoxider-agents`. Not yet verified with a real
+  `/plugin install` round-trip on a second machine — worth double-checking once
+  someone else tries it.
 
 ## Research
 

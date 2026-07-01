@@ -44,12 +44,46 @@ this project fills.
   change required. Wiring up how to actually *invoke* a new CLI is a small `case`
   branch in `agent.sh`.
 
+## Installation
+
+**No package manager, no dependencies to install.** `agent.sh` is plain POSIX shell;
+`gui.py` uses only the Python 3 standard library (`http.server`, `json`, `subprocess`,
+`urllib`, `glob`, ...) — there is no `requirements.txt`, no `pip install`, no
+`npm install`, nothing to build.
+
+**Option A — as a Claude Code plugin** (recommended if you use Claude Code):
+
+```
+/plugin marketplace add NeoXider/neoxider-agents
+/plugin install neoxider-agents@neoxider-agents
+```
+
+That registers `SKILL.md` for you automatically — no manual file copying.
+
+**Option B — plain git clone** (works regardless of which CLI(s) you use it from):
+
+```bash
+git clone https://github.com/NeoXider/neoxider-agents.git
+cd neoxider-agents
+```
+
+That's it — you're installed. Requirements (already have these if you use any of the
+CLIs below):
+
+- `bash` (git-bash on Windows, already installed with Git for Windows; native on macOS/Linux)
+- Python 3 (any recent version; standard library only, needed only for the GUI, not
+  for `agent.sh` itself)
+- At least one of the CLIs it wraps: [Codex CLI](https://github.com/openai/codex),
+  [Claude Code](https://github.com/anthropics/claude-code), opencode, or the Gemini CLI
+  — install and log in to whichever one(s) you plan to use, `agent.sh doctor` will tell
+  you what it can see.
+
+Optional one-time setup: the [`neoxider`](bin/README.md) command (a one-word launcher
+for the GUI, from bash or PowerShell).
+
 ## Quick start
 
 ```bash
-git clone <this-repo> neoxider-agents
-cd neoxider-agents
-
 # run a task
 bash agent.sh run -t fix-readme -C /path/to/project "fix the typo in the README"
 
@@ -66,10 +100,6 @@ bash agent.sh doctor
 # or drive all of the above from a browser
 neoxider
 ```
-
-Requires `bash` (git-bash on Windows), Python 3 (stdlib only, for the GUI), and at
-least one of the CLIs it wraps: [Codex CLI](https://github.com/openai/codex),
-[Claude Code](https://github.com/anthropics/claude-code), opencode, or the Gemini CLI.
 
 ### The `neoxider` command
 

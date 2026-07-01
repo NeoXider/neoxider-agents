@@ -1,0 +1,11 @@
+{
+  "name": "neoxider-agents",
+  "owner": { "name": "NeoXider", "url": "https://github.com/NeoXider" },
+  "plugins": [
+    {
+      "name": "neoxider-agents",
+      "source": "./",
+      "description": "A tiny local control room for AI coding subagents across Codex, Claude Code, opencode, and Gemini CLI — one bash wrapper plus an optional zero-dependency web GUI."
+    }
+  ]
+}
