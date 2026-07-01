@@ -1,5 +1,29 @@
 # Ideas (open questions, not decided yet)
 
+## CliDeck / agent-of-empires deep-dive findings
+
+Confirms the earlier first-pass finding: neither tool has anything resembling this
+project's rate-limit panel or i18n — a genuine differentiator, not something to copy.
+Both are Node/Rust with a real build step (CliDeck: `npx clideck`; agent-of-empires:
+`cargo build --release`), vs. this project's zero-dependency Python-stdlib + bash.
+
+Three concrete ideas worth considering as future work (not yet scoped/implemented):
+
+1. **Cross-session "ask another agent" relay (from CliDeck).** A session can inject a
+   question into another session's real terminal, wait for it to finish, and pipe the
+   answer back as command output. Could let a subagent consult a sibling (e.g. a
+   reviewer asking the implementer a clarifying question) without manual copy-paste —
+   ties into the "subagents spawning subagents as a real tree" idea above.
+2. **`agent_detect_as = "claude"`-style status-detection mapping for custom/forked
+   CLIs (from agent-of-empires).** Lets a wrapped/renamed binary reuse an existing
+   provider's question-detection heuristic instead of never showing `waiting`. Would
+   help anyone running a fork/wrapper of Codex/Claude/etc. under a different binary name.
+3. **A raw live-output pane as an escape hatch (from agent-of-empires' raw tmux pane
+   next to its structured view).** This project's log/thread model already captures
+   full output, so a literal "tail -f, unparsed" panel — separate from the
+   markdown-rendered chat view — could help when the question-detection heuristic
+   misfires and a user wants to see exactly what the CLI printed.
+
 ## Subagents spawning subagents as a real tree
 
 `agent.sh` already supports `-P <parent>` (or `AGENT_PARENT` env var) to record a

@@ -96,12 +96,14 @@ Roughly in priority order. PRs welcome.
   *quality* benchmarking, not embedding control in another app. Recommendation: extend
   this tool's own pattern with a thin `test-api` wrapper rather than adopt a framework
   — full design proposal in [`docs/IDEAS.md`](docs/IDEAS.md#local-http-api-test-driver-api-test-mode).
-- [ ] **Deeper CliDeck / agent-of-empires comparison.** Queued but not yet delivered —
-  was mid-flight in a workflow that got stopped before returning results (see git
-  history around 2026-07-01). Worth re-running: both are closer analogs than the first
-  research pass found, and their actual source/UX may have concrete ideas worth
-  adopting, while keeping this tool's zero-dependency stdlib-only + adaptive
-  rate-limit-panel angle, which neither of them has.
+- [x] **Deeper CliDeck / agent-of-empires comparison.** Done — confirms neither
+  competitor has anything like this project's rate-limit panel or i18n (genuine
+  differentiators); both require a real build step (Node/Rust) vs. this project's
+  zero-dependency stdlib+bash. Three concrete future ideas captured in
+  [`docs/IDEAS.md`](docs/IDEAS.md#clideck--agent-of-empires-deep-dive-findings):
+  cross-session "ask a sibling agent" relay, `agent_detect_as`-style status-detection
+  mapping for custom/forked CLI binaries, and a raw unparsed live-output pane as an
+  escape hatch alongside the markdown chat view.
 - [x] **Cross-tool instruction-file conventions.** Answered — Codex CLI and opencode
   both natively read `AGENTS.md` (an open, Linux-Foundation-governed cross-tool
   standard as of Dec 2025, supported by 28+ tools); Claude Code reads it as secondary
