@@ -48,6 +48,9 @@
   .proj>.ph .pname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .proj>.ph .cnt{color:var(--dim);font-size:11px;font-weight:400}
   .proj.col .tasks{display:none}
+  /* каждый проект — собственный скролл списка задач, иначе один большой проект (много задач)
+     занимает всю область дерева и остальные проекты уезжают за пределы видимости */
+  .proj>.tasks{max-height:38vh;overflow-y:auto}
   .task{display:flex;gap:8px;align-items:baseline;padding:5px 10px 5px 24px;cursor:pointer}
   .task:hover{background:var(--panel2)} .task.sel{background:#223049;box-shadow:inset 3px 0 0 var(--accent)}
   .task .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -209,6 +212,7 @@
 <script>
 const $=s=>document.querySelector(s);
 let PROVIDERS={}, ENGINES=[], CWD="", SEL=null, activeDir=null, collapsed=new Set(), lastLog="";
+let seenProjects=new Set();
 let prevStates={}, firstLoad=true;
 let BROWSE_MODE="pick-field";
 const TOAST_HISTORY = JSON.parse(localStorage.getItem("agentgui_toast_history")||"[]");
@@ -316,7 +320,16 @@ async function refresh(){
   for(const t of d.tasks){ (groups[t.dir]=groups[t.dir]||[]).push(t); }
   for(const p of (d.projects||[])){ groups[p]=groups[p]||[]; }
   if(!Object.keys(groups).length) groups[d.cwd]=[];
+  // новый/пустой проект по умолчанию сворачиваем ВСЁ, КРОМЕ активного — иначе один проект
+  // с полусотней задач перекрывает остальные, и добавленную папку не видно без скролла.
+  for(const dir of Object.keys(groups)){
+    if(!seenProjects.has(dir)){
+      seenProjects.add(dir);
+      if(dir!==activeDir && Object.keys(groups).length>1) collapsed.add(dir);
+    }
+  }
   const dirs=Object.keys(groups).sort((a,b)=>{
+    if(a===activeDir) return -1; if(b===activeDir) return 1;  // активный проект — всегда сверху
     const ua=groups[a].length?Math.max(...groups[a].map(t=>t.updated||0)):0;
     const ub=groups[b].length?Math.max(...groups[b].map(t=>t.updated||0)):0;
     return ub-ua;
@@ -339,8 +352,8 @@ async function refresh(){
     const col=collapsed.has(dir)?"col":"";
     const act=dir===activeDir?"active":"";
     return `<div class="proj ${col} ${act}" data-dir="${esc(dir)}">
-      <div class="ph" onclick="toggleProj('${esc(dir)}',event)">
-        <span class="caret">▾</span>
+      <div class="ph" onclick="selectProj('${esc(dir)}',event)">
+        <span class="caret" onclick="toggleCollapse('${esc(dir)}',event)">▾</span>
         <span class="pname" title="${esc(dir||'')}">📁 ${esc(base(dir))}</span>
         <span class="cnt">${all.length}</span>
         <button class="mini" onclick="newHere('${esc(dir)}',event)" title="новая задача здесь">＋</button>
@@ -350,9 +363,13 @@ async function refresh(){
 
   if(SEL){ const t=d.tasks.find(x=>x.name===SEL); if(t) loadThread(t); }
 }
-function toggleProj(dir,e){ e&&e.stopPropagation(); activeDir=dir; $("#f-dir").value=dir;
+// клик по строке проекта: делает его активным (дефолт для новой задачи) и ГАРАНТИРОВАННО разворачивает —
+// иначе выбранный проект мог бы остаться скрытым за своим же collapsed-состоянием.
+function selectProj(dir,e){ e&&e.stopPropagation(); activeDir=dir; $("#f-dir").value=dir; collapsed.delete(dir); refresh(); }
+// клик по стрелке: только свернуть/развернуть, не трогая активный проект (не дёргает форму справа)
+function toggleCollapse(dir,e){ e&&e.stopPropagation();
   if(collapsed.has(dir))collapsed.delete(dir); else collapsed.add(dir); refresh(); }
-function newHere(dir,e){ e&&e.stopPropagation(); activeDir=dir; $("#f-dir").value=dir; $("#f-prompt").focus(); }
+function newHere(dir,e){ e&&e.stopPropagation(); activeDir=dir; $("#f-dir").value=dir; collapsed.delete(dir); $("#f-prompt").focus(); }
 function select(n,e){ e&&e.stopPropagation(); SEL=n; lastLog=""; refresh(); }
 
 async function loadThread(t){

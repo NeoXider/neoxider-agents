@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# neoxider — one-word launcher for neoxider-cockpit.
+#   neoxider            -> opens the web GUI in your browser
+#   neoxider <anything>  -> passed straight through to agent.sh (run/reply/log/doctor/...)
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SK="$HERE/../agent.sh"
+
+if [ $# -eq 0 ]; then
+    exec bash "$SK" gui
+else
+    exec bash "$SK" "$@"
+fi

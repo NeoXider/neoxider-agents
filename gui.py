@@ -7,8 +7,16 @@
 Бэкенд читает <name>.meta / <name>.log напрямую (быстро, без парсинга текста list),
 а действия (run/reply/doctor) шеллит в agent.sh, чтобы вся логика жила в одном месте.
 """
-import json, os, sys, time, subprocess, urllib.parse, glob
+import json, os, re, sys, time, subprocess, urllib.parse, glob
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+def to_git_bash_path(p):
+    """C:/Git/CoreAI или C:\\Git\\CoreAI -> /c/Git/CoreAI — канонический вид, в котором agent.sh
+    (git-bash) сам хранит dir= в .meta. Без этого GUI-задачи группировались бы отдельно от
+    CLI-задач той же папки (разные строки для одной директории)."""
+    p = (p or "").replace("\\", "/")
+    m = re.match(r"^([A-Za-z]):/(.*)$", p)
+    return "/%s/%s" % (m.group(1).lower(), m.group(2)) if m else p
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # bash (git-bash) понимает прямые слэши в win-путях, но НЕ бэкслеши в argv -> нормализуем
@@ -290,7 +298,7 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/tasks":
             self._send(200, json.dumps({"tasks": list_tasks(), "engines": ENGINES,
                                         "providers": PROVIDERS, "projects": load_projects(),
-                                        "cwd": os.getcwd()}))
+                                        "cwd": to_git_bash_path(os.getcwd())}))
         elif u.path == "/api/providers":
             self._send(200, json.dumps({"providers": PROVIDERS}))
         elif u.path == "/api/browse":
@@ -319,18 +327,19 @@ class H(BaseHTTPRequestHandler):
             prompt = (data.get("prompt") or "").strip()
             if not prompt:
                 return self._send(400, json.dumps({"error": "empty prompt"}))
+            rdir = to_git_bash_path(data.get("dir") or "")
             args = ["run", "-e", data.get("engine") or "codex"]
             if data.get("model"):    args += ["-m", data["model"]]
-            if data.get("dir"):      args += ["-C", data["dir"]]
+            if rdir:                 args += ["-C", rdir]
             if data.get("name"):     args += ["-t", data["name"]]
             if data.get("parent"):   args += ["-P", data["parent"]]
             if data.get("progress"): args += ["-p"]
             args.append(prompt)
             spawn(args, terminal=bool(data.get("terminal")))
-            if data.get("dir"):  # запомнить проект
+            if rdir:  # запомнить проект
                 pr = load_projects()
-                if data["dir"] not in pr:
-                    pr.append(data["dir"]); save_projects(pr)
+                if rdir not in pr:
+                    pr.append(rdir); save_projects(pr)
             self._send(200, json.dumps({"ok": True}))
         elif u.path == "/api/reply":
             task = (data.get("task") or "").strip()
@@ -342,7 +351,7 @@ class H(BaseHTTPRequestHandler):
             spawn(args, terminal=bool(data.get("terminal")))
             self._send(200, json.dumps({"ok": True}))
         elif u.path == "/api/project":
-            d = (data.get("dir") or "").strip()
+            d = to_git_bash_path((data.get("dir") or "").strip())
             if not d:
                 return self._send(400, json.dumps({"error": "dir required"}))
             pr = load_projects()

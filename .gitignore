@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# runtime data (default AGENT_CLI_LOGS lives outside the repo, but ignore it
+# defensively in case someone points it at a repo-local path)
+agent-cli-logs/
+projects.json
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# editor/local overrides
+.vscode/
+.idea/
+*.local.json
