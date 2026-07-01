@@ -56,17 +56,18 @@ Roughly in priority order. PRs welcome.
   into the model alias string (`sonnet-high`, `5.5-high`) — the picker should offer two
   independent dropdowns (model, then effort: auto/low/medium/high/xhigh/max, only the
   levels a given provider actually supports) whenever a provider exposes an effort
-  concept, falling back to "auto" (provider/CLI default) when not selected or not
-  applicable (e.g. opencode/gemini today have no effort concept at all).
-- [ ] **Audit full-auto/non-interactive flags for every provider, document in README.**
-  The whole point of this tool is zero prompts/confirmations blocking a subagent run.
-  codex (`--sandbox workspace-write --skip-git-repo-check`) and claude
-  (`--permission-mode acceptEdits`) are already wired for this. Double-check opencode
-  and gemini have an equivalent "don't ask for approval" flag and that it's actually
-  passed (they may currently rely on CLI defaults that could still prompt in some
-  configs) — then add a clear README section stating explicitly that every provider is
-  expected to run fully unattended (auto/full mode), so a user setting up a new CLI
-  knows what flag to add if it isn't there yet.
+  concept, falling back to "auto" (provider/CLI default) when not selected. Gemini has
+  no effort concept; **opencode does** (`--variant`, e.g. high/max/minimal) —
+  `provider_opencode_run_cmd` already forwards `EFFORT` to `--variant` if set, but
+  nothing in the current CLI/GUI args flow ever populates it (no `_resolve` function
+  for opencode yet) — this selector work is what will actually make it reachable.
+- [x] **Audit full-auto/non-interactive flags for every provider, document in README.**
+  Done — codex/claude were already covered. Found and fixed two real gaps: gemini now
+  gets `--yolo`, opencode now gets `--dangerously-skip-permissions` (both confirmed
+  via each CLI's own `--help`, and smoke-tested — gemini's own output now reads "YOLO
+  mode is enabled"). Without these, a non-interactive run (`</dev/null` stdin, by
+  design) could have hung forever on an approval prompt it could never answer. README
+  now has a table of the flag each provider uses, in the "Adding a provider" section.
 
 ## Distribution
 
@@ -82,14 +83,26 @@ Roughly in priority order. PRs welcome.
 
 ## Research
 
-- [ ] **CLI-as-API for automated testing.** Separate investigation: for CoreAI and other
-  libraries, check whether existing open-source solutions let you drive Claude Code /
-  Codex CLI etc. as an API from your own app's test suite (rather than through a human
-  terminal session), before building anything custom.
-- [ ] **Deeper CliDeck / agent-of-empires comparison.** Both are closer analogs than the
-  first pass found. Read their actual source/UX for concrete ideas worth adopting (e.g.
-  CliDeck's session sidebar interaction), while keeping our zero-dependency
-  stdlib-only + adaptive rate-limit-panel angle, which neither of them has.
+- [x] **CLI-as-API for automated testing.** Answered — no ready cross-vendor solution
+  exists; each vendor has its own official headless/SDK mode instead (Claude Code's
+  `-p --output-format stream-json` + Claude Agent SDK; Codex's `codex exec --json` +
+  Codex SDK; Gemini CLI's `-p --output-format json`; opencode has CLI flags only, no
+  SDK). Purpose-built eval harnesses (Promptfoo, Harbor/Terminal-Bench) target agent
+  *quality* benchmarking, not embedding control in another app. Recommendation: extend
+  this tool's own pattern with a thin `test-api` wrapper rather than adopt a framework
+  — full design proposal in [`docs/IDEAS.md`](docs/IDEAS.md#local-http-api-test-driver-api-test-mode).
+- [ ] **Deeper CliDeck / agent-of-empires comparison.** Queued but not yet delivered —
+  was mid-flight in a workflow that got stopped before returning results (see git
+  history around 2026-07-01). Worth re-running: both are closer analogs than the first
+  research pass found, and their actual source/UX may have concrete ideas worth
+  adopting, while keeping this tool's zero-dependency stdlib-only + adaptive
+  rate-limit-panel angle, which neither of them has.
+- [x] **Cross-tool instruction-file conventions.** Answered — Codex CLI and opencode
+  both natively read `AGENTS.md` (an open, Linux-Foundation-governed cross-tool
+  standard as of Dec 2025, supported by 28+ tools); Claude Code reads it as secondary
+  context (`CLAUDE.md`/`SKILL.md` stay primary); Gemini CLI has its own `GEMINI.md`
+  convention and does not support `AGENTS.md`. Implemented: `AGENTS.md` and
+  `GEMINI.md` now ship at the repo root alongside `SKILL.md`.
 
 ## Platform
 
@@ -108,5 +121,12 @@ Roughly in priority order. PRs welcome.
 
 ## Nice to have
 
-- [ ] Translate `SKILL.md` (currently partly Russian) fully to English — code/doc
-  artifacts should be English regardless of chat language.
+- [x] Translate `SKILL.md` fully to English — done, verified no stray Cyrillic remains
+  (one leftover Russian diagnostic-string quote was found and fixed by hand after the
+  bulk translation pass).
+- [ ] **Local HTTP API test-driver (`test-api` mode).** Scoped, ready-to-build design
+  in [`docs/IDEAS.md`](docs/IDEAS.md#local-http-api-test-driver-api-test-mode) — not
+  yet implemented. Smallest viable version: `--base-url` + `--goal` only, reusing the
+  existing `run` mechanism with a prompt template, no new provider-plugin machinery.
+- [ ] **`/plugin install` round-trip, unverified.** The plugin packaging (see
+  Distribution above) hasn't been tested by an actual install on a second machine yet.

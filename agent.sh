@@ -60,7 +60,11 @@ cmd="${1:-}"
 [ -n "$cmd" ] || die "usage: agent.sh run|reply|log|last|status|list|doctor|provider-info ... (see file header)"
 shift
 
-engine="codex"; model=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)"; progress=0
+engine="codex"; model=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=0
+# ^ PID suffix makes the default name collision-resistant: two processes (e.g. from two
+# different installs/tools sharing one LOGDIR) can never share a PID, so they never race on
+# the same .meta/.log even if they start in the same second. Always give tasks a meaningful
+# name via -t anyway -- this default just needs to be *safe*, not pretty.
 parent="${AGENT_PARENT:-}"   # parent task name (for the tree); can be set via env or -P
 
 parse_opts() {
@@ -84,9 +88,28 @@ PROGRESS_PROTO='
 [Progress protocol] Maintain a file PROGRESS.md in the working directory. If it already exists, read it FIRST and continue from where it left off (do not redo finished steps). As you work, keep it updated with: the goal, a checklist of steps with done/todo status, and any decisions made. Keep it concise. Do NOT run git commit.'
 
 # --- meta sidecar (key=value) ---------------------------------------------
+# meta_set's read-modify-write isn't atomic across processes on its own, so we wrap it in a
+# portable mkdir-based mutex (mkdir is atomic on every POSIX filesystem; no dependency on
+# flock, which isn't reliably available in git-bash). This matters once this tool is invoked
+# concurrently from multiple agents/providers/installs sharing the same LOGDIR — without it,
+# two near-simultaneous writers to the same task's .meta could silently clobber each other's update.
 meta_file() { echo "$LOGDIR/$1.meta"; }
-meta_set()  { local f; f="$(meta_file "$1")"; touch "$f"
-    grep -v "^$2=" "$f" > "$f.tmp" 2>/dev/null || true; echo "$2=$3" >> "$f.tmp"; mv "$f.tmp" "$f"; }
+_meta_lock() {
+    local lock="$1.lock.d" i=0
+    until mkdir "$lock" 2>/dev/null; do
+        i=$((i + 1))
+        # stale lock (holder crashed / was killed) -> force through after ~5s rather than deadlock forever
+        [ "$i" -gt 50 ] && { rm -rf "$lock" 2>/dev/null; break; }
+        sleep 0.1
+    done
+}
+_meta_unlock() { rmdir "$1.lock.d" 2>/dev/null; }
+meta_set()  { local f; f="$(meta_file "$1")"
+    _meta_lock "$f"
+    touch "$f"
+    grep -v "^$2=" "$f" > "$f.tmp" 2>/dev/null || true; echo "$2=$3" >> "$f.tmp"; mv "$f.tmp" "$f"
+    _meta_unlock "$f"
+}
 meta_get()  { grep -m1 "^$2=" "$(meta_file "$1")" 2>/dev/null | cut -d= -f2- ; }
 
 resolve_session() {

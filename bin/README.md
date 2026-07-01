@@ -6,24 +6,41 @@ Any other argument is passed straight through to `agent.sh` — `neoxider run ..
 `bash agent.sh run ...`. It resolves its own location, so it works no matter where
 you cloned the repo.
 
-## Recommended: add `bin/` to your `PATH` (once, works in every shell)
+## Recommended: run the installer once (adds `bin/` to your `PATH`)
 
 This directory contains three entry points for the same command — `neoxider` (bash
 script), `neoxider.cmd` (cmd.exe/PowerShell wrapper), `neoxider.ps1` (PowerShell
 wrapper) — so once `bin/` is on your `PATH`, typing bare `neoxider` works from
 git-bash, `cmd.exe`, **and** PowerShell, with no per-shell setup.
 
-**Windows** (any shell): Win+R → `sysdm.cpl` → Advanced → Environment Variables →
-edit your user `Path` → add `C:\path\to\neoxider-agents\bin`. Open a new terminal.
+These scripts only touch *your own* PATH, and only when *you* run them — nothing runs
+itself automatically.
 
-**macOS/Linux**: add to your shell rc file (`~/.bashrc`, `~/.zshrc`, ...):
+**Windows** (PowerShell):
 
-```bash
-export PATH="/path/to/neoxider-agents/bin:$PATH"
+```powershell
+powershell -ExecutionPolicy Bypass -File .\bin\install.ps1
 ```
 
-Verify it worked: `neoxider doctor` should print the engines/rate-limits table from
-any shell, without a `bash` prefix.
+Uses `[Environment]::SetEnvironmentVariable(..., "User")`, not `setx` — `setx` has a
+documented bug where it silently truncates an already-long `PATH`.
+
+**macOS / Linux / git-bash**:
+
+```bash
+bash bin/install.sh
+```
+
+Appends a `PATH` export to `~/.bashrc` (or `~/.zshrc` if that's your shell).
+
+Either way: open a **new** terminal window afterward, then verify with
+`neoxider doctor` — it should print the engines/rate-limits table from any shell,
+with no `bash` prefix needed. Both scripts are idempotent (safe to run more than once).
+
+**Prefer to do it by hand instead?** Windows: Win+R → `sysdm.cpl` → Advanced →
+Environment Variables → edit your user `Path` → add the full path to this `bin`
+directory. macOS/Linux: add `export PATH="/path/to/neoxider-agents/bin:$PATH"` to your
+shell rc file yourself.
 
 ## Alternative: per-shell alias/function (no PATH edit)
 

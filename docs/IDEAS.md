@@ -46,30 +46,79 @@ across concurrent, uncoordinated processes has two real gaps, found while thinki
 through "what if this skill is invoked from several agents/providers at the same
 time":
 
-1. **`meta_set`'s read-modify-write isn't atomic across processes.** It does
-   `grep -v "^key=" file > file.tmp && mv file.tmp file` — if two processes update the
-   *same* task's `.meta` around the same time (e.g. a GUI double-click firing two
-   `reply` calls, or a background poller reading while a run is mid-write), one write
-   can silently clobber the other's key (a classic read-modify-write race / lost
-   update). In the common case — one task, one writer at a time, sequential steps
-   within a single `run`/`reply` invocation — this never triggers. It's a real but
-   narrow edge case, worth a proper fix (e.g. wrap the read-modify-write in `flock` on
-   a per-task lock file) rather than a "someday" item, since it gets more likely the
-   more concurrent installs/agents point at the same `LOGDIR`.
-2. **Auto-generated task names can collide.** The default name is
-   `task-$(date +%Y%m%d-%H%M%S)` — two processes (from the same or different
-   tools/installs) starting within the same second get the *same* default name and
-   then race on the same `.meta`/`.log` files. Fix: make the default name
-   collision-resistant (append a short random suffix or the PID), or have `run`
-   check-and-retry if the target `.meta` already exists.
+1. ~~**`meta_set`'s read-modify-write isn't atomic across processes.**~~ **Fixed.**
+   Wrapped the read-modify-write in a portable `mkdir`-based mutex (`_meta_lock`/
+   `_meta_unlock` in `agent.sh` — `mkdir` is atomic on every POSIX filesystem; `flock`
+   isn't reliably available in git-bash, so this doesn't depend on it). Verified with
+   10 concurrent writers to one `.meta` file: without the lock, only 1 of 10 keys
+   survived (plus outright `mv` errors from colliding temp files); with it, all 10
+   survive every time.
+2. ~~**Auto-generated task names can collide.**~~ **Fixed.** Default name is now
+   `task-<timestamp>-<pid>` — two processes can never share a PID, so they can never
+   collide on the same `.meta`/`.log` even starting in the same second.
 
-Neither is implemented yet — noted here (rather than acted on immediately) because
-`agent.sh` was mid-refactor (provider-plugin migration) when this was written; do it
-as a small, focused follow-up once that refactor lands, to avoid two concurrent edits
-to the same file colliding — which would be a delightfully on-the-nose demonstration
-of exactly the problem described above.
+Both landed as a small, focused follow-up right after the provider-plugin migration
+merged (deliberately not done *during* that refactor, to avoid two concurrent edits to
+the same file colliding — which would have been a delightfully on-the-nose
+demonstration of exactly the problem being fixed).
 
 The `AGENT_CLI_LOGS` env var already gives a clean escape hatch for anyone who *wants*
 strict namespace isolation between installs (e.g. two people sharing a machine, or a
-"personal" vs "CI" split) — worth calling out explicitly in the README once the
-locking fix lands, rather than adding new namespacing machinery on top.
+"personal" vs "CI" split) — now documented in the README's Installation section,
+rather than adding new namespacing machinery on top.
+
+## Local HTTP API test-driver ("api-test" mode)
+
+Design proposal for a separate feature (from research prompted by: "I have CoreAI and
+other libraries — I'd like to use Claude/Codex/etc. as an API for automated testing,
+pointed at a local HTTP server"). Prior research confirmed there's no ready open-source
+solution for this (each vendor has its own official headless mode instead — Claude
+Code's `-p --output-format stream-json` + Claude Agent SDK, Codex's `codex exec --json`
++ Codex SDK, Gemini CLI's `-p --output-format json` — none has a dedicated
+"drive-me-as-a-test-harness" framework on top). Proposed shape:
+
+**Interface** — a new subcommand, not a new provider:
+```
+agent.sh test-api --base-url http://localhost:7777 \
+  --spec ./unity-debug-api.yaml \        # optional OpenAPI/Swagger, or a flat endpoint list
+  --goal "Verify player spawn, inventory add/remove, and save/load round-trip" \
+  --provider codex --model gpt-5.5 --out ./results/api-test-run1.json
+```
+
+**How it drives the CLI** — no new infrastructure needed: Claude Code, Codex, and
+Gemini CLI's non-interactive modes all already support shell/tool use (a `curl`/
+`Invoke-WebRequest` call is just another shell command to them). The prompt states the
+base URL + spec/endpoint list + goal, instructs the agent to exercise the API via its
+own shell tool, and mandates a structured JSON report as the final message. An
+MCP HTTP-client server would be a nicer *upgrade* later (structured request/response
+capture instead of parsing free text), but curl-via-shell works today across all three
+vendors with zero new moving parts.
+
+**Output contract** — small, flat, one entry per endpoint call, meant to be directly
+assertable from e.g. a Unity NUnit test:
+```json
+{
+  "base_url": "http://localhost:7777", "goal": "...", "provider": "codex", "model": "gpt-5.5",
+  "overall": "pass|fail|partial",
+  "endpoints": [
+    { "method": "POST", "path": "/debug/spawn", "assertion": "spawns a player and returns an id",
+      "result": "pass", "reason": "" },
+    { "method": "GET", "path": "/debug/inventory/12", "result": "fail",
+      "reason": "expected item count 1 after add, got 0" }
+  ],
+  "summary": { "total": 6, "passed": 5, "failed": 1 }
+}
+```
+
+**Integration sketch** — reuses the existing `run` mechanism as-is, no new
+provider-plugin machinery: `test-api` builds a prompt from a template
+(interpolating base URL/spec/goal + the output-contract instruction above), calls the
+normal `run` path for the chosen provider/model, then validates and post-processes the
+agent's final JSON message into `--out`, logged in the shared GUI with a `kind=api-test`
+tag for filtering. **Smallest viable first version**: skip `--spec`/OpenAPI parsing
+entirely — just `--base-url` + `--goal`, let the agent introspect the API itself
+(hit `/`, `/health`, `/openapi.json` if present, or ask the goal text to enumerate
+endpoints) and report back in the JSON shape above. Add spec-file support once that
+loop is proven out.
+
+Not implemented yet — this is a scoped, ready-to-build design, not code.

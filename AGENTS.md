@@ -1,0 +1,38 @@
+# neoxider-agents — agent instructions
+
+This repo is `agent.sh` + `gui.py`/`gui.html`: a non-interactive wrapper for launching
+and managing CLI coding subagents (Codex, Claude Code, opencode, Gemini CLI) across a
+shared thread-per-task log, plus an optional zero-dependency local web GUI.
+
+If you (an AI agent) are working *in* this repo, see [`SKILL.md`](SKILL.md) for the
+full command reference, model-alias tables, the question-detection heuristic, and
+known trade-offs — it's the canonical operating manual and takes precedence over this
+file if anything here goes stale. This file exists so Codex CLI and opencode (which
+read `AGENTS.md` natively) and Claude Code (which reads it as secondary context) all
+pick up the same baseline instructions without extra setup.
+
+## Quick reference
+
+```bash
+SK=./agent.sh
+bash $SK run  -t <name> -C <dir> "<prompt>"     # new task (codex/gpt-5.5 by default)
+bash $SK run  -e claude -t <name> -C <dir> "..." # -e: codex|claude|opencode|gemini
+bash $SK reply <name> "<answer>"                 # continue a task by name
+bash $SK log  -f <name>                          # follow a task live
+bash $SK status <name>                           # state / current step / needs a reply?
+bash $SK doctor                                   # engines + codex rate limits, before a batch
+bash $SK gui                                      # web GUI (or: ./bin/neoxider)
+```
+
+## Rules for using this tool as a subagent orchestrator
+
+- Give every task a meaningful name via `-t` — the auto-generated default
+  (`task-<timestamp>-<pid>`) is collision-safe but not descriptive.
+- Always `reply` by task name (or session id) — never rely on "last task" when more
+  than one subagent might be running, or you'll answer into the wrong session.
+- Every provider runs fully unattended (no approval prompts — see `providers/*/provider.sh`
+  and the "Adding a provider" section of [`README.md`](README.md) for the exact flag
+  each one uses). Do not remove those flags; a subagent's stdin is always closed, so a
+  provider that blocks on a prompt hangs forever instead of failing loudly.
+- Keep this file, `GEMINI.md`, and `SKILL.md` in sync when the tool's interface changes
+  — they intentionally overlap so every CLI convention picks up the same instructions.

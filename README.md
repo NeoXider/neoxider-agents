@@ -106,7 +106,29 @@ neoxider
 `neoxider` with no arguments opens the web GUI in your browser. Any other argument is
 passed straight through to `agent.sh`, so `neoxider run ...`, `neoxider doctor`, etc.
 all work exactly like `bash agent.sh run ...`. See [`bin/README.md`](bin/README.md)
-for one-time setup (bash and PowerShell).
+for one-time setup (installer scripts for PowerShell/bash, or manual PATH edit).
+
+### Multiple installs / shared machines
+
+All state (`.meta`/`.log`/`.md` per task) lives under `AGENT_CLI_LOGS`
+(`~/.claude/agent-cli-logs` by default) — shared on purpose, so one GUI shows every
+subagent regardless of which provider or which install launched it, with concurrent
+writes to the same task made safe by a portable file lock. If you want strict
+isolation instead (e.g. two people sharing a machine, or a "personal" vs "CI" split),
+point different installs at different directories:
+
+```bash
+export AGENT_CLI_LOGS="$HOME/.neoxider-ci-logs"
+```
+
+### Working with other AI coding CLIs
+
+This repo's usage instructions are duplicated across the conventions different tools
+read automatically: [`SKILL.md`](SKILL.md) (Claude Code), [`AGENTS.md`](AGENTS.md)
+(Codex CLI and opencode natively; Claude Code as secondary context), and
+[`GEMINI.md`](GEMINI.md) (Gemini CLI, which hasn't adopted the shared `AGENTS.md`
+convention). Whichever CLI you're chatting with, it should pick up the same baseline
+instructions with no extra setup.
 
 ## CLI reference
 
@@ -131,6 +153,19 @@ at startup; `gui.py` glob-loads every `providers/*/provider.json` for display me
     session for `reply`; omit it if the CLI has no resume/continue support.
   - `provider_<name>_doctor` — prints one line of JSON to stdout:
     `{"engine":...,"version":...,"available":true|false,"login":...,"limits":{...}|null,"note":...}`.
+
+**Every provider must run fully unattended — no confirmation prompts.** This tool always
+runs CLIs with stdin closed (`</dev/null`), by design, so a subagent never hangs waiting
+for input — but that also means a provider that *can* block on an approval prompt will
+hang forever if `provider_<name>_run_cmd` doesn't pass its "don't ask, just do it" flag.
+When adding a provider, find and pass that flag:
+
+| Provider | Flag |
+|---|---|
+| Codex | `--sandbox workspace-write --skip-git-repo-check` |
+| Claude Code | `--permission-mode acceptEdits` |
+| Gemini CLI | `--yolo` (auto-approve all tool actions) |
+| opencode | `--dangerously-skip-permissions` |
 
 See `providers/codex/` and `providers/claude/` for full worked examples (alias
 resolution, effort suffixes, and codex's rate-limit JSON parsing).
