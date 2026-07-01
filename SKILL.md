@@ -85,10 +85,18 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   as word-sized SSE chunks. It is NOT real per-token streaming from the underlying
   provider.
 - **`tools`/function-calling is emulated via prompting**, not native — best-effort. The
-  bridge accepts the call as EITHER a JSON `{"tool_calls":[...]}` block OR literal
-  `name(arg=value, ...)` lines (codex tends to write the latter), and the prompt warns
-  that describing an action in prose is ignored/failed. Re-sent on every `tools` call,
-  even a continuation turn.
+  bridge accepts the call as EITHER a JSON `{"tool_calls":[...]}` block OR literal call
+  lines in three spellings: `name(arg=value, ...)` pairs (codex's habit),
+  `name({"arg": "value"})` with one positional JSON object (gpt-5.5's habit — the
+  OpenAI-SDK spelling), or `name("scalar")` mapped onto a one-parameter function's sole
+  schema property. The prompt warns that describing an action in prose is
+  ignored/failed. Echo protection: a call-syntax line exactly repeating an
+  already-executed call (same name + canonical args) is summary prose, not re-executed;
+  fenced `{"tool_calls":[...]}` stays exempt. Re-sent on every `tools` call, even a
+  continuation turn.
+- **Empty completions retry, bridge bugs return OpenAI-style errors.** An empty or
+  `error`-state CLI invocation is re-run (`--retries`, default 1); an unexpected bridge
+  exception returns `{"error": {...}}` HTTP 500 instead of a bare connection reset.
 - **The wrapped CLI is locked to text-only completion — real CLI flags, not just a
   prompt ask.** Every subprocess gets `AGENT_CHAT_ONLY=1`, which makes codex run with
   `--sandbox read-only --ignore-user-config` (no shell/file writes, and skips
@@ -98,7 +106,8 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   subprocesses — a normal `agent.sh run` keeps full access. Verified live: `-c
   mcp_servers={}` alone did NOT stop a real MCP call from succeeding; the flags above
   do.
-- **`usage` token counts are always `0/0/0`** — don't trust them for cost tracking.
+- **`usage` token counts are estimates** (~4 chars/token, `"neoxider_estimated": true`)
+  — useful for cost panels, not billing-grade.
 - **`content` is a clean answer for every bundled engine.** `codex` would otherwise mix
   its startup banner/session-id/error-log/"tokens used" chrome (and a cp866-mojibake line
   on Windows) into the answer, so its provider runs `codex exec --json` and extracts only

@@ -266,15 +266,33 @@ about this before pointing anything at it:
   includes an OpenAI `tools` array, the bridge instructs the agent (in the prompt) to
   reply with either plain prose or a tool call, then parses the call into a real
   `tool_calls` response. It accepts the call in **two** formats and parses them
-  identically: a fenced/bare JSON `{"tool_calls":[...]}` block, OR literal
-  `name(arg=value, ...)` call lines (one per line) — the latter because CLI agents
-  (codex especially) tend to WRITE calls that way rather than emit JSON, and the prompt
-  now explicitly warns that *describing* an action in prose ("I called X", "Execution
-  succeeded") does nothing and is treated as a failure. Best-effort still — a model can
-  occasionally misformat — but recognizing both formats plus the stronger prompt cut the
-  main real-world failure mode (prose-instead-of-call). The instructions are re-sent on
-  every call that includes `tools`, including a continuation turn — a deliberate
-  simplicity/robustness choice over tracking whether the schema already "stuck".
+  identically: a fenced/bare JSON `{"tool_calls":[...]}` block, OR literal call lines
+  (one per line) in any of three argument spellings — `name(arg=value, ...)` pairs,
+  `name({"arg": "value", ...})` with one positional JSON object (how gpt-5.5 writes
+  calls — literally the OpenAI-SDK spelling; dropping it used to silently zero whole
+  benchmark groups), or `name("scalar")` mapped onto the schema's sole parameter when
+  the function takes exactly one. The prompt explicitly warns that *describing* an
+  action in prose ("I called X", "Execution succeeded") does nothing and is treated as
+  a failure. **Echo protection**: after a tool-result round-trip, models tend to
+  restate the calls they already made (in exactly the `name({...})` style the rendered
+  history shows them); a call-syntax line that exactly repeats an already-executed call
+  (same name, same canonical arguments) is treated as summary prose, not re-executed —
+  fenced `{"tool_calls":[...]}` JSON stays exempt as an explicit, deliberate format,
+  and the prompt also tells the model not to restate executed calls in call syntax.
+  Best-effort still — a model can occasionally misformat — but recognizing all these
+  spellings plus the stronger prompt cut the main real-world failure modes
+  (prose-instead-of-call, dropped positional-object calls, echo re-execution). The
+  instructions are re-sent on every call that includes `tools`, including a
+  continuation turn — a deliberate simplicity/robustness choice over tracking whether
+  the schema already "stuck".
+- **Empty completions are retried, bridge bugs surface as OpenAI-style errors.** A
+  completion whose CLI invocation came back empty or in an `error` state is re-run
+  (`--retries`, default `1`) before the bridge gives up — a real OpenAI endpoint
+  effectively never returns an empty 200, and one transient CLI hiccup should not zero
+  a whole benchmark scenario. A resume that "succeeds" but produces an empty answer
+  falls back to a fresh run the same way. An unexpected exception inside the bridge
+  returns an OpenAI-style `{"error": {...}}` HTTP 500, never a bare connection reset
+  the client can't tell apart from a network failure.
 - **The wrapped CLI is locked to text-only completion — no MCP, no shell/file access,
   no skills/subagents of its own.** Every subprocess this bridge launches gets
   `AGENT_CHAT_ONLY=1` in its env, which `providers/{codex,claude}/provider.sh` react to
@@ -299,8 +317,10 @@ about this before pointing anything at it:
   prompt-injection defenses refused that framing live; the current wording (see
   `BASE_INSTRUCTIONS` in `openai_server.py`) states the restriction as plain fact
   instead ("this session has no MCP/tools configured"), which it now genuinely is.
-- **`usage` token counts are always `0/0/0`** — the wrapped CLIs don't expose real
-  token counts in a structured form.
+- **`usage` token counts are estimates** (~4 chars/token, flagged with
+  `"neoxider_estimated": true`) — the wrapped CLIs don't expose real token counts in a
+  structured form, but a rough non-zero number is far more useful to cost panels and
+  dashboards than the `0/0/0` the bridge used to return. Not billing-grade.
 - Image content in messages is not rendered to the agent (replaced with a
   `[image omitted]`-style note) — the wrapped CLI can't see images either way.
 - **`content` is a clean answer for every bundled engine.** `codex`'s non-interactive
@@ -386,8 +406,10 @@ resolution, effort suffixes, and codex's rate-limit JSON parsing).
 ## Development
 
 ```bash
-bash tests/test_agent_sh.sh   # bash logic: meta_set locking, provider alias resolution, ...
-python tests/test_gui.py      # gui.py's pure functions: path normalization, state, ...
+bash tests/test_agent_sh.sh          # bash logic: meta_set locking, provider alias resolution, ...
+python tests/test_gui.py             # gui.py's pure functions: path normalization, state, ...
+python tests/test_openai_server.py   # bridge logic: tool-call parsing (all spellings), echo dedup,
+                                     # session extension/expiry, retry/fallback, usage estimates, ...
 ```
 
 Zero dependencies here too — stdlib/bash only, no pytest or bats. See
