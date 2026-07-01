@@ -49,6 +49,12 @@ this project fills.
 - **Model and effort are separate.** `-m <model> -f <effort>` (or two dropdowns in the
   GUI) — not baked into one alias string — for every provider that has an effort
   concept (codex, claude, opencode's `--variant`; gemini has none).
+- **`test-api` mode + GUI "API" tab.** Point an agent at a local HTTP API
+  (`agent.sh test-api --base-url <url> --goal "<what to verify>"`) and get back one
+  strict JSON pass/fail report — the agent exercises your API with real HTTP calls via
+  its own shell/curl capability, no new architecture needed. The GUI's API tab wraps
+  the same `/api/test-api` endpoint with a form + results view, and shows ready-made
+  curl/C# (Unity `UnityWebRequest`) snippets for calling it from your own test suite.
 
 ## Installation
 
@@ -102,6 +108,10 @@ bash agent.sh reply fix-readme "yes, use option B"
 # check state / diff / limits before a big batch
 bash agent.sh status fix-readme
 bash agent.sh doctor
+
+# point an agent at a local HTTP API and get a structured pass/fail report
+bash agent.sh test-api --base-url http://127.0.0.1:8080 \
+  --goal "check /health returns ok, then POST /item and GET it back" --out result.json
 
 # or drive all of the above from a browser
 neoxider
@@ -181,11 +191,21 @@ When adding a provider, find and pass that flag:
 See `providers/codex/` and `providers/claude/` for full worked examples (alias
 resolution, effort suffixes, and codex's rate-limit JSON parsing).
 
+## Development
+
+```bash
+bash tests/test_agent_sh.sh   # bash logic: meta_set locking, provider alias resolution, ...
+python tests/test_gui.py      # gui.py's pure functions: path normalization, state, ...
+```
+
+Zero dependencies here too — stdlib/bash only, no pytest or bats. See
+[`tests/README.md`](tests/README.md).
+
 ## Roadmap
 
-See [`TODO.md`](TODO.md) for planned work (i18n, diff rendering, macOS support, etc.)
-and [`docs/IDEAS.md`](docs/IDEAS.md) for an open design question about
-subagents-spawning-subagents as a real tree.
+See [`TODO.md`](TODO.md) for planned work (diff rendering, macOS support, etc.) and
+[`docs/IDEAS.md`](docs/IDEAS.md) for open design questions (subagents spawning
+subagents as a real tree, ideas borrowed from CliDeck/agent-of-empires).
 
 ## Author
 

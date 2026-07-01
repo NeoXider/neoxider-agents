@@ -201,6 +201,7 @@ def list_tasks():
             "exit": meta.get("exit", ""),
             "session": (meta.get("session", "") or "")[:8],
             "started": meta.get("started", ""),
+            "kind": meta.get("kind", ""),  # "api-test" for agent.sh test-api tasks, else ""
             "idle_sec": int(nowt - lm) if lm else None,
             "updated": lm,
         })
@@ -414,11 +415,36 @@ class H(BaseHTTPRequestHandler):
             if d not in pr:
                 pr.append(d); save_projects(pr)
             self._send(200, json.dumps({"ok": True, "projects": pr}))
+        elif u.path == "/api/test-api":
+            base_url = (data.get("base_url") or "").strip()
+            goal = (data.get("goal") or "").strip()
+            if not base_url or not goal:
+                return self._send(400, json.dumps({"error": "base_url and goal are required"}))
+            rdir = to_git_bash_path(data.get("dir") or "") or HERE
+            name = data.get("name") or ("api-test-%d" % int(time.time()))
+            args = ["test-api", "--base-url", base_url, "--goal", goal, "-e", data.get("engine") or "codex",
+                    "-C", rdir, "-t", name]
+            if data.get("model"):  args += ["-m", data["model"]]
+            if data.get("effort"): args += ["-f", data["effort"]]
+            spawn(args, terminal=bool(data.get("terminal")))
+            self._send(200, json.dumps({"ok": True, "name": name}))
         else:
             self._send(404, "not found")
 
 class Srv(ThreadingHTTPServer):
     allow_reuse_address = False  # so we detect "already running" instead of starting a second server on top
+
+def prewarm_cache():
+    """Populate the doctor/provider-info cache for every known engine in the background on
+    startup, so switching providers in the GUI doesn't eat a ~9s cold shell-out the first
+    time you pick one that isn't cached yet -- everything is warm within a few seconds of
+    the server starting, not on first click."""
+    import threading
+    def run():
+        doctor_text()
+        for eng in ENGINES:
+            provider_info(eng)
+    threading.Thread(target=run, daemon=True).start()
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
@@ -435,6 +461,7 @@ def main():
             pass
         return
     print("[agent-gui] %s  (logs: %s)  Ctrl-C to stop" % (url, LOGDIR))
+    prewarm_cache()
     try:
         import webbrowser; webbrowser.open(url)
     except Exception:

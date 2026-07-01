@@ -7,7 +7,11 @@
 # (engine/model/dir/session/state/exit/files). All replies are APPENDED to the same <name>.log,
 # so the whole conversation with the subagent reads as one file.
 #
-#   agent.sh run    [-e engine] [-m model] [-C dir] [-t name] "prompt"   — new task
+#   agent.sh run    [-e engine] [-m model] [-f effort] [-C dir] [-t name] "prompt"   — new task
+#   agent.sh test-api --base-url <url> --goal "<what to verify>" [-e engine] [-m model]
+#                      [-f effort] [-C dir] [-t name] [--out <path>]  — drive an agent to
+#                      exercise a local HTTP API via its own shell/curl and report a
+#                      structured JSON result (thin wrapper on `run`, tagged kind=api-test)
 #   agent.sh reply  [-e engine] [-C dir] [name|session_id] "answer"      — continue a task/session
 #   agent.sh log    [-f] [-n N] [-l] [name]                              — thread: -f follow, -n N lines, -l last step
 #   agent.sh last   [name]                                               — only the agent's last reply
@@ -66,6 +70,7 @@ engine="codex"; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%
 # the same .meta/.log even if they start in the same second. Always give tasks a meaningful
 # name via -t anyway -- this default just needs to be *safe*, not pretty.
 parent="${AGENT_PARENT:-}"   # parent task name (for the tree); can be set via env or -P
+task_kind=""; base_url=""; test_goal=""; out_file=""   # test-api only (see that subcommand)
 
 parse_opts() {
     while [ $# -gt 0 ]; do
@@ -77,6 +82,9 @@ parse_opts() {
             -t) name="$2"; shift 2 ;;
             -P) parent="$2"; shift 2 ;;
             -p) progress=1; shift ;;
+            --base-url) base_url="$2"; shift 2 ;;
+            --goal) test_goal="$2"; shift 2 ;;
+            --out) out_file="$2"; shift 2 ;;
             *) break ;;
         esac
     done
@@ -235,25 +243,93 @@ provider_dispatch_resume() {
     rc=${PIPESTATUS[0]}
 }
 
+# shared body for `run` and `test-api` (identical except test-api also tags kind=api-test via
+# $task_kind) -- creates the log/meta, dispatches to the provider, finishes the step.
+# Expects $name/$engine/$model/$dir/$parent/$prompt (and optionally $task_kind) already set.
+_do_run_dispatch() {
+    log="$LOGDIR/$name.log"; : > "$log"
+    meta_set "$name" engine "$engine"; meta_set "$name" model "${model:-default}"
+    meta_set "$name" dir "$dir"; meta_set "$name" state running
+    meta_set "$name" pid "$$"; meta_set "$name" started "$(now)"
+    [ -n "$parent" ] && meta_set "$name" parent "$parent"
+    [ -n "$task_kind" ] && meta_set "$name" kind "$task_kind"
+    echo "[agent.sh] ▶ run task=$name engine=$engine model=${model:-default} dir=$dir" >&2
+    hdr run "engine=$engine model=${model:-default} dir=$dir" PROMPT "$prompt" "$log"
+    rc=0
+    provider_dispatch_run "$engine" "$model" "$dir" "$prompt" "$name"
+    if [ "$engine" = codex ]; then
+        sid=$(grep -m1 -oE 'session id: [0-9a-f-]{36}' "$log" | cut -d' ' -f3)
+        [ -n "$sid" ] && meta_set "$name" session "$sid"
+    fi
+    finish_step "$name" "$rc"
+}
+
+# builds the instructive prompt for `test-api`: exercise a local HTTP API via the agent's own
+# shell/tool-use capability (curl et al. -- all four providers' non-interactive modes already
+# support this, no new architecture needed), and report back one strict JSON object.
+build_api_test_prompt() {
+    local url="$1" goal="$2"
+    cat <<PROMPT
+You are testing a local HTTP API at $url .
+
+Goal: $goal
+
+Instructions:
+1. Use your shell/tool-use capability (curl or equivalent) to explore and exercise this API
+   according to the goal above. If you don't already know its shape, first try common
+   introspection paths against $url (/, /health, /openapi.json, /swagger.json) to discover
+   what's available, then proceed based on the goal.
+2. Make REAL HTTP requests against $url and observe the actual responses -- do not guess or
+   assume behavior without calling it.
+3. When done, your FINAL message must be ONLY a single JSON object -- no markdown code fences,
+   no prose before or after it -- matching exactly this shape:
+{"base_url":"$url","goal":"<restate the goal>","overall":"pass|fail|partial","endpoints":[{"method":"...","path":"...","assertion":"...","result":"pass|fail","reason":"..."}],"summary":{"total":N,"passed":N,"failed":N}}
+
+Do NOT run git commit. Do NOT modify any files unless the goal explicitly requires it.
+PROMPT
+}
+
 case "$cmd" in
     run)
         parse_opts "$@"
         prompt="${REST[0]:-}"; [ -n "$prompt" ] || die "run: needs a prompt"
         [ "$progress" = 1 ] && prompt="$prompt$PROGRESS_PROTO"
-        log="$LOGDIR/$name.log"; : > "$log"
-        meta_set "$name" engine "$engine"; meta_set "$name" model "${model:-default}"
-        meta_set "$name" dir "$dir"; meta_set "$name" state running
-        meta_set "$name" pid "$$"; meta_set "$name" started "$(now)"
-        [ -n "$parent" ] && meta_set "$name" parent "$parent"
-        echo "[agent.sh] ▶ run task=$name engine=$engine model=${model:-default} dir=$dir" >&2
-        hdr run "engine=$engine model=${model:-default} dir=$dir" PROMPT "$prompt" "$log"
-        rc=0
-        provider_dispatch_run "$engine" "$model" "$dir" "$prompt" "$name"
-        if [ "$engine" = codex ]; then
-            sid=$(grep -m1 -oE 'session id: [0-9a-f-]{36}' "$log" | cut -d' ' -f3)
-            [ -n "$sid" ] && meta_set "$name" session "$sid"
+        _do_run_dispatch
+        ;;
+    test-api)
+        # Thin wrapper on top of `run`, not a new provider: builds a prompt instructing the
+        # agent to exercise a local HTTP API via its own shell/curl capability and report back
+        # one strict JSON object, then dispatches through the exact same path as `run`.
+        parse_opts "$@"
+        [ -n "$base_url" ] || die "test-api: needs --base-url <url>"
+        [ -n "$test_goal" ] || die "test-api: needs --goal \"<what to verify>\""
+        prompt="$(build_api_test_prompt "$base_url" "$test_goal")"
+        [ "$progress" = 1 ] && prompt="$prompt$PROGRESS_PROTO"
+        task_kind="api-test"
+        _do_run_dispatch
+        if [ -n "$out_file" ]; then
+            # Extract the agent's final JSON despite real-world variance (models sometimes wrap
+            # it in a markdown ```json fence or add a sentence before/after despite the
+            # instruction not to) -- take from the first "{" to the last "}" in the last output
+            # block, which tolerates both a bare JSON line and a fenced/annotated one.
+            if command -v python >/dev/null 2>&1; then
+                last_output "$log" | PYTHONIOENCODING=utf-8 python -c "
+import json, sys
+s = sys.stdin.read()
+i, j = s.find('{'), s.rfind('}')
+extracted = s[i:j+1] if i != -1 and j != -1 and j > i else s.strip()
+try:
+    json.loads(extracted)
+    print(extracted, end='')
+except Exception:
+    sys.stderr.write('warning: could not extract valid JSON from the agent output -- writing raw output instead\n')
+    print(s, end='')
+" > "$out_file"
+            else
+                last_output "$log" | grep -v '^[[:space:]]*$' | tail -1 > "$out_file"
+            fi
+            echo "[agent.sh] wrote $out_file" >&2
         fi
-        finish_step "$name" "$rc"
         ;;
     reply)
         parse_opts "$@"

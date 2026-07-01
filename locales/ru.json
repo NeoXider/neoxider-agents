@@ -58,5 +58,21 @@
   "toast.task_started": "▶ задача запущена",
   "toast.reply_not_sent": "reply не отправлен",
   "toast.not_added": "не добавлено",
-  "toast.project_added": "проект добавлен"
+  "toast.project_added": "проект добавлен",
+  "tabs.tasks": "Задачи",
+  "tabs.api": "API",
+  "api.title": "Проверка локального HTTP API",
+  "api.subtitle": "Агент прогоняет ваш локальный API и возвращает структурированный pass/fail результат — тот же эндпоинт ниже можно вызывать из своих программ/тестов напрямую.",
+  "api.base_url": "базовый URL",
+  "api.goal": "цель (что проверить)",
+  "api.goal_placeholder": "например: /health отвечает ok, затем POST /item и проверить GET",
+  "api.run": "▶ запустить API-тест",
+  "api.results": "Прошлые запуски",
+  "api.no_runs": "пока нет запусков API-теста",
+  "api.view_log": "смотреть лог",
+  "api.still_running": "ещё выполняется…",
+  "api.no_json": "структурированный JSON в выводе пока не найден",
+  "api.snippets": "Использовать из своего кода",
+  "api.snippets_hint": "Эндпоинт /api/test-api этого GUI — тот же, что вызывает кнопка выше — направьте на него свой тестовый набор напрямую.",
+  "api.copy": "копировать"
 }

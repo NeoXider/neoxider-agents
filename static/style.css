@@ -3,16 +3,29 @@
   --fg:#e6edf3; --dim:#8b98a8; --accent:#4d9cf6;
   --run:#4d9cf6; --done:#3fb950; --wait:#d29922; --err:#f85149; --stall:#6e7681;
   --codex:#10a37f; --claude:#d97757; --opencode:#a371f7; --gemini:#4d9cf6;
+  /* Apple's actual CAMediaTimingFunction easeInEaseOut curve (0.42,0,0.58,1) -- not the
+     Material-design curve (0.4,0,0.2,1) that's commonly mistaken for it. HIG principle:
+     "prefer quick, precise animations" -- short durations, not decorative. */
+  --ease-apple:cubic-bezier(.42,0,.58,1);
+  --dur-fast:.2s;   /* micro-interactions: hover, press, small state changes */
+  --dur-modal:.3s;  /* modal/sheet reveal, within HIG's cited ~0.2-0.5s range */
 }
 *{box-sizing:border-box}
+/* respect the OS-level "reduce motion" preference (HIG: offer non-motion alternatives) */
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important;scroll-behavior:auto!important}
+}
 body{margin:0;font:13px/1.55 ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif;
      background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column;overflow:hidden}
 code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 header{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
 header h1{font-size:14px;margin:0;font-weight:700;letter-spacing:.4px}
+header h1 a{color:var(--fg);text-decoration:none} header h1 a:hover{color:var(--accent)}
 .sp{flex:1}
-button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}
+button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit;
+  transition:border-color var(--dur-fast) var(--ease-apple),background-color var(--dur-fast) var(--ease-apple),transform var(--dur-fast) var(--ease-apple)}
 button:hover{border-color:var(--accent)} button:disabled{opacity:.55;cursor:default}
+button:active:not(:disabled){transform:scale(.96)}
 button.primary{background:var(--accent);border-color:var(--accent);color:#04101f;font-weight:600}
 button.mini{padding:1px 7px;font-size:12px;line-height:1.4}
 button.icon{padding:4px 8px;position:relative}
@@ -33,28 +46,54 @@ label.chk input{width:auto}
 ::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px;border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-thumb:hover{background:var(--dim);background-clip:content-box}
 
+/* ---- tab bar (Tasks / API) ---- */
+.tabbar{display:flex;gap:2px;padding:0 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+.tabbtn{background:none;border:none;border-bottom:2px solid transparent;border-radius:0;padding:8px 4px;margin-right:16px;
+  color:var(--dim);font-weight:600;transition:color var(--dur-fast) var(--ease-apple),border-color var(--dur-fast) var(--ease-apple)}
+.tabbtn:hover{color:var(--fg);border-color:none}
+.tabbtn.on{color:var(--fg);border-bottom-color:var(--accent)}
+.tabview{display:none;flex:1;min-height:0}
+.tabview.on{display:flex}
+#tabview-api.on{overflow:auto}
+.apiwrap{max-width:760px;margin:0 auto;padding:16px;width:100%}
+.apiwrap .subtitle{color:var(--dim);font-size:12px;margin:0 0 10px}
+.api-run{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:8px}
+.api-run-hd{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.api-summary{font-weight:700;padding:4px 8px;border-radius:6px;margin-bottom:6px;display:inline-block}
+.api-summary.success{background:#1a3a24;color:var(--done)} .api-summary.error{background:#3a1a1a;color:var(--err)}
+.api-summary.warning{background:#3a2f14;color:var(--wait)}
+.api-ep{font-size:12px;padding:4px 0;border-top:1px solid var(--line)}
+.api-ep.ok{color:var(--done)} .api-ep.bad{color:var(--err)}
+.api-ep .note{color:var(--dim)}
+.snippet{position:relative;margin-bottom:10px}
+.snippet pre{background:#0b0f16;border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:12px;overflow:auto;white-space:pre-wrap;margin:0}
+.snippet button{position:absolute;top:6px;right:6px}
+
 /* ---- layout with resizable panels ---- */
 main{flex:1;display:flex;min-height:0}
 #left{width:300px;flex:none;border-right:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0;min-width:160px;max-width:640px}
 #right{width:300px;flex:none;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;overflow:auto;min-width:220px;max-width:640px}
-.resizer{width:5px;flex:none;cursor:col-resize;background:transparent;position:relative;z-index:5}
+.resizer{width:5px;flex:none;cursor:col-resize;background:transparent;position:relative;z-index:5;
+  transition:background-color var(--dur-fast) var(--ease-apple)}
 .resizer:hover,.resizer.drag{background:var(--accent)}
 .resizer::after{content:"";position:absolute;left:-3px;right:-3px;top:0;bottom:0}
 
 /* ---- left tree ---- */
 #left .hd{padding:8px 12px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:6px}
 #tree{overflow:auto;flex:1}
-.proj>.ph{display:flex;align-items:center;gap:6px;padding:6px 10px;cursor:pointer;user-select:none;color:var(--fg);font-weight:600}
+.proj>.ph{display:flex;align-items:center;gap:6px;padding:6px 10px;cursor:pointer;user-select:none;color:var(--fg);font-weight:600;
+  transition:background-color var(--dur-fast) var(--ease-apple)}
 .proj>.ph:hover{background:var(--panel2)}
 .proj.active>.ph{background:var(--panel2)}
-.proj>.ph .caret{width:10px;color:var(--dim);transition:transform .1s} .proj.col>.ph .caret{transform:rotate(-90deg)}
+.proj>.ph .caret{width:10px;color:var(--dim);transition:transform var(--dur-fast) var(--ease-apple)} .proj.col>.ph .caret{transform:rotate(-90deg)}
 .proj>.ph .pname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .proj>.ph .cnt{color:var(--dim);font-size:11px;font-weight:400}
 .proj.col .tasks{display:none}
 /* each project scrolls on its own, so one big project (many tasks) can't push the rest
    of the tree out of view */
 .proj>.tasks{max-height:38vh;overflow-y:auto}
-.task{display:flex;gap:8px;align-items:baseline;padding:5px 10px 5px 24px;cursor:pointer}
+.task{display:flex;gap:8px;align-items:baseline;padding:5px 10px 5px 24px;cursor:pointer;
+  transition:background-color var(--dur-fast) var(--ease-apple)}
 .task:hover{background:var(--panel2)} .task.sel{background:#223049;box-shadow:inset 3px 0 0 var(--accent)}
 .task .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .task.strike .nm{text-decoration:line-through;opacity:.7}
@@ -62,7 +101,7 @@ main{flex:1;display:flex;min-height:0}
 /* status is conveyed by the activity/topic emoji + strikethrough alone (no separate colored
    dot) -- a dot on top of those was a redundant third encoding of the same signal. A running
    task's emoji pulses gently so "still live" stays visible without the dot. */
-.task .em.running{animation:pulse 1.2s infinite}
+.task .em.running{animation:pulse 1.2s var(--ease-apple) infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 .pill{font-size:10px;padding:0 6px;border-radius:8px;border:1px solid var(--line);color:var(--dim);flex:none}
 .pe-codex{color:var(--codex);border-color:var(--codex)} .pe-claude{color:var(--claude);border-color:var(--claude)}
@@ -102,9 +141,16 @@ main{flex:1;display:flex;min-height:0}
 .dirfld{display:flex;gap:6px}
 
 /* ---- modals ---- */
-.modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:20}
+/* Apple's default modal/sheet transition is a slide up (HIG "Modality"): fade the dimming
+   layer, slide+scale the sheet itself -- quick and precise, not decorative. Plain CSS
+   @keyframes (no JS timing needed): re-triggers every time display goes none -> flex. */
+.modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:20;
+  animation:modalBgIn var(--dur-modal) var(--ease-apple)}
 .modal.on{display:flex}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;width:640px;max-width:92vw;max-height:82vh;display:flex;flex-direction:column}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;width:640px;max-width:92vw;max-height:82vh;display:flex;flex-direction:column;
+  animation:modalCardIn var(--dur-modal) var(--ease-apple)}
+@keyframes modalBgIn{from{opacity:0}to{opacity:1}}
+@keyframes modalCardIn{from{opacity:0;transform:translateY(28px) scale(.97)}to{opacity:1;transform:translateY(0) scale(1)}}
 .card h2{margin:0 0 10px;font-size:14px;display:flex;align-items:center;gap:8px}
 .card pre{margin:0;overflow:auto;white-space:pre-wrap;font-size:12px;flex:1}
 
@@ -113,17 +159,19 @@ main{flex:1;display:flex;min-height:0}
 .crumbs span{cursor:pointer} .crumbs span:hover{color:var(--accent)}
 .shortcuts{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
 .dirlist{flex:1;overflow:auto;border:1px solid var(--line);border-radius:8px}
-.direntry{padding:6px 10px;cursor:pointer;display:flex;gap:8px;align-items:center}
+.direntry{padding:6px 10px;cursor:pointer;display:flex;gap:8px;align-items:center;
+  transition:background-color var(--dur-fast) var(--ease-apple)}
 .direntry:hover{background:var(--panel2)}
 
 /* ---- toasts ---- */
 #toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50;width:320px}
 .toast{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;
-  padding:9px 12px;font-size:12px;box-shadow:0 6px 20px #0008;animation:toastin .18s ease-out;opacity:1;transition:opacity .3s,transform .3s}
-.toast.out{opacity:0;transform:translateX(20px)}
+  padding:9px 12px;font-size:12px;box-shadow:0 6px 20px #0008;animation:toastin var(--dur-fast) var(--ease-apple);opacity:1;
+  transition:opacity var(--dur-modal) var(--ease-apple),transform var(--dur-modal) var(--ease-apple)}
+.toast.out{opacity:0;transform:translateX(20px) scale(.96)}
 .toast.success{border-left-color:var(--done)} .toast.error{border-left-color:var(--err)}
 .toast.warning{border-left-color:var(--wait)} .toast .tt{font-weight:600;margin-bottom:2px}
-@keyframes toastin{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+@keyframes toastin{from{opacity:0;transform:translateX(20px) scale(.96)}to{opacity:1;transform:translateX(0) scale(1)}}
 #hist-list .hrow{padding:8px 4px;border-bottom:1px solid var(--line);font-size:12px;display:flex;gap:8px}
 #hist-list .time{color:var(--dim);font-size:11px}
 #hist-list .hicon{flex:none}

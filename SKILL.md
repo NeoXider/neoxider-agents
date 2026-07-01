@@ -17,6 +17,10 @@ bash $SK run  -t fix-readme -C /c/Git/Proj "prompt" # codex, gpt-5.5 medium (def
 bash $SK run  -p -t big-job -C dir "prompt"         # -p: agent maintains PROGRESS.md (resumable after shutdown)
 bash $SK run  -m spark -C /c/Git/Proj "prompt"      # trivial task -> spark
 bash $SK run  -e claude -m haiku -C dir "prompt"    # a different CLI: claude/opencode/gemini
+bash $SK run  -m sonnet -f low -e claude -C dir "prompt"  # -f <effort>, separate from -m <model>
+bash $SK test-api --base-url http://127.0.0.1:8080 --goal "check /health, then POST+GET /item" --out r.json
+                                                     # thin wrapper on `run`: agent exercises a local
+                                                     # HTTP API via its own curl/shell, returns strict JSON
 bash $SK reply fix-readme "answer"                  # continue the task by name (session/dir taken from meta)
 bash $SK reply <session-uuid> "answer"              # or by uuid; with no argument — the last task
 bash $SK log  fix-readme                            # the entire task thread (run + all replies in one file)

@@ -123,16 +123,30 @@ async function loadProvider(force) {
 function onLocaleChanged() {
   syncModels();
   if (SEL) { lastLog = ""; refresh(); }
+  apiSnippets();
 }
 
 makeResizer("rez-left", "left", "left");
 makeResizer("rez-right", "right", "right");
 
+$("#api-url").addEventListener("input", apiSnippets);
+$("#api-goal").addEventListener("input", apiSnippets);
+
 (async function init() {
   await initI18n();
   updateHistBadge();
-  refresh();
+  await refresh(); // awaited once so CWD/ENGINES/PROVIDERS are populated before the API tab reads them
   loadProvider();
+
+  const savedTab = localStorage.getItem("agentgui_tab") || "tasks";
+  $("#api-dir").value = CWD;
+  if (!$("#api-engine").options.length) {
+    $("#api-engine").innerHTML = ENGINES.map(e => `<option value="${e}">${esc((PROVIDERS[e] || {}).label || e)}</option>`).join("");
+    syncApiModels();
+  }
+  apiSnippets();
+  switchTab(savedTab);
+
   setInterval(refresh, 3000);
   setInterval(() => loadProvider(), 15000);
 })();

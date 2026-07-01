@@ -131,9 +131,38 @@ Roughly in priority order. PRs welcome.
 - [x] Translate `SKILL.md` fully to English — done, verified no stray Cyrillic remains
   (one leftover Russian diagnostic-string quote was found and fixed by hand after the
   bulk translation pass).
-- [ ] **Local HTTP API test-driver (`test-api` mode).** Scoped, ready-to-build design
-  in [`docs/IDEAS.md`](docs/IDEAS.md#local-http-api-test-driver-api-test-mode) — not
-  yet implemented. Smallest viable version: `--base-url` + `--goal` only, reusing the
-  existing `run` mechanism with a prompt template, no new provider-plugin machinery.
+- [x] **Local HTTP API test-driver (`test-api` mode).** Done — `agent.sh test-api
+  --base-url <url> --goal "<what to verify>"` (plus the usual `-e`/`-m`/`-f`/`-C`/`-t`
+  and an optional `--out <path>`), a thin wrapper on `run` (shares `_do_run_dispatch`,
+  tagged `kind=api-test`) with zero new provider-plugin machinery, exactly per the
+  design in [`docs/IDEAS.md`](docs/IDEAS.md#local-http-api-test-driver-api-test-mode).
+  The agent exercises the API via its own shell/curl capability (no MCP/new tool-use
+  needed) and returns one strict JSON object; `--out` extracts it robustly (tolerates
+  a markdown-fenced or annotated answer despite the instruction not to). Also exposed
+  in the GUI as a new **API tab**: a form (base URL/goal/provider/model/effort), a
+  results list parsing each run's JSON into a pass/fail summary + per-endpoint detail,
+  and ready-made curl/C# (Unity `UnityWebRequest`) snippets for calling the same
+  `/api/test-api` GUI endpoint from your own test suite. Verified end-to-end twice
+  against a real local Python HTTP server (via the CLI directly and via the GUI form)
+  — real HTTP calls, real structured JSON, correctly rendered pass/fail in the tab.
 - [ ] **`/plugin install` round-trip, unverified.** The plugin packaging (see
   Distribution above) hasn't been tested by an actual install on a second machine yet.
+- [x] **Test coverage.** Done — `tests/test_agent_sh.sh` (48 bash assertions: the
+  `meta_set` concurrency lock incl. a 10-way concurrent regression test, both
+  providers' `_resolve` alias parsing, the collision-resistant default task name) and
+  `tests/test_gui.py` (28 Python `unittest` tests: `to_git_bash_path`, `eff_state`,
+  activity/topic emoji, `list_locales`, the `_serve_static` traversal guard). Zero
+  dependencies (stdlib/bash only, no pytest/bats), scratch temp dirs so running them
+  never touches the real `~/.claude/agent-cli-logs`. Independently re-verified both
+  suites still pass (48/48, 28/28 OK) after the API-tab/animation changes above.
+- [x] **GUI animations.** Done — researched Apple's actual HIG motion principles and
+  the real `CAMediaTimingFunction easeInEaseOut` curve (`cubic-bezier(.42,0,.58,1)`,
+  not the commonly-confused Material-design curve), applied consistently (buttons,
+  task rows, modals sliding up + fading per Apple's default sheet transition, toasts)
+  at HIG-cited durations (~0.2s micro-interactions, ~0.3s modal reveal), and added
+  `prefers-reduced-motion` support per HIG's accessibility guidance.
+- [x] **GUI branding + doctor/limits pre-warming.** Header now reads "Neoxider"
+  (linked to the repo) instead of generic "agent". `gui.py` pre-warms the doctor +
+  every provider's cache in a background thread on server startup, so switching
+  providers doesn't eat a ~9s cold shell-out the first time — verified a provider
+  shows `cached: true` on its very first request after the server comes up.
