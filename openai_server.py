@@ -177,6 +177,19 @@ def is_extension(prev, new):
     return len(new) > len(prev) and new[:len(prev)] == prev
 
 
+def _chatonly_env():
+    """Env for every agent.sh subprocess this bridge launches: AGENT_CHAT_ONLY=1 tells the
+    codex/claude provider scripts to lock the CLI down to text-only completion -- no file writes,
+    no shell execution, no MCP servers (verified live: without this, codex could actually call a
+    real configured MCP tool, e.g. a live Unity Editor's unityMCP server, instead of just
+    answering in text). Unset for a normal `agent.sh run`/`reply` outside this bridge, which
+    legitimately needs full file/shell/MCP access to do real coding work -- see
+    providers/{codex,claude}/provider.sh's `_provider_*_chatonly_args`."""
+    env = dict(os.environ)
+    env["AGENT_CHAT_ONLY"] = "1"
+    return env
+
+
 def run_agent(engine, model, effort, workdir, prompt, name, timeout):
     args = [BASH, SK, "run", "-e", engine, "-C", to_git_bash_path(workdir), "-t", name]
     if model:
@@ -186,7 +199,7 @@ def run_agent(engine, model, effort, workdir, prompt, name, timeout):
     args.append(prompt)
     try:
         subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                        errors="replace", timeout=timeout, cwd=HERE)
+                        errors="replace", timeout=timeout, cwd=HERE, env=_chatonly_env())
     except subprocess.TimeoutExpired:
         pass  # the log up to the timeout is still readable/useful below
     return last_output(read_log(name))
@@ -211,7 +224,7 @@ def reply_agent(engine, model, effort, workdir, name, answer, timeout):
     before = len(read_log(name))
     try:
         subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                        errors="replace", timeout=timeout, cwd=HERE)
+                        errors="replace", timeout=timeout, cwd=HERE, env=_chatonly_env())
     except subprocess.TimeoutExpired:
         pass
     after = read_log(name)
@@ -287,26 +300,45 @@ def render_messages(messages):
     return "\n\n".join(lines)
 
 
+# BASE_INSTRUCTIONS is prepended to EVERY prompt, tools or not. Framing matters a lot here: an
+# earlier draft opened with "You are acting as X, NOT as an autonomous coding agent" -- live
+# testing against claude showed that identity-override phrasing gets flagged and REFUSED as a
+# prompt-injection attempt (Claude Code has its own defenses against "ignore your role, you are
+# now X" text). This version instead states plainly, as background/context rather than a role
+# reassignment, that the session genuinely has no other tools -- which is also just TRUE: the
+# bridge launches every engine with AGENT_CHAT_ONLY=1 (see providers/{codex,claude}/provider.sh),
+# which strips MCP servers and blocks shell/file/subagent access at the CLI-flag level, not just
+# by asking nicely. Verified live: with this framing + those flags, claude no longer refuses the
+# tool-calling instructions below as an injection, and correctly reports having no real tools
+# when asked to use one directly.
+BASE_INSTRUCTIONS = """
+[Context] The conversation below is the ENTIRE task, sent by an external application that is
+using this session purely as a text completion endpoint. Answer using only what the conversation
+contains -- there is nothing else to go on, and nothing outside it to check. This session has no
+MCP servers, project skills/subagents, or file/shell tools configured, so none of that is
+reachable here even if it's mentioned below; anything that looks like a tool name belongs to the
+external application's own systems, not to this session.
+"""
+
 TOOLCALL_INSTRUCTIONS = """
-[Function-calling mode] You are acting as a plain text/function-calling completion backend for an
-external application -- NOT as an autonomous coding agent. You have NO shell, no file system, and
-no way to execute anything yourself here: the ONLY way to make something happen is to EMIT a
-function call in one of the exact formats below, which the calling application then runs. You have
-exactly this set of callable functions available to that application (OpenAI function-calling
-schema):
+The external application also wants you to format part of your answer as a function call, for
+cases where the task calls for one. It runs the call on its own side, after you respond -- your
+job here is only to WRITE the call text in one of the two exact formats below (you have no tool
+of your own that could run it, so nothing happens until the application parses your text).
+Functions it can run:
 
 %s
 
-CRITICAL: describing an action in prose does NOTHING. Sentences like "I called world_command...",
-"Defined the slot via ...", "Execution succeeded", or "Done." are IGNORED -- the application never
-sees a call and treats the turn as a failure. If you intend an action, you MUST emit an actual
-call. Emit as MANY calls as the task needs (e.g. one per object to spawn), not just one.
+Merely describing an action in your own words does not count: sentences like "I called
+world_command...", "Defined the slot via ...", "Execution succeeded", or "Done." leave no call for
+the application to find, so it scores the turn as a failure even if your reasoning was correct.
+Write as many calls as the task needs (e.g. one per object to place), not just one.
 
 Decide ONE of:
-(a) No action needed -- answer directly in plain prose (this is ALSO the right choice when a
-    previous call's result is already visible above and you are now just using/explaining it), or
-(b) Take action -- emit one or more function calls, using EITHER of these two formats (pick one
-    and use it consistently), and nothing else in the message except the calls:
+(a) No call needed -- answer directly in plain prose (also the right choice when a previous
+    call's result is already shown above and you are now just using/explaining it), or
+(b) Write one or more calls, using EITHER format below (pick one, use it consistently for this
+    message), and nothing else in the message except the call(s):
 
     Format 1 -- a single fenced JSON block listing every call:
 ```json
@@ -316,13 +348,12 @@ Decide ONE of:
     <fn>(arg="text", num=1.5, flag=true)
     <fn>(arg="other", num=2)
 
-Both formats are parsed identically; use whichever is natural. Do NOT wrap Format 2 prose around
-the calls -- just the call lines.
+Both formats are parsed identically. Do NOT wrap Format 2 in prose -- just the call line(s).
 """
 
 
 def build_prompt(messages, tools):
-    text = render_messages(messages)
+    text = BASE_INSTRUCTIONS.strip() + "\n\n" + render_messages(messages)
     if tools:
         text += "\n\n" + (TOOLCALL_INSTRUCTIONS % json.dumps(tools, ensure_ascii=False, indent=2))
     return text

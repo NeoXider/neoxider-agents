@@ -275,6 +275,30 @@ about this before pointing anything at it:
   main real-world failure mode (prose-instead-of-call). The instructions are re-sent on
   every call that includes `tools`, including a continuation turn — a deliberate
   simplicity/robustness choice over tracking whether the schema already "stuck".
+- **The wrapped CLI is locked to text-only completion — no MCP, no shell/file access,
+  no skills/subagents of its own.** Every subprocess this bridge launches gets
+  `AGENT_CHAT_ONLY=1` in its env, which `providers/{codex,claude}/provider.sh` react to
+  by adding real CLI-level restrictions (not just a prompt request): codex gets
+  `--sandbox read-only --ignore-user-config` (blocks file/shell execution and skips
+  loading `~/.codex/config.toml`, where this machine's real `[mcp_servers.*]` — e.g. a
+  live `unityMCP` — are defined); claude gets `--strict-mcp-config` (zero MCP servers)
+  plus `--disallowedTools Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`. This
+  only applies to bridge-launched subprocesses — a normal `agent.sh run`/`reply` outside
+  the bridge is untouched and keeps full file/shell/MCP access for real coding work.
+  Why this matters: without it, a model could reach for a REAL tool (e.g. an actual
+  Unity Editor via `unityMCP`) instead of answering in the expected `tool_calls` format
+  — silently mutating live state outside the calling application's own control, and
+  making benchmark results reflect what codex/claude did locally rather than what the
+  calling application's own tool loop executed. Verified live: `-c mcp_servers={}` on
+  the codex command line did NOT actually stop a real `unityMCP.manage_tools` call from
+  succeeding against a live Unity Editor, but `--ignore-user-config` does (confirmed
+  empty `list_mcp_resources`); asking the bridge directly to "use unityMCP" got a
+  correct refusal from both engines with no side effects, while tool-calling and plain
+  chat kept working normally. The prompt was also reframed to avoid "You are acting as
+  X, NOT as an autonomous agent" identity-override phrasing — Claude Code's own
+  prompt-injection defenses refused that framing live; the current wording (see
+  `BASE_INSTRUCTIONS` in `openai_server.py`) states the restriction as plain fact
+  instead ("this session has no MCP/tools configured"), which it now genuinely is.
 - **`usage` token counts are always `0/0/0`** — the wrapped CLIs don't expose real
   token counts in a structured form.
 - Image content in messages is not rendered to the agent (replaced with a

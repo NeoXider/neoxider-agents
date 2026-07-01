@@ -69,7 +69,13 @@ prompt warns that prose describing an action is ignored; re-sent on every `tools
 otherwise mix its banner/session-id/error-log/"tokens used" chrome into the answer, so its
 provider runs `codex exec --json` and extracts only the final agent message — this also
 cleaned up `agent.sh last`/the GUI for codex). One process = one fixed engine/model/effort
-— run it again on another port to compare models.
+— run it again on another port to compare models. **The wrapped CLI is locked to
+text-only completion for bridge calls**: `AGENT_CHAT_ONLY=1` makes codex run
+`--sandbox read-only --ignore-user-config` and claude run `--strict-mcp-config
+--disallowedTools Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, so it can't
+reach a real MCP server (verified live against a configured `unityMCP`) or write files
+instead of answering in the expected format — a normal `agent.sh run` outside the
+bridge is unaffected.
 
 ## Rules for using this tool as a subagent orchestrator
 

@@ -165,20 +165,29 @@ class RenderMessagesTests(unittest.TestCase):
 
 
 class BuildPromptTests(unittest.TestCase):
-    def test_no_tools_is_just_rendered_messages(self):
+    def test_no_tools_still_gets_base_instructions_plus_messages(self):
+        # BASE_INSTRUCTIONS (the "no MCP/skills/tools, chat-content-only" guard) is prepended to
+        # EVERY prompt, tools or not -- this is the "chat-only" boundary the user asked for.
         messages = [{"role": "user", "content": "hi"}]
-        self.assertEqual(srv.build_prompt(messages, None), srv.render_messages(messages))
+        out = srv.build_prompt(messages, None)
+        self.assertIn("MCP servers", out)
+        self.assertIn(srv.render_messages(messages), out)
+
+    def test_base_instructions_do_not_use_identity_override_framing(self):
+        # Regression: an earlier draft ("You are acting as X, NOT an autonomous agent") got
+        # REFUSED live by claude as a prompt-injection attempt. Guard against reintroducing it.
+        self.assertNotIn("You are acting as", srv.BASE_INSTRUCTIONS)
+        self.assertNotIn("NOT as an autonomous", srv.BASE_INSTRUCTIONS)
 
     def test_tools_appends_function_calling_instructions(self):
         messages = [{"role": "user", "content": "hi"}]
         tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
         out = srv.build_prompt(messages, tools)
-        self.assertIn("Function-calling mode", out)
         self.assertIn('"name": "f"', out)
         # both accepted call formats must be advertised, and prose-only must be discouraged
         self.assertIn("tool_calls", out)                 # Format 1 (JSON block)
         self.assertIn("one literal call per line", out)  # Format 2 (name(arg=value))
-        self.assertIn("IGNORED", out)                    # prose-describes-an-action warning
+        self.assertIn("does not count", out)             # prose-describes-an-action warning
 
 
 class ExtractToolCallsTests(unittest.TestCase):
@@ -470,6 +479,54 @@ class SessionExpiryTests(unittest.TestCase):
         srv.SESSION["task_name"] = "some-task"
         srv.SESSION["last_activity"] = time.time() - 1799  # 1s under the 1800s ttl
         self.assertFalse(srv.session_expired())
+
+
+class ChatOnlyEnvTests(unittest.TestCase):
+    """run_agent/reply_agent must launch agent.sh with AGENT_CHAT_ONLY=1 in the subprocess env --
+    that's what tells providers/{codex,claude}/provider.sh to strip MCP/shell/file access (see
+    _chatonly_env). Regression guard against a future refactor silently dropping `env=`."""
+
+    def test_chatonly_env_sets_the_flag_without_mutating_the_real_process_env(self):
+        env = srv._chatonly_env()
+        self.assertEqual(env.get("AGENT_CHAT_ONLY"), "1")
+        self.assertNotIn("AGENT_CHAT_ONLY", os.environ)  # _chatonly_env must copy, not mutate
+
+    def test_run_agent_passes_chatonly_env_to_subprocess(self):
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured.update(kwargs)
+            class R:
+                pass
+            return R()
+
+        real_run, real_read_log = srv.subprocess.run, srv.read_log
+        srv.subprocess.run = fake_run
+        srv.read_log = lambda name: ""
+        try:
+            srv.run_agent("codex", "spark", "medium", "/tmp/x", "hi", "t", 60)
+        finally:
+            srv.subprocess.run, srv.read_log = real_run, real_read_log
+        self.assertEqual(captured.get("env", {}).get("AGENT_CHAT_ONLY"), "1")
+
+    def test_reply_agent_passes_chatonly_env_to_subprocess(self):
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured.update(kwargs)
+            class R:
+                pass
+            return R()
+
+        real_run, real_read_log, real_read_meta = srv.subprocess.run, srv.read_log, srv.read_meta
+        srv.subprocess.run = fake_run
+        srv.read_log = lambda name: ""  # log never grows -> reply_agent returns None, that's fine
+        srv.read_meta = lambda name: {"state": "done"}
+        try:
+            srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60)
+        finally:
+            srv.subprocess.run, srv.read_log, srv.read_meta = real_run, real_read_log, real_read_meta
+        self.assertEqual(captured.get("env", {}).get("AGENT_CHAT_ONLY"), "1")
 
 
 class ReplyAgentStaleGuardTests(unittest.TestCase):

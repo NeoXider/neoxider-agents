@@ -6,6 +6,32 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- Security/correctness hardening (the bridge is now genuinely a chat-only completion endpoint,
+  not just "a CLI told not to use its other tools"): every subprocess the bridge launches now gets
+  `AGENT_CHAT_ONLY=1` in its env, which `providers/{codex,claude}/provider.sh` react to with REAL
+  CLI-level restrictions rather than a prompt-only ask. codex runs with `--sandbox read-only
+  --ignore-user-config` (blocks file writes/shell execution; skips `~/.codex/config.toml`, where
+  this machine's real `[mcp_servers.*]` are defined). claude runs with `--strict-mcp-config` (zero
+  MCP servers) plus `--disallowedTools Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`.
+  Motivation: a CLI subagent has its own real, separately-configured tool access (this machine has
+  a live `unityMCP` registered for both codex and claude) — without this, a model could reach for
+  the REAL tool instead of answering in the format the calling application expects, silently
+  mutating live state the calling application never asked it to touch. Verified live:
+  `-c mcp_servers={}` on the codex command line did NOT actually stop a real `unityMCP.manage_tools`
+  call from succeeding against a live Unity Editor (list_groups came back with real data) --
+  `--ignore-user-config` does (list_mcp_resources came back empty, and the model correctly reported
+  no MCP tools available). Asking the hardened bridge directly to "use unityMCP" got a correct
+  refusal from both engines, no side effects, no hang. A normal `agent.sh run`/`reply` OUTSIDE the
+  bridge (AGENT_CHAT_ONLY unset) is completely unaffected and keeps full file/shell/MCP access,
+  confirmed live (wrote a real file successfully). `openai_server.py`'s prompt was also rewritten:
+  a new `BASE_INSTRUCTIONS` block (prepended to every prompt, tools or not) states plainly that the
+  session has no MCP/skills/tools, and `TOOLCALL_INSTRUCTIONS` was reframed away from "You are
+  acting as X, NOT an autonomous agent" -- that identity-override phrasing was OBSERVED LIVE to get
+  refused by Claude Code as a prompt-injection attempt; the new framing ("the external application
+  wants you to draft a call for its own downstream execution") does not. opencode/gemini have no
+  equivalent restriction yet -- their CLIs weren't verified to have an analogous flag, documented
+  as a known gap rather than guessed at. Tests: new `ChatOnlyEnvTests` (python) +
+  "AGENT_CHAT_ONLY sandboxing" section (bash).
 - Fix (tool-calling recognition — the big benchmark win): the bridge's tool-call reparser now
   ALSO recognizes literal `name(arg=value, ...)` call syntax, not only a JSON
   `{"tool_calls":[...]}` block. Root cause surfaced by running CoreAI's Game-Creation Benchmark

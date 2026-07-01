@@ -286,6 +286,42 @@ emit_mojibake="$(printf '{"type":"item.completed","item":{"type":"agent_message"
 assert_eq "non-UTF-8 mojibake line does not crash the parser" "ok" "$emit_mojibake"
 
 # ============================================================================================
+section "AGENT_CHAT_ONLY sandboxing (codex + claude provider flags)"
+# ============================================================================================
+# openai_server.py sets AGENT_CHAT_ONLY=1 for every subprocess it launches; the provider scripts
+# must react by locking the CLI down to text-only completion (no shell/file/MCP access), and must
+# NOT do so for a normal `agent.sh run` (AGENT_CHAT_ONLY unset), which legitimately needs full
+# access to do real coding work. Verified LIVE (not just here) that --sandbox read-only blocks a
+# real file write without hanging, and --ignore-user-config empties codex's configured MCP servers
+# (a real unityMCP call otherwise succeeded even with `-c mcp_servers={}`); and that claude's
+# --strict-mcp-config + --disallowedTools blocks a real file write/MCP use without hanging or
+# breaking the tool-calling prompt. These assertions just lock in the FLAG WIRING so a refactor
+# can't silently drop it; the "does it actually restrict" claim is a live/manual check, not here.
+
+unset AGENT_CHAT_ONLY
+mapfile -t codex_default < <(_provider_codex_chatonly_args)
+assert_eq "codex default (no AGENT_CHAT_ONLY): sandbox stays workspace-write" \
+    "--sandbox workspace-write" "${codex_default[*]}"
+
+AGENT_CHAT_ONLY=1
+mapfile -t codex_chatonly < <(_provider_codex_chatonly_args)
+assert_eq "codex chat-only: switches to read-only sandbox + ignore-user-config" \
+    "--sandbox read-only --ignore-user-config" "${codex_chatonly[*]}"
+unset AGENT_CHAT_ONLY
+
+unset AGENT_CHAT_ONLY
+claude_default="$(_provider_claude_chatonly_args)"
+assert_eq "claude default (no AGENT_CHAT_ONLY): no extra flags" "" "$claude_default"
+
+AGENT_CHAT_ONLY=1
+mapfile -t claude_chatonly < <(_provider_claude_chatonly_args)
+assert_eq "claude chat-only: adds strict-mcp-config" "--strict-mcp-config" "${claude_chatonly[0]}"
+assert_eq "claude chat-only: adds disallowedTools flag" "--disallowedTools" "${claude_chatonly[1]}"
+assert_match "claude chat-only: denylist blocks Bash/Edit/Write/Task/Web*" \
+    'Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch' "${claude_chatonly[2]}"
+unset AGENT_CHAT_ONLY
+
+# ============================================================================================
 section "summary"
 # ============================================================================================
 TOTAL=$((PASS + FAIL))

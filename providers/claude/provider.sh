@@ -31,10 +31,35 @@ provider_claude_resolve() {
     P_EFFORT="$eff"
 }
 
+# _provider_claude_chatonly_args — extra flags applied ONLY when AGENT_CHAT_ONLY=1 (set by
+# openai_server.py; unset for normal `agent.sh run`, which legitimately needs real file/shell/MCP
+# access to do coding work). Locks the model down to text-only completion, verified live:
+#   --strict-mcp-config (with no --mcp-config)  -- zero MCP servers loaded for the session, so a
+#     real project MCP server (e.g. this machine's unityMCP) is not reachable. NOTE: switching to
+#     --permission-mode plan instead of acceptEdits was tried first and rejected -- it produced
+#     INCONSISTENT results on the identical tool-calling prompt (worked once, then refused the
+#     same prompt as a "prompt injection" on a later run), which is worse for a benchmark than
+#     acceptEdits + an explicit tool denylist.
+#   --disallowedTools ... -- explicitly blocks Bash/Edit/Write/NotebookEdit (file+shell mutation),
+#     Task (this CLI's own subagent/skill launcher), WebFetch/WebSearch (reaching outside the
+#     conversation). Read/Grep/Glob stay allowed (read-only, scoped to the isolated scratch dir --
+#     no mutation risk, and useful for the model to look at its own prior turns if ever needed).
+# Verified live: with both flags, asking it to "use UnityMCP or any tool to write a file" got a
+# correct refusal ("I don't have a file-writing or shell-execution tool available... read-only
+# Glob/Grep/Read"), no file was created, no hang -- and the SAME flags did not break a normal
+# tool-calling completion (still returned a clean fenced JSON tool_calls block).
+_provider_claude_chatonly_args() {
+    if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
+        printf '%s\n' --strict-mcp-config --disallowedTools \
+            Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch
+    fi
+}
+
 # provider_claude_run_cmd DIR MODEL EFFORT PROMPT — runs the CLI, streams to stdout/stderr.
 provider_claude_run_cmd() {
     local dir="$1" model="$2" effort="$3" prompt="$4" cargs
     cargs=(--model "$model"); [ -n "$effort" ] && cargs+=(--effort "$effort")
+    mapfile -t -O ${#cargs[@]} cargs < <(_provider_claude_chatonly_args)
     ( cd "$dir" && claude -p "${cargs[@]}" --permission-mode acceptEdits "$prompt" </dev/null 2>&1 )
 }
 
@@ -46,6 +71,7 @@ provider_claude_resume_cmd() {
     local dir="$1" session="$2" answer="$3" cargs
     cargs=(--model "$P_MODEL"); [ -n "$P_EFFORT" ] && cargs+=(--effort "$P_EFFORT")
     if [ -n "$session" ]; then cargs+=(--resume "$session"); else cargs+=(--continue); fi
+    mapfile -t -O ${#cargs[@]} cargs < <(_provider_claude_chatonly_args)
     ( cd "$dir" && claude -p "${cargs[@]}" --permission-mode acceptEdits "$answer" </dev/null 2>&1 )
 }
 

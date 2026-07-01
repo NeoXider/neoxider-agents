@@ -93,6 +93,27 @@ if not msg.endswith("\n"):
 '
 }
 
+# _provider_codex_chatonly_args — extra flags applied ONLY when AGENT_CHAT_ONLY=1 (set by
+# openai_server.py; unset for normal `agent.sh run`, which legitimately needs real file/shell/MCP
+# access). Locks the model down to text-only completion:
+#   --sandbox read-only     -- no file writes, no shell command execution (verified live: a
+#                               'write a file' request is rejected by policy, model answers in
+#                               text, no hang, no side effect).
+#   --ignore-user-config    -- skips ~/.codex/config.toml entirely, which is where this machine's
+#                               [mcp_servers.*] live (verified live: `-c mcp_servers={}` on the
+#                               command line did NOT stop codex from actually calling a configured
+#                               MCP server -- e.g. a real unityMCP tool against a live Unity Editor
+#                               -- but --ignore-user-config does: list_mcp_resources came back
+#                               empty and the model correctly reported no MCP tools available).
+#                               Auth still works (`--help`: "auth still uses CODEX_HOME").
+_provider_codex_chatonly_args() {
+    if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
+        printf '%s\n' --sandbox read-only --ignore-user-config
+    else
+        printf '%s\n' --sandbox workspace-write
+    fi
+}
+
 # provider_codex_run_cmd DIR MODEL EFFORT PROMPT — runs the CLI via `--json` and cleans the output.
 # codex's plaintext `exec` mixes its banner/session-id/ERROR-log/"tokens used" chrome (and Windows
 # cp866 mojibake) into the same stdout stream as the answer, which used to pollute `agent.sh last`,
@@ -100,8 +121,9 @@ if not msg.endswith("\n"):
 # instead, from which `_provider_codex_emit` pulls just the session id + the final agent message.
 provider_codex_run_cmd() {
     local dir="$1" model="$2" effort="$3" prompt="$4"
+    local -a sbargs; mapfile -t sbargs < <(_provider_codex_chatonly_args)
     codex exec -m "$model" -c model_reasoning_effort="$effort" \
-        --sandbox workspace-write --skip-git-repo-check -C "$dir" \
+        "${sbargs[@]}" --skip-git-repo-check -C "$dir" \
         --json "$prompt" </dev/null 2>&1 | _provider_codex_emit
     # Surface a parser failure (e.g. python missing/crashed) rather than masking it behind codex's
     # own exit code -- otherwise the task could be marked done with empty/partial output.
@@ -115,7 +137,11 @@ provider_codex_run_cmd() {
 # above opts into that) -- same pattern provider_claude_resume_cmd uses. Same `--json` cleanup.
 provider_codex_resume_cmd() {
     local dir="$1" session="$2" answer="$3" cargs
-    cargs=(-c 'sandbox_mode="workspace-write"')
+    if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
+        cargs=(-c 'sandbox_mode="read-only"' --ignore-user-config)
+    else
+        cargs=(-c 'sandbox_mode="workspace-write"')
+    fi
     [ -n "$P_MODEL" ] && cargs+=(-m "$P_MODEL")
     [ -n "$P_EFFORT" ] && cargs+=(-c "model_reasoning_effort=\"$P_EFFORT\"")
     ( cd "$dir" && codex exec resume --skip-git-repo-check \
