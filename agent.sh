@@ -180,13 +180,13 @@ case "$cmd" in
         meta_set "$name" dir "$dir"; meta_set "$name" state running
         meta_set "$name" pid "$$"; meta_set "$name" started "$(now)"
         [ -n "$parent" ] && meta_set "$name" parent "$parent"
-        [ -n "$parent" ] && meta_set "$name" parent "$parent"
         echo "[agent.sh] ▶ run task=$name engine=$engine model=${model:-default} dir=$dir" >&2
         hdr run "engine=$engine model=${model:-default} dir=$dir" PROMPT "$prompt" "$log"
         rc=0
         case "$engine" in
             codex)
                 codex_model_args "$model"
+                meta_set "$name" model "$M${EFFORT:+-$EFFORT}"  # резолвнутая модель, не сырой alias
                 codex exec -m "$M" -c model_reasoning_effort="$EFFORT" \
                     --sandbox workspace-write --skip-git-repo-check -C "$dir" \
                     "$prompt" </dev/null 2>&1 | tee -a "$log" | tail -40; rc=${PIPESTATUS[0]}
@@ -195,6 +195,7 @@ case "$cmd" in
                 ;;
             claude)
                 claude_model_args "$model"
+                meta_set "$name" model "$CM${CEFFORT:+-$CEFFORT}"  # резолвнутая модель, не сырой alias
                 cargs=(--model "$CM"); [ -n "$CEFFORT" ] && cargs+=(--effort "$CEFFORT")
                 ( cd "$dir" && claude -p "${cargs[@]}" --permission-mode acceptEdits "$prompt" </dev/null 2>&1 ) \
                     | tee -a "$log" | tail -40; rc=${PIPESTATUS[0]}
@@ -238,6 +239,7 @@ case "$cmd" in
             claude)
                 # claude не логирует session id в текстовом режиме -> при отсутствии session fallback на --continue
                 claude_model_args "$model"
+                meta_set "$tname" model "$CM${CEFFORT:+-$CEFFORT}"  # резолвнутая модель, не сырой alias
                 cargs=(--model "$CM"); [ -n "$CEFFORT" ] && cargs+=(--effort "$CEFFORT")
                 if [ -n "${session:-}" ]; then cargs+=(--resume "$session"); else cargs+=(--continue); fi
                 ( cd "$dir" && claude -p "${cargs[@]}" --permission-mode acceptEdits "$answer" </dev/null 2>&1 ) \

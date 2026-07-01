@@ -4,12 +4,12 @@ Roughly in priority order. PRs welcome.
 
 ## Bugs
 
-- [ ] **Model name isn't resolved in the UI.** `agent.sh` records the raw alias/`"default"`
-  passed on the command line into `<name>.meta`'s `model=` field *before* resolving it to
-  the real model — so the tree/chat header show `codex/default` instead of the actual
-  resolved model, e.g. `gpt-5.5 (medium)` or `claude-sonnet-5 (high)`. Fix: record the
-  resolved `M`/`CM` (+ effort) after `codex_model_args`/`claude_model_args` run, for both
-  `run` and `reply`.
+- [x] **Model name isn't resolved in the UI.** Fixed — `run`/`reply` now overwrite
+  `<name>.meta`'s `model=` with the resolved model+effort (e.g. `claude-sonnet-5-high`,
+  `gpt-5.3-codex-spark-medium`) right after `codex_model_args`/`claude_model_args`
+  run, instead of the raw alias/`"default"`. opencode/gemini still show `"default"`
+  when no `-m` was given (they have no alias-resolution layer to resolve against —
+  matches the provider-plugin architecture item below).
 
 ## Provider plugin architecture
 
