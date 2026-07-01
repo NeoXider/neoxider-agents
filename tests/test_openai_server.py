@@ -59,21 +59,59 @@ class LastOutputTests(unittest.TestCase):
 
 
 class ModelLabelTests(unittest.TestCase):
-    def test_explicit_model_and_effort(self):
-        self.assertEqual(srv.model_label("claude", "sonnet", "high"), "claude/sonnet-high")
+    """model_label must show a versioned, human-readable name (e.g. "Sonnet 5", "Opus 4.8"),
+    not the bare CLI alias ("sonnet", "opus") -- that was the exact bug reported live: the
+    bridge's `model` field said "claude/sonnet-low"/"claude/opus" with no version number,
+    giving no indication of which real model the alias points to."""
 
-    def test_explicit_model_no_effort(self):
-        self.assertEqual(srv.model_label("codex", "spark", ""), "codex/spark")
+    def setUp(self):
+        # isolate from the real providers/*/provider.json files for the lookup-logic tests
+        self._orig_providers = srv.PROVIDERS
+        srv.PROVIDERS = {
+            "fakeeng": {
+                "default_model": "alpha",
+                "model_labels": {"alpha": "Alpha 9", "beta": "Beta 2.1"},
+            }
+        }
 
-    def test_falls_back_to_provider_default_model(self):
-        # empty model -> PROVIDERS[engine]["default_model"] when known, else "default"
-        engine = next(iter(srv.PROVIDERS), None)
-        if engine:
-            expected_model = srv.PROVIDERS[engine].get("default_model") or "default"
-            self.assertEqual(srv.model_label(engine, "", ""), "%s/%s" % (engine, expected_model))
+    def tearDown(self):
+        srv.PROVIDERS = self._orig_providers
+
+    def test_known_alias_uses_display_name_from_model_labels(self):
+        self.assertEqual(srv.model_label("fakeeng", "beta", ""), "fakeeng/Beta 2.1")
+
+    def test_effort_appended_in_parens_after_display_name(self):
+        self.assertEqual(srv.model_label("fakeeng", "beta", "high"), "fakeeng/Beta 2.1 (high)")
+
+    def test_unknown_alias_falls_back_to_the_raw_alias_itself(self):
+        self.assertEqual(srv.model_label("fakeeng", "gamma-not-in-map", ""), "fakeeng/gamma-not-in-map")
+
+    def test_empty_model_falls_back_to_provider_default_then_its_display_name(self):
+        self.assertEqual(srv.model_label("fakeeng", "", ""), "fakeeng/Alpha 9")
 
     def test_unknown_engine_with_no_model_falls_back_to_default_literal(self):
         self.assertEqual(srv.model_label("totally-unknown-engine-xyz", "", ""), "totally-unknown-engine-xyz/default")
+
+
+class ModelLabelRealProviderDataTests(unittest.TestCase):
+    """Integration-style checks against the actual providers/*/provider.json shipped in this
+    repo -- pins down the exact real-world regression: claude's "sonnet"/"opus" aliases must
+    resolve to a versioned display name, not pass through unchanged."""
+
+    def test_claude_sonnet_alias_shows_version_number(self):
+        self.assertEqual(srv.model_label("claude", "sonnet", "low"), "claude/Sonnet 5 (low)")
+
+    def test_claude_opus_alias_shows_version_number(self):
+        self.assertEqual(srv.model_label("claude", "opus", ""), "claude/Opus 4.8")
+
+    def test_claude_haiku_alias_shows_version_number(self):
+        self.assertEqual(srv.model_label("claude", "haiku", ""), "claude/Haiku 4.5")
+
+    def test_codex_spark_alias_shows_full_name(self):
+        self.assertEqual(srv.model_label("codex", "spark", ""), "codex/GPT-5.3 Codex Spark")
+
+    def test_codex_default_model_shows_version_number(self):
+        self.assertEqual(srv.model_label("codex", "5.5", "medium"), "codex/GPT-5.5 (medium)")
 
 
 class ContentTextTests(unittest.TestCase):

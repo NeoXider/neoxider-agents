@@ -153,6 +153,20 @@ Roughly in priority order. PRs welcome.
   with an empty `COREAI_TEST_API_KEY`. **Not yet run**: the actual Unity PlayMode
   benchmark suite itself against this bridge end-to-end — only the wire contract was
   verified, not a full Unity test run.
+- [x] **Multi-provider sweep + versioned model labels.** Done — tested `claude`
+  (sonnet/opus, clean output), `codex` (5.5/spark, functionally correct but noisy raw
+  CLI chrome + an occasional cp866-mojibake Windows OS line, both documented as
+  pre-existing/out of scope), `gemini`/`opencode` (CLI present but not usable in this
+  environment — see below). Found and fixed a real bug along the way: `model` showed
+  the bare alias with no version (`"claude/sonnet-low"`, `"claude/opus"`) instead of
+  which real model it resolves to. Added `model_labels` to
+  `providers/{claude,codex,gemini}/provider.json` and updated `model_label()` —
+  verified live: `"claude/Sonnet 5 (low)"`, `"claude/Opus 4.8"`.
+- [ ] **`opencode` "Unexpected server error".** Confirmed live that `opencode` currently
+  fails on every model tried (including an authenticated one, `zai/glm-4.5-flash`),
+  reproducing identically via the raw `opencode run` CLI with zero involvement from
+  this project's code — an environment/opencode-side issue to investigate separately,
+  not a bug here.
 
 ## Distribution
 

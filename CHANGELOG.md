@@ -61,6 +61,23 @@ All notable changes to this project are documented here. Format follows
   chat view already show for codex tasks) — this bridge does not attempt
   engine-specific cleanup, so `claude`/`opencode`/`gemini` are recommended when a
   clean `content` string matters to the caller.
+- Root-caused an occasional garbled/mojibake line in `codex`'s raw output (e.g.
+  `ᯥ譮: ,  䨪஬ ...`): it's a Windows OS notification ("process N terminated") printed
+  in the console's cp866 codepage, mis-decoded as UTF-8 by the `utf-8`-assuming
+  subprocess capture shared with `agent.sh`/`gui.py`. Documented, not fixed (project-
+  wide capture behavior, out of scope for this bridge alone).
+- Fix: `model` in responses/`/health`/`/v1/models` showed the bare CLI alias with no
+  version number (`"claude/sonnet-low"`, `"claude/opus"`), not which real model that
+  alias resolves to. Added a `model_labels` alias→display-name map to
+  `providers/{claude,codex,gemini}/provider.json` (`"sonnet"` → `"Sonnet 5"`, `"opus"`
+  → `"Opus 4.8"`, `"haiku"` → `"Haiku 4.5"`, `"spark"` → `"GPT-5.3 Codex Spark"`, etc.);
+  `model_label()` now shows `"claude/Sonnet 5 (low)"` / `"claude/Opus 4.8"`. Verified
+  live end-to-end for both aliases.
+- Confirmed (live, outside this bridge entirely) that `opencode` currently fails with
+  `UnknownError: Unexpected server error` on every model tried, including an
+  authenticated one (`zai/glm-4.5-flash`) — reproduces identically via the raw
+  `opencode run` CLI with zero `agent.sh`/bridge involvement, so it's an
+  environment/opencode-side issue, not a bug in this project.
 
 ## [0.1.0] - 2026-07-01
 

@@ -5,5 +5,10 @@
   "default_model": "sonnet",
   "default_effort": "high",
   "limits": null,
-  "resolved_label": "Sonnet 5 (high)"
+  "resolved_label": "Sonnet 5 (high)",
+  "model_labels": {
+    "sonnet": "Sonnet 5",
+    "opus": "Opus 4.8",
+    "haiku": "Haiku 4.5"
+  }
 }

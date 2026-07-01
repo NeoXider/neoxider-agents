@@ -5,5 +5,9 @@
   "default_model": "5.5",
   "default_effort": "medium",
   "limits": "codex",
-  "resolved_label": "GPT-5.5 (medium)"
+  "resolved_label": "GPT-5.5 (medium)",
+  "model_labels": {
+    "5.5": "GPT-5.5",
+    "spark": "GPT-5.3 Codex Spark"
+  }
 }

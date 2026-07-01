@@ -113,10 +113,17 @@ def run_agent(engine, model, effort, workdir, prompt, name, timeout):
 
 
 def model_label(engine, model, effort):
-    m = model or (PROVIDERS.get(engine, {}).get("default_model") or "default")
+    """Human-readable, versioned label for the `model` field in responses -- e.g.
+    "claude/Sonnet 5 (low)", not the bare CLI alias ("claude/sonnet-low"), which doesn't say
+    WHICH real model that alias currently points to (aliases like "opus"/"sonnet" are resolved
+    to a specific dated model id by the provider's own CLI or by provider_<engine>_resolve;
+    see providers/<engine>/provider.json's "model_labels" for the alias -> display-name map)."""
+    p = PROVIDERS.get(engine, {})
+    alias = model or (p.get("default_model") or "default")
+    label = (p.get("model_labels") or {}).get(alias, alias)
     if effort:
-        m = m + "-" + effort
-    return "%s/%s" % (engine, m)
+        label = "%s (%s)" % (label, effort)
+    return "%s/%s" % (engine, label)
 
 
 def _content_text(content):
