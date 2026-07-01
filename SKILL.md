@@ -59,24 +59,38 @@ bash $SK openai-server -e claude -m sonnet -f low -p 8801
 ```
 
 This starts a standalone HTTP server that translates `/v1/chat/completions` calls into
-`agent.sh run` invocations of the chosen CLI subagent and translates the answer back
-into an OpenAI-shaped response. Before relying on it, know what you're actually
-getting — it is a wire-compatible shim, not a real low-latency LLM API:
+`agent.sh run`/`agent.sh reply` invocations of the chosen CLI subagent and translates
+the answer back into an OpenAI-shaped response. Before relying on it, know what you're
+actually getting — it is a wire-compatible shim, not a real low-latency LLM API:
 
-- **Stateless per call** — the caller's whole `messages` array is serialized into one
-  prompt and sent to a brand-new `agent.sh run` every time; nothing is remembered
-  server-side between calls.
+- **One ongoing chat session per process, not a fresh agent every call.** The bridge
+  remembers the `messages` array from the previous call; when a new call's `messages`
+  is that exact array plus new messages appended at the end (a deterministic prefix
+  check, not a guess), it resumes the *same* CLI session via `agent.sh reply` with only
+  the new tail, instead of resending the whole growing history via a brand-new
+  `agent.sh run`. Any mismatch (edited history, an unrelated conversation, the first
+  call, or a dead/errored session) falls back safely to a fresh `agent.sh run` with the
+  full history. Only `claude`/`codex` support this (`provider.json`'s
+  `supports_resume`); `opencode`/`gemini` always take the fresh-run path.
+- **Trade-off: one bridge process serves one conversation at a time** — a lock
+  serializes every request, so don't point multiple unrelated tasks at the same bridge
+  port expecting them to stay independent (start one process per port per conversation
+  instead). `POST .../reset` clears the remembered session so the next call starts
+  completely fresh; `GET /health` reports `session_active`/`session_turns`.
 - **Slow** — each call is a full CLI subprocess invocation (seconds to low minutes),
   not a token stream. Don't use it anywhere real-time latency matters.
 - **`stream: true` is emulated** — the full answer is generated first, then replayed
   as word-sized SSE chunks. It is NOT real per-token streaming from the underlying
   provider.
 - **`tools`/function-calling is emulated via prompting**, not native — best-effort,
-  can occasionally misformat or ignore the instruction.
+  can occasionally misformat or ignore the instruction; the instructions are re-sent on
+  every call that includes `tools`, even a continuation turn.
 - **`usage` token counts are always `0/0/0`** — don't trust them for cost tracking.
 - **`content` can include raw CLI chrome for `codex`** (startup banner/session-id/
   error-log lines mixed into the answer, same as `agent.sh last` shows for codex
-  tasks) — prefer `claude`/`opencode`/`gemini` when a clean answer string matters.
+  tasks) — prefer `claude`/`opencode`/`gemini` when a clean answer string matters. Also
+  note: `codex`'s own resume command doesn't forward `--effort`/model flags, so a
+  resumed `codex` session may silently run at a different effort than it started with.
 - One process = one fixed engine/model/effort for its whole lifetime. To compare
   models, run the command again with different `-e/-m/-f/-p` on another port.
 

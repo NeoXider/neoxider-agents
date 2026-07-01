@@ -24,6 +24,8 @@
 #                      own docstring for the full contract/caveats). Point any OpenAI-compatible
 #                      client -- including CoreAI's COREAI_TEST_BASE_URL -- at its base_url. Run
 #                      several with different -e/-m/-f/-p to compare providers side by side.
+#                      One process = one ongoing chat session (deterministic continuation via
+#                      `reply`, not a fresh agent every call) -- `POST .../reset` clears it.
 #
 # Models (alias -> real):
 #   codex:  5.5|default -> gpt-5.5 (effort medium) [DEFAULT]; 5.5-high -> effort high;
@@ -491,7 +493,7 @@ PY
     help|--help|-h)
         # print this file's own header comment as the command reference -- one source of
         # truth instead of a duplicated usage string that can drift out of sync.
-        sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *) die "unknown command: $cmd (see: agent.sh help)" ;;
 esac

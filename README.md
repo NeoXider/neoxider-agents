@@ -81,8 +81,10 @@ this project fills.
 - **`openai-server` mode.** `agent.sh openai-server -e claude -m sonnet -f low -p 8801`
   starts a standalone OpenAI-compatible `/v1/chat/completions` HTTP bridge backed by a
   CLI subagent — point any OpenAI-compatible client (or COREAI_TEST_BASE_URL, see
-  below) at it instead of a real provider API key. See the dedicated section below for
-  the honesty points (stateless, emulated streaming/tools, no real token usage).
+  below) at it instead of a real provider API key. One process keeps one ongoing chat
+  session (not a fresh agent every call — see the dedicated section below), so a
+  multi-turn conversation against it gets real token/cache savings, not just wire
+  compatibility.
 
 ## Installation
 
@@ -209,10 +211,34 @@ separate provider API key needed.
 **This is a wire-compatible shim, not a low-latency native LLM backend** — be clear
 about this before pointing anything at it:
 
-- **Stateless per call**, exactly like the real OpenAI API: the whole `messages` array
-  is serialized into one prompt and sent to a brand-new `agent.sh run` invocation every
-  time. Nothing is remembered server-side between calls — the caller's own `messages`
-  array *is* the memory.
+- **One ongoing chat session per process, not a fresh agent every call.** The bridge
+  remembers the exact `messages` array it saw on the previous call. When a new call's
+  `messages` is that exact array plus one or more new messages appended at the end (a
+  deterministic, exact prefix check — not a model guessing), it sends only the new
+  tail to the *same* underlying CLI session via `agent.sh reply` (resume), instead of
+  re-serializing the whole growing history into a brand-new `agent.sh run`. Any
+  mismatch — edited/rolled-back history, a genuinely different conversation, the very
+  first call ever, or a previous session that ended in an `error`/`stalled` state —
+  falls back safely to a brand-new `agent.sh run` with the full history; it never
+  resumes onto a session that might disagree with what the caller thinks happened.
+  Only `claude` and `codex` support this continuation (`provider.json`'s
+  `"supports_resume"` — `opencode`/`gemini` are `false` and always take the fresh-run
+  path). Verified live: Claude's underlying task log showed one `[run]` block followed
+  by a `[reply]` block containing only the new tail, the task-file count stayed at 1
+  across 4 sequential calls, and a genuinely unrelated conversation sent next correctly
+  triggered a new session.
+- **Trade-off: one bridge process serves one conversation at a time**, not many
+  concurrent independent ones — a lock (`SESSION_LOCK`) serializes every request. This
+  is safe under concurrency (verified live: two genuinely concurrent, unrelated
+  requests both got correct answers with zero cross-contamination — the lock
+  serializes them, and since the second one's messages don't extend the first's, it
+  correctly falls back to its own fresh session), but it is not efficient for callers
+  that need many independent parallel conversations against the same port — start
+  multiple bridge processes on different ports for that instead.
+- **`POST .../reset`** clears the remembered session (drops the remembered
+  `messages`/task, wipes the scratch working dir unless `--dir` pinned a real project)
+  so the next call starts completely fresh. `GET /health` and `GET /` report
+  `session_active` (bool) and `session_turns` (message count in the remembered array).
 - **Latency is a full CLI subprocess invocation** — seconds to low minutes, not a token
   stream.
 - **`stream: true` is emulated**: the full answer is generated first, then replayed as
@@ -223,7 +249,10 @@ about this before pointing anything at it:
   includes an OpenAI `tools` array, the bridge instructs the agent (in the prompt) to
   reply with either plain prose or a fenced JSON tool-call block, then parses that
   block into a real `tool_calls` response. Best-effort — verified working, but it can
-  occasionally misformat or ignore the instruction.
+  occasionally misformat or ignore the instruction. The instructions are re-sent on
+  every call that includes `tools`, including a continuation turn on an already-resumed
+  session — not just the first call — a deliberate simplicity/robustness choice over
+  tracking whether the schema already "stuck".
 - **`usage` token counts are always `0/0/0`** — the wrapped CLIs don't expose real
   token counts in a structured form.
 - Image content in messages is not rendered to the agent (replaced with a
@@ -236,11 +265,20 @@ about this before pointing anything at it:
 - **One process = one fixed engine/model/effort** for its whole lifetime. To compare
   models/providers side by side, or serve several at once, just run the command again
   with different `-e/-m/-f/-p` in another terminal — no built-in multi-server manager.
+- **Known quirk on `codex` resume**: `agent.sh`'s `provider_codex_resume_cmd` does not
+  forward the `--effort`/model flags on resume (unlike `claude`, which needs and gets
+  them re-sent) — so a resumed `codex` session may silently run at a different
+  reasoning effort than the one the session started with. This is a pre-existing
+  `agent.sh`/codex characteristic, not a bug in this bridge; there is no fix from the
+  bridge's side.
 
 **Motivating use case** — CoreAI's Unity Game-Creation Benchmark can point its live
-PlayMode test suite at any OpenAI-compatible provider via env vars. To run it against
-Claude Sonnet 5 through your existing Claude Code CLI subscription instead of a real
-Anthropic API key:
+PlayMode test suite at any OpenAI-compatible provider via env vars. This design is a
+particularly good fit for that use case: one benchmark scenario is one ongoing
+conversation against the bridge, so the session-continuation model above turns into
+real token/cache savings over the scenario's lifetime, not just wire compatibility. To
+run it against Claude Sonnet 5 through your existing Claude Code CLI subscription
+instead of a real Anthropic API key:
 
 ```bash
 # terminal 1, from this skill's directory:

@@ -10,10 +10,32 @@ configured CLI agent as the LLM backend for every /v1/chat/completions call. One
 fixed engine/model/effort; start several processes on different ports (and/or --dir) to compare
 providers/models/efforts side by side, or to run more than one at once.
 
-WHAT THIS IS -- a wire-compatible shim, NOT a low-latency native LLM backend:
-  - Every call is a FRESH, STATELESS `agent.sh run` (mirrors OpenAI's own stateless chat-completions
-    contract -- the whole `messages` array is serialized into one prompt each call; nothing is
-    resumed/remembered between calls, the CALLER's `messages` array IS the memory).
+THE SESSION MODEL -- one API process = one ongoing chat session, not a fresh agent every call:
+  - The bridge keeps the `messages` array from the previous call. When a new call's `messages`
+    is that exact array PLUS one or more new turns appended at the end (a deterministic, exact
+    prefix check -- not a guess), only the NEW turns are sent to the SAME underlying CLI session
+    via `agent.sh reply` (resume), instead of re-serializing the whole growing history into a
+    brand-new `agent.sh run` every time. This saves the resend cost of an ever-growing history
+    AND lets the underlying provider's own prompt caching (which keys on repeated message
+    structure) actually apply -- something a fresh mega-prompt every call could not benefit from.
+  - Any mismatch (edited/rolled-back history, a genuinely different conversation, first call
+    ever, or a dead/errored previous session) falls back SAFELY to a brand-new `agent.sh run`
+    with the full history -- never resumes onto a session that might disagree with the caller.
+  - Engines without CLI-level resume support (`opencode`, `gemini` -- see provider.json's
+    "supports_resume") always take the fresh-run path; there is no continuation to lose for them.
+  - Consequence: **one bridge process serves ONE conversation at a time**, not many concurrent
+    ones -- a lock serializes overlapping requests. This is the deliberate trade-off for the
+    token/latency win above; it is NOT a general-purpose multi-conversation server. If your
+    client only ever runs one conversation against a given port at a time (e.g. one benchmark
+    scenario end to end), this is a clean fit; do not point multiple unrelated conversations at
+    the same port expecting them to stay independent.
+  - `POST .../reset` clears the session (drops the remembered `messages`/task, wipes the scratch
+    working dir unless `--dir` was pinned) so the next call starts completely fresh.
+  - The session's working directory persists for the session's lifetime (unlike a one-shot
+    completion server that could safely use a disposable per-call temp dir) -- it is wiped and
+    recreated whenever a brand-new session starts, unless `--dir` pins a real project path.
+
+WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backend:
   - Latency is a full CLI subprocess invocation (seconds to low minutes), not a token stream.
   - `stream: true` replays the finished answer as word-sized SSE deltas -- this is NOT real
     per-token streaming from the underlying provider, just a wire-compatible reveal of a result
@@ -22,6 +44,8 @@ WHAT THIS IS -- a wire-compatible shim, NOT a low-latency native LLM backend:
     tool call as a strict JSON block instead of using its own shell/file tools, which is then
     reformatted into a real OpenAI `tool_calls` response. This is best-effort prompting, not a
     protocol the CLI natively speaks -- it can occasionally ignore the instruction or misformat it.
+    The instructions are re-sent on every call that includes `tools` (even a continuation), not
+    just the first -- simpler and more robust than tracking whether the schema already "stuck".
   - `usage` token counts are always 0/0/0 -- the wrapped CLIs don't expose them in a structured form.
   - `content` can include raw CLI chrome for some engines -- e.g. codex's non-interactive `exec`
     mode prints its own startup banner/session-id/error-log lines to the same stream as the
@@ -32,7 +56,7 @@ WHAT THIS IS -- a wire-compatible shim, NOT a low-latency native LLM backend:
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
 (does not import gui.py) so the two servers can run/fail independently.
 """
-import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.parse, uuid
+import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -89,12 +113,54 @@ def last_output(text):
     return text[idx + len(marker):].lstrip("\n") if idx != -1 else text
 
 
-def scratch_dir(name):
-    """Isolated per-request working dir so a completion-only call can't wander off and edit a
-    real project's files -- used unless the operator explicitly pins --dir."""
-    d = os.path.join(tempfile.gettempdir(), "neoxider-openai-bridge", name)
+def read_meta(name):
+    """Same format agent.sh itself writes (key=value lines) -- mirrors gui.py's identical
+    helper. Used to check a session's task is still healthy (not error/stalled) before
+    resuming it."""
+    d = {}
+    try:
+        with open(os.path.join(LOGDIR, name + ".meta"), encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.rstrip("\n").split("=", 1)
+                    d[k] = v
+    except OSError:
+        pass
+    return d
+
+
+def session_scratch_dir():
+    """Path (not created) of the ONE stable working dir this bridge process's ongoing session
+    lives in -- fixed per port, so it's dedicated to this instance and never collides with
+    another bridge/task using the same LOGDIR."""
+    return os.path.join(tempfile.gettempdir(), "neoxider-openai-bridge", "session-%d" % CFG.port)
+
+
+def fresh_session_dir():
+    """(Re)creates the working dir for a BRAND-NEW session. Wipes any leftover files from a
+    previous, unrelated conversation first -- since this dir now persists for a whole session's
+    lifetime (not a disposable per-call temp dir), a stray file the agent wrote in an earlier,
+    different conversation must not leak into this new one. Never touches an operator-pinned
+    --dir (that's a real project path -- respected as-is, exactly like every other command in
+    this project)."""
+    if CFG.dir:
+        return CFG.dir
+    d = session_scratch_dir()
+    shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d, exist_ok=True)
     return d
+
+
+def new_task_name():
+    return "openai-%d-%s" % (CFG.port, uuid.uuid4().hex[:12])
+
+
+def is_extension(prev, new):
+    """True when `new` is exactly `prev` plus one or more messages appended at the end -- the
+    deterministic (not heuristic) check that lets a continuation safely resume the existing CLI
+    session instead of guessing. Any other relationship (edited/rolled-back history, a shorter
+    or unrelated array, no prior session) is NOT an extension and must fall back to a fresh run."""
+    return len(new) > len(prev) and new[:len(prev)] == prev
 
 
 def run_agent(engine, model, effort, workdir, prompt, name, timeout):
@@ -109,6 +175,24 @@ def run_agent(engine, model, effort, workdir, prompt, name, timeout):
                         errors="replace", timeout=timeout, cwd=HERE)
     except subprocess.TimeoutExpired:
         pass  # the log up to the timeout is still readable/useful below
+    return last_output(read_log(name))
+
+
+def reply_agent(engine, model, effort, workdir, name, answer, timeout):
+    """Continues an existing task's CLI session via `agent.sh reply` -- same dispatch machinery
+    `run` uses, just resuming instead of starting over. -m/-f are re-sent because some providers
+    (claude) need them again on resume (see agent.sh's PROVIDER_*_RESUME_NEEDS_MODEL)."""
+    args = [BASH, SK, "reply", "-e", engine]
+    if model:
+        args += ["-m", model]
+    if effort:
+        args += ["-f", effort]
+    args += ["-C", to_git_bash_path(workdir), name, answer]
+    try:
+        subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", timeout=timeout, cwd=HERE)
+    except subprocess.TimeoutExpired:
+        pass
     return last_output(read_log(name))
 
 
@@ -151,9 +235,10 @@ def _content_text(content):
 
 
 def render_messages(messages):
-    """Serializes an OpenAI `messages` array into one plain-text prompt -- there is no session
-    to resume, so the FULL history is re-sent to a fresh agent every call, exactly like a real
-    OpenAI-compatible provider would see it from any other stateless client."""
+    """Serializes a (sub)set of an OpenAI `messages` array into one plain-text prompt. Called
+    with the FULL history when starting a brand-new agent session, or with just the NEW tail
+    when continuing an existing one (see is_extension/H._run) -- the rendering logic itself
+    doesn't care which; it just formats whatever list it's given."""
     lines = []
     for m in messages:
         role = (m.get("role") or "user").upper()
@@ -262,6 +347,12 @@ def extract_tool_calls(text):
 
 CFG = None  # set in main(); read by the request handler
 
+# The one ongoing session this bridge process serves (see the module docstring's "THE SESSION
+# MODEL"). SESSION_LOCK serializes every request that touches it -- by design, only one
+# conversation is ever in flight against a given bridge instance at a time.
+SESSION_LOCK = threading.Lock()
+SESSION = {"task_name": None, "messages": [], "dir": None}
+
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):  # silent
@@ -279,26 +370,56 @@ class H(BaseHTTPRequestHandler):
         p = urllib.parse.urlparse(self.path).path
         label = model_label(CFG.engine, CFG.model, CFG.effort)
         if p == "/health":
-            self._send_json(200, {"ok": True, "engine": CFG.engine, "model": label})
+            with SESSION_LOCK:
+                active, turns = bool(SESSION["task_name"]), len(SESSION["messages"])
+            self._send_json(200, {"ok": True, "engine": CFG.engine, "model": label,
+                                   "session_active": active, "session_turns": turns})
         elif p.endswith("/models"):
             self._send_json(200, {"object": "list", "data": [{"id": label, "object": "model", "owned_by": "neoxider-agents"}]})
         elif p == "/":
+            with SESSION_LOCK:
+                active, turns = bool(SESSION["task_name"]), len(SESSION["messages"])
             self._send_json(200, {"neoxider_openai_bridge": True, "engine": CFG.engine, "model": label,
-                                   "endpoint": "POST .../chat/completions"})
+                                   "endpoint": "POST .../chat/completions", "reset_endpoint": "POST .../reset",
+                                   "session_active": active, "session_turns": turns})
         else:
             self._send_json(404, {"error": {"message": "not found: " + p}})
 
     def _run(self, messages, tools):
-        prompt = build_prompt(messages, tools)
-        name = "openai-%d-%s" % (CFG.port, uuid.uuid4().hex[:12])
-        workdir = CFG.dir or scratch_dir(name)
-        try:
-            raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt, name, CFG.timeout)
-        finally:
-            if not CFG.dir:
-                shutil.rmtree(workdir, ignore_errors=True)
+        """Implements THE SESSION MODEL (see module docstring): continue the existing CLI
+        session via `agent.sh reply` when `messages` is a deterministic extension of what we
+        saw last time and that session is still healthy; otherwise fall back to a brand-new
+        `agent.sh run` with the full history. Holds SESSION_LOCK for the whole CLI call --
+        by design, this bridge serves one conversation at a time."""
+        with SESSION_LOCK:
+            supports_resume = bool((PROVIDERS.get(CFG.engine) or {}).get("supports_resume"))
+            prev_name = SESSION["task_name"]
+            healthy = bool(prev_name) and read_meta(prev_name).get("state") not in (None, "", "error", "stalled")
+            if supports_resume and healthy and is_extension(SESSION["messages"], messages):
+                new_turns = messages[len(SESSION["messages"]):]
+                answer = build_prompt(new_turns, tools)
+                raw_text = reply_agent(CFG.engine, CFG.model, CFG.effort, SESSION["dir"], prev_name, answer, CFG.timeout)
+                name = prev_name
+            else:
+                prompt = build_prompt(messages, tools)
+                name = new_task_name()
+                workdir = fresh_session_dir()
+                SESSION["dir"] = workdir
+                raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt, name, CFG.timeout)
+            SESSION["task_name"] = name
+            SESSION["messages"] = messages
         tool_calls, text = extract_tool_calls(raw_text)
         return text, tool_calls
+
+    def _reset_session(self):
+        with SESSION_LOCK:
+            old_dir = SESSION["dir"]
+            SESSION["task_name"] = None
+            SESSION["messages"] = []
+            SESSION["dir"] = None
+            if old_dir and not CFG.dir:
+                shutil.rmtree(old_dir, ignore_errors=True)
+        self._send_json(200, {"ok": True, "reset": True})
 
     def _sync_response(self, messages, tools):
         text, tool_calls = self._run(messages, tools)
@@ -357,6 +478,8 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urllib.parse.urlparse(self.path).path
+        if p.endswith("/reset"):
+            return self._reset_session()
         if not p.endswith("/chat/completions"):
             return self._send_json(404, {"error": {"message": "not found: " + p}})
         length = int(self.headers.get("Content-Length") or 0)
@@ -384,7 +507,10 @@ def main():
                      help="which CLI subagent backs this server (default: codex)")
     ap.add_argument("-m", "--model", default="", help="model alias passed to agent.sh (default: provider default)")
     ap.add_argument("-f", "--effort", default="", help="effort level passed to agent.sh (default: provider default)")
-    ap.add_argument("-C", "--dir", default="", help="working dir for the agent (default: a fresh scratch temp dir per call)")
+    ap.add_argument("-C", "--dir", default="",
+                     help="working dir for the agent's session (default: a scratch temp dir, "
+                          "wiped and recreated each time a brand-new session starts). Pin this "
+                          "to a real project path if the agent should operate there instead.")
     ap.add_argument("-p", "--port", type=int, default=int(os.environ.get("AGENT_OPENAI_PORT") or 8801))
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--timeout", type=int, default=240, help="max seconds to wait for one completion (default: 240)")

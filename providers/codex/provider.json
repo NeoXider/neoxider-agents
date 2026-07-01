@@ -9,5 +9,6 @@
   "model_labels": {
     "5.5": "GPT-5.5",
     "spark": "GPT-5.3 Codex Spark"
-  }
+  },
+  "supports_resume": true
 }

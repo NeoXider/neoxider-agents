@@ -167,6 +167,43 @@ Roughly in priority order. PRs welcome.
   reproducing identically via the raw `opencode run` CLI with zero involvement from
   this project's code — an environment/opencode-side issue to investigate separately,
   not a bug here.
+- [x] **Session-continuation model, replacing the earlier stateless design.** Done —
+  one bridge process now keeps one ongoing chat session instead of resending the whole
+  `messages` history as a fresh `agent.sh run` every call. The bridge remembers the
+  `messages` array from the previous call; when a new call's `messages` is a
+  deterministic extension of it (exact prefix check, not a guess), only the new tail is
+  sent to the *same* CLI session via `agent.sh reply`. Any mismatch (edited history, an
+  unrelated conversation, the first call, or a dead/errored session) falls back safely
+  to a fresh `agent.sh run` with the full history. Added `"supports_resume"` to every
+  `provider.json` (`claude`/`codex`: `true`; `opencode`/`gemini`: `false`). Verified
+  live against Claude: the task log showed exactly one `[run]` block followed by one
+  `[reply]` block containing only the new tail (not the whole history); the task-file
+  count stayed at 1 across 4 sequential calls (basic continuation, a tool-call turn, a
+  tool-result turn — 8 messages of session state); a genuinely different conversation
+  sent next correctly triggered a new session (task count 1→2, `session_turns` reset to
+  1). Verified live against Codex: the same underlying session id was reused across 2
+  calls (task count stayed at 1), correctly recalling a fact from 2 turns earlier.
+  Verified live against Gemini (no resume support): every call, including an
+  "extension" one, correctly created a brand-new task, zero errors — confirms graceful
+  degradation for engines without `supports_resume`.
+- [x] **`POST .../reset` endpoint.** Done — clears the remembered session (drops the
+  remembered `messages`/task, wipes the scratch working dir unless `--dir` was pinned
+  to a real project) so the next call starts completely fresh. `GET /health` and
+  `GET /` now also report `session_active` (bool) and `session_turns` (message count in
+  the remembered array). Verified live: `session_active` went back to `false`
+  immediately after reset, and the next call correctly started yet another new session
+  (task count → 3 in the same verification pass as above).
+- [x] **Concurrency-safety verification for the new session model.** Done — two
+  genuinely concurrent, unrelated one-shot requests both got their own correct answers
+  with zero cross-contamination. `SESSION_LOCK` serializes overlapping requests, and
+  since the second request's messages don't extend the first's, it correctly falls
+  back to its own fresh session rather than corrupting or blocking on the first's.
+- [x] **Documented `codex` resume-effort quirk.** Done — `agent.sh`'s
+  `provider_codex_resume_cmd` does not forward the `--effort`/model flags on resume
+  (unlike `claude`, which needs and gets them re-sent), so a resumed `codex` session may
+  silently run at a different reasoning effort than the one it started with. Pre-
+  existing `agent.sh`/codex characteristic, not a bug in this bridge — documented, no
+  fix needed or possible from the bridge's side.
 
 ## Distribution
 

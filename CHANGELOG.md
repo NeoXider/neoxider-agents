@@ -78,6 +78,54 @@ All notable changes to this project are documented here. Format follows
   authenticated one (`zai/glm-4.5-flash`) — reproduces identically via the raw
   `opencode run` CLI with zero `agent.sh`/bridge involvement, so it's an
   environment/opencode-side issue, not a bug in this project.
+- **Session-continuation model for `openai-server`, replacing the earlier stateless
+  design**: one bridge process now keeps one ongoing chat session, not a fresh agent
+  every call. The bridge remembers the `messages` array from the previous call, and
+  when a new call's `messages` is a deterministic extension of it (exact prefix check,
+  not a guess), only the new tail is sent to the *same* underlying CLI session via
+  `agent.sh reply` (resume) instead of resending the whole growing history through a
+  brand-new `agent.sh run`. Any mismatch (edited/rolled-back history, a genuinely
+  different conversation, the first call ever, or a previous session that ended in
+  `error`/`stalled`) falls back safely to a fresh `agent.sh run` with the full history.
+  This both avoids resending an ever-growing prompt and lets the underlying provider's
+  own prompt caching apply, since the CLI sees one real growing conversation instead of
+  a brand-new mega-prompt every time.
+- Added `"supports_resume"` to every `provider.json` (`claude`/`codex`: `true`;
+  `opencode`/`gemini`: `false`) — engines without resume support always take the
+  fresh-run path, every call.
+- New `POST .../reset` endpoint: clears the remembered session (drops the remembered
+  `messages`/task, wipes the scratch working dir unless `--dir` was pinned to a real
+  project) so the next call starts completely fresh. `GET /health` and `GET /` now also
+  report `session_active` (bool) and `session_turns` (message count in the remembered
+  array).
+- The session's working directory now persists for the session's whole lifetime
+  (previously a disposable per-call scratch dir) — wiped and recreated only when a
+  brand-new session starts (divergence, reset, or first-ever call), never touched when
+  `--dir` pins a real project path.
+- Verified live: Claude — a 2-turn history followed by a 3rd-turn recall question
+  produced the correct answer, and the task log showed exactly one `[run]` block
+  followed by one `[reply]` block containing only the new tail; the task-file count
+  stayed at 1 across 4 sequential calls (8 messages of session state). A genuinely
+  different conversation sent next correctly triggered a new session (task count
+  1→2, `session_turns` reset to 1). `POST .../reset` correctly cleared the session
+  (`session_active` back to `false`), and the next call after reset started yet
+  another new session (task count → 3). Streaming (`stream: true`) works on a
+  continuation call too, not just fresh sessions.
+- Verified live: Codex — the same continuation mechanism reused the same underlying
+  session id across 2 calls, task count stayed at 1, and correctly recalled a fact
+  from 2 turns earlier.
+- Verified live: concurrency safety — two genuinely concurrent, unrelated one-shot
+  requests both got their own correct answers with zero cross-contamination; the
+  `SESSION_LOCK` serializes overlapping requests, and since the second request's
+  messages don't extend the first's, it correctly falls back to its own fresh session.
+- Verified live: Gemini (no resume support) — every call, including an "extension"
+  one, correctly created a brand-new task, with zero errors, confirming graceful
+  degradation for engines without `supports_resume`.
+- Documented a new, pre-existing `codex`/`agent.sh` quirk surfaced by this work:
+  `provider_codex_resume_cmd` does not forward the `--effort`/model flags on resume
+  (unlike `claude`, which needs and gets them re-sent) — a resumed `codex` session may
+  silently run at a different reasoning effort than the one it started with. No fix
+  needed or possible from this bridge's side.
 
 ## [0.1.0] - 2026-07-01
 

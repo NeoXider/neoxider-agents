@@ -246,14 +246,110 @@ class ExtractToolCallsTests(unittest.TestCase):
         self.assertEqual(cleaned, "")
 
 
-class ScratchDirTests(unittest.TestCase):
-    def test_creates_and_returns_a_directory(self):
+class IsExtensionTests(unittest.TestCase):
+    """is_extension is THE deterministic check that decides whether a call continues the
+    existing CLI session (via `agent.sh reply`) or falls back to a brand-new one -- this is
+    the crux of the whole session model, so it gets the most thorough coverage here."""
+
+    def test_new_turn_appended_is_an_extension(self):
+        prev = [{"role": "user", "content": "hi"}]
+        new = prev + [{"role": "assistant", "content": "hello"}]
+        self.assertTrue(srv.is_extension(prev, new))
+
+    def test_identical_arrays_are_not_an_extension(self):
+        # nothing NEW was appended -- must not resume on a no-op repeat
+        msgs = [{"role": "user", "content": "hi"}]
+        self.assertFalse(srv.is_extension(msgs, list(msgs)))
+
+    def test_shorter_array_is_not_an_extension(self):
+        prev = [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]
+        new = [{"role": "user", "content": "a"}]
+        self.assertFalse(srv.is_extension(prev, new))
+
+    def test_edited_earlier_message_is_not_an_extension(self):
+        # same length-or-longer, but the shared prefix itself changed -- must NOT resume onto
+        # a session that would then disagree with what the caller thinks the history is
+        prev = [{"role": "user", "content": "hi"}]
+        new = [{"role": "user", "content": "hi, EDITED"}, {"role": "assistant", "content": "hello"}]
+        self.assertFalse(srv.is_extension(prev, new))
+
+    def test_empty_previous_history_with_new_messages_is_an_extension(self):
+        self.assertTrue(srv.is_extension([], [{"role": "user", "content": "first ever message"}]))
+
+    def test_both_empty_is_not_an_extension(self):
+        self.assertFalse(srv.is_extension([], []))
+
+    def test_unrelated_conversation_of_equal_length_is_not_an_extension(self):
+        prev = [{"role": "user", "content": "conversation A"}]
+        new = [{"role": "user", "content": "conversation B"}]
+        self.assertFalse(srv.is_extension(prev, new))
+
+
+class ReadMetaTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._orig_logdir = srv.LOGDIR
+        srv.LOGDIR = tempfile.mkdtemp()
+
+    def tearDown(self):
         import shutil
-        d = srv.scratch_dir("test-scratch-dir-xyz")
+        shutil.rmtree(srv.LOGDIR, ignore_errors=True)
+        srv.LOGDIR = self._orig_logdir
+
+    def test_reads_key_value_pairs(self):
+        with open(os.path.join(srv.LOGDIR, "sometask.meta"), "w", encoding="utf-8") as f:
+            f.write("state=done\nengine=claude\nmodel=sonnet-low\n")
+        meta = srv.read_meta("sometask")
+        self.assertEqual(meta.get("state"), "done")
+        self.assertEqual(meta.get("engine"), "claude")
+
+    def test_missing_file_returns_empty_dict(self):
+        self.assertEqual(srv.read_meta("does-not-exist-xyz"), {})
+
+
+class SessionDirTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_cfg = srv.CFG
+
+        class FakeCfg:
+            dir = ""
+            port = 19191
+
+        srv.CFG = FakeCfg()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(srv.session_scratch_dir(), ignore_errors=True)
+        srv.CFG = self._orig_cfg
+
+    def test_fresh_session_dir_creates_and_returns_the_scratch_path(self):
+        d = srv.fresh_session_dir()
+        self.assertTrue(os.path.isdir(d))
+        self.assertEqual(d, srv.session_scratch_dir())
+
+    def test_fresh_session_dir_wipes_leftover_files_from_a_prior_session(self):
+        d = srv.fresh_session_dir()
+        stray = os.path.join(d, "leftover.txt")
+        with open(stray, "w", encoding="utf-8") as f:
+            f.write("stale data from a previous unrelated conversation")
+        d2 = srv.fresh_session_dir()
+        self.assertEqual(d, d2)
+        self.assertFalse(os.path.exists(stray))
+
+    def test_pinned_dir_is_returned_as_is_and_never_wiped(self):
+        import tempfile
+        pinned = tempfile.mkdtemp()
         try:
-            self.assertTrue(os.path.isdir(d))
+            stray = os.path.join(pinned, "keep-me.txt")
+            with open(stray, "w", encoding="utf-8") as f:
+                f.write("a real project file")
+            srv.CFG.dir = pinned
+            d = srv.fresh_session_dir()
+            self.assertEqual(d, pinned)
+            self.assertTrue(os.path.exists(stray))  # never touched
         finally:
-            shutil.rmtree(d, ignore_errors=True)
+            import shutil
+            shutil.rmtree(pinned, ignore_errors=True)
 
 
 if __name__ == "__main__":

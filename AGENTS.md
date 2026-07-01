@@ -45,17 +45,28 @@ bash agent.sh openai-server -e claude -m sonnet -f low -p 8801
 ```
 
 This is a wire-compatible shim, not a real low-latency LLM API — know the trade-offs
-before relying on it: every call is **stateless** (the caller's `messages` array is
-serialized into one prompt and sent to a brand-new `agent.sh run` each time, nothing
-resumed server-side); latency is a **full CLI subprocess invocation** (seconds to low
-minutes, not a token stream); `stream: true` **replays an already-finished answer** as
-word-sized SSE chunks, it is not real per-token streaming; `tools`/function-calling is
-**emulated via prompting** (best-effort, can misformat); `usage` token counts are
-**always `0/0/0`**; and **`content` can include raw CLI chrome for `codex`** (its
-`exec` mode mixes startup-banner/session-id/error-log lines into the answer, same as
-`agent.sh last` shows for codex tasks) — prefer `claude`/`opencode`/`gemini` for a
-clean answer string. One process = one fixed engine/model/effort — run it again on
-another port to compare models.
+before relying on it: it keeps **one ongoing chat session per process**, not a fresh
+agent every call — when a new call's `messages` is a deterministic extension of what
+it saw last time (exact prefix match, not a guess), it resumes the *same* underlying
+CLI session via `agent.sh reply` with only the new tail; any mismatch (edited history,
+an unrelated conversation, the first call, or a dead/errored session) falls back safely
+to a brand-new `agent.sh run` with the full history. Only `claude`/`codex` support this
+resume (`opencode`/`gemini` always take the fresh-run path). Consequence: **one bridge
+process serves one conversation at a time** — a lock serializes every request, so don't
+point multiple unrelated tasks at the same port expecting independence (run one process
+per port per conversation instead); `POST .../reset` clears the remembered session,
+and `GET /health` reports `session_active`/`session_turns`. Beyond that: latency is a
+**full CLI subprocess invocation** (seconds to low minutes, not a token stream);
+`stream: true` **replays an already-finished answer** as word-sized SSE chunks, it is
+not real per-token streaming; `tools`/function-calling is **emulated via prompting**
+(best-effort, can misformat, and the instructions are re-sent on every call that
+includes `tools`, even a continuation turn); `usage` token counts are **always
+`0/0/0`**; and **`content` can include raw CLI chrome for `codex`** (its `exec` mode
+mixes startup-banner/session-id/error-log lines into the answer, same as `agent.sh
+last` shows for codex tasks, and its resume command doesn't forward `--effort`/model
+flags either) — prefer `claude`/`opencode`/`gemini` for a clean answer string. One
+process = one fixed engine/model/effort — run it again on another port to compare
+models.
 
 ## Rules for using this tool as a subagent orchestrator
 

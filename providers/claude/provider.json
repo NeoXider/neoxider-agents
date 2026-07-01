@@ -10,5 +10,6 @@
     "sonnet": "Sonnet 5",
     "opus": "Opus 4.8",
     "haiku": "Haiku 4.5"
-  }
+  },
+  "supports_resume": true
 }

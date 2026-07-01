@@ -6,5 +6,6 @@
   "default_effort": "",
   "limits": null,
   "_efforts_note": "from opencode's own --variant help text ('e.g. high, max, minimal') -- the exact accepted enum isn't independently confirmed beyond that hint.",
-  "resolved_label": ""
+  "resolved_label": "",
+  "supports_resume": false
 }

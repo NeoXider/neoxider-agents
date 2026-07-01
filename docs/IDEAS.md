@@ -163,7 +163,8 @@ without adding capability.
 
 `agent.sh openai-server` (see `TODO.md`'s API section and `openai_server.py`) does the
 *opposite* of the resolution above — one process per engine/model/effort, deliberately.
-That's not an inconsistency, it follows from a real difference in the two protocols:
+That's not an inconsistency, it follows from a real difference in the two protocols —
+and it's an entirely separate axis from the session model discussed below:
 
 - `/api/run`, `/api/test-api`, and every other `gui.py`-served endpoint are *this
   project's own* wire format — every request already carries explicit `engine`/
@@ -184,6 +185,25 @@ wants to pick `claude-sonnet-5` vs `gpt-5.5` by request), the honest fix is a ro
 proxy in front of several `openai-server` instances — not teaching this bridge to
 parse its own convention out of the `model` field, which would silently diverge from
 what real OpenAI-compatible servers do with that field.
+
+**A related but separate axis: one process is now also one ongoing conversation at a
+time.** The engine/model/effort pinning above was always true; what's new is that the
+bridge now *also* maintains real session state server-side (one CLI session, resumed
+across calls when the caller's `messages` deterministically extends what it saw last
+time — see `openai_server.py`'s own "THE SESSION MODEL" docstring and `README.md`/
+`SKILL.md` for the mechanism). This does not change or reopen the "one shared server"
+resolution above: `gui.py`/`test-api` dispatch per-request because their own wire
+format carries `engine`/`model`/`effort` on every call; `openai-server` now *also*
+tracks one conversation per process because the OpenAI wire format has no room to
+smuggle a conversation/session identifier either — from the bridge's point of view, all
+it can see is "does this call's `messages` look like a continuation of the last one," so
+one process can only safely track one conversation's continuation state at a time. A
+lock (`SESSION_LOCK`) serializes overlapping requests rather than letting a second,
+unrelated conversation race the first's session; the safe (if less efficient) fallback
+when two truly independent conversations share a port is that the second one just
+starts its own fresh session, verified live to produce zero cross-contamination. If a
+caller genuinely needs many independent parallel conversations, the answer is the same
+as for comparing models: run more processes on more ports, not one smarter shared one.
 
 **A second thing worth being explicit about, since both sections use the word
 "streaming" for different things**: `/api/stream` (above) tails the *real*, live,
