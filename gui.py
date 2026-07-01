@@ -1,29 +1,36 @@
 #!/usr/bin/env python3
-"""Минималистичный локальный веб-GUI над agent.sh — единый пульт для всех CLI-провайдеров.
+"""Minimalist local web GUI over agent.sh — one dashboard for all CLI providers.
 
-Запуск:  agent.sh gui [port]   (или: python gui.py [port])
-Открывает http://127.0.0.1:8765 . Только localhost. Ноль зависимостей (stdlib).
+Run:  agent.sh gui [port]   (or: python gui.py [port])
+Opens http://127.0.0.1:8765 . Localhost only. Zero dependencies (stdlib).
 
-Бэкенд читает <name>.meta / <name>.log напрямую (быстро, без парсинга текста list),
-а действия (run/reply/doctor) шеллит в agent.sh, чтобы вся логика жила в одном месте.
+The backend reads <name>.meta / <name>.log directly (fast, no parsing of `list`'s text),
+while actions (run/reply/doctor) shell out to agent.sh so all the logic lives in one place.
+Provider metadata (label/models/limits) is glob-loaded from providers/*/provider.json, and
+per-provider info (version/login/rate limits) is fetched by shelling out to
+`agent.sh provider-info <engine>` — the plugin's own provider.sh owns that logic, gui.py
+does not hardcode any per-engine behavior.
 """
 import json, os, re, sys, time, subprocess, urllib.parse, glob
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def to_git_bash_path(p):
-    """C:/Git/CoreAI или C:\\Git\\CoreAI -> /c/Git/CoreAI — канонический вид, в котором agent.sh
-    (git-bash) сам хранит dir= в .meta. Без этого GUI-задачи группировались бы отдельно от
-    CLI-задач той же папки (разные строки для одной директории)."""
+    """C:/Git/CoreAI or C:\\Git\\CoreAI -> /c/Git/CoreAI — the canonical form agent.sh
+    (git-bash) itself stores as dir= in .meta. Without this, GUI-launched tasks would be
+    grouped separately from CLI-launched tasks in the same folder (different keys for the
+    same directory)."""
     p = (p or "").replace("\\", "/")
     m = re.match(r"^([A-Za-z]):/(.*)$", p)
     return "/%s/%s" % (m.group(1).lower(), m.group(2)) if m else p
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# bash (git-bash) понимает прямые слэши в win-путях, но НЕ бэкслеши в argv -> нормализуем
+# bash (git-bash) understands forward slashes in win paths, but NOT backslashes in argv -> normalize
 SK = os.path.join(HERE, "agent.sh").replace("\\", "/")
 HTML = os.path.join(HERE, "gui.html")
-# точный git-bash из agent.sh (иначе native-python может дёрнуть WSL bash и не найти C:/... путь).
-# Фолбэк на типовые пути git-bash, чтобы и прямой `python gui.py` работал (не только через agent.sh gui).
+PROVIDERS_DIR = os.path.join(HERE, "providers")
+# the exact git-bash agent.sh uses (otherwise native-python may pick up WSL bash and fail
+# to find C:/... paths). Falls back to common git-bash locations so plain `python gui.py`
+# also works (not just via `agent.sh gui`).
 BASH = os.environ.get("AGENT_SH_BASH")
 if not BASH:
     for c in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe",
@@ -35,7 +42,7 @@ if not BASH:
         BASH = "bash"
 LOGDIR = os.environ.get("AGENT_CLI_LOGS") or os.path.expanduser("~/.claude/agent-cli-logs")
 PROJECTS_FILE = os.path.join(LOGDIR, "projects.json")
-STALE_SEC = 300  # running + нет активности в логе дольше -> считаем stalled
+STALE_SEC = 300  # running + no log activity for longer than this -> treat as stalled
 
 _DEFAULT_PROVIDERS = {
     "codex":   {"label": "Codex", "models": ["5.5", "5.5-high", "spark"], "limits": "codex"},
@@ -44,11 +51,18 @@ _DEFAULT_PROVIDERS = {
     "gemini":  {"label": "Gemini", "models": [], "limits": None},
 }
 def load_providers():
-    try:
-        with open(os.path.join(HERE, "providers.json"), encoding="utf-8") as f:
-            return json.load(f).get("providers", _DEFAULT_PROVIDERS)
-    except Exception:
-        return _DEFAULT_PROVIDERS
+    """Glob-load providers/*/provider.json for display metadata (label/models/default_model/
+    limits-flag). Falls back to a small built-in default set if the providers/ dir is missing
+    or empty, so the GUI still works from a partial checkout."""
+    out = {}
+    for pf in sorted(glob.glob(os.path.join(PROVIDERS_DIR, "*", "provider.json"))):
+        name = os.path.basename(os.path.dirname(pf))
+        try:
+            with open(pf, encoding="utf-8") as f:
+                out[name] = json.load(f)
+        except Exception:
+            continue
+    return out or _DEFAULT_PROVIDERS
 PROVIDERS = load_providers()
 ENGINES = list(PROVIDERS.keys())
 
@@ -78,14 +92,14 @@ def read_meta(name):
     return d
 
 def eff_state(meta, log_mtime, nowt):
-    """Liveness через mtime лога (pid из git-bash не сопоставим с win-pid в python)."""
+    """Liveness via the log's mtime (a git-bash pid isn't comparable to a win-pid in python)."""
     st = meta.get("state", "?")
     if st == "running" and log_mtime and (nowt - log_mtime) > STALE_SEC:
         return "stalled"
     return st
 
 def first_prompt(name):
-    """Первая строка первого PROMPT — как заголовок «чата» в дереве."""
+    """First line of the first PROMPT — used as the "chat" title in the tree."""
     lines = read_log(name).splitlines()
     for i, l in enumerate(lines):
         if l.strip() in ("> PROMPT:", "> ANSWER:"):
@@ -99,14 +113,17 @@ def first_prompt(name):
     return ""
 
 ACT_BY_STATE = {"done": "✅", "waiting": "⏳", "error": "❌", "stalled": "⚠️"}
-ACT_RULES = [  # для running — по последней строке лога: что делает прямо сейчас
+ACT_RULES = [  # for running — based on the log's last line: what it's doing right now
     (("read", "open", "cat ", "grep", "ls "), "📖"),
     (("edit", "appl", "writ", "patch", "creat", "wrote"), "✏️"),
     (("test", "pytest", "npm test", "dotnet test"), "🧪"),
     (("run", "exec", "$ ", "bash", "compil", "build"), "🔧"),
     (("token", "usage"), "🧮"),
 ]
-TOPIC_RULES = [  # тема задачи — по тексту первого prompt
+# TOPIC_RULES: task topic guessed from the first prompt's text. Keyword lists intentionally
+# include Russian keywords (исправ/почин/etc.) alongside English ones, since chats may be in
+# either language — these are matched data, not comments, so they stay untranslated.
+TOPIC_RULES = [
     (("fix", "bug", "race", "crash", "исправ", "почин"), "🐛"),
     (("readme", "doc", "docs", "документ", "коммент"), "📖"),
     (("test", "тест", "spec"), "🧪"),
@@ -182,7 +199,7 @@ def list_dirs(path):
         return []
 
 def browse(raw):
-    """Мини файловый браузер (только каталоги) для выбора рабочей директории проекта из GUI."""
+    """Mini file browser (directories only) for picking a project working dir from the GUI."""
     base = os.path.abspath(raw.strip() or os.path.expanduser("~"))
     if not os.path.isdir(base):
         base = os.path.expanduser("~")
@@ -197,32 +214,6 @@ def browse(raw):
                       [os.path.expanduser("~"), "C:/Git", "C:/", HERE] if os.path.isdir(p)],
     }
 
-def codex_limits():
-    """Структурные rate-limits codex из последней сессии (для панели справа)."""
-    files = sorted(glob.glob(os.path.expanduser("~/.codex/sessions/**/*.jsonl"), recursive=True),
-                   key=os.path.getmtime)[-8:]
-    def find(d):
-        if isinstance(d, dict):
-            if "rate_limits" in d:
-                return d["rate_limits"]
-            for v in d.values():
-                r = find(v)
-                if r:
-                    return r
-        return None
-    rl = None
-    for f in files:
-        try:
-            for line in open(f, encoding="utf-8", errors="ignore"):
-                if '"rate_limits"' in line:
-                    try:
-                        rl = find(json.loads(line)) or rl
-                    except ValueError:
-                        pass
-        except OSError:
-            pass
-    return rl
-
 def read_log(name):
     try:
         with open(os.path.join(LOGDIR, name + ".log"), encoding="utf-8", errors="ignore") as f:
@@ -231,10 +222,10 @@ def read_log(name):
         return ""
 
 def spawn(args, terminal=False):
-    """Фоновый запуск agent.sh. terminal=True -> отдельное окно консоли с живым выводом чата."""
+    """Background launch of agent.sh. terminal=True -> a separate console window with a live chat view."""
     kw = dict(cwd=HERE)
     if terminal and os.name == "nt":
-        kw["creationflags"] = 0x00000010  # CREATE_NEW_CONSOLE — видно чат живьём
+        kw["creationflags"] = 0x00000010  # CREATE_NEW_CONSOLE — chat visible live
     elif os.name == "nt":
         kw.update(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
@@ -251,31 +242,26 @@ def run_sync(args, timeout=30):
     except Exception as e:
         return "error: %s" % e
 
-def _sh(cmd, timeout=10):
-    try:
-        return subprocess.run([BASH, "-lc", cmd], capture_output=True, text=True,
-                              encoding="utf-8", errors="replace", timeout=timeout, cwd=HERE).stdout.strip()
-    except Exception:
-        return ""
-
 def provider_info(engine):
-    """Инфо по конкретному провайдеру для правой панели (лимиты там, где CLI их отдаёт)."""
-    ver = _sh("command -v %s >/dev/null 2>&1 && %s --version 2>&1 | head -1 || echo NOT_FOUND" % (engine, engine))
-    info = {"engine": engine, "version": ver, "available": ver != "NOT_FOUND",
-            "login": "", "limits": None, "now": time.time(), "note": ""}
-    lim_src = (PROVIDERS.get(engine) or {}).get("limits")
-    if lim_src == "codex":
-        info["login"] = _sh("codex login status 2>&1 | head -1")
-        info["limits"] = codex_limits()  # primary/secondary rate-limits
-    elif engine == "claude":
-        info["login"] = _sh("claude --version >/dev/null 2>&1 && echo 'CLI ok'")
-        info["note"] = "Claude CLI не отдаёт остаток лимитов через API — только версия/доступность."
-    else:
-        info["note"] = "У этого провайдера нет CLI-эндпоинта лимитов."
+    """Info for one provider, for the right-hand panel (limits where the CLI exposes them).
+    Shells out to `agent.sh provider-info <engine>`, which sources providers/<engine>/provider.sh
+    and calls its provider_<engine>_doctor — all per-engine logic lives in the plugin, not here."""
+    raw = run_sync(["provider-info", engine], timeout=25)
+    try:
+        info = json.loads(raw)
+    except ValueError:
+        info = {"engine": engine, "version": "NOT_FOUND", "available": False,
+                 "login": "", "limits": None, "note": "provider-info returned invalid JSON"}
+    info["now"] = time.time()
     return info
 
+def codex_limits():
+    """primary/secondary codex rate-limits only, via the same provider-info plugin path
+    (kept for the standalone /api/limits endpoint)."""
+    return provider_info("codex").get("limits")
+
 class H(BaseHTTPRequestHandler):
-    def log_message(self, *a):  # тихо
+    def log_message(self, *a):  # silent
         pass
 
     def _send(self, code, body, ctype="application/json"):
@@ -336,7 +322,7 @@ class H(BaseHTTPRequestHandler):
             if data.get("progress"): args += ["-p"]
             args.append(prompt)
             spawn(args, terminal=bool(data.get("terminal")))
-            if rdir:  # запомнить проект
+            if rdir:  # remember the project
                 pr = load_projects()
                 if rdir not in pr:
                     pr.append(rdir); save_projects(pr)
@@ -362,17 +348,17 @@ class H(BaseHTTPRequestHandler):
             self._send(404, "not found")
 
 class Srv(ThreadingHTTPServer):
-    allow_reuse_address = False  # чтобы поймать «уже запущен», а не поднять второй сервер поверх
+    allow_reuse_address = False  # so we detect "already running" instead of starting a second server on top
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
     url = "http://127.0.0.1:%d" % port
-    # Идемпотентность: GUI/логика общие для всех провайдеров. Если сервер уже поднят
-    # (другой агент/сам пользователь), НЕ падаем и не дублируем — открываем браузер на него.
+    # Idempotency: the GUI/logic are shared across all providers. If a server is already up
+    # (another agent/the user themself), DO NOT fail or duplicate it — just open the browser on it.
     try:
         srv = Srv(("127.0.0.1", port), H)
     except OSError:
-        print("[agent-gui] уже запущен на %s — открываю браузер" % url)
+        print("[agent-gui] already running at %s — opening browser" % url)
         try:
             import webbrowser; webbrowser.open(url)
         except Exception:

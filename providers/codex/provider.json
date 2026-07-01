@@ -1,0 +1,6 @@
+{
+  "label": "Codex",
+  "models": ["5.5", "5.5-high", "spark"],
+  "default_model": "5.5",
+  "limits": "codex"
+}

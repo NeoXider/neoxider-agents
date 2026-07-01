@@ -39,10 +39,10 @@ this project fills.
   whose rate-limit panel adapts to whichever provider is selected, a folder browser to
   add new projects, resizable panels, toast notifications with history, and an
   optional "open in a real terminal" checkbox per task.
-- **Config-driven providers.** Adding a provider to the picker (label, models,
-  whether it exposes rate limits) is a single edit to `providers.json` — no GUI code
-  change required. Wiring up how to actually *invoke* a new CLI is a small `case`
-  branch in `agent.sh`.
+- **Plugin providers.** Every CLI provider (invocation, model/effort resolution,
+  `doctor` info, and GUI display metadata) is one `providers/<name>/` directory —
+  adding a provider means creating that directory, with zero edits to `agent.sh`,
+  `gui.py`, or `gui.html`.
 
 ## Installation
 
@@ -116,19 +116,30 @@ doubles as the operating manual an AI agent reads before using this tool.
 
 ## Adding a provider
 
-1. Add an entry to `providers.json` (`label`, `models`, `limits`, `default_model`) —
-   the GUI's dropdown, model list, and adaptive rate-limit panel pick it up immediately.
-2. If the CLI needs special invocation (flags, resume syntax), add a `case` branch for
-   it in `agent.sh`'s `run`/`reply`.
+Create `providers/<name>/provider.sh` and `providers/<name>/provider.json` — nothing
+else needs to change. `agent.sh` auto-discovers and sources every `providers/*/provider.sh`
+at startup; `gui.py` glob-loads every `providers/*/provider.json` for display metadata.
 
-(A fully plugin-based provider system — one new file, zero edits to existing files —
-is planned; see [`TODO.md`](TODO.md).)
+- `provider.json`: `label`, `models`, `default_model`, `limits` (`"codex"`-style tag or
+  `null`) — picked up by the GUI's dropdown, model list, and rate-limit panel.
+- `provider.sh` defines a small function contract, named `provider_<name>_*`:
+  - `provider_<name>_resolve MODEL_ALIAS` (optional) — sets `P_MODEL`/`P_EFFORT` from an
+    alias. Providers without alias resolution (e.g. opencode/gemini today) can skip this;
+    the raw `-m` value is passed straight through.
+  - `provider_<name>_run_cmd DIR MODEL EFFORT PROMPT` — runs the CLI for a new task.
+  - `provider_<name>_resume_cmd DIR SESSION ANSWER` (optional) — resumes an existing
+    session for `reply`; omit it if the CLI has no resume/continue support.
+  - `provider_<name>_doctor` — prints one line of JSON to stdout:
+    `{"engine":...,"version":...,"available":true|false,"login":...,"limits":{...}|null,"note":...}`.
+
+See `providers/codex/` and `providers/claude/` for full worked examples (alias
+resolution, effort suffixes, and codex's rate-limit JSON parsing).
 
 ## Roadmap
 
-See [`TODO.md`](TODO.md) for planned work (provider plugin architecture, i18n,
-diff rendering, macOS support, etc.) and [`docs/IDEAS.md`](docs/IDEAS.md) for an
-open design question about subagents-spawning-subagents as a real tree.
+See [`TODO.md`](TODO.md) for planned work (i18n, diff rendering, macOS support, etc.)
+and [`docs/IDEAS.md`](docs/IDEAS.md) for an open design question about
+subagents-spawning-subagents as a real tree.
 
 ## Author
 

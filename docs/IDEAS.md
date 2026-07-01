@@ -33,3 +33,43 @@ If/when `TODO.md`'s macOS item is picked up, the terminal checkbox's `spawn(...,
 terminal=True)` needs a real "open a visible terminal window running this command"
 branch for Mac — likely `open -a Terminal.app <script>` or similar — mirroring what
 `CREATE_NEW_CONSOLE` does on Windows.
+
+## Concurrency safety when this tool is used from multiple places at once
+
+The design is intentionally provider-agnostic and installation-agnostic: `agent.sh` /
+`gui.py` don't care who invoked them — a human terminal, a Claude Code session, a
+Codex/opencode/Gemini agent, or several of those at once, all sharing the same
+`LOGDIR` (`~/.claude/agent-cli-logs` by default) so the GUI shows one unified tree
+regardless of source. That's the right shared-interface design (there's no need for
+per-provider silos — one dashboard is the whole point). But sharing one `LOGDIR`
+across concurrent, uncoordinated processes has two real gaps, found while thinking
+through "what if this skill is invoked from several agents/providers at the same
+time":
+
+1. **`meta_set`'s read-modify-write isn't atomic across processes.** It does
+   `grep -v "^key=" file > file.tmp && mv file.tmp file` — if two processes update the
+   *same* task's `.meta` around the same time (e.g. a GUI double-click firing two
+   `reply` calls, or a background poller reading while a run is mid-write), one write
+   can silently clobber the other's key (a classic read-modify-write race / lost
+   update). In the common case — one task, one writer at a time, sequential steps
+   within a single `run`/`reply` invocation — this never triggers. It's a real but
+   narrow edge case, worth a proper fix (e.g. wrap the read-modify-write in `flock` on
+   a per-task lock file) rather than a "someday" item, since it gets more likely the
+   more concurrent installs/agents point at the same `LOGDIR`.
+2. **Auto-generated task names can collide.** The default name is
+   `task-$(date +%Y%m%d-%H%M%S)` — two processes (from the same or different
+   tools/installs) starting within the same second get the *same* default name and
+   then race on the same `.meta`/`.log` files. Fix: make the default name
+   collision-resistant (append a short random suffix or the PID), or have `run`
+   check-and-retry if the target `.meta` already exists.
+
+Neither is implemented yet — noted here (rather than acted on immediately) because
+`agent.sh` was mid-refactor (provider-plugin migration) when this was written; do it
+as a small, focused follow-up once that refactor lands, to avoid two concurrent edits
+to the same file colliding — which would be a delightfully on-the-nose demonstration
+of exactly the problem described above.
+
+The `AGENT_CLI_LOGS` env var already gives a clean escape hatch for anyone who *wants*
+strict namespace isolation between installs (e.g. two people sharing a machine, or a
+"personal" vs "CI" split) — worth calling out explicitly in the README once the
+locking fix lands, rather than adding new namespacing machinery on top.

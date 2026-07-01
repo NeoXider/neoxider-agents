@@ -1,153 +1,165 @@
 ---
 name: cli-agents
-description: Делегирование задач CLI-сабагентам (Codex по умолчанию; также Claude Code, opencode, gemini) через обёртку agent.sh — запуск, выбор модели (gpt-5.5 medium по умолчанию, spark для тривиальных), ответы на вопросы агента через resume, логи.
+description: Delegating tasks to CLI subagents (Codex by default; also Claude Code, opencode, gemini) through the agent.sh wrapper — launching, model selection (gpt-5.5 medium by default, spark for trivial tasks), answering agent questions via resume, logs.
 ---
 
-# CLI-сабагенты (Codex-оркестрация)
+# CLI Subagents (Codex Orchestration)
 
-Для сабагентских задач используй **Codex CLI** через обёртку
-`C:\Users\User\.claude\skills\cli-agents\agent.sh` (git-bash). Claude-сабагентов (Agent tool)
-использовать только если задача требует контекста текущего разговора.
+For subagent tasks use **Codex CLI** through the wrapper
+`C:\Users\User\.claude\skills\cli-agents\agent.sh` (git-bash). Use Claude subagents (Agent tool)
+only if the task requires the context of the current conversation.
 
-## Команды
+## Commands
 
 ```bash
 SK=~/.claude/skills/cli-agents/agent.sh
-bash $SK run  -t fix-readme -C /c/Git/Proj "prompt" # codex, gpt-5.5 medium (дефолт); -t = имя задачи
-bash $SK run  -p -t big-job -C dir "prompt"         # -p: агент ведёт PROGRESS.md (резюмируемо после выключения)
-bash $SK run  -m spark -C /c/Git/Proj "prompt"      # тривиальная задача -> spark
-bash $SK run  -e claude -m haiku -C dir "prompt"    # другой CLI: claude/opencode/gemini
-bash $SK reply fix-readme "ответ"                   # продолжить задачу по имени (session/dir берутся из meta)
-bash $SK reply <session-uuid> "ответ"               # или по uuid; без аргумента — последняя задача
-bash $SK log  fix-readme                            # весь тред задачи (run + все reply одним файлом)
-bash $SK log  -f fix-readme                         # follow живого фонового агента (tail -f)
-bash $SK log  -l fix-readme                         # только последний шаг
-bash $SK last fix-readme                            # только последний ответ агента
-bash $SK status fix-readme                          # состояние: state/этап/изменённые файлы/нужен ли reply
-bash $SK list                                       # таблица: state / engine / model / возраст / files / session
-bash $SK doctor                                     # пре-флайт: движки + лимиты codex (перед фан-аутом!)
-bash $SK gui [port]                                 # веб-пульт над всеми провайдерами (по умолч. :8765)
+bash $SK run  -t fix-readme -C /c/Git/Proj "prompt" # codex, gpt-5.5 medium (default); -t = task name
+bash $SK run  -p -t big-job -C dir "prompt"         # -p: agent maintains PROGRESS.md (resumable after shutdown)
+bash $SK run  -m spark -C /c/Git/Proj "prompt"      # trivial task -> spark
+bash $SK run  -e claude -m haiku -C dir "prompt"    # a different CLI: claude/opencode/gemini
+bash $SK reply fix-readme "answer"                  # continue the task by name (session/dir taken from meta)
+bash $SK reply <session-uuid> "answer"              # or by uuid; with no argument — the last task
+bash $SK log  fix-readme                            # the entire task thread (run + all replies in one file)
+bash $SK log  -f fix-readme                         # follow a live background agent (tail -f)
+bash $SK log  -l fix-readme                         # only the last step
+bash $SK last fix-readme                            # only the agent's last answer
+bash $SK status fix-readme                          # state: state/stage/changed files/whether a reply is needed
+bash $SK list                                       # table: state / engine / model / age / files / session
+bash $SK doctor                                     # pre-flight: engines + codex limits (before fanning out!)
+bash $SK gui [port]                                 # web control panel over all providers (default :8765)
 ```
 
-**GUI (`agent.sh gui`).** Лёгкий локальный веб-пульт (python-stdlib, ноль зависимостей): дерево
-проект→сабагенты слева, чат с агентом (markdown + бабблы) в центре, запуск новой задачи и лимиты
-выбранного провайдера справа, кнопка `doctor` со всеми лимитами. Статусы кружком+эмодзи (✅⏳❌⚠️ +
-активность 📖✏️🔧💭 и тема задачи 🐛📖🧪…). Файлы: `gui.py` + `gui.html`.
-- **Идемпотентность**: GUI один на всех провайдеров, `LOGDIR` общий. Если сервер уже поднят на порту —
-  повторный `gui` не падает и не дублирует, а просто открывает браузер. Параллельные воркеры пишут
-  каждый в свой `<name>.meta/.log`, поэтому общий обзор безопасен.
-- **Дерево**: вложенность по `parent` (см. `-P`). Задача-родитель → её сабагенты с отступом.
-  Проекты = задачи ∪ явно зарегистрированные через 📂＋ (даже с 0 задач, `projects.json` в `LOGDIR`).
-  Активный проект — сверху и развёрнут; у каждого проекта свой скролл (`max-height`), поэтому большой
-  проект (много задач) не выталкивает остальные за пределы видимости.
-- **Нормализация путей**: GUI (нативный Windows python) и `agent.sh` (git-bash) по-разному пишут один
-  и тот же путь (`C:\Git\X` vs `C:/Git/X` vs `/c/Git/X`). `gui.py`'s `to_git_bash_path()` приводит
-  ЛЮБОЙ путь к unix-style (`/c/...`) в момент отправки в `-C` / сохранения в `projects.json` — иначе
-  задачи из GUI группировались бы отдельно от задач той же папки, запущенных из CLI.
-- **Провайдеры — конфиг, не код**: `providers.json` (label/models/limits/default_model) — дропдаун,
-  список моделей и адаптивная панель лимитов в GUI подхватывают новую запись без правки `gui.py`/`gui.html`.
-  Реальный запуск нового CLI всё равно требует `case`-ветку в `agent.sh` (синтаксис у каждого свой).
-- **Терминал**: чекбокс «открыть в терминале» (дефолт выключен) — при включении GUI спавнит `agent.sh`
-  в отдельном окне консоли (`CREATE_NEW_CONSOLE`), где виден живой вывод; без чекбокса — как обычно, тихо.
-- **Тосты + история**: любое завершение/ошибка/вопрос агента — всплывающее уведомление на 3с, плюс
-  история по 🔔 (persisted в localStorage). Универсальный CSS-спиннер (`.spinner`) — для doctor,
-  панели лимитов, кнопок run/reply на время запроса.
-- **Сплиттеры**: левая и правая панели тянутся мышью, ширина сохраняется в localStorage.
-- Запускать через `agent.sh gui` (проставляет путь к git-bash для python); прямой `python gui.py` тоже
-  работает — есть фолбэк на типовые пути git-bash.
+**GUI (`agent.sh gui`).** A lightweight local web control panel (python-stdlib, zero dependencies): a
+project→subagents tree on the left, a chat with the agent (markdown + bubbles) in the center, launching
+a new task and the selected provider's limits on the right, a `doctor` button with all the limits.
+Statuses as a circle+emoji (✅⏳❌⚠️ + activity 📖✏️🔧💭 and task topic 🐛📖🧪…). Files: `gui.py` + `gui.html`.
+- **Idempotency**: one GUI for all providers, `LOGDIR` is shared. If a server is already up on the port —
+  a repeated `gui` doesn't crash or duplicate it, it just opens the browser. Parallel workers each write
+  to their own `<name>.meta/.log`, so a shared overview is safe.
+- **Tree**: nesting by `parent` (see `-P`). A parent task → its subagents indented.
+  Projects = tasks ∪ explicitly registered ones via 📂＋ (even with 0 tasks, `projects.json` in `LOGDIR`).
+  The active project is on top and expanded; each project has its own scroll (`max-height`), so a large
+  project (many tasks) doesn't push the others out of view.
+- **Path normalization**: the GUI (native Windows python) and `agent.sh` (git-bash) write the same
+  path differently (`C:\Git\X` vs `C:/Git/X` vs `/c/Git/X`). `gui.py`'s `to_git_bash_path()` converts
+  ANY path to unix-style (`/c/...`) at the moment it's sent to `-C` / saved to `projects.json` — otherwise
+  tasks from the GUI would be grouped separately from tasks in the same folder launched from the CLI.
+- **Providers are plugins**: each CLI lives entirely under `providers/<name>/` — `provider.json`
+  (label/models/limits/default_model) drives the GUI's dropdown, model list, and adaptive limits
+  panel; `provider.sh` defines `provider_<name>_resolve`/`_run_cmd`/`_resume_cmd`/`_doctor`.
+  `agent.sh` auto-sources every `providers/*/provider.sh` and dispatches generically — adding a
+  new CLI is one new directory, zero edits to `agent.sh`/`gui.py`/`gui.html`.
+- **Terminal**: an "open in terminal" checkbox (off by default) — when enabled, the GUI spawns `agent.sh`
+  in a separate console window (`CREATE_NEW_CONSOLE`) where you can see live output; without the checkbox — as usual, silently.
+- **Toasts + history**: any completion/error/agent question — a popup notification for 3s, plus
+  history via 🔔 (persisted in localStorage). A universal CSS spinner (`.spinner`) — for doctor,
+  the limits panel, and the run/reply buttons while a request is in flight.
+- **Splitters**: the left and right panels can be dragged with the mouse, width is saved to localStorage.
+- Launch it via `agent.sh gui` (it sets the git-bash path for python); running `python gui.py` directly
+  also works — there's a fallback to typical git-bash paths.
 
-**Состояние задачи (state).** После каждого шага обёртка проставляет в `.meta`:
-`state` (`running`/`done`/`waiting`/`error`), `exit`-код, `files` (сколько файлов изменил агент по
-`git status`), `pid` и `started`. Иконки в `list`/`status`: `▶` running, `✔` done, `⏳` waiting,
+**Task state.** After every step the wrapper sets in `.meta`:
+`state` (`running`/`done`/`waiting`/`error`), the `exit` code, `files` (how many files the agent changed
+per `git status`), `pid`, and `started`. Icons in `list`/`status`: `▶` running, `✔` done, `⏳` waiting,
 `✖` error, `⚠` stalled.
 
-**Работает или завис (liveness).** `status`/`list` проверяют, жив ли процесс (`kill -0 pid`).
-Если `state=running`, но процесс мёртв (комп выключался / убит) → показывается `⚠ stalled` с подсказкой
-`agent.sh reply <name> "continue"`. Живой процесс — `▶ running (alive)`, следить: `agent.sh log -f <name>`.
+**Working or stuck (liveness).** `status`/`list` check whether the process is alive (`kill -0 pid`).
+If `state=running` but the process is dead (the machine was shut down / it was killed) → it shows
+`⚠ stalled` with the hint `agent.sh reply <name> "continue"`. A live process shows `▶ running (alive)`;
+to watch it: `agent.sh log -f <name>`.
 
-**Durable-чекпоинт (переживает выключение).** После каждого шага генерится `<name>.md` —
-человекочитаемый markdown: шапка (state/engine/session/dir/изменённые файлы/resume-команда) + весь тред.
-Плюс сами сессии codex/claude лежат на диске (`~/.codex/sessions`), поэтому даже после перезагрузки
-задача продолжается через `agent.sh reply <name> "continue"`. Для длинных задач флаг `-p` заставляет
-агента вести свой `PROGRESS.md` в рабочем каталоге и читать его при возобновлении.
+**Durable checkpoint (survives shutdown).** After every step a `<name>.md` is generated — a
+human-readable markdown file: a header (state/engine/session/dir/changed files/resume command) + the
+whole thread. Plus the codex/claude sessions themselves live on disk (`~/.codex/sessions`), so even
+after a reboot the task continues via `agent.sh reply <name> "continue"`. For long tasks the `-p` flag
+makes the agent maintain its own `PROGRESS.md` in the working directory and read it on resume.
 
-**Детект «агент спросил».** Если последние строки вывода похожи на вопрос, `state=waiting` и обёртка
-печатает `⏳ agent, похоже, ЗАДАЛ вопрос — ответь: agent.sh reply <name> "..."`. Так видно, что сабагент
-ждёт ответа, а не завис. `agent.sh status <name>` показывает сам вопрос и текущий этап работы.
+**"Agent asked a question" detection.** If the last lines of output look like a question, `state=waiting`
+and the wrapper prints `⏳ the agent appears to have ASKED a question — reply: agent.sh reply <name> "..."`.
+This makes it visible that the subagent is waiting for an answer rather than stuck. `agent.sh status <name>`
+shows the question itself and the current stage of work.
 
-**Пре-флайт `doctor`.** Перед запуском пачки сабагентов гоняй `agent.sh doctor`: проверяет наличие
-и версии CLI (codex/claude/opencode/gemini), логин codex и **остаток лимитов** codex — primary (5h-окно)
-и secondary (недельное) с % и временем до сброса (из session-jsonl). При >80% печатает предупреждение —
-тогда фан-аут лучше притормозить.
+**Pre-flight `doctor`.** Before launching a batch of subagents, run `agent.sh doctor`: it checks the
+presence and versions of the CLIs (codex/claude/opencode/gemini), codex login, and codex's **remaining
+limits** — primary (5h window) and secondary (weekly) with % and time until reset (from session-jsonl).
+At >80% it prints a warning — in that case it's better to throttle the fan-out.
 
-**Модель «тред на задачу»**: каждый `run` создаёт `<name>.log` (полный транскрипт) и `<name>.meta`
-(engine/model/dir/session). Все `reply` ДОПИСЫВАЮТСЯ в тот же `<name>.log` с заголовками
-`========== [run|reply] ... ==========`, поэтому весь диалог читается одним файлом и тобой, и
-пользователем. `reply <name>` сам достаёт session id и каталог из meta — `-C` указывать не нужно.
+**"One thread per task" model**: every `run` creates a `<name>.log` (full transcript) and a `<name>.meta`
+(engine/model/dir/session). All `reply` calls are APPENDED to that same `<name>.log` with headers
+`========== [run|reply] ... ==========`, so the whole dialogue can be read as a single file by both you
+and the user. `reply <name>` fetches the session id and directory from meta by itself — there's no need
+to specify `-C`.
 
-Запускать можно в фоне (`run_in_background`) — stdin в скрипте закрыт, агент не зависнет на вводе.
-Пока агент работает в фоне — следи за ним через `agent.sh log -f <name>`.
-НИКОГДА не вызывай `codex exec` без `</dev/null` вне этой обёртки.
+It can be run in the background (`run_in_background`) — stdin is closed in the script, so the agent
+won't hang waiting for input. While the agent is working in the background — watch it via
+`agent.sh log -f <name>`.
+NEVER call `codex exec` without `</dev/null` outside this wrapper.
 
-Ловушки (проверено):
-- `reply` всегда вызывай с именем задачи (`-t` при run) или session id — без аргумента берётся
-  последняя задача, что ОПАСНО при параллельных воркерах (попадёшь в чужую сессию).
-- `reply <name>` сам делает `cd` в каталог задачи из meta (cwd resume-сессии = cwd процесса).
-- Давай задаче осмысленное имя через `-t` — иначе имя будет `task-<timestamp>`.
+Gotchas (verified):
+- Always call `reply` with the task name (`-t` at run time) or the session id — with no argument it
+  picks up the last task, which is DANGEROUS with parallel workers (you'll end up in someone else's
+  session).
+- `reply <name>` does its own `cd` into the task's directory from meta (the resume session's cwd = the
+  process's cwd).
+- Give the task a meaningful name via `-t` — otherwise the name will be `task-<timestamp>`.
 
-## Выбор модели
+## Model selection
 
-**Codex** (`-e codex`, дефолтный engine):
+**Codex** (`-e codex`, the default engine):
 
-| Алиас | Модель | Когда |
+| Alias | Model | When |
 |---|---|---|
-| `5.5` (дефолт) | `gpt-5.5`, effort medium | обычные задачи |
-| `5.5-high` | `gpt-5.5`, effort high | сложнее обычного (редко; большое лучше делать самому) |
-| `spark` / `5.3` | `gpt-5.3-codex-spark` | очень простые: переименования, мелкие правки текста/доков, однострочные фиксы |
+| `5.5` (default) | `gpt-5.5`, effort medium | regular tasks |
+| `5.5-high` | `gpt-5.5`, effort high | harder than usual (rare; big stuff is better done yourself) |
+| `spark` / `5.3` | `gpt-5.3-codex-spark` | very simple: renames, minor text/docs edits, one-line fixes |
 
-Если пользователь явно называет модель («codex spark 5.3», «5.5») — используй её.
-`gpt-5.5-codex` на этом ChatGPT-аккаунте НЕ доступен — только `gpt-5.5`.
+If the user explicitly names a model ("codex spark 5.3", "5.5") — use that one.
+`gpt-5.5-codex` is NOT available on this ChatGPT account — only `gpt-5.5`.
 
 **Claude** (`-e claude`):
 
-| Алиас | Модель / effort | Когда |
+| Alias | Model / effort | When |
 |---|---|---|
-| `sonnet` (дефолт) | `claude-sonnet-5`, effort **high** | обычные задачи — новый Sonnet 5, дефолт по запросу пользователя |
-| `sonnet-medium` / `sonnet-low` | `claude-sonnet-5`, effort medium/low | подешевле/побыстрее, когда high избыточен |
-| `opus` / `haiku` | без явного effort (CLI-дефолт) | opus — сложнее обычного; haiku — тривиальные задачи |
+| `sonnet` (default) | `claude-sonnet-5`, effort **high** | regular tasks — the new Sonnet 5, default per the user's request |
+| `sonnet-medium` / `sonnet-low` | `claude-sonnet-5`, effort medium/low | cheaper/faster, when high is overkill |
+| `opus` / `haiku` | no explicit effort (CLI default) | opus — harder than usual; haiku — trivial tasks |
 
-Общий паттерн: `<model>-<effort>` (low/medium/high/xhigh/max) на любом алиасе переопределяет effort,
-например `opus-high`. Реализация — `claude_model_args()` в `agent.sh`.
+General pattern: `<model>-<effort>` (low/medium/high/xhigh/max) on any alias overrides the effort,
+e.g. `opus-high`. Implementation — `provider_claude_resolve()` in `providers/claude/provider.sh`.
 
-## Правила постановки задач
+## Rules for setting tasks
 
-- **Маленькие, точно выполнимые задачи**: один файл/одна тема, точные пути, точные сигнатуры,
-  «сделай ровно это, ничего больше». Не давать агентам задач с безопасностью/архитектурой «на подумать».
-- В каждом промпте: **"Do NOT run git commit"** (коммитит только оркестратор после проверки).
-- После каждого воркера проверять `git diff` его файлов; компиляцию/тесты гонит оркестратор.
-- Параллельные воркеры — только по непересекающимся файлам.
-- Секреты/токены в промпты не включать.
+- **Small, precisely doable tasks**: one file/one topic, exact paths, exact signatures,
+  "do exactly this, nothing more." Don't hand agents tasks with security/architecture decisions "to
+  think over."
+- In every prompt: **"Do NOT run git commit"** (only the orchestrator commits, after verification).
+- After every worker, check the `git diff` of its files; the orchestrator runs the build/tests.
+- Parallel workers — only on non-overlapping files.
+- Do not include secrets/tokens in prompts.
 
-## Для пользователя (запуск из терминала)
+## For the user (launching from a terminal)
 
-Удобный алиас (git-bash, добавить в `~/.bashrc`):
+A handy alias (git-bash, add to `~/.bashrc`):
 
 ```bash
 alias agent='bash ~/.claude/skills/cli-agents/agent.sh'
-# agent run -t readme -C /c/Git/CoreAI "поправь опечатку в README"
-# agent log -f readme     # смотреть, что делает агент, в реальном времени
-# agent last readme       # короткий итог: последний ответ агента
-# agent reply readme "ещё поправь CHANGELOG"   # дописать сообщение в ту же сессию
+# agent run -t readme -C /c/Git/CoreAI "fix the typo in the README"
+# agent log -f readme     # watch what the agent is doing, in real time
+# agent last readme       # short summary: the agent's last answer
+# agent reply readme "also fix the CHANGELOG"   # append a message to the same session
 ```
 
-## Готовые аналоги (ресёрч, 2026-07)
+## Ready-made analogues (research, 2026-07)
 
-Готового инструмента под эту headless-нишу (launch → per-task log → reply/resume → machine-readable
-state) нет — все зрелые «менеджеры» (claude-squad, vibe-kanban, uzi, crystal) заточены под интерактивную
-параллельную разработку в git-worktree с TUI/GUI. Своя обёртка оправдана. Идеи для заимствования:
-- **CCManager** (github.com/kbwo/ccmanager) — лучший 4-state детект «ждёт ввода» с per-CLI паттернами и
-  status-hooks; мульти-провайдер. Если детект вопросов начнёт врать — сверить паттерны с ним.
-- **caut** (github.com/Dicklesworthstone/coding_agent_usage_tracker) — обобщённый `doctor`: лимиты по
-  16+ провайдерам, JSON/Markdown-вывод. Можно шеллить вместо своего codex-парсера (нужен cargo).
-- Ближайшие по духу bash-обёртки: **sage**, **Agent AFK**, **agx** (checkpoint wake/work/sleep) — мелкие,
-  но полезны как источник идей.
+There's no ready-made tool for this headless niche (launch → per-task log → reply/resume →
+machine-readable state) — all the mature "managers" (claude-squad, vibe-kanban, uzi, crystal) are
+built for interactive parallel development in a git worktree with a TUI/GUI. A custom wrapper is
+justified. Ideas worth borrowing:
+- **CCManager** (github.com/kbwo/ccmanager) — the best 4-state "waiting for input" detection with
+  per-CLI patterns and status hooks; multi-provider. If question detection starts lying — compare
+  patterns with it.
+- **caut** (github.com/Dicklesworthstone/coding_agent_usage_tracker) — a generalized `doctor`: limits
+  across 16+ providers, JSON/Markdown output. Could be shelled out to instead of our own codex parser
+  (requires cargo).
+- The closest bash wrappers in spirit: **sage**, **Agent AFK**, **agx** (checkpoint wake/work/sleep) —
+  small, but useful as a source of ideas.

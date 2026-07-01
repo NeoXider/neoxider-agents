@@ -6,33 +6,25 @@ Roughly in priority order. PRs welcome.
 
 - [x] **Model name isn't resolved in the UI.** Fixed — `run`/`reply` now overwrite
   `<name>.meta`'s `model=` with the resolved model+effort (e.g. `claude-sonnet-5-high`,
-  `gpt-5.3-codex-spark-medium`) right after `codex_model_args`/`claude_model_args`
+  `gpt-5.3-codex-spark-medium`) right after `provider_codex_resolve`/`provider_claude_resolve`
   run, instead of the raw alias/`"default"`. opencode/gemini still show `"default"`
-  when no `-m` was given (they have no alias-resolution layer to resolve against —
-  matches the provider-plugin architecture item below).
+  when no `-m` was given (they have no `provider_<name>_resolve` alias-resolution function —
+  see the provider plugin architecture below).
 
 ## Provider plugin architecture
 
-Today adding a provider means editing `providers.json` (display) *and* a `case` branch in
-`agent.sh` (invocation) *and* (for rate limits) a branch in `gui.py`'s `provider_info()`.
-Goal: **one new file, zero edits to existing files.**
-
-Status: **in progress** (`providers/<name>/provider.sh` + `provider.json`,
-`agent.sh provider-info <engine>` — being migrated now). Design below for reference.
-- `providers/<name>/provider.sh` — sourced by `agent.sh` at startup (`for f in
-  providers/*/provider.sh; do source "$f"; done`). Defines a small contract of functions
-  per provider: `provider_<name>_args` (alias→model+effort resolution), `provider_<name>_run_cmd`,
-  `provider_<name>_resume_cmd`, `provider_<name>_doctor` (prints version/login/limits as JSON).
-- `providers/<name>/provider.json` — display metadata (label, models, default_model,
-  whether it has rate limits). `gui.py` glob-loads `providers/*/provider.json` instead of
-  one big file.
-- New subcommand `agent.sh provider-info <engine>` calls `provider_<engine>_doctor` and
-  prints JSON. `agent.sh doctor` becomes "loop over discovered providers, call
-  `provider-info` for each, pretty-print." `gui.py`'s `/api/provider` just shells out to
-  `provider-info` instead of hardcoding per-engine logic in Python.
+- [x] **Done.** Adding a provider now means creating `providers/<name>/provider.sh` +
+  `providers/<name>/provider.json`, with zero edits to `agent.sh`/`gui.py`/`gui.html`.
+  `agent.sh` sources every `providers/*/provider.sh` at startup and dispatches `run`/`reply`
+  generically via `declare -F provider_<engine>_run_cmd` / `_resume_cmd`. `agent.sh
+  provider-info <engine>` calls `provider_<engine>_doctor` (single-line JSON); `doctor` loops
+  over discovered providers and pretty-prints the same way as before. `gui.py` glob-loads
+  `providers/*/provider.json` for display metadata and shells out to `provider-info` for
+  `/api/provider` instead of hardcoding per-engine Python. `providers.json` was deleted
+  (fully superseded). The 4 existing providers (codex/claude/opencode/gemini) were migrated
+  with identical CLI flags, effort resolution, and rate-limit JSON shape.
 - This also fixes "doctor and the per-provider limits panel should go through one path
-  and be cached together" — see Caching below.
-- Migrate the existing 4 providers (codex/claude/opencode/gemini) into this shape.
+  and be cached together" — see Caching below (caching itself is still open).
 
 ## GUI
 
