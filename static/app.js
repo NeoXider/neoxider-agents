@@ -144,6 +144,7 @@ $("#api-goal").addEventListener("input", apiSnippets);
     $("#api-engine").innerHTML = ENGINES.map(e => `<option value="${e}">${esc((PROVIDERS[e] || {}).label || e)}</option>`).join("");
     syncApiModels();
   }
+  applyApiFieldDefaults();
   apiSnippets();
   switchTab(savedTab);
 

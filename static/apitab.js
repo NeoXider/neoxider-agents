@@ -123,6 +123,17 @@ async function refreshApiTab() {
   }
 }
 
+/* The base URL/goal fields only had placeholder text -- clicking "run" with nothing typed
+   just showed a "base URL + goal required" toast, which reads as the button being broken
+   rather than as a hint to fill in two fields. Pre-fill the placeholder text as real starter
+   values (once, at load, only if the field is still empty) so the button works immediately
+   as a runnable example the user can edit for their own server. */
+function applyApiFieldDefaults() {
+  const urlEl = $("#api-url"), goalEl = $("#api-goal");
+  if (urlEl && !urlEl.value.trim() && urlEl.placeholder) urlEl.value = urlEl.placeholder;
+  if (goalEl && !goalEl.value.trim() && goalEl.placeholder) goalEl.value = goalEl.placeholder;
+}
+
 function apiSnippets() {
   const url = $("#api-url").value.trim() || "http://127.0.0.1:PORT";
   const goal = ($("#api-goal").value.trim() || "...").replace(/"/g, '\\"');
