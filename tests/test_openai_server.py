@@ -323,6 +323,116 @@ class FuncCallSyntaxTests(unittest.TestCase):
         self.assertEqual(text, 'world_command(action="spawn", x=1)')
 
 
+class PositionalJsonArgTests(unittest.TestCase):
+    """The `name({...})` spelling: a single positional JSON object instead of name=value pairs.
+    This is gpt-5.5's DOMINANT spelling (literally how an OpenAI SDK call is written) -- before
+    it was accepted, every such line was silently dropped as prose, which zeroed whole benchmark
+    groups (G5 went 0/6 with tools=0 on runs whose transcripts contained perfectly good calls)."""
+
+    NAMES = {"world_command", "execute_lua"}
+    TOOLS = [
+        {"type": "function", "function": {
+            "name": "world_command",
+            "parameters": {"type": "object", "properties": {
+                "action": {"type": "string"}, "targetName": {"type": "string"},
+                "prefabKey": {"type": "string"}, "x": {"type": "number"},
+                "y": {"type": "number"}, "z": {"type": "number"}}}}},
+        {"type": "function", "function": {
+            "name": "execute_lua",
+            "parameters": {"type": "object", "properties": {"code": {"type": "string"}}}}},
+    ]
+
+    def test_single_positional_json_object_recovered(self):
+        text = 'world_command({"action":"spawn","prefabKey":"Cube","targetName":"Enemy1"})'
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"action": "spawn", "prefabKey": "Cube", "targetName": "Enemy1"})
+        self.assertEqual(cleaned, "")
+
+    def test_positional_json_with_typed_values(self):
+        text = 'world_command({"action":"spawn","targetName":"Enemy1","prefabKey":"sphere","x":3,"y":0.5,"z":-3})'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        a = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(a["x"], 3)
+        self.assertEqual(a["y"], 0.5)
+        self.assertEqual(a["z"], -3)
+
+    def test_multiple_positional_json_call_lines_all_recovered(self):
+        # Verbatim shape from a live gpt-5.5 G3 "Balanced enemy HP" run that scored tools=0.
+        text = (
+            'world_command({"action":"spawn","prefabKey":"Cube","targetName":"Enemy1"})\n'
+            'world_command({"action":"spawn","prefabKey":"Cube","targetName":"Enemy2"})\n'
+            'world_command({"action":"spawn","prefabKey":"Cube","targetName":"Enemy3"})\n'
+            'world_command({"action":"spawn","prefabKey":"Cube","targetName":"Enemy4"})\n'
+            'execute_lua({"code":"logic_define(\'enemy_hp\', function(name)\\n  local hp = '
+            '{\\n    Enemy1 = 50,\\n    Enemy2 = 75,\\n    Enemy3 = 125,\\n    Enemy4 = 150\\n  }'
+            '\\n  return hp[name]\\nend)"})'
+        )
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 5)
+        self.assertEqual([c["function"]["name"] for c in calls],
+                         ["world_command"] * 4 + ["execute_lua"])
+        self.assertIn("logic_define", json.loads(calls[4]["function"]["arguments"])["code"])
+        self.assertEqual(cleaned, "")
+
+    def test_positional_json_whose_string_contains_equals_and_parens(self):
+        text = ('execute_lua({"code":"logic_define(\'win\', function(s) return s >= 100 end)"})')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["code"],
+                         "logic_define('win', function(s) return s >= 100 end)")
+
+    def test_positional_scalar_maps_onto_single_parameter_function(self):
+        calls, _ = srv.extract_tool_calls('execute_lua("print(1)")', self.NAMES, self.TOOLS)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"code": "print(1)"})
+
+    def test_positional_scalar_not_mapped_for_multi_parameter_function(self):
+        # world_command has many parameters -- a bare scalar has no safe mapping.
+        calls, cleaned = srv.extract_tool_calls('world_command("spawn")', self.NAMES, self.TOOLS)
+        self.assertIsNone(calls)
+        self.assertEqual(cleaned, 'world_command("spawn")')
+
+    def test_malformed_json_object_arg_is_not_double_wrapped_into_sole_param(self):
+        # An invalid {...} blob is a FAILED shape-2 parse; stuffing it into "code" would
+        # double-wrap it into nonsense Lua, so it must stay unparsed prose instead.
+        text = 'execute_lua({"code": "line1\nline2"})'  # literal newline inside a JSON string
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertIsNone(calls)
+        self.assertEqual(cleaned, text)
+
+    def test_prose_around_positional_json_lines_is_kept_as_display_text(self):
+        text = ('Spawning the gate now.\n'
+                'world_command({"action":"spawn","targetName":"Gate","prefabKey":"cube"})\n'
+                'Done.')
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Spawning the gate now.", cleaned)
+        self.assertIn("Done.", cleaned)
+        self.assertNotIn("world_command(", cleaned)
+
+    def test_works_without_tools_schema_for_object_args(self):
+        # The schema map is only needed for the scalar mapping; a positional JSON OBJECT must
+        # parse with names alone (old call sites that never pass `tools`).
+        text = 'world_command({"action":"spawn","targetName":"Key","prefabKey":"Cube"})'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES)
+        self.assertEqual(len(calls), 1)
+
+
+class ToolParamNamesTests(unittest.TestCase):
+    def test_extracts_property_names_per_function(self):
+        tools = [{"type": "function", "function": {
+            "name": "f", "parameters": {"type": "object", "properties": {"a": {}, "b": {}}}}}]
+        self.assertEqual(srv.tool_param_names(tools), {"f": ["a", "b"]})
+
+    def test_bare_shape_and_missing_parameters_tolerated(self):
+        tools = [{"name": "g"}]
+        self.assertEqual(srv.tool_param_names(tools), {"g": []})
+
+    def test_none_and_junk_entries_ignored(self):
+        self.assertEqual(srv.tool_param_names(None), {})
+        self.assertEqual(srv.tool_param_names(["junk", 42, {}]), {})
+
+
 class IsExtensionTests(unittest.TestCase):
     """is_extension is THE deterministic check that decides whether a call continues the
     existing CLI session (via `agent.sh reply`) or falls back to a brand-new one -- this is

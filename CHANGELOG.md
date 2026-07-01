@@ -6,6 +6,20 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- openai-server: the Format-2 call parser now accepts a single positional JSON object argument —
+  `world_command({"action":"spawn","targetName":"Enemy1"})` — in addition to `name=value` pairs.
+  This is gpt-5.5's DOMINANT spelling (literally how an OpenAI SDK call is written); before this,
+  every such line was silently dropped as prose, which zeroed whole CoreAI benchmark groups
+  (a live gpt-5.5 run scored G5 50/100 with 4 scenarios at `tools=0` whose transcripts contained
+  perfectly good calls — replaying the fixed parser over those exact captured outputs recovers
+  10/10 previously-dropped call-shaped messages, 0 still dropped). A single positional SCALAR now
+  also maps onto the function's sole parameter when the OpenAI `tools` JSON schema says it has
+  exactly one (`execute_lua("print(1)")` → `{"code":"print(1)"}`); a scalar that looks like a
+  failed `{...}` parse is deliberately NOT wrapped that way (would double-wrap into nonsense).
+  New `tool_param_names()` helper; `extract_tool_calls()` takes an optional `tools=` argument
+  (old call sites without it keep working). `TOOLCALL_INSTRUCTIONS` documents the accepted
+  spelling. +12 parser tests (79 total), including verbatim shapes from the live failing run.
+
 - Security/correctness hardening (the bridge is now genuinely a chat-only completion endpoint,
   not just "a CLI told not to use its other tools"): every subprocess the bridge launches now gets
   `AGENT_CHAT_ONLY=1` in its env, which `providers/{codex,claude}/provider.sh` react to with REAL

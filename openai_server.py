@@ -344,9 +344,10 @@ Decide ONE of:
 ```json
 {"tool_calls":[{"name":"<fn>","arguments":{...}},{"name":"<fn>","arguments":{...}}]}
 ```
-    Format 2 -- one literal call per line (arguments as name=value, strings quoted):
+    Format 2 -- one literal call per line, arguments either as name=value pairs or as a single
+    JSON object (both spellings below are accepted):
     <fn>(arg="text", num=1.5, flag=true)
-    <fn>(arg="other", num=2)
+    <fn>({"arg": "other", "num": 2})
 
 Both formats are parsed identically. Do NOT wrap Format 2 in prose -- just the call line(s).
 """
@@ -376,6 +377,24 @@ def tool_names(tools):
         if n:
             names.add(n)
     return names
+
+
+def tool_param_names(tools):
+    """{function name: [parameter property names...]} from an OpenAI `tools` array's JSON
+    schemas. Used by extract_func_calls to map a SINGLE positional scalar argument onto a
+    one-parameter function (e.g. `execute_lua("print(1)")` -> {"code": "print(1)"}) -- with
+    more than one parameter there is no safe mapping, so a positional scalar stays unparsed."""
+    out = {}
+    for t in tools or []:
+        if not isinstance(t, dict):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        n = fn.get("name")
+        if not n:
+            continue
+        props = ((fn.get("parameters") or {}).get("properties") or {})
+        out[n] = [k for k in props if isinstance(k, str)]
+    return out
 
 
 def _parse_arg_value(v):
@@ -427,7 +446,7 @@ def _split_top_level(s, sep=","):
     return out
 
 
-def extract_func_calls(text, names):
+def extract_func_calls(text, names, params=None):
     """Fallback tool-call syntax: CLI agents (codex especially) tend to emit calls as literal
     `name(arg=value, arg=value)` lines -- the way they'd WRITE a call in code -- instead of the
     prompted `{"tool_calls":[...]}` JSON block, so the JSON reparser missed a model that had
@@ -435,7 +454,17 @@ def extract_func_calls(text, names):
     tool `names` (gate against false positives on prose), parenthesis-balanced and quote-aware,
     and returns [(name, args_dict), ...] plus the (start,end) span of each so the caller can
     strip them from the display text. Empty-paren mentions (`world_command()`) are treated as
-    prose, not calls."""
+    prose, not calls.
+
+    Accepted argument spellings, in order of preference:
+      1. name=value pairs:            world_command(action="spawn", x=1)
+      2. one positional JSON object:  world_command({"action": "spawn", "x": 1})
+         (gpt-5.5's dominant spelling -- literally how you'd write the call in an OpenAI SDK;
+         dropping it silently zeroed whole benchmark groups before this was accepted)
+      3. one positional scalar, ONLY when `params` says the function takes exactly one
+         parameter: execute_lua("print(1)") -> {"code": "print(1)"}. A scalar that itself
+         looks like a JSON-object blob is NOT wrapped this way -- that is shape 2 that failed
+         to parse, and stuffing it into the sole parameter would double-wrap it."""
     if not names:
         return [], []
     found, spans = [], []
@@ -472,6 +501,16 @@ def extract_func_calls(text, names):
                 continue  # positional/garbled segment -> skip rather than guess
             args[k] = _parse_arg_value(val)
         if not args:
+            val = _parse_arg_value(inner.strip())
+            if isinstance(val, dict):
+                # One positional JSON object -> it IS the arguments dict.
+                args = {k: v for k, v in val.items() if isinstance(k, str)}
+            else:
+                props = (params or {}).get(name) or []
+                looks_like_failed_object = isinstance(val, str) and val.lstrip().startswith("{")
+                if len(props) == 1 and not looks_like_failed_object:
+                    args = {props[0]: val}
+        if not args:
             continue  # nothing parsed cleanly -> most likely prose that happened to match
         found.append((name, args))
         spans.append((m.start(), j + 1))
@@ -492,12 +531,14 @@ def _to_calls(raw_calls):
     return out or None
 
 
-def extract_tool_calls(text, names=None):
+def extract_tool_calls(text, names=None, tools=None):
     """Best-effort: look for fenced ```json {"tool_calls":[...]} ``` block(s) (the LAST one
     that yields a non-empty call list wins, in case the agent narrates before committing to
     its final answer), falling back to a bare (unfenced) JSON object if that's the whole
-    trailing message, and finally to literal `name(arg=value, ...)` call syntax for any known
-    tool `names` (see extract_func_calls -- codex CLI emits this instead of the JSON block).
+    trailing message, and finally to literal `name(arg=value, ...)` / `name({...})` call
+    syntax for any known tool `names` (see extract_func_calls -- codex CLI emits these
+    instead of the JSON block). Pass the original `tools` array too when available: its JSON
+    schemas let a single positional scalar map onto a one-parameter function.
     Returns (tool_calls_or_None, display_text).
 
     Every fenced block that parses as a dict containing a "tool_calls" key is stripped from
@@ -533,7 +574,7 @@ def extract_tool_calls(text, names=None):
             except ValueError:
                 pass
     if calls is None and names:
-        found, spans = extract_func_calls(cleaned, names)
+        found, spans = extract_func_calls(cleaned, names, tool_param_names(tools))
         if found:
             calls = [{"id": "call_%s" % uuid.uuid4().hex[:24], "type": "function",
                       "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}}
@@ -634,7 +675,7 @@ class H(BaseHTTPRequestHandler):
             SESSION["task_name"] = name
             SESSION["messages"] = messages
             SESSION["last_activity"] = time.time()
-        tool_calls, text = extract_tool_calls(raw_text, tool_names(tools))
+        tool_calls, text = extract_tool_calls(raw_text, tool_names(tools), tools)
         return text, tool_calls
 
     def _reset_session(self):
