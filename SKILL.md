@@ -90,9 +90,7 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
 - **`usage` token counts are always `0/0/0`** — don't trust them for cost tracking.
 - **`content` can include raw CLI chrome for `codex`** (startup banner/session-id/
   error-log lines mixed into the answer, same as `agent.sh last` shows for codex
-  tasks) — prefer `claude`/`opencode`/`gemini` when a clean answer string matters. Also
-  note: `codex`'s own resume command doesn't forward `--effort`/model flags, so a
-  resumed `codex` session may silently run at a different effort than it started with.
+  tasks) — prefer `claude`/`opencode`/`gemini` when a clean answer string matters.
 - One process = one fixed engine/model/effort for its whole lifetime. To compare
   models, run the command again with different `-e/-m/-f/-p` on another port.
 

@@ -6,6 +6,16 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- Fix: `codex` sessions resumed via `agent.sh reply` silently drifted to a different
+  model/effort than they started with (a `-m spark` session came back as `gpt-5.5` on
+  resume) — `codex exec resume` does support `-m`/`-c model_reasoning_effort=`
+  (confirmed via `--help`), it just wasn't being forwarded.
+  `provider_codex_resume_cmd` now passes both, matching `claude`'s existing resume
+  behavior (`PROVIDER_CODEX_RESUME_NEEDS_MODEL=1`). Verified live: the resumed
+  session's own banner correctly reports the original model/effort after the fix.
+  Caveat: a bare `reply` with no explicit `-m` still resolves to the provider's
+  default rather than the task's original model — this was already true for
+  `claude` and is now consistent for `codex` too.
 - New `tests/live_smoke_openai_server.py`: a standalone, deliberately-manual end-to-end
   smoke test for `openai_server.py` against a real CLI subagent (not part of the fast
   unit suites, since it costs real subscription usage) — health/error responses, a

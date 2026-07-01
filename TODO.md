@@ -198,12 +198,17 @@ Roughly in priority order. PRs welcome.
   with zero cross-contamination. `SESSION_LOCK` serializes overlapping requests, and
   since the second request's messages don't extend the first's, it correctly falls
   back to its own fresh session rather than corrupting or blocking on the first's.
-- [x] **Documented `codex` resume-effort quirk.** Done — `agent.sh`'s
-  `provider_codex_resume_cmd` does not forward the `--effort`/model flags on resume
-  (unlike `claude`, which needs and gets them re-sent), so a resumed `codex` session may
-  silently run at a different reasoning effort than the one it started with. Pre-
-  existing `agent.sh`/codex characteristic, not a bug in this bridge — documented, no
-  fix needed or possible from the bridge's side.
+- [x] **Fixed `codex` resume model/effort drift (was: documented as unfixable).**
+  Reopened and actually fixed — `codex exec resume --help` confirms it DOES accept
+  `-m`/`-c model_reasoning_effort=`, unlike what was assumed earlier.
+  `provider_codex_resume_cmd` now forwards both (`PROVIDER_CODEX_RESUME_NEEDS_MODEL=1`,
+  mirroring `claude`'s existing resume behavior). Verified live: a `-m spark` session
+  was silently running under `gpt-5.5` on resume before the fix; after the fix, the
+  resumed session's own banner correctly reports `model: gpt-5.3-codex-spark` and the
+  original reasoning effort. Caveat noted in `agent.sh`: a bare `reply` with no
+  explicit `-m` still resolves to the provider's default alias, not the task's
+  original model — callers needing a guaranteed-stable model (like `openai_server.py`)
+  must keep passing `-m`/`-f` explicitly on every reply, which it already does.
 - [x] **Idle session expiry (`--session-ttl`).** Done — a session untouched longer than
   `--session-ttl` seconds (default 1800 = 30 min) is treated exactly like a dead one:
   the next call falls back to a fresh `agent.sh run` with the full history instead of

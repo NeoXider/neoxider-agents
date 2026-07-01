@@ -282,12 +282,13 @@ about this before pointing anything at it:
 - **One process = one fixed engine/model/effort** for its whole lifetime. To compare
   models/providers side by side, or serve several at once, just run the command again
   with different `-e/-m/-f/-p` in another terminal — no built-in multi-server manager.
-- **Known quirk on `codex` resume**: `agent.sh`'s `provider_codex_resume_cmd` does not
-  forward the `--effort`/model flags on resume (unlike `claude`, which needs and gets
-  them re-sent) — so a resumed `codex` session may silently run at a different
-  reasoning effort than the one the session started with. This is a pre-existing
-  `agent.sh`/codex characteristic, not a bug in this bridge; there is no fix from the
-  bridge's side.
+- **`codex` resume preserves its pinned model/effort.** `codex exec resume` accepts
+  `-m`/`-c model_reasoning_effort=` just like `codex exec` does — `provider_codex_resume_cmd`
+  now forwards both (matching `claude`'s resume, which already needed and got them
+  re-sent). Fixed a real drift found live: a session started with `-m spark` was
+  silently running under `gpt-5.5` on resume before this fix. Verified live after the
+  fix: the resumed session's own banner correctly reported `model: gpt-5.3-codex-spark`
+  and `reasoning effort: medium`, matching what the session started with.
 
 **Motivating use case** — CoreAI's Unity Game-Creation Benchmark can point its live
 PlayMode test suite at any OpenAI-compatible provider via env vars. This design is a

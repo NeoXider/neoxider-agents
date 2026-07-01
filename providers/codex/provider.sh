@@ -2,6 +2,12 @@
 # Contract: provider_codex_resolve, provider_codex_run_cmd, provider_codex_resume_cmd,
 # provider_codex_doctor. See ../../agent.sh for the dispatch that calls these.
 
+# `codex exec resume` DOES accept -m/--model and -c model_reasoning_effort=... (confirmed via
+# `codex exec resume --help`, codex-cli 0.130.0) -- without forwarding them, a resumed session
+# silently drifted to whatever codex's own default is (observed live: a session started with
+# `-m spark` came back reporting `model: gpt-5.5` on resume). Opting in here like claude does.
+PROVIDER_CODEX_RESUME_NEEDS_MODEL=1
+
 # alias -> real model + effort. Sets globals P_MODEL / P_EFFORT (P_EFFORT may be empty).
 provider_codex_resolve() {
     local alias="${1:-5.5}"; P_EFFORT="medium"
@@ -21,11 +27,16 @@ provider_codex_run_cmd() {
         "$prompt" </dev/null 2>&1
 }
 
-# provider_codex_resume_cmd DIR SESSION ANSWER — resumes an existing session.
+# provider_codex_resume_cmd DIR SESSION ANSWER — resumes an existing session. $P_MODEL/$P_EFFORT
+# are set by agent.sh's provider_dispatch_resume just before this runs (PROVIDER_CODEX_RESUME_NEEDS_MODEL=1
+# above opts into that) -- same pattern provider_claude_resume_cmd uses.
 provider_codex_resume_cmd() {
-    local dir="$1" session="$2" answer="$3"
+    local dir="$1" session="$2" answer="$3" cargs
+    cargs=(-c 'sandbox_mode="workspace-write"')
+    [ -n "$P_MODEL" ] && cargs+=(-m "$P_MODEL")
+    [ -n "$P_EFFORT" ] && cargs+=(-c "model_reasoning_effort=\"$P_EFFORT\"")
     ( cd "$dir" && codex exec resume --skip-git-repo-check \
-        -c 'sandbox_mode="workspace-write"' "$session" "$answer" </dev/null 2>&1 )
+        "${cargs[@]}" "$session" "$answer" </dev/null 2>&1 )
 }
 
 # provider_codex_doctor — prints a single-line JSON object to stdout:

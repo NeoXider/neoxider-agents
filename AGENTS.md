@@ -65,10 +65,9 @@ not real per-token streaming; `tools`/function-calling is **emulated via prompti
 includes `tools`, even a continuation turn); `usage` token counts are **always
 `0/0/0`**; and **`content` can include raw CLI chrome for `codex`** (its `exec` mode
 mixes startup-banner/session-id/error-log lines into the answer, same as `agent.sh
-last` shows for codex tasks, and its resume command doesn't forward `--effort`/model
-flags either) — prefer `claude`/`opencode`/`gemini` for a clean answer string. One
-process = one fixed engine/model/effort — run it again on another port to compare
-models.
+last` shows for codex tasks) — prefer `claude`/`opencode`/`gemini` for a clean answer
+string. One process = one fixed engine/model/effort — run it again on another port to
+compare models.
 
 ## Rules for using this tool as a subagent orchestrator
 
