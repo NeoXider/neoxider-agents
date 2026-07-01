@@ -27,6 +27,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # bash (git-bash) understands forward slashes in win paths, but NOT backslashes in argv -> normalize
 SK = os.path.join(HERE, "agent.sh").replace("\\", "/")
 HTML = os.path.join(HERE, "gui.html")
+STATIC_DIR = os.path.join(HERE, "static")
+LOCALES_DIR = os.path.join(HERE, "locales")
 PROVIDERS_DIR = os.path.join(HERE, "providers")
 # the exact git-bash agent.sh uses (otherwise native-python may pick up WSL bash and fail
 # to find C:/... paths). Falls back to common git-bash locations so plain `python gui.py`
@@ -65,6 +67,20 @@ def load_providers():
     return out or _DEFAULT_PROVIDERS
 PROVIDERS = load_providers()
 ENGINES = list(PROVIDERS.keys())
+
+def list_locales():
+    """Scan locales/*.json for available UI languages -- dropping in one more file is
+    enough to add a locale, no code change needed (the picker reads this list)."""
+    out = []
+    for lf in sorted(glob.glob(os.path.join(LOCALES_DIR, "*.json"))):
+        code = os.path.splitext(os.path.basename(lf))[0]
+        try:
+            with open(lf, encoding="utf-8") as f:
+                data = json.load(f)
+            out.append({"code": code, "label": data.get("_label", code)})
+        except Exception:
+            continue
+    return out
 
 def load_projects():
     try:
@@ -242,18 +258,44 @@ def run_sync(args, timeout=30):
     except Exception as e:
         return "error: %s" % e
 
-def provider_info(engine):
+# Doctor/provider-info both shell out to agent.sh, which is not cheap (subprocess + the
+# provider's own CLI --version/login calls) -- cache each by key with a short TTL so switching
+# providers or an idle poll doesn't re-shell-out every few seconds. A manual "refresh" button in
+# the GUI bypasses the cache via ?force=1. Read-through: return the cached value if still fresh,
+# otherwise recompute and repopulate -- and always keep the last-good value even on a failed
+# recompute, so a transient error doesn't blank out a panel that was showing good data.
+_CACHE = {}
+_CACHE_TTL = 30
+
+def _cached(key, compute, force=False):
+    now = time.time()
+    hit = _CACHE.get(key)
+    if not force and hit and (now - hit["at"]) < _CACHE_TTL:
+        return hit["value"], True
+    value = compute()
+    _CACHE[key] = {"value": value, "at": now}
+    return value, False
+
+def provider_info(engine, force=False):
     """Info for one provider, for the right-hand panel (limits where the CLI exposes them).
     Shells out to `agent.sh provider-info <engine>`, which sources providers/<engine>/provider.sh
     and calls its provider_<engine>_doctor — all per-engine logic lives in the plugin, not here."""
-    raw = run_sync(["provider-info", engine], timeout=25)
-    try:
-        info = json.loads(raw)
-    except ValueError:
-        info = {"engine": engine, "version": "NOT_FOUND", "available": False,
-                 "login": "", "limits": None, "note": "provider-info returned invalid JSON"}
+    def compute():
+        raw = run_sync(["provider-info", engine], timeout=25)
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return {"engine": engine, "version": "NOT_FOUND", "available": False,
+                    "login": "", "limits": None, "note": "provider-info returned invalid JSON"}
+    info, cached = _cached("provider:" + engine, compute, force)
+    info = dict(info)
     info["now"] = time.time()
+    info["cached"] = cached
     return info
+
+def doctor_text(force=False):
+    text, cached = _cached("doctor", lambda: run_sync(["doctor"], timeout=25), force)
+    return text, cached
 
 def codex_limits():
     """primary/secondary codex rate-limits only, via the same provider-info plugin path
@@ -293,14 +335,41 @@ class H(BaseHTTPRequestHandler):
             name = (q.get("task") or [""])[0]
             self._send(200, json.dumps({"name": name, "log": read_log(name)}))
         elif u.path == "/api/doctor":
-            self._send(200, json.dumps({"text": run_sync(["doctor"], timeout=25)}))
+            force = (q.get("force") or ["0"])[0] == "1"
+            text, cached = doctor_text(force)
+            self._send(200, json.dumps({"text": text, "cached": cached}))
         elif u.path == "/api/limits":
             self._send(200, json.dumps({"limits": codex_limits(), "now": time.time()}))
         elif u.path == "/api/provider":
             eng = (q.get("engine") or ["codex"])[0]
-            self._send(200, json.dumps(provider_info(eng)))
+            force = (q.get("force") or ["0"])[0] == "1"
+            self._send(200, json.dumps(provider_info(eng, force)))
+        elif u.path == "/api/locales":
+            self._send(200, json.dumps({"locales": list_locales()}))
+        elif u.path.startswith("/locales/") and u.path.endswith(".json"):
+            self._serve_static(LOCALES_DIR, u.path[len("/locales/"):], "application/json")
+        elif u.path.startswith("/static/"):
+            self._serve_static(STATIC_DIR, u.path[len("/static/"):])
         else:
             self._send(404, "not found")
+
+    def _serve_static(self, root, rel, ctype=None):
+        """Serve a file from `root`, rejecting any path that resolves outside it
+        (directory traversal via ../ or an absolute path)."""
+        rel = urllib.parse.unquote(rel)
+        full = os.path.normpath(os.path.join(root, rel))
+        if os.path.commonpath([os.path.abspath(root), full]) != os.path.abspath(root):
+            return self._send(403, "forbidden")
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self._send(404, "not found")
+        if not ctype:
+            ext = os.path.splitext(full)[1]
+            ctype = {".js": "text/javascript", ".css": "text/css",
+                     ".json": "application/json"}.get(ext, "application/octet-stream")
+        self._send(200, data, ctype)
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
@@ -316,6 +385,7 @@ class H(BaseHTTPRequestHandler):
             rdir = to_git_bash_path(data.get("dir") or "")
             args = ["run", "-e", data.get("engine") or "codex"]
             if data.get("model"):    args += ["-m", data["model"]]
+            if data.get("effort"):   args += ["-f", data["effort"]]
             if rdir:                 args += ["-C", rdir]
             if data.get("name"):     args += ["-t", data["name"]]
             if data.get("parent"):   args += ["-P", data["parent"]]

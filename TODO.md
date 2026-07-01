@@ -28,39 +28,44 @@ Roughly in priority order. PRs welcome.
 
 ## GUI
 
-- [ ] **Caching for doctor/limits.** Both should read from one server-side cache (TTL,
-  e.g. 30s) instead of shelling out on every panel switch / poll. Add an explicit
-  "refresh" button (separate from switching providers) that force-bypasses the cache.
-  While refreshing, keep showing the last-known-good data with a small loading
-  indicator — don't blank the panel.
-- [ ] **Remove the redundant status dot.** The colored dot, the state emoji
-  (✅⏳❌⚠️), and the strikethrough all encode the same "is this task done/waiting/
-  errored" signal. Drop the dot, keep emoji + strikethrough.
-- [ ] **Split `gui.html` into smaller files.** It's grown into one large file (tree,
-  chat, doctor modal, browse modal, toasts, splitters all inline). Break into logical
-  pieces (e.g. `static/tree.js`, `static/chat.js`, `static/modals.js`, `static/toast.js`,
-  `static/style.css`) served by `gui.py`, keeping `gui.html` as a thin shell.
-- [ ] **i18n.** English by default, Russian as a second locale, and adding a new locale
-  should be "drop one file in." Proposed: `locales/en.json`, `locales/ru.json` (flat
-  key→string maps), a tiny `t(key)` helper in the frontend, language picker in the
-  header, `?lang=` query param or localStorage to persist choice.
+- [x] **Caching for doctor/limits.** Done — server-side cache, 30s TTL, keyed per
+  `doctor`/`provider:<engine>`. A ⟳ refresh button next to the limits panel and inside
+  the doctor modal forces a fresh fetch (`?force=1`). Verified: first call ~9s
+  (uncached), second call ~0.2s (cached), `?force=1` bypasses it (~9s again). The panel
+  never blanks while refreshing — keeps the last-known-good data with a spinner.
+- [x] **Remove the redundant status dot.** Done — dropped the colored dot; status is
+  now emoji + strikethrough only. A running task's emoji pulses gently so "still live"
+  doesn't disappear along with the dot.
+- [x] **Split `gui.html` into smaller files.** Done — `static/util.js` (shared
+  primitives + state), `i18n.js`, `toast.js`, `tree.js`, `chat.js`, `modals.js`,
+  `splitters.js`, `app.js` (entry point), `style.css`. `gui.html` is now a thin shell.
+  These are plain classic `<script src>` tags sharing one global scope (no bundler, no
+  modules) — every shared primitive (`$`, `esc`, `jget`, state vars) is declared
+  exactly once in `util.js` to avoid duplicate-declaration errors across files.
+- [x] **i18n.** Done — `locales/en.json` (default) + `locales/ru.json`, a `t(key)`
+  helper with automatic English fallback for any key a locale doesn't cover (so a
+  partial translation still works — this is what makes adding a locale a drop-in-one-
+  file operation), a header language picker persisted in localStorage. `/api/locales`
+  lists available locales dynamically, so a third `locales/<code>.json` shows up in the
+  picker with no code change.
 - [ ] **Diff rendering.** Render unified diffs in the chat thread as a real diff view
   (colored +/- lines, file headers) instead of a plain code block — codex/claude output
   often contains real diffs worth rendering nicely.
-- [ ] **Prettier scrollbars.** Custom `::-webkit-scrollbar` styling to match the dark
-  theme instead of the OS default.
+- [x] **Prettier scrollbars.** Done — `::-webkit-scrollbar` styling matching the dark
+  theme (thin, rounded, using the existing CSS custom properties) for every scrollable
+  area, plus a Firefox fallback (`scrollbar-width`/`scrollbar-color`).
 - [ ] Re-look at the task-list interaction after CliDeck/agent-of-empires comparison
   (see below) — e.g. a compact "running now" summary strip, or a Claude-Code-style
   background-tasks flyout, if it turns out to be clearer than the current tree.
-- [ ] **Separate model + effort selectors, for every provider.** Today effort is baked
-  into the model alias string (`sonnet-high`, `5.5-high`) — the picker should offer two
-  independent dropdowns (model, then effort: auto/low/medium/high/xhigh/max, only the
-  levels a given provider actually supports) whenever a provider exposes an effort
-  concept, falling back to "auto" (provider/CLI default) when not selected. Gemini has
-  no effort concept; **opencode does** (`--variant`, e.g. high/max/minimal) —
-  `provider_opencode_run_cmd` already forwards `EFFORT` to `--variant` if set, but
-  nothing in the current CLI/GUI args flow ever populates it (no `_resolve` function
-  for opencode yet) — this selector work is what will actually make it reachable.
+- [x] **Separate model + effort selectors, for every provider.** Done — a new `-f
+  <effort>` flag/CLI arg (separate from `-m`) flows through `agent.sh`'s generic
+  dispatch to `P_EFFORT`, overriding whatever a provider's own `_resolve` derived from
+  an alias suffix (backward compatible: `sonnet-high` via `-m` alone still works if you
+  don't pass `-f`). Each `provider.json` now has an `efforts` array (`codex`:
+  medium/high; `claude`: low/medium/high/xhigh/max; `opencode`: minimal/low/medium/
+  high/max via `--variant`; `gemini`: none) driving a second GUI dropdown, correctly
+  disabled when empty. Verified end-to-end via a real GUI-launched task
+  (`model=claude-sonnet-5-low` from separate `model:"sonnet"`/`effort:"low"` fields).
 - [x] **Audit full-auto/non-interactive flags for every provider, document in README.**
   Done — codex/claude were already covered. Found and fixed two real gaps: gemini now
   gets `--yolo`, opencode now gets `--dangerously-skip-permissions` (both confirmed

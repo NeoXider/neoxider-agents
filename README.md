@@ -5,7 +5,8 @@ A tiny local control room for AI coding subagents across multiple CLI providers 
 non-interactive bash wrapper plus an optional zero-dependency web GUI.
 
 No daemon, no database, no npm/cargo build step. `agent.sh` is plain POSIX shell;
-`gui.py` is Python stdlib only; `gui.html` is one static file with vanilla JS.
+`gui.py` is Python stdlib only; the frontend is plain classic `<script>` files (no
+bundler, no framework).
 
 By [NeoXider](https://github.com/NeoXider).
 
@@ -35,14 +36,19 @@ this project fills.
   (primary/secondary window, % used, time to reset) before you fan out a batch of
   subagents.
 - **Web GUI** (`neoxider` / `agent.sh gui`): a project tree of subagents (activity +
-  topic emoji), a chat-style thread view with basic markdown, a provider/model picker
-  whose rate-limit panel adapts to whichever provider is selected, a folder browser to
-  add new projects, resizable panels, toast notifications with history, and an
-  optional "open in a real terminal" checkbox per task.
+  topic emoji, no redundant status dot), a chat-style thread view with basic markdown,
+  a provider/model/**effort** picker whose cached, manually-refreshable rate-limit
+  panel adapts to whichever provider is selected, a folder browser to add new
+  projects, resizable panels, toast notifications with history, an optional "open in a
+  real terminal" checkbox per task, and a language picker (English/Russian, more via
+  one dropped-in locale file).
 - **Plugin providers.** Every CLI provider (invocation, model/effort resolution,
   `doctor` info, and GUI display metadata) is one `providers/<name>/` directory —
   adding a provider means creating that directory, with zero edits to `agent.sh`,
   `gui.py`, or `gui.html`.
+- **Model and effort are separate.** `-m <model> -f <effort>` (or two dropdowns in the
+  GUI) — not baked into one alias string — for every provider that has an effort
+  concept (codex, claude, opencode's `--variant`; gemini has none).
 
 ## Installation
 
@@ -84,10 +90,10 @@ for the GUI, from bash or PowerShell).
 ## Quick start
 
 ```bash
-# run a task
+# run a task (add -f <effort> to set effort separately from -m <model>, e.g. -f high)
 bash agent.sh run -t fix-readme -C /path/to/project "fix the typo in the README"
 
-# watch it live
+# watch it live (log's own -f means "follow" -- a different meaning of -f, only for `log`)
 bash agent.sh log -f fix-readme
 
 # it asked a question? reply in the same thread
@@ -142,13 +148,18 @@ Create `providers/<name>/provider.sh` and `providers/<name>/provider.json` — n
 else needs to change. `agent.sh` auto-discovers and sources every `providers/*/provider.sh`
 at startup; `gui.py` glob-loads every `providers/*/provider.json` for display metadata.
 
-- `provider.json`: `label`, `models`, `default_model`, `limits` (`"codex"`-style tag or
-  `null`) — picked up by the GUI's dropdown, model list, and rate-limit panel.
+- `provider.json`: `label`, `models`, `efforts` (list of effort levels this provider
+  supports, e.g. `["low","medium","high"]`, or `[]` if it has no effort concept),
+  `default_model`, `default_effort`, `limits` (`"codex"`-style tag or `null`) — picked
+  up by the GUI's model dropdown, the *separate* effort dropdown, and the rate-limit panel.
 - `provider.sh` defines a small function contract, named `provider_<name>_*`:
   - `provider_<name>_resolve MODEL_ALIAS` (optional) — sets `P_MODEL`/`P_EFFORT` from an
-    alias. Providers without alias resolution (e.g. opencode/gemini today) can skip this;
-    the raw `-m` value is passed straight through.
+    alias (e.g. a `-high` suffix). Providers without alias resolution (opencode/gemini
+    today) can skip this; the raw `-m` value is passed straight through as `P_MODEL`,
+    and `-f <effort>` (see below) is the only way to set their `P_EFFORT`.
   - `provider_<name>_run_cmd DIR MODEL EFFORT PROMPT` — runs the CLI for a new task.
+    `EFFORT` is whatever `-f` (or `_resolve`'s own suffix parsing) produced — pass it to
+    whatever flag your CLI uses for a reasoning-effort/verbosity level, if it has one.
   - `provider_<name>_resume_cmd DIR SESSION ANSWER` (optional) — resumes an existing
     session for `reply`; omit it if the CLI has no resume/continue support.
   - `provider_<name>_doctor` — prints one line of JSON to stdout:

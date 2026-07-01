@@ -1,6 +1,8 @@
 {
   "label": "Claude",
-  "models": ["sonnet", "sonnet-medium", "sonnet-low", "opus", "haiku"],
+  "models": ["sonnet", "opus", "haiku"],
+  "efforts": ["low", "medium", "high", "xhigh", "max"],
   "default_model": "sonnet",
+  "default_effort": "high",
   "limits": null
 }

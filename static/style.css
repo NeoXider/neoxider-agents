@@ -1,0 +1,129 @@
+:root{
+  --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3140;
+  --fg:#e6edf3; --dim:#8b98a8; --accent:#4d9cf6;
+  --run:#4d9cf6; --done:#3fb950; --wait:#d29922; --err:#f85149; --stall:#6e7681;
+  --codex:#10a37f; --claude:#d97757; --opencode:#a371f7; --gemini:#4d9cf6;
+}
+*{box-sizing:border-box}
+body{margin:0;font:13px/1.55 ui-sans-serif,system-ui,Segoe UI,Roboto,sans-serif;
+     background:var(--bg);color:var(--fg);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+code,pre,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+header{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:14px;margin:0;font-weight:700;letter-spacing:.4px}
+.sp{flex:1}
+button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 10px;cursor:pointer;font:inherit}
+button:hover{border-color:var(--accent)} button:disabled{opacity:.55;cursor:default}
+button.primary{background:var(--accent);border-color:var(--accent);color:#04101f;font-weight:600}
+button.mini{padding:1px 7px;font-size:12px;line-height:1.4}
+button.icon{padding:4px 8px;position:relative}
+input,select,textarea{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;width:100%}
+textarea{resize:vertical}
+label.chk{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dim);cursor:pointer}
+label.chk input{width:auto}
+
+/* ---- universal async spinner ---- */
+.spinner{width:13px;height:13px;border:2px solid rgba(255,255,255,.25);border-top-color:currentColor;
+  border-radius:50%;display:inline-block;animation:spin .7s linear infinite;vertical-align:-2px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ---- prettier scrollbars (webkit; Firefox gets the thin/auto fallback below) ---- */
+*{scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px;border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:var(--dim);background-clip:content-box}
+
+/* ---- layout with resizable panels ---- */
+main{flex:1;display:flex;min-height:0}
+#left{width:300px;flex:none;border-right:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0;min-width:160px;max-width:640px}
+#right{width:300px;flex:none;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;overflow:auto;min-width:220px;max-width:640px}
+.resizer{width:5px;flex:none;cursor:col-resize;background:transparent;position:relative;z-index:5}
+.resizer:hover,.resizer.drag{background:var(--accent)}
+.resizer::after{content:"";position:absolute;left:-3px;right:-3px;top:0;bottom:0}
+
+/* ---- left tree ---- */
+#left .hd{padding:8px 12px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:6px}
+#tree{overflow:auto;flex:1}
+.proj>.ph{display:flex;align-items:center;gap:6px;padding:6px 10px;cursor:pointer;user-select:none;color:var(--fg);font-weight:600}
+.proj>.ph:hover{background:var(--panel2)}
+.proj.active>.ph{background:var(--panel2)}
+.proj>.ph .caret{width:10px;color:var(--dim);transition:transform .1s} .proj.col>.ph .caret{transform:rotate(-90deg)}
+.proj>.ph .pname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.proj>.ph .cnt{color:var(--dim);font-size:11px;font-weight:400}
+.proj.col .tasks{display:none}
+/* each project scrolls on its own, so one big project (many tasks) can't push the rest
+   of the tree out of view */
+.proj>.tasks{max-height:38vh;overflow-y:auto}
+.task{display:flex;gap:8px;align-items:baseline;padding:5px 10px 5px 24px;cursor:pointer}
+.task:hover{background:var(--panel2)} .task.sel{background:#223049;box-shadow:inset 3px 0 0 var(--accent)}
+.task .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task.strike .nm{text-decoration:line-through;opacity:.7}
+.task.empty-row{color:var(--dim);cursor:default;font-size:12px}
+/* status is conveyed by the activity/topic emoji + strikethrough alone (no separate colored
+   dot) -- a dot on top of those was a redundant third encoding of the same signal. A running
+   task's emoji pulses gently so "still live" stays visible without the dot. */
+.task .em.running{animation:pulse 1.2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.pill{font-size:10px;padding:0 6px;border-radius:8px;border:1px solid var(--line);color:var(--dim);flex:none}
+.pe-codex{color:var(--codex);border-color:var(--codex)} .pe-claude{color:var(--claude);border-color:var(--claude)}
+.pe-opencode{color:var(--opencode);border-color:var(--opencode)} .pe-gemini{color:var(--gemini);border-color:var(--gemini)}
+.task .em{flex:none} .tasks .tasks{margin-left:14px;border-left:1px solid var(--line)}
+
+/* ---- center chat ---- */
+#center{display:flex;flex-direction:column;min-width:0;min-height:0;flex:1}
+#chead{padding:8px 12px;border-bottom:1px solid var(--line);background:var(--panel);display:flex;gap:8px;align-items:center;flex-wrap:wrap;min-height:38px}
+#chat{flex:1;overflow:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:88%} .msg.user{align-self:flex-end}
+.who{font-size:11px;color:var(--dim);margin-bottom:3px}
+.bubble{border:1px solid var(--line);border-radius:10px;padding:8px 12px;background:var(--panel)}
+.msg.user .bubble{background:#1b2a44;border-color:#2b3f63}
+.msg.agent .bubble{background:var(--panel2)}
+.bubble>div{margin:2px 0} .bubble ul{margin:4px 0;padding-left:20px}
+.bubble code{background:#0009;padding:1px 5px;border-radius:4px;font-size:12px}
+.bubble pre.code{background:#0b0f16;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;margin:6px 0}
+.bubble pre.code code{background:none;padding:0}
+.mh1,.mh2,.mh3{font-weight:700;margin:8px 0 2px} .mh1{font-size:15px}.mh2{font-size:14px}.mh3{font-size:13px}
+#replybar{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);background:var(--panel);align-items:flex-end}
+#replybar textarea{flex:1;height:40px}
+#replybar .rcol{display:flex;flex-direction:column;gap:6px;align-items:stretch}
+.empty{color:var(--dim);margin:auto;text-align:center}
+
+/* ---- right panel ---- */
+.box{padding:12px;border-bottom:1px solid var(--line)}
+.box h3{margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);display:flex;align-items:center;gap:6px}
+.fld{margin-bottom:8px} .fld label{display:block;font-size:11px;color:var(--dim);margin-bottom:2px}
+.lim{margin:8px 0} .lim .t{display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px}
+.bar{height:8px;border-radius:5px;background:#0b0f16;overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--done)}
+.bar>i.mid{background:var(--wait)} .bar>i.hi{background:var(--err)}
+.kv{display:flex;justify-content:space-between;font-size:12px;padding:2px 0;color:var(--dim)}
+.kv b{color:var(--fg);font-weight:600}
+.note{font-size:11px;color:var(--dim);margin-top:6px}
+.dirfld{display:flex;gap:6px}
+
+/* ---- modals ---- */
+.modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;z-index:20}
+.modal.on{display:flex}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;width:640px;max-width:92vw;max-height:82vh;display:flex;flex-direction:column}
+.card h2{margin:0 0 10px;font-size:14px;display:flex;align-items:center;gap:8px}
+.card pre{margin:0;overflow:auto;white-space:pre-wrap;font-size:12px;flex:1}
+
+/* ---- folder browser ---- */
+.crumbs{display:flex;flex-wrap:wrap;gap:2px;font-size:12px;margin-bottom:8px;color:var(--dim)}
+.crumbs span{cursor:pointer} .crumbs span:hover{color:var(--accent)}
+.shortcuts{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
+.dirlist{flex:1;overflow:auto;border:1px solid var(--line);border-radius:8px}
+.direntry{padding:6px 10px;cursor:pointer;display:flex;gap:8px;align-items:center}
+.direntry:hover{background:var(--panel2)}
+
+/* ---- toasts ---- */
+#toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:50;width:320px}
+.toast{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;
+  padding:9px 12px;font-size:12px;box-shadow:0 6px 20px #0008;animation:toastin .18s ease-out;opacity:1;transition:opacity .3s,transform .3s}
+.toast.out{opacity:0;transform:translateX(20px)}
+.toast.success{border-left-color:var(--done)} .toast.error{border-left-color:var(--err)}
+.toast.warning{border-left-color:var(--wait)} .toast .tt{font-weight:600;margin-bottom:2px}
+@keyframes toastin{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+#hist-list .hrow{padding:8px 4px;border-bottom:1px solid var(--line);font-size:12px;display:flex;gap:8px}
+#hist-list .time{color:var(--dim);font-size:11px}
+#hist-list .hicon{flex:none}

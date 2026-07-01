@@ -60,7 +60,7 @@ cmd="${1:-}"
 [ -n "$cmd" ] || die "usage: agent.sh run|reply|log|last|status|list|doctor|provider-info ... (see file header)"
 shift
 
-engine="codex"; model=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=0
+engine="codex"; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=0
 # ^ PID suffix makes the default name collision-resistant: two processes (e.g. from two
 # different installs/tools sharing one LOGDIR) can never share a PID, so they never race on
 # the same .meta/.log even if they start in the same second. Always give tasks a meaningful
@@ -72,6 +72,7 @@ parse_opts() {
         case "$1" in
             -e) engine="$2"; shift 2 ;;
             -m) model="$2"; shift 2 ;;
+            -f) effort_override="$2"; shift 2 ;;
             -C) dir="$2"; shift 2 ;;
             -t) name="$2"; shift 2 ;;
             -P) parent="$2"; shift 2 ;;
@@ -199,6 +200,12 @@ provider_dispatch_run() {
     else
         P_MODEL="$alias"
     fi
+    # -f/effort_override is a genuinely separate "model" and "effort" input (e.g. from the GUI's
+    # two-dropdown picker) rather than a suffix baked into the alias string (e.g. "sonnet-high").
+    # It wins over whatever the alias/resolve function derived, and is the ONLY way to set effort
+    # for providers with no _resolve function at all (opencode, gemini) -- those get P_MODEL="$alias"
+    # verbatim above with P_EFFORT always empty, since there's no suffix parsing to find it in.
+    [ -n "$effort_override" ] && P_EFFORT="$effort_override"
     if [ -n "$P_MODEL" ]; then
         meta_set "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}"  # resolved model, not the raw alias
     fi
@@ -219,6 +226,7 @@ provider_dispatch_resume() {
     P_MODEL=""; P_EFFORT=""
     if [ "${!needs_var:-0}" = 1 ] && declare -F "$resolve_fn" >/dev/null 2>&1; then
         "$resolve_fn" "$model"
+        [ -n "$effort_override" ] && P_EFFORT="$effort_override"  # see provider_dispatch_run
         if [ -n "$P_MODEL" ]; then
             meta_set "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}"  # resolved model, not the raw alias
         fi
