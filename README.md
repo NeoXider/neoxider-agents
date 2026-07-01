@@ -274,11 +274,14 @@ about this before pointing anything at it:
   token counts in a structured form.
 - Image content in messages is not rendered to the agent (replaced with a
   `[image omitted]`-style note) — the wrapped CLI can't see images either way.
-- **`content` can include raw CLI chrome for some engines** — e.g. `codex`'s
-  non-interactive `exec` mode mixes its own startup banner/session-id/error-log lines
-  into the same output stream as the answer (the same raw text `agent.sh last`/the
-  GUI's own chat view already show for codex tasks). This bridge doesn't attempt
-  engine-specific cleanup; `claude`/`opencode`/`gemini` were cleaner in testing.
+- **`content` is a clean answer for every bundled engine.** `codex`'s non-interactive
+  `exec` mode otherwise mixes its own startup banner/session-id/error-log/"tokens used"
+  chrome (and, on Windows, a cp866-mojibake OS-notification line) into the same output
+  stream as the answer — so the `codex` provider runs `codex exec --json` and extracts
+  just the final agent message (`_provider_codex_emit` in `providers/codex/provider.sh`),
+  which also fixed the same chrome in `agent.sh last` and the GUI chat view for codex.
+  `claude`/`opencode`/`gemini` were already clean. The bridge itself still applies no
+  extra per-engine cleanup, so if a provider regresses its raw chrome would show through.
 - **One process = one fixed engine/model/effort** for its whole lifetime. To compare
   models/providers side by side, or serve several at once, just run the command again
   with different `-e/-m/-f/-p` in another terminal — no built-in multi-server manager.

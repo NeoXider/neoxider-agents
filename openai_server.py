@@ -52,12 +52,13 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
     The instructions are re-sent on every call that includes `tools` (even a continuation), not
     just the first -- simpler and more robust than tracking whether the schema already "stuck".
   - `usage` token counts are always 0/0/0 -- the wrapped CLIs don't expose them in a structured form.
-  - `content` can include raw CLI chrome for some engines -- e.g. codex's non-interactive `exec`
-    mode prints its own startup banner/session-id/error-log lines to the same stream as the
-    answer, and this bridge (like every other feature in this project -- `agent.sh last`, the
-    GUI's chat view -- reads the CLI's raw captured output verbatim, with no engine-specific
-    cleanup. `claude` was observed to return clean answers in testing; `codex` was not. Prefer
-    `claude`/`opencode`/`gemini` when a clean `content` string matters to the caller.
+  - `content` is a clean answer for every bundled engine. codex's non-interactive `exec` mode
+    otherwise mixes its own startup banner/session-id/error-log/"tokens used" chrome (and, on
+    Windows, a cp866-mojibake OS-notification line) into the same stream as the answer, so the
+    codex provider runs it via `codex exec --json` and extracts just the final agent message --
+    see providers/codex/provider.sh (`_provider_codex_emit`). `claude`/`opencode`/`gemini` were
+    already clean. (If a provider ever regresses, the bridge reads the CLI's captured output
+    verbatim with no extra cleanup, so raw chrome would show through.)
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
 (does not import gui.py) so the two servers can run/fail independently.
 """
@@ -186,19 +187,29 @@ def run_agent(engine, model, effort, workdir, prompt, name, timeout):
 def reply_agent(engine, model, effort, workdir, name, answer, timeout):
     """Continues an existing task's CLI session via `agent.sh reply` -- same dispatch machinery
     `run` uses, just resuming instead of starting over. -m/-f are re-sent because some providers
-    (claude) need them again on resume (see agent.sh's PROVIDER_*_RESUME_NEEDS_MODEL)."""
+    (claude) need them again on resume (see agent.sh's PROVIDER_*_RESUME_NEEDS_MODEL).
+
+    Returns None (NOT the log's last answer) when the reply appended nothing to the log -- e.g.
+    `agent.sh reply` died before writing a new block because the session id could not be resolved.
+    Without this guard `last_output(read_log(name))` would echo the PREVIOUS successful answer as
+    if it were the reply's -- a silent stale-answer bug. The caller (_run) falls back to a fresh
+    run when it sees None."""
     args = [BASH, SK, "reply", "-e", engine]
     if model:
         args += ["-m", model]
     if effort:
         args += ["-f", effort]
     args += ["-C", to_git_bash_path(workdir), name, answer]
+    before = len(read_log(name))
     try:
         subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
                         errors="replace", timeout=timeout, cwd=HERE)
     except subprocess.TimeoutExpired:
         pass
-    return last_output(read_log(name))
+    after = read_log(name)
+    if len(after) == before:
+        return None  # nothing was appended -> the resume failed; don't return the stale prior answer
+    return last_output(after)
 
 
 def model_label(engine, model, effort):
@@ -422,12 +433,16 @@ class H(BaseHTTPRequestHandler):
                 and not session_expired()
                 and read_meta(prev_name).get("state") not in (None, "", "error", "stalled")
             )
+            raw_text = None
             if supports_resume and healthy and is_extension(SESSION["messages"], messages):
                 new_turns = messages[len(SESSION["messages"]):]
                 answer = build_prompt(new_turns, tools)
                 raw_text = reply_agent(CFG.engine, CFG.model, CFG.effort, SESSION["dir"], prev_name, answer, CFG.timeout)
                 name = prev_name
-            else:
+            if raw_text is None:
+                # First call, a non-extension, an unhealthy session, OR a resume that appended
+                # nothing (reply_agent returned None). Any of these -> a clean fresh run with the
+                # FULL history, never a stale echo of the previous answer.
                 prompt = build_prompt(messages, tools)
                 name = new_task_name()
                 workdir = fresh_session_dir()

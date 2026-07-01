@@ -63,11 +63,11 @@ after that just starts fresh instead of resuming. Beyond that: latency is a
 not real per-token streaming; `tools`/function-calling is **emulated via prompting**
 (best-effort, can misformat, and the instructions are re-sent on every call that
 includes `tools`, even a continuation turn); `usage` token counts are **always
-`0/0/0`**; and **`content` can include raw CLI chrome for `codex`** (its `exec` mode
-mixes startup-banner/session-id/error-log lines into the answer, same as `agent.sh
-last` shows for codex tasks) — prefer `claude`/`opencode`/`gemini` for a clean answer
-string. One process = one fixed engine/model/effort — run it again on another port to
-compare models.
+`0/0/0`**; and **`content` is a clean answer for every bundled engine** (`codex` would
+otherwise mix its banner/session-id/error-log/"tokens used" chrome into the answer, so its
+provider runs `codex exec --json` and extracts only the final agent message — this also
+cleaned up `agent.sh last`/the GUI for codex). One process = one fixed engine/model/effort
+— run it again on another port to compare models.
 
 ## Rules for using this tool as a subagent orchestrator
 

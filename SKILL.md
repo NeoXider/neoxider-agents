@@ -88,9 +88,11 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   can occasionally misformat or ignore the instruction; the instructions are re-sent on
   every call that includes `tools`, even a continuation turn.
 - **`usage` token counts are always `0/0/0`** — don't trust them for cost tracking.
-- **`content` can include raw CLI chrome for `codex`** (startup banner/session-id/
-  error-log lines mixed into the answer, same as `agent.sh last` shows for codex
-  tasks) — prefer `claude`/`opencode`/`gemini` when a clean answer string matters.
+- **`content` is a clean answer for every bundled engine.** `codex` would otherwise mix
+  its startup banner/session-id/error-log/"tokens used" chrome (and a cp866-mojibake line
+  on Windows) into the answer, so its provider runs `codex exec --json` and extracts only
+  the final agent message (`_provider_codex_emit`) — this also cleaned up `agent.sh last`
+  and the GUI chat view for codex. `claude`/`opencode`/`gemini` were already clean.
 - One process = one fixed engine/model/effort for its whole lifetime. To compare
   models, run the command again with different `-e/-m/-f/-p` on another port.
 

@@ -404,5 +404,38 @@ class SessionExpiryTests(unittest.TestCase):
         self.assertFalse(srv.session_expired())
 
 
+class ReplyAgentStaleGuardTests(unittest.TestCase):
+    """reply_agent must NOT return the previous answer when a resume appended nothing to the log
+    (e.g. `agent.sh reply` died before writing a new block). It returns None instead, so _run
+    falls back to a fresh run rather than silently echoing the stale prior answer."""
+
+    def setUp(self):
+        self._real_run = srv.subprocess.run
+        self._real_read_log = srv.read_log
+        srv.subprocess.run = lambda *a, **k: None  # never actually shell out
+
+    def tearDown(self):
+        srv.subprocess.run = self._real_run
+        srv.read_log = self._real_read_log
+
+    def test_returns_none_when_log_did_not_grow(self):
+        # read_log returns the same content before and after -> nothing was appended.
+        srv.read_log = lambda name: "========== [run] ...\n---------- output ----------\nOLD ANSWER\n"
+        self.assertIsNone(srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60))
+
+    def test_returns_new_answer_when_log_grew(self):
+        state = {"n": 0}
+        before = "========== [run] ...\n---------- output ----------\nOLD ANSWER\n"
+        after = before + "========== [reply] ...\n---------- output ----------\nNEW ANSWER\n"
+
+        def fake_read_log(name):
+            state["n"] += 1
+            return before if state["n"] == 1 else after  # 1st call = before, later = after
+
+        srv.read_log = fake_read_log
+        self.assertEqual(srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60),
+                         "NEW ANSWER\n")
+
+
 if __name__ == "__main__":
     unittest.main()

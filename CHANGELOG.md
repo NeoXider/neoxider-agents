@@ -6,6 +6,34 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- Fix (codex clean output): the `codex` provider now runs `codex exec --json` and extracts
+  ONLY the final agent message (`_provider_codex_emit` in `providers/codex/provider.sh`),
+  instead of letting codex's plaintext `exec` dump its startup banner / session id / ERROR-log
+  lines / "tokens used" footer / cp866-mojibake OS-notification line into the same stream as the
+  answer. This supersedes the earlier "documented, not fixed" codex-chrome and mojibake notes
+  below: `agent.sh last`, the GUI chat view, and the openai-server bridge's `content` now all
+  get a clean codex answer. The parser re-emits a `session id: <uuid>` line (so agent.sh's
+  resume grep keeps working) plus a synthetic `---------- output ----------` marker so
+  `last_output` slices to just the answer; on any failure with no agent message it passes the
+  raw stream through so auth/rate-limit errors stay visible. Verified live end-to-end against
+  `gpt-5.3-codex-spark`: fresh completion, multi-turn context recall via resume, and a
+  divergent unrelated turn (new session) all returned clean one-word answers. Covered by new
+  unit tests (`_provider_codex_emit` cases in `tests/test_agent_sh.sh`).
+- Fix (bridge stale-answer guard): `reply_agent` in `openai_server.py` returned
+  `last_output(read_log(name))` unconditionally, so if a resume appended nothing to the log
+  (e.g. `agent.sh reply` died before writing a block because no session id resolved) the bridge
+  silently echoed the PREVIOUS answer as if it were the new one. It now detects that the log
+  didn't grow, returns `None`, and `_run` falls back to a fresh run with the full history.
+  Covered by new `ReplyAgentStaleGuardTests` in `tests/test_openai_server.py`.
+- Fix (codex provider exit code): `provider_codex_run_cmd`/`provider_codex_resume_cmd` now
+  surface a `_provider_codex_emit` (Python parser) failure via `PIPESTATUS[1]` instead of
+  masking it behind codex's own exit code, so a missing/crashed Python interpreter can't mark a
+  task "done" with empty output.
+- Known trade-off (accepted, systemic): the answer boundary is still the exact line
+  `---------- output ----------`; a provider answer that literally contains that line on its own
+  would be truncated by `last_output`. This has always been true for every provider (agent.sh
+  writes one such marker per turn) — the codex `--json` path adds a second synthetic one but no
+  new failure mode, since the trigger is the same never-observed literal string.
 - Fix: `codex` sessions resumed via `agent.sh reply` silently drifted to a different
   model/effort than they started with (a `-m spark` session came back as `gpt-5.5` on
   resume) — `codex exec resume` does support `-m`/`-c model_reasoning_effort=`
@@ -78,11 +106,16 @@ All notable changes to this project are documented here. Format follows
   chat view already show for codex tasks) — this bridge does not attempt
   engine-specific cleanup, so `claude`/`opencode`/`gemini` are recommended when a
   clean `content` string matters to the caller.
+  **(Superseded above: the codex provider now uses `codex exec --json` and returns a clean
+  answer for all three surfaces.)**
 - Root-caused an occasional garbled/mojibake line in `codex`'s raw output (e.g.
   `ᯥ譮: ,  䨪஬ ...`): it's a Windows OS notification ("process N terminated") printed
   in the console's cp866 codepage, mis-decoded as UTF-8 by the `utf-8`-assuming
   subprocess capture shared with `agent.sh`/`gui.py`. Documented, not fixed (project-
   wide capture behavior, out of scope for this bridge alone).
+  **(Superseded above for the openai-server/`agent.sh last` codex path: the `--json` parser
+  reads with `errors="ignore"` and keeps only the structured final message, so the mojibake
+  line no longer reaches the answer.)**
 - Fix: `model` in responses/`/health`/`/v1/models` showed the bare CLI alias with no
   version number (`"claude/sonnet-low"`, `"claude/opus"`), not which real model that
   alias resolves to. Added a `model_labels` alias→display-name map to
@@ -149,8 +182,9 @@ All notable changes to this project are documented here. Format follows
 - Documented a new, pre-existing `codex`/`agent.sh` quirk surfaced by this work:
   `provider_codex_resume_cmd` does not forward the `--effort`/model flags on resume
   (unlike `claude`, which needs and gets them re-sent) — a resumed `codex` session may
-  silently run at a different reasoning effort than the one it started with. No fix
-  needed or possible from this bridge's side.
+  silently run at a different reasoning effort than the one it started with.
+  **(Superseded above: `provider_codex_resume_cmd` now forwards `-m`/`-c
+  model_reasoning_effort=`, `PROVIDER_CODEX_RESUME_NEEDS_MODEL=1`.)**
 
 ## [0.1.0] - 2026-07-01
 
