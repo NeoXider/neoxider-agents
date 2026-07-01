@@ -74,5 +74,7 @@
   "api.no_json": "no structured JSON result found in the output yet",
   "api.snippets": "Use from your own code",
   "api.snippets_hint": "This GUI's /api/test-api endpoint is the same one the button above calls — point your own test suite at it directly.",
-  "api.copy": "copy"
+  "api.copy": "copy",
+  "api.copied": "copied ✓",
+  "api.copy_failed": "copy failed"
 }

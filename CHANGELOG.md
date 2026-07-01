@@ -26,6 +26,21 @@ All notable changes to this project are documented here. Format follows
 - Separate model + effort selectors in the GUI (today effort is baked into the model
   alias string).
 - Audited full-auto/non-interactive flags for every provider; documented in the README.
+- New `agent.sh openai-server` command + standalone `openai_server.py`: an
+  OpenAI-compatible `/v1/chat/completions` HTTP bridge backed by a CLI subagent
+  (claude/codex/opencode/gemini), so any OpenAI-compatible client can use a CLI-agent
+  subscription as its "model" instead of a real provider API key.
+- `stream: true` and `tools`/function-calling support in the bridge, both emulated on
+  top of the underlying CLI: streaming replays an already-finished answer as
+  word-sized SSE chunks (connection closed after `data: [DONE]`); tool-calling is
+  prompted (fenced JSON tool-call block) and reparsed into a real OpenAI `tool_calls`
+  response.
+- One bridge process = one fixed engine/model/effort; run several instances on
+  different ports to compare models/providers side by side.
+- Verified live: non-streaming, streaming, and tool-calling round-trips against a real
+  CLI subagent (Claude) all confirmed working end-to-end via curl. Wire-compatibility
+  with CoreAI's Game-Creation Benchmark integration point (`COREAI_TEST_BASE_URL`) was
+  confirmed by design/code-reading, not by running the actual Unity benchmark suite.
 
 ## [0.1.0] - 2026-07-01
 

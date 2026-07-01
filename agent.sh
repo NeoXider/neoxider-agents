@@ -19,6 +19,11 @@
 #   agent.sh list                                                        — task table (state/engine/model/age/files)
 #   agent.sh doctor                                                      — pre-flight: engines + codex limits (before fan-out)
 #   agent.sh provider-info <engine>                                      — single provider's doctor JSON (used by gui.py)
+#   agent.sh openai-server [-e engine] [-m model] [-f effort] [-p port]  — OpenAI-compatible
+#                      /v1/chat/completions bridge over a CLI subagent (see openai_server.py's
+#                      own docstring for the full contract/caveats). Point any OpenAI-compatible
+#                      client -- including CoreAI's COREAI_TEST_BASE_URL -- at its base_url. Run
+#                      several with different -e/-m/-f/-p to compare providers side by side.
 #
 # Models (alias -> real):
 #   codex:  5.5|default -> gpt-5.5 (effort medium) [DEFAULT]; 5.5-high -> effort high;
@@ -61,7 +66,7 @@ done
 unset _p
 
 cmd="${1:-}"
-[ -n "$cmd" ] || die "usage: agent.sh run|reply|log|last|status|list|doctor|provider-info|gui|help ... (run 'agent.sh help' for the full reference)"
+[ -n "$cmd" ] || die "usage: agent.sh run|reply|log|last|status|list|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
 shift
 
 engine="codex"; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=0
@@ -476,10 +481,17 @@ PY
             exec python "$(dirname "$0")/gui.py"
         fi
         ;;
+    openai-server)
+        # OpenAI-compatible /v1/chat/completions bridge over a CLI subagent -- one process =
+        # one fixed engine/model/effort; run several (different -e/-m/-f/-p) to compare
+        # providers/models side by side. Foreground like `gui`, not backgrounded here.
+        export AGENT_SH_BASH="$(cygpath -w "$BASH" 2>/dev/null || echo bash)"
+        exec python "$(dirname "$0")/openai_server.py" "$@"
+        ;;
     help|--help|-h)
         # print this file's own header comment as the command reference -- one source of
         # truth instead of a duplicated usage string that can drift out of sync.
-        sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *) die "unknown command: $cmd (see: agent.sh help)" ;;
 esac

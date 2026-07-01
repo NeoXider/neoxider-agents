@@ -47,6 +47,36 @@ This spawns another agent that exercises the API with real HTTP calls (its own
 curl/shell, no MCP needed) and reports one strict pass/fail JSON object — a quick,
 cheap self-check before you tell the user it's done.
 
+**Need an OpenAI-compatible LLM backend pinned to a specific model?** If a task calls
+for something that speaks the OpenAI `/v1/chat/completions` wire format (e.g. another
+tool's test harness that only knows how to point at `COREAI_TEST_BASE_URL`-style env
+vars, or any OpenAI-client library), use `agent.sh openai-server` instead of setting up
+a real provider API key:
+
+```bash
+bash $SK openai-server -e claude -m sonnet -f low -p 8801
+# then point any OpenAI-compatible client's base_url at http://127.0.0.1:8801/v1
+```
+
+This starts a standalone HTTP server that translates `/v1/chat/completions` calls into
+`agent.sh run` invocations of the chosen CLI subagent and translates the answer back
+into an OpenAI-shaped response. Before relying on it, know what you're actually
+getting — it is a wire-compatible shim, not a real low-latency LLM API:
+
+- **Stateless per call** — the caller's whole `messages` array is serialized into one
+  prompt and sent to a brand-new `agent.sh run` every time; nothing is remembered
+  server-side between calls.
+- **Slow** — each call is a full CLI subprocess invocation (seconds to low minutes),
+  not a token stream. Don't use it anywhere real-time latency matters.
+- **`stream: true` is emulated** — the full answer is generated first, then replayed
+  as word-sized SSE chunks. It is NOT real per-token streaming from the underlying
+  provider.
+- **`tools`/function-calling is emulated via prompting**, not native — best-effort,
+  can occasionally misformat or ignore the instruction.
+- **`usage` token counts are always `0/0/0`** — don't trust them for cost tracking.
+- One process = one fixed engine/model/effort for its whole lifetime. To compare
+  models, run the command again with different `-e/-m/-f/-p` on another port.
+
 **GUI (`agent.sh gui`).** A lightweight local web control panel (python-stdlib, zero dependencies): a
 project→subagents tree on the left, a chat with the agent (markdown + bubbles) in the center, launching
 a new task and the selected provider's limits on the right, a `doctor` button with all the limits.

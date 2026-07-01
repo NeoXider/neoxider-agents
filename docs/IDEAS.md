@@ -159,6 +159,43 @@ one process, one cache), and the CLI (`agent.sh test-api -e claude -m sonnet -f 
 the terminal with zero GUI involved, so a multi-server design would add complexity
 without adding capability.
 
+### `openai-server`: the deliberate exception to "one shared server"
+
+`agent.sh openai-server` (see `TODO.md`'s API section and `openai_server.py`) does the
+*opposite* of the resolution above — one process per engine/model/effort, deliberately.
+That's not an inconsistency, it follows from a real difference in the two protocols:
+
+- `/api/run`, `/api/test-api`, and every other `gui.py`-served endpoint are *this
+  project's own* wire format — every request already carries explicit `engine`/
+  `model`/`effort` fields, so one shared server can dispatch per-call with no loss of
+  capability.
+- An OpenAI-compatible client speaks *OpenAI's* wire format, which has no per-request
+  provider/model-selection field a bridge could dispatch on — the `model` string in an
+  OpenAI chat-completions request is informational only (echoed back, occasionally
+  used for client-side bookkeeping), never something the server is expected to switch
+  backends on mid-stream. There is nowhere in that protocol to smuggle "and also use
+  claude-sonnet-5 at effort low for this one call."
+
+So the model has to be pinned at the *server* level, at startup, via `-e/-m/-f`. This
+is intentionally as simple as running `agent.sh gui` in the foreground: comparing N
+models means starting N `openai-server` processes on N ports, not building a routing
+layer. If a real per-request provider-selection need ever shows up (e.g. a client that
+wants to pick `claude-sonnet-5` vs `gpt-5.5` by request), the honest fix is a routing
+proxy in front of several `openai-server` instances — not teaching this bridge to
+parse its own convention out of the `model` field, which would silently diverge from
+what real OpenAI-compatible servers do with that field.
+
+**A second thing worth being explicit about, since both sections use the word
+"streaming" for different things**: `/api/stream` (above) tails the *real*, live,
+in-progress CLI transcript as the wrapped agent produces it — genuine incremental
+output. `openai-server`'s `stream: true` is a *post-hoc replay*: the full answer is
+generated first (same blocking wait as non-streaming), then chopped into word-sized
+SSE chunks and sent out on a fixed cadence. Both are legitimately useful, but a reader
+skimming both sections could easily assume they're the same kind of "streaming" when
+they aren't — `/api/stream` gives you the agent's actual real-time work; the bridge's
+streaming only exists so OpenAI-compatible client libraries that expect an SSE
+response shape don't have to special-case this one backend.
+
 ### "Does this feel like a real API?" — history, tool calls, streaming
 
 - **History** = the task's own `<name>.log` file, already the full multi-turn

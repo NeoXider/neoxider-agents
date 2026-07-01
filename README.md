@@ -78,6 +78,11 @@ this project fills.
   "log":...}`. Turns a kick-off call (`/api/test-api` or `/api/run`) plus one
   `/api/wait` call into a synchronous round-trip, for callers like a test harness or a
   Unity/C# test that don't want to hand-roll a polling loop.
+- **`openai-server` mode.** `agent.sh openai-server -e claude -m sonnet -f low -p 8801`
+  starts a standalone OpenAI-compatible `/v1/chat/completions` HTTP bridge backed by a
+  CLI subagent — point any OpenAI-compatible client (or COREAI_TEST_BASE_URL, see
+  below) at it instead of a real provider API key. See the dedicated section below for
+  the honesty points (stateless, emulated streaming/tools, no real token usage).
 
 ## Installation
 
@@ -186,6 +191,65 @@ instructions with no extra setup.
 See [`SKILL.md`](SKILL.md) for the full command reference (model aliases, the
 question-detection heuristic, path-normalization notes, and known trade-offs) — it
 doubles as the operating manual an AI agent reads before using this tool.
+
+## OpenAI-compatible bridge (`openai-server`)
+
+```bash
+agent.sh openai-server -e claude -m sonnet -f low -p 8801
+# or directly: python openai_server.py -e claude -m sonnet -f low -p 8899
+```
+
+Starts a standalone, zero-dependency HTTP server that exposes an OpenAI-compatible
+`POST .../chat/completions` endpoint (plus `GET /health`, `GET .../models`, `GET /`)
+backed by a CLI subagent (claude/codex/opencode/gemini, via the same `agent.sh run`
+machinery as everything else in this file). Point any OpenAI-compatible client's
+`base_url` at it and it drives your CLI-agent subscription as the "model" — no
+separate provider API key needed.
+
+**This is a wire-compatible shim, not a low-latency native LLM backend** — be clear
+about this before pointing anything at it:
+
+- **Stateless per call**, exactly like the real OpenAI API: the whole `messages` array
+  is serialized into one prompt and sent to a brand-new `agent.sh run` invocation every
+  time. Nothing is remembered server-side between calls — the caller's own `messages`
+  array *is* the memory.
+- **Latency is a full CLI subprocess invocation** — seconds to low minutes, not a token
+  stream.
+- **`stream: true` is emulated**: the full answer is generated first, then replayed as
+  word-sized SSE chunks ending in `data: [DONE]`. It is not real per-token streaming
+  from the underlying provider. The connection is explicitly closed after `[DONE]` so
+  plain HTTP clients that don't know that sentinel convention don't hang.
+- **`tools`/function-calling is emulated via prompting**, not native: when a request
+  includes an OpenAI `tools` array, the bridge instructs the agent (in the prompt) to
+  reply with either plain prose or a fenced JSON tool-call block, then parses that
+  block into a real `tool_calls` response. Best-effort — verified working, but it can
+  occasionally misformat or ignore the instruction.
+- **`usage` token counts are always `0/0/0`** — the wrapped CLIs don't expose real
+  token counts in a structured form.
+- Image content in messages is not rendered to the agent (replaced with a
+  `[image omitted]`-style note) — the wrapped CLI can't see images either way.
+- **One process = one fixed engine/model/effort** for its whole lifetime. To compare
+  models/providers side by side, or serve several at once, just run the command again
+  with different `-e/-m/-f/-p` in another terminal — no built-in multi-server manager.
+
+**Motivating use case** — CoreAI's Unity Game-Creation Benchmark can point its live
+PlayMode test suite at any OpenAI-compatible provider via env vars. To run it against
+Claude Sonnet 5 through your existing Claude Code CLI subscription instead of a real
+Anthropic API key:
+
+```bash
+# terminal 1, from this skill's directory:
+agent.sh openai-server -e claude -m sonnet -f low -p 8801
+
+# env for the Unity test run:
+export COREAI_TEST_BASE_URL=http://127.0.0.1:8801/v1
+export COREAI_TEST_MODEL=claude-sonnet-5
+export COREAI_TEST_API_KEY=
+```
+
+To compare several models in one full benchmark run each, start one bridge instance
+per model on a different port (`-p 8801/8802/8803/8804`, different `-e/-m/-f` each) and
+point a separate benchmark run at each port's `/v1` base URL in turn.
 
 ## Adding a provider
 

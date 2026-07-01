@@ -98,8 +98,8 @@
     <div class="box">
       <h3 data-i18n="api.snippets">Use from your own code</h3>
       <p class="subtitle" data-i18n="api.snippets_hint">This GUI's /api/test-api endpoint is the same one the button above calls — point your own test suite at it directly.</p>
-      <div class="snippet"><pre id="api-curl" class="mono"></pre><button class="mini" onclick="navigator.clipboard.writeText($('#api-curl').textContent)" data-i18n="api.copy">copy</button></div>
-      <div class="snippet"><pre id="api-csharp" class="mono"></pre><button class="mini" onclick="navigator.clipboard.writeText($('#api-csharp').textContent)" data-i18n="api.copy">copy</button></div>
+      <div class="snippet"><pre id="api-curl" class="mono"></pre><button class="mini" onclick="copyText(this, $('#api-curl').textContent)" data-i18n="api.copy">copy</button></div>
+      <div class="snippet"><pre id="api-csharp" class="mono"></pre><button class="mini" onclick="copyText(this, $('#api-csharp').textContent)" data-i18n="api.copy">copy</button></div>
     </div>
   </div>
 </div>

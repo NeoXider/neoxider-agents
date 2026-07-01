@@ -107,6 +107,36 @@ Roughly in priority order. PRs welcome.
   shell/file actions (no new schema), streaming/waiting are the two endpoints above;
   and the server design stays a single shared `gui.py` instance where every request
   carries its own `engine`/`model`/`effort`, not a server-per-provider.
+- [x] **`openai-server`: OpenAI-compatible `/v1/chat/completions` bridge.** Done —
+  standalone `openai_server.py` (zero stdlib deps) + `agent.sh openai-server` launcher,
+  translating `POST .../chat/completions` (plus `GET /health`, `.../models`, `/`) into
+  an `agent.sh run` invocation of a chosen CLI subagent. Verified live: a real
+  non-streaming call against `-e claude -m sonnet -f low` returned a clean
+  `{"choices":[{"message":{"content":"pong"}}],"finish_reason":"stop"}`.
+- [x] **Streaming emulation (`stream: true`).** Done — the full answer is generated
+  first, then replayed as word-sized SSE `chat.completion.chunk` deltas ending in
+  `data: [DONE]`, connection explicitly closed after (`Connection: close`) so plain
+  HTTP clients that don't know the `[DONE]` sentinel convention don't hang. Verified
+  live: correct role delta → word deltas → `finish_reason: "stop"` delta → `[DONE]`
+  sequence, connection closed cleanly.
+- [x] **Tool-calling emulation.** Done — when a request's `tools` array is present, the
+  bridge prompts the agent to reply with a fenced JSON tool-call block instead of
+  using its own shell/file tools, then parses it into a real OpenAI `tool_calls`
+  response (`finish_reason: "tool_calls"`, `content: null`). Verified live: a
+  `get_weather(city)` tool call round-tripped correctly against Claude.
+- [x] **Multi-instance support (compare models/providers).** Done by design, not new
+  code — one process is one fixed engine/model/effort for its lifetime; running
+  `agent.sh openai-server` again with different `-e/-m/-f/-p` starts an independent
+  instance on another port, same as running `agent.sh gui` in the foreground.
+- [x] **CoreAI Game-Creation Benchmark integration point.** Done — designed and wire-
+  verified (via curl, and by reading `MeaiOpenAiChatClient.cs`/`HTTP_TRANSPORT_SPEC.md`
+  to confirm CoreAI's own SSE reader stops at a literal `data: [DONE]` line rather than
+  relying on connection close) as a drop-in target for CoreAI's `COREAI_TEST_BASE_URL`/
+  `COREAI_TEST_API_KEY`/`COREAI_TEST_MODEL` env vars (see CoreAI's own
+  `RUNNING_LIVE_TESTS.md`): point `COREAI_TEST_BASE_URL` at `http://127.0.0.1:<port>/v1`
+  with an empty `COREAI_TEST_API_KEY`. **Not yet run**: the actual Unity PlayMode
+  benchmark suite itself against this bridge end-to-end — only the wire contract was
+  verified, not a full Unity test run.
 
 ## Distribution
 
