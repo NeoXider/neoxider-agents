@@ -6,6 +6,20 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- openai-server: accept the ONE-FENCED-JSON-PER-CALL spelling — each call in its own fenced
+  block shaped like an OpenAI tool-call object ({"type":"function","function":{...}}), no
+  `tool_calls` wrapper. Observed live from Sonnet 5: every world_command scenario scored
+  tools=0 while the transcripts held perfectly-shaped calls (suite 56.3 → 76.1 after the fix).
+  Fences are collected in order, the flat {"name":...,"arguments":{...}} shape is accepted too,
+  the name must be a KNOWN tool (a plain JSON answer is never eaten), and an explicit
+  `tool_calls` block still wins. +5 tests.
+
+- openai-server: a CLI answer that IS the provider's usage-limit banner ("You've hit your
+  session limit · resets 7:40am") now surfaces as an OpenAI-style HTTP 429 `rate_limit_error`
+  instead of a normal 200 completion — a live benchmark run scored every scenario ~0 as a MODEL
+  failure when the account was simply rate-limited. Narrow gate: short text matching the banner
+  wording; prose that merely discusses limits is untouched. +4 tests.
+
 - openai-server: recognize the NAMELESS call spelling — the entire message is bare JSON argument
   objects, one per line, with no function name at all. Observed live from gpt-5.3-codex-spark in
   the single-tool G6 scenario ({"action":"spawn","targetName":...} x~400 — the model "saved" the
