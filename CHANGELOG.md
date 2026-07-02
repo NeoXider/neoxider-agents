@@ -6,6 +6,13 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- openai-server: accept a fenced JSON ARRAY of BARE ARGUMENT OBJECTS (Fable 5 live: a 75-object
+  G6 castle as ```json [ {"action":"spawn","targetName":...}, ... ] ``` with no function name
+  anywhere scored tools=0). Same exactly-one-tool key-fit gate as the bare-object-lines
+  spelling; the live emitter also streams plain-array fences OBJECT BY OBJECT (both Opus-style
+  call objects and Fable-style bare argument objects), so this spelling now execute-as-streams
+  too. +5 tests.
+
 - openai-server: accept the {"action": "<tool>", "arguments": {...}} call spelling (Opus 4.8
   live: G5 Ordered spawn scored tools=0 on a perfectly-shaped 3-call array using "action"
   instead of "name"). Exact-keys rule as for {name, arguments}; normalized in _call_shaped so

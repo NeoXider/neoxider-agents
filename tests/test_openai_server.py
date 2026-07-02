@@ -1246,6 +1246,66 @@ class RunRetryAndFallbackTests(unittest.TestCase):
                          usage["prompt_tokens"] + usage["completion_tokens"])
 
 
+class BareArgsArrayTests(unittest.TestCase):
+    """Fable 5 live G6 spelling: ONE fenced JSON ARRAY whose elements are bare argument objects
+    of a single tool (no function name anywhere) -- a 75-object castle scored tools=0 before
+    this. Gate mirrors extract_bare_object_lines: keys must fit EXACTLY ONE declared tool."""
+
+    TOOLS = [
+        {"type": "function", "function": {"name": "world_command",
+         "parameters": {"type": "object", "properties": {
+             "action": {}, "targetName": {}, "prefabKey": {}, "stringValue": {},
+             "x": {}, "y": {}, "z": {}}}}},
+        {"type": "function", "function": {"name": "execute_lua",
+         "parameters": {"type": "object", "properties": {"code": {}}}}},
+    ]
+    NAMES = {"world_command", "execute_lua"}
+
+    FABLE_FENCE = ('```json\n[\n'
+                   '  {"action":"spawn","prefabKey":"Cube","targetName":"Wall1","x":0,"y":0,"z":0},\n'
+                   '  {"action":"set_color","targetName":"TreeTop4","stringValue":"#2f6d33"}\n'
+                   ']\n```')
+
+    def test_fenced_bare_args_array_extracts_calls(self):
+        calls, cleaned = srv.extract_tool_calls(self.FABLE_FENCE, self.NAMES, self.TOOLS)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(c["function"]["name"] == "world_command" for c in calls))
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"])["stringValue"], "#2f6d33")
+        self.assertEqual(cleaned, "")
+
+    def test_plain_data_array_survives_as_content(self):
+        text = '```json\n[{"score": 10, "player": "a"}, {"score": 20, "player": "b"}]\n```'
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, self.TOOLS)
+        self.assertIsNone(calls)
+        self.assertIn("score", cleaned)
+
+    def test_ambiguous_two_tools_rejected(self):
+        tools = self.TOOLS + [{"type": "function", "function": {"name": "other_tool",
+            "parameters": {"type": "object", "properties": {"action": {}, "targetName": {}}}}}]
+        text = '```json\n[{"action":"spawn","targetName":"a"}]\n```'
+        calls, _ = srv.extract_tool_calls(text, {"world_command", "execute_lua", "other_tool"}, tools)
+        self.assertIsNone(calls)
+
+    def test_live_emitter_streams_bare_args_objects_before_fence_closes(self):
+        h = _EmitterHarness(names=self.NAMES, tools=self.TOOLS)
+        cut = self.FABLE_FENCE.index('\n]')  # everything except the closing bracket + fence
+        h.feed_chunked(self.FABLE_FENCE[:cut])
+        self.assertEqual(len(h.calls), 2, "Both bare-args objects must stream before the fence closes.")
+        self.assertEqual(h.calls[0][1], "world_command")
+        self.assertEqual(h.calls[0][2]["targetName"], "Wall1")
+        h.emitter.feed(self.FABLE_FENCE[cut:])
+        h.emitter.finish()
+        self.assertEqual(len(h.calls), 2, "Reconciliation must not double-emit.")
+
+    def test_live_emitter_releases_data_array_as_content(self):
+        text = '```json\n[{"score": 10}, {"score": 20}]\n```\n' + "x" * 400
+        h = _EmitterHarness(names=self.NAMES, tools=self.TOOLS)
+        h.feed_chunked(text)
+        h.emitter.finish()
+        self.assertEqual(h.calls, [])
+        self.assertIn('"score"', h.content.replace(" ", "") or h.content)
+
+
 class ActionAliasSpellingTests(unittest.TestCase):
     """Opus 4.8 live spelling: {"action": "<tool>", "arguments": {...}} instead of "name" --
     G5 Ordered spawn scored tools=0 on a perfectly-shaped 3-call array before this."""

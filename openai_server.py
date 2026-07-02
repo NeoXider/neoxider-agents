@@ -768,6 +768,32 @@ def extract_bare_object_lines(text, tools):
     return [(name, o) for o in objs]
 
 
+def _bare_args_array(obj, tools):
+    """A fenced JSON ARRAY whose elements are BARE ARGUMENT OBJECTS of exactly one declared
+    tool -- Fable 5's live G6 spelling (```json [ {"action":"spawn","targetName":...}, ... ] ```
+    x75: the whole castle scored tools=0 because no element carried a function name). Same
+    deterministic gate as extract_bare_object_lines, applied to array elements: every element
+    must be a non-empty JSON object and the union of keys must fit (subset of parameter names)
+    EXACTLY ONE tool -- ambiguity or any non-matching key rejects the whole array, so a plain
+    data array survives as content. Returns call-shaped [{name, arguments}, ...] or None."""
+    if not (isinstance(obj, list) and obj and tools):
+        return None
+    props_by_tool = tool_param_names(tools)
+    candidates = None
+    for o in obj:
+        if not isinstance(o, dict) or not o:
+            return None
+        keys = {k for k in o if isinstance(k, str)}
+        fits = {name for name, props in props_by_tool.items() if keys <= set(props)}
+        candidates = fits if candidates is None else candidates & fits
+        if not candidates:
+            return None
+    if len(candidates) != 1:
+        return None
+    name = next(iter(candidates))
+    return [{"name": name, "arguments": o} for o in obj]
+
+
 def _call_shaped(obj, names):
     """The object IS one tool call: the OpenAI shape ({"function": {"name": ...}}, its own
     marker), the flat shape with EXACTLY {name, arguments} keys, or the {action, arguments}
@@ -863,11 +889,17 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
         if isinstance(obj, list):
             # A JSON ARRAY of call objects in one fence (Opus 4.8's dominant spelling:
             # ```json [ {"name":...,"arguments":...}, ... ] ```). Consumed only when every
-            # element is call-shaped, so a plain data array survives as content.
+            # element is call-shaped, so a plain data array survives as content. Falls back to
+            # the bare-argument-objects array (Fable 5's live spelling, see _bare_args_array).
             shaped = [_call_shaped(o, names) for o in obj]
             if obj and all(s is not None for s in shaped):
                 call_fences.append(shaped)
                 cleaned = cleaned[:m.start()] + cleaned[m.end():]
+            else:
+                bare = _bare_args_array(obj, tools)
+                if bare:
+                    call_fences.append(bare)
+                    cleaned = cleaned[:m.start()] + cleaned[m.end():]
             continue
         if not isinstance(obj, dict):
             continue
@@ -1171,7 +1203,16 @@ class LiveToolCallEmitter:
                 self.array_tail = self.fence_body[end:]
                 self._scan_array()
             elif state == "no":
-                self.canonical = False  # some other spelling: parsed whole at fence close
+                bracket = self.fence_body.find("[")
+                if bracket != -1 and not self.fence_body[:bracket].strip():
+                    # A plain JSON array fence (no {"tool_calls": wrapper): Opus writes arrays
+                    # of call objects, Fable writes arrays of bare argument objects -- both
+                    # stream object-by-object through the same scanner.
+                    self.canonical = True
+                    self.array_tail = self.fence_body[bracket + 1:]
+                    self._scan_array()
+                else:
+                    self.canonical = False  # some other spelling: parsed whole at fence close
             return
         self.array_tail += take
         self._scan_array()
@@ -1200,7 +1241,7 @@ class LiveToolCallEmitter:
             except ValueError:
                 self.fence_bad = True
                 break
-            shaped = _call_shaped(obj, self.names)
+            shaped = self._shape_streamed_obj(obj)
             if shaped is None:
                 self.fence_bad = True
                 break
@@ -1208,6 +1249,23 @@ class LiveToolCallEmitter:
             self.fence_emitted += 1
             pos = end
         self.array_tail = s[pos:]
+
+    def _shape_streamed_obj(self, obj):
+        """One streamed array element -> a call-shaped object. Accepts every _call_shaped
+        spelling, plus a BARE ARGUMENT OBJECT when its keys fit exactly one declared tool
+        (Fable 5's array-of-bare-args spelling, streamed object-by-object). Ambiguity (several
+        tools fit) returns None -- the fence degrades to complete-at-close handling, where the
+        whole-array key-union decides (see _bare_args_array)."""
+        shaped = _call_shaped(obj, self.names)
+        if shaped is not None:
+            return shaped
+        if isinstance(obj, dict) and obj and self.tools:
+            keys = {k for k in obj if isinstance(k, str)}
+            fits = {name for name, props in tool_param_names(self.tools).items()
+                    if keys <= set(props)}
+            if len(fits) == 1:
+                return {"name": next(iter(fits)), "arguments": obj}
+        return None
 
     def _fence_calls_complete(self, body):
         """Complete-fence parse mirroring extract_tool_calls' per-fence logic: returns a list
@@ -1227,7 +1285,9 @@ class LiveToolCallEmitter:
             return [one] if one else None
         if isinstance(obj, list) and obj:
             shaped = [_call_shaped(c, self.names) for c in obj]
-            return shaped if all(shaped) else None
+            if all(shaped):
+                return shaped
+            return _bare_args_array(obj, self.tools)
         return None
 
     def _fence_closed(self):
