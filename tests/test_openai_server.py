@@ -1309,6 +1309,29 @@ class WrapperKeyAliasTests(unittest.TestCase):
         calls, _ = srv.extract_tool_calls(text, self.NAMES)
         self.assertIsNone(calls, "A dict with extra keys besides the alias wrapper is a data answer.")
 
+    def test_commands_wrapper_with_bare_args_extracts_calls(self):
+        # Haiku 4.5 live G6 spelling: {"commands": [...]} wrapper whose elements are BARE
+        # argument objects (no function name) -- the whole castle scored tools=0 before.
+        tools = [{"type": "function", "function": {
+            "name": "world_command",
+            "parameters": {"type": "object", "properties": {
+                "action": {"type": "string"}, "targetName": {"type": "string"},
+                "prefabKey": {"type": "string"}, "stringValue": {"type": "string"},
+                "x": {"type": "number"}, "y": {"type": "number"}, "z": {"type": "number"},
+                "scaleX": {"type": "number"}, "scaleY": {"type": "number"},
+                "scaleZ": {"type": "number"}}, "required": ["action"]}}}]
+        text = ('```json\n{"commands": [\n'
+                '  {"action": "spawn", "targetName": "ground", "prefabKey": "cube",'
+                ' "x": 0, "y": 0, "z": 0, "scaleX": 18, "scaleY": 0.2, "scaleZ": 18},\n'
+                '  {"action": "set_color", "targetName": "ground", "stringValue": "#8b7355"}\n'
+                ']}\n```')
+        calls, cleaned = srv.extract_tool_calls(text, {"world_command"}, tools=tools)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["function"]["name"], "world_command")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "ground")
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"])["action"], "set_color")
+        self.assertEqual(cleaned, "")
+
     def test_actions_wrapper_streams_incrementally(self):
         h = _EmitterHarness(names=self.NAMES)
         cut = self.FENCE.index('  ]')

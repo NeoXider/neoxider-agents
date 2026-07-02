@@ -1050,8 +1050,9 @@ STREAM_HOLDBACK_CHARS = 350
 # the incremental scanner parses call-by-call. Everything else waits for fence close
 # (complete-fence parse) or end of turn (full-parser reconciliation).
 # Wrapper keys accepted around a call array: "tool_calls" is the prescribed one; the aliases
-# were each observed live ({"actions":[...]} from Fable 5 scored a whole scenario tools=0).
-CANONICAL_WRAPPER_KEYS = ("tool_calls", "actions", "calls", "function_calls")
+# were each observed live ({"actions":[...]} from Fable 5 scored a whole scenario tools=0,
+# {"commands":[...bare arg objects...]} from Haiku 4.5 scored a whole G6 castle tools=0).
+CANONICAL_WRAPPER_KEYS = ("tool_calls", "actions", "calls", "function_calls", "commands")
 
 
 def _match_canonical_prefix(body):
