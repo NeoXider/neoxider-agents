@@ -794,26 +794,48 @@ def _bare_args_array(obj, tools):
     return [{"name": name, "arguments": o} for o in obj]
 
 
+# Key aliases models use in place of "arguments" -- "parameters" observed live from Haiku 4.5
+# ({"function": {"name": ..., "parameters": {...}}}): _to_calls silently took EMPTY args and
+# every call failed schema validation ("9 failed, 0 spawns").
+_ARGS_KEY_ALIASES = ("arguments", "parameters", "params", "input")
+
+
+def _args_of(d):
+    """The argument payload of a call-ish dict, honoring the argument-key aliases."""
+    for key in _ARGS_KEY_ALIASES:
+        if key in d:
+            return d.get(key)
+    return {}
+
+
 def _call_shaped(obj, names):
     """The object IS one tool call: the OpenAI shape ({"function": {"name": ...}}, its own
-    marker), the flat shape with EXACTLY {name, arguments} keys, or the {action, arguments}
-    alias (Opus 4.8's live spelling -- '{"action": "world_command", "arguments": {...}}' scored
-    tools=0 before this; normalized to {name, arguments} so downstream conversion just works).
-    Exact-keys rules mean a data answer with extra fields survives as content. The name must be
-    a KNOWN declared tool."""
+    marker), the flat shape with EXACTLY {name-or-action, arguments-alias} keys ({action,
+    arguments} observed live from Opus 4.8, {name, parameters} from Haiku 4.5 -- both scored
+    tools=0 or empty-args failures before). Normalized to {name, arguments} so downstream
+    conversion just works. Exact-keys rules mean a data answer with extra fields survives as
+    content. The name must be a KNOWN declared tool."""
     if not isinstance(obj, dict):
         return None
     fn = obj.get("function") if isinstance(obj.get("function"), dict) else None
-    flat_exact = set(obj.keys()) == {"name", "arguments"}
-    alias_exact = set(obj.keys()) == {"action", "arguments"}
-    call_name = ((fn or {}).get("name") if fn
-                 else obj.get("name") if flat_exact
-                 else obj.get("action") if alias_exact
-                 else None)
+    call_name = None
+    flat = False
+    if fn is not None:
+        call_name = fn.get("name")
+    else:
+        keys = set(obj.keys())
+        for name_key in ("name", "action"):
+            for args_key in _ARGS_KEY_ALIASES:
+                if keys == {name_key, args_key}:
+                    call_name = obj.get(name_key)
+                    flat = True
+                    break
+            if flat:
+                break
     if isinstance(call_name, str) and call_name and names and call_name in names:
-        if alias_exact:
-            return {"name": call_name, "arguments": obj.get("arguments")}
-        return obj
+        if fn is not None:
+            return {"name": call_name, "arguments": _args_of(fn)}
+        return {"name": call_name, "arguments": _args_of(obj)}
     return None
 
 
@@ -841,10 +863,14 @@ def _parse_call_jsonl(body, names):
 def _to_calls(raw_calls):
     out = []
     for c in raw_calls:
-        name = c.get("name") or (c.get("function") or {}).get("name")
+        if not isinstance(c, dict):
+            continue
+        fn = c.get("function") if isinstance(c.get("function"), dict) else None
+        name = c.get("name") or (fn or {}).get("name")
         if not name:
             continue
-        args = c.get("arguments", (c.get("function") or {}).get("arguments", {}))
+        args = _args_of(fn) if (fn is not None and any(k in fn for k in _ARGS_KEY_ALIASES)) \
+            else _args_of(c)
         if not isinstance(args, str):
             args = json.dumps(args, ensure_ascii=False)
         out.append({"id": "call_%s" % uuid.uuid4().hex[:24], "type": "function",

@@ -6,6 +6,13 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- openai-server: accept "parameters"/"params"/"input" as argument-key aliases (Haiku 4.5 live:
+  {"function": {"name": ..., "parameters": {...}}} silently produced EMPTY arguments -- every
+  call failed schema validation, "9 failed, 0 spawns"). _call_shaped normalizes every accepted
+  shape to flat {name, arguments}; _to_calls honors the aliases for the legacy tool_calls
+  wrapper too. Also: drop SlashCommand from the chat-only --disallowedTools list (not a valid
+  tool name -- the CLI prepended a warning line to every answer). +4 tests.
+
 - openai-server: accept alias wrapper keys around the call array -- {"actions":[...]},
   {"calls":[...]}, {"function_calls":[...]} (Fable 5 live: the Dungeon-win-logic scenario came
   as {"actions":[OpenAI-shaped calls]} and scored tools=0). Stricter than "tool_calls": the

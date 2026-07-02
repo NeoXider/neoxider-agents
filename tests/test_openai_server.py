@@ -1246,6 +1246,36 @@ class RunRetryAndFallbackTests(unittest.TestCase):
                          usage["prompt_tokens"] + usage["completion_tokens"])
 
 
+class ParametersKeyAliasTests(unittest.TestCase):
+    """Haiku 4.5 live spelling #13: "parameters" instead of "arguments" inside the function
+    object -- _to_calls silently took EMPTY args and every call failed schema validation."""
+
+    NAMES = {"world_command"}
+
+    def test_openai_shape_with_parameters_key(self):
+        text = ('```json\n[{"type": "function", "function": {"name": "world_command",'
+                ' "parameters": {"action": "spawn", "targetName": "Player"}}}]\n```')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "Player")
+
+    def test_flat_name_parameters_exact_keys(self):
+        shaped = srv._call_shaped(
+            {"name": "world_command", "parameters": {"action": "spawn"}}, self.NAMES)
+        self.assertEqual(shaped, {"name": "world_command", "arguments": {"action": "spawn"}})
+
+    def test_tool_calls_wrapper_with_parameters_key(self):
+        text = ('```json\n{"tool_calls": [{"name": "world_command",'
+                ' "parameters": {"action": "spawn", "targetName": "Tree"}}]}\n```')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "Tree")
+
+    def test_extra_keys_still_content(self):
+        self.assertIsNone(srv._call_shaped(
+            {"name": "world_command", "parameters": {}, "note": "x"}, self.NAMES))
+
+
 class WrapperKeyAliasTests(unittest.TestCase):
     """Fable 5 live spelling #12: the canonical fence but with {"actions": [...]} instead of
     {"tool_calls": [...]}, elements shaped as OpenAI call objects with dict arguments -- the
