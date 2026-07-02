@@ -1246,6 +1246,49 @@ class RunRetryAndFallbackTests(unittest.TestCase):
                          usage["prompt_tokens"] + usage["completion_tokens"])
 
 
+class WrapperKeyAliasTests(unittest.TestCase):
+    """Fable 5 live spelling #12: the canonical fence but with {"actions": [...]} instead of
+    {"tool_calls": [...]}, elements shaped as OpenAI call objects with dict arguments -- the
+    whole Dungeon-win-logic scenario scored tools=0 before this."""
+
+    NAMES = {"world_command", "execute_lua"}
+    FENCE = ('```json\n{\n  "actions": [\n'
+             '    {"type": "function", "function": {"name": "world_command",'
+             ' "arguments": {"action": "spawn", "prefabKey": "Cube", "targetName": "Player"}}},\n'
+             '    {"type": "function", "function": {"name": "execute_lua",'
+             ' "arguments": {"code": "logic_define(1)"}}}\n'
+             '  ]\n}\n```')
+
+    def test_actions_wrapper_extracts_calls(self):
+        calls, cleaned = srv.extract_tool_calls(self.FENCE, self.NAMES)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["function"]["name"], "world_command")
+        self.assertEqual(calls[1]["function"]["name"], "execute_lua")
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"])["code"], "logic_define(1)")
+        self.assertEqual(cleaned, "")
+
+    def test_actions_wrapper_with_non_call_elements_stays_content(self):
+        text = '```json\n{"actions": [{"step": 1, "note": "walk"}, {"step": 2}]}\n```'
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES)
+        self.assertIsNone(calls)
+        self.assertIn("walk", cleaned)
+
+    def test_actions_wrapper_with_extra_keys_stays_content(self):
+        text = ('```json\n{"actions": [{"type": "function", "function": {"name": "world_command",'
+                ' "arguments": {}}}], "note": "plan"}\n```')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES)
+        self.assertIsNone(calls, "A dict with extra keys besides the alias wrapper is a data answer.")
+
+    def test_actions_wrapper_streams_incrementally(self):
+        h = _EmitterHarness(names=self.NAMES)
+        cut = self.FENCE.index('  ]')
+        h.feed_chunked(self.FENCE[:cut])
+        self.assertEqual(len(h.calls), 2, "Both calls must stream before the array closes.")
+        h.emitter.feed(self.FENCE[cut:])
+        h.emitter.finish()
+        self.assertEqual(len(h.calls), 2, "No double emit after reconciliation.")
+
+
 class BareArgsArrayTests(unittest.TestCase):
     """Fable 5 live G6 spelling: ONE fenced JSON ARRAY whose elements are bare argument objects
     of a single tool (no function name anywhere) -- a 75-object castle scored tools=0 before

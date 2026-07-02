@@ -904,6 +904,21 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
         if not isinstance(obj, dict):
             continue
         if "tool_calls" not in obj:
+            # Alias wrapper keys around the call array ({"actions":[...]} observed live from
+            # Fable 5 -- a whole scenario scored tools=0). Stricter than "tool_calls": every
+            # element must be call-shaped, or the list must be a bare-args array, so a data
+            # answer that happens to use these common key names survives as content.
+            aliased = None
+            for key in CANONICAL_WRAPPER_KEYS[1:]:
+                raw = obj.get(key)
+                if isinstance(raw, list) and raw and len(obj) == 1:
+                    shaped = [_call_shaped(o, names) for o in raw]
+                    aliased = shaped if all(shaped) else _bare_args_array(raw, tools)
+                    break
+            if aliased:
+                call_fences.append(aliased)
+                cleaned = cleaned[:m.start()] + cleaned[m.end():]
+                continue
             # ONE fenced JSON block PER CALL, shaped like an OpenAI tool-call object (observed
             # live from Sonnet 5) or the exact flat {name, arguments} spelling -- see
             # _call_shaped for the gates that keep plain JSON answers intact.
@@ -1008,22 +1023,33 @@ STREAM_HOLDBACK_CHARS = 350
 # The canonical tool-call fence body this bridge's own prompt prescribes -- the ONLY spelling
 # the incremental scanner parses call-by-call. Everything else waits for fence close
 # (complete-fence parse) or end of turn (full-parser reconciliation).
+# Wrapper keys accepted around a call array: "tool_calls" is the prescribed one; the aliases
+# were each observed live ({"actions":[...]} from Fable 5 scored a whole scenario tools=0).
+CANONICAL_WRAPPER_KEYS = ("tool_calls", "actions", "calls", "function_calls")
+
+
 def _match_canonical_prefix(body):
-    """('yes', end_index) when body starts with the canonical {"tool_calls":[ prefix
-    (end_index = first char after it), ('maybe', -1) while body is still a truncation of that
-    prefix, ('no', -1) otherwise. Whitespace between the JSON tokens is allowed."""
-    want = '{"tool_calls":['
-    wi = 0
-    for i, ch in enumerate(body):
-        if wi < len(want) and ch == want[wi]:
-            wi += 1
-            if wi == len(want):
-                return "yes", i + 1
-        elif ch in " \t\r\n":
-            continue
-        else:
-            return "no", -1
-    return "maybe", -1
+    """('yes', end_index) when body starts with {"<wrapper>":[ for any accepted wrapper key
+    (end_index = first char after it), ('maybe', -1) while body is still a truncation of one,
+    ('no', -1) otherwise. Whitespace between the JSON tokens is allowed."""
+    any_maybe = False
+    for key in CANONICAL_WRAPPER_KEYS:
+        want = '{"%s":[' % key
+        wi = 0
+        mismatch = False
+        for i, ch in enumerate(body):
+            if wi < len(want) and ch == want[wi]:
+                wi += 1
+                if wi == len(want):
+                    return "yes", i + 1
+            elif ch in " \t\r\n":
+                continue
+            else:
+                mismatch = True
+                break
+        if not mismatch:
+            any_maybe = True
+    return ("maybe" if any_maybe else "no"), -1
 
 
 def _object_end(s, start):
@@ -1277,10 +1303,14 @@ class LiveToolCallEmitter:
             obj = json.loads(body)
         except ValueError:
             return _parse_call_jsonl(body, self.names)
-        if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list):
-            shaped = [_call_shaped(c, self.names) for c in obj["tool_calls"]]
-            return shaped if shaped and all(shaped) else None
         if isinstance(obj, dict):
+            for key in CANONICAL_WRAPPER_KEYS:
+                raw = obj.get(key)
+                if isinstance(raw, list) and raw:
+                    shaped = [_call_shaped(c, self.names) for c in raw]
+                    if all(shaped):
+                        return shaped
+                    return _bare_args_array(raw, self.tools)
             one = _call_shaped(obj, self.names)
             return [one] if one else None
         if isinstance(obj, list) and obj:

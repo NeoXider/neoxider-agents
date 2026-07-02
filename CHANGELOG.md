@@ -6,6 +6,12 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- openai-server: accept alias wrapper keys around the call array -- {"actions":[...]},
+  {"calls":[...]}, {"function_calls":[...]} (Fable 5 live: the Dungeon-win-logic scenario came
+  as {"actions":[OpenAI-shaped calls]} and scored tools=0). Stricter than "tool_calls": the
+  dict must contain ONLY the wrapper key and every element must be call-shaped (or the list a
+  bare-args array). The live emitter streams all wrapper spellings incrementally. +4 tests.
+
 - openai-server: accept a fenced JSON ARRAY of BARE ARGUMENT OBJECTS (Fable 5 live: a 75-object
   G6 castle as ```json [ {"action":"spawn","targetName":...}, ... ] ``` with no function name
   anywhere scored tools=0). Same exactly-one-tool key-fit gate as the bare-object-lines
