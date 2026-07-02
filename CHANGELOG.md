@@ -6,6 +6,24 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- openai-server: REAL token streaming for the `claude` engine. `stream: true` now forwards
+  live deltas while the CLI generates instead of replaying the finished answer: the claude
+  provider runs `--output-format stream-json --include-partial-messages` piped through the new
+  `stream_text_filter.py` (events -> plain answer text, written incrementally), so the task log
+  grows during generation; the bridge tails the log (`_tail_task_log`, byte-offset + incremental
+  UTF-8 decode, CR-normalized) and emits each piece as an SSE `delta.content` chunk. Canonical
+  fenced `{"tool_calls":[...]}` calls are converted into native `delta.tool_calls` chunks AS
+  EACH CALL'S JSON OBJECT CLOSES (`LiveToolCallEmitter` — a 100-call build turn streams its
+  calls one by one); non-canonical fences are parsed complete at fence close, and an
+  end-of-turn full-parser reconciliation emits anything the incremental scanner missed (late
+  but correct, no double emits — matched by name + canonical args). The first ~350 chars are
+  held back so a provider limit banner can still surface as HTTP 429 (SSE headers are sent
+  lazily on the first real chunk); invisible retries/resume-fallbacks are only permitted while
+  nothing has reached the client (`LiveStreamDied` finalizes with what was already sent
+  otherwise). `--no-live-stream` reverts to the legacy replay; non-live engines keep it.
+  Verified live on haiku: ~0.2 s chunk spacing, per-call tool_calls chunks, clean resume turn.
+  +29 tests (emitter, canonical-prefix matcher, JSON object scanner, stream filter, log tail).
+
 - openai-server: prompt rewritten to prescribe ONE canonical tool-call format — a single fenced
   ```json {"tool_calls":[...]} block — instead of offering multiple. Reduces the format sprawl
   that kept surfacing new unparsed spellings, and drops the "write the call text for the

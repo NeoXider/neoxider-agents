@@ -79,11 +79,16 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   completely fresh; `GET /health` reports `session_active`/`session_turns`. An idle
   session also auto-expires after `--session-ttl` seconds (default 1800 = 30 min) —
   the next call after that just starts fresh instead of resuming.
-- **Slow** — each call is a full CLI subprocess invocation (seconds to low minutes),
-  not a token stream. Don't use it anywhere real-time latency matters.
-- **`stream: true` is emulated** — the full answer is generated first, then replayed
-  as word-sized SSE chunks. It is NOT real per-token streaming from the underlying
-  provider.
+- **Slow to first token** — each call starts a full CLI subprocess (several seconds
+  before the first delta). Don't use it anywhere real-time first-token latency matters.
+- **`stream: true` is REAL token streaming on the `claude` engine** — the CLI runs in
+  stream-json mode, the bridge tails the growing task log and forwards deltas as SSE
+  chunks while the model generates; canonical fenced tool calls become
+  `delta.tool_calls` chunks as each call's JSON closes. A short holdback keeps limit
+  banners convertible to HTTP 429, and an end-of-turn full parse reconciles any
+  non-canonical call spellings (they arrive late but correct). `--no-live-stream`
+  reverts to the legacy replay; non-live engines (codex/opencode/gemini) always use
+  the legacy replay of the finished answer as word-sized SSE chunks.
 - **`tools`/function-calling is emulated via prompting**, not native — best-effort. The
   bridge accepts every spelling seen live: a JSON `{"tool_calls":[...]}` block; one
   fenced OpenAI-shaped call object PER CALL (Sonnet 5's habit; known tool names only);

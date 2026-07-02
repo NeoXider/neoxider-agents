@@ -261,12 +261,26 @@ about this before pointing anything at it:
   `session_ttl_seconds`. Verified live with `--session-ttl 8`: an extension sent after
   12s idle correctly fell back to a fresh `agent.sh run` with the full history (task
   count incremented) instead of resuming — the answer was still correct either way.
-- **Latency is a full CLI subprocess invocation** — seconds to low minutes, not a token
-  stream.
-- **`stream: true` is emulated**: the full answer is generated first, then replayed as
-  word-sized SSE chunks ending in `data: [DONE]`. It is not real per-token streaming
-  from the underlying provider. The connection is explicitly closed after `[DONE]` so
-  plain HTTP clients that don't know that sentinel convention don't hang.
+- **First-token latency is a full CLI subprocess start** — a few seconds even when
+  streaming; the CLI process itself has to boot before the first delta can exist.
+- **`stream: true` is REAL token streaming on live-capable engines** (currently
+  `claude`): the provider runs the CLI with `--output-format stream-json
+  --include-partial-messages` piped through `stream_text_filter.py`, so the task log
+  grows while the model generates; the bridge tails the log and forwards each new piece
+  as an SSE `delta.content` chunk the moment it appears. Tool calls written in the
+  canonical fenced `{"tool_calls":[...]}` format are converted into native
+  `delta.tool_calls` chunks **as each call's JSON object closes** — a 100-call build
+  turn streams its calls one by one instead of dumping them at the end (verified live:
+  ~0.2 s spacing between chunks on haiku). Safety valves: the first ~350 chars are held
+  back so a provider limit banner still becomes an HTTP 429 (impossible once SSE
+  headers are out); a full end-of-turn parse reconciles any calls the incremental
+  scanner didn't recognize (non-canonical spellings arrive late but correct); invisible
+  retries/resume-fallbacks are only allowed while nothing has reached the client yet.
+  `--no-live-stream` is an emergency switch back to the legacy behavior. Non-live
+  engines (codex/opencode/gemini) keep that legacy behavior: the finished answer is
+  replayed as word-sized SSE chunks ending in `data: [DONE]`. The connection is
+  explicitly closed after `[DONE]` so plain HTTP clients that don't know that sentinel
+  convention don't hang.
 - **`tools`/function-calling is emulated via prompting**, not native: when a request
   includes an OpenAI `tools` array, the bridge instructs the agent (in the prompt) to
   reply with either plain prose or a tool call, then parses the call into a real

@@ -55,12 +55,31 @@ _provider_claude_chatonly_args() {
     fi
 }
 
+# _provider_claude_invoke DIR PROMPT CARGS... — shared tail of run/resume. Plain mode prints the
+# finished answer once; AGENT_STREAM_TEXT=1 (set by openai_server.py's live-streaming path) switches
+# the CLI to --output-format stream-json (token deltas as JSONL events) and pipes it through
+# stream_text_filter.py, which reprints the SAME answer text incrementally -- so the task log
+# (agent.sh tees this stdout into it) GROWS while the model generates and a tailing reader can
+# forward real deltas. --verbose is required by the CLI for stream-json in -p mode.
+_provider_claude_invoke() {
+    local dir="$1" prompt="$2"; shift 2
+    if [ "${AGENT_STREAM_TEXT:-0}" = 1 ]; then
+        local py
+        py="$(command -v python || command -v python3 || command -v python3.12 || echo python)"
+        ( cd "$dir" && claude -p "$@" --permission-mode acceptEdits \
+            --output-format stream-json --include-partial-messages --verbose "$prompt" </dev/null 2>&1 \
+          | PYTHONIOENCODING=utf-8 "$py" -u "$HERE/stream_text_filter.py" )
+    else
+        ( cd "$dir" && claude -p "$@" --permission-mode acceptEdits "$prompt" </dev/null 2>&1 )
+    fi
+}
+
 # provider_claude_run_cmd DIR MODEL EFFORT PROMPT — runs the CLI, streams to stdout/stderr.
 provider_claude_run_cmd() {
     local dir="$1" model="$2" effort="$3" prompt="$4" cargs
     cargs=(--model "$model"); [ -n "$effort" ] && cargs+=(--effort "$effort")
     mapfile -t -O ${#cargs[@]} cargs < <(_provider_claude_chatonly_args)
-    ( cd "$dir" && claude -p "${cargs[@]}" --permission-mode acceptEdits "$prompt" </dev/null 2>&1 )
+    _provider_claude_invoke "$dir" "$prompt" "${cargs[@]}"
 }
 
 # provider_claude_resume_cmd DIR SESSION ANSWER — resumes an existing session.
@@ -72,7 +91,7 @@ provider_claude_resume_cmd() {
     cargs=(--model "$P_MODEL"); [ -n "$P_EFFORT" ] && cargs+=(--effort "$P_EFFORT")
     if [ -n "$session" ]; then cargs+=(--resume "$session"); else cargs+=(--continue); fi
     mapfile -t -O ${#cargs[@]} cargs < <(_provider_claude_chatonly_args)
-    ( cd "$dir" && claude -p "${cargs[@]}" --permission-mode acceptEdits "$answer" </dev/null 2>&1 )
+    _provider_claude_invoke "$dir" "$answer" "${cargs[@]}"
 }
 
 # provider_claude_doctor — prints a single-line JSON object to stdout. The Claude CLI exposes no

@@ -1246,5 +1246,291 @@ class RunRetryAndFallbackTests(unittest.TestCase):
                          usage["prompt_tokens"] + usage["completion_tokens"])
 
 
+class MatchCanonicalPrefixTests(unittest.TestCase):
+    def test_complete_prefix_yes_with_end_index(self):
+        state, end = srv._match_canonical_prefix('{"tool_calls": [{"name":')
+        self.assertEqual(state, "yes")
+        self.assertEqual('{"tool_calls": [{"name":'[end:], '{"name":')
+
+    def test_truncated_prefix_is_maybe(self):
+        for body in ("", "{", '{"tool', '{ "tool_calls"', '{"tool_calls":'):
+            self.assertEqual(srv._match_canonical_prefix(body)[0], "maybe", body)
+
+    def test_whitespace_between_tokens_allowed(self):
+        state, _ = srv._match_canonical_prefix('  {\n  "tool_calls" : [\n')
+        self.assertEqual(state, "yes")
+
+    def test_other_json_is_no(self):
+        self.assertEqual(srv._match_canonical_prefix('{"answer": 42}')[0], "no")
+        self.assertEqual(srv._match_canonical_prefix('def foo():')[0], "no")
+
+
+class ObjectEndTests(unittest.TestCase):
+    def test_simple_object(self):
+        s = '{"a": 1} tail'
+        self.assertEqual(s[:srv._object_end(s, 0)], '{"a": 1}')
+
+    def test_nested_and_strings_with_braces(self):
+        s = '{"a": {"b": "}"}, "c": "{"} rest'
+        self.assertEqual(s[:srv._object_end(s, 0)], '{"a": {"b": "}"}, "c": "{"}')
+
+    def test_escaped_quote_inside_string(self):
+        s = '{"a": "x\\"}{"} tail'
+        self.assertEqual(s[:srv._object_end(s, 0)], '{"a": "x\\"}{"}')
+
+    def test_incomplete_returns_minus_one(self):
+        self.assertEqual(srv._object_end('{"a": {"b": 1}', 0), -1)
+
+
+class _EmitterHarness:
+    """Collects everything a LiveToolCallEmitter sends to the wire, in order."""
+
+    def __init__(self, names=("spawn_object", "set_color"), tools=None, prior=None):
+        self.events = []  # ("content", str) / ("call", name, args_dict)
+        self.emitter = srv.LiveToolCallEmitter(
+            set(names), tools, prior,
+            on_content=lambda s: self.events.append(("content", s)),
+            on_call=lambda call, idx: self.events.append(
+                ("call", call["function"]["name"],
+                 json.loads(call["function"]["arguments"]))),
+        )
+
+    def feed_chunked(self, text, size=3):
+        for i in range(0, len(text), size):
+            self.emitter.feed(text[i:i + size])
+
+    @property
+    def calls(self):
+        return [e for e in self.events if e[0] == "call"]
+
+    @property
+    def content(self):
+        return "".join(e[1] for e in self.events if e[0] == "content")
+
+
+class LiveEmitterCanonicalTests(unittest.TestCase):
+    CANONICAL = ('Building it now.\n```json\n{"tool_calls": [\n'
+                 '{"name": "spawn_object", "arguments": {"prefab": "cube", "name": "t1"}},\n'
+                 '{"name": "set_color", "arguments": {"name": "t1", "color": "red"}}\n'
+                 ']}\n```\nDone.')
+
+    def test_calls_emitted_before_fence_closes(self):
+        h = _EmitterHarness()
+        # Feed everything UP TO (not including) the closing fence: both calls must already be out.
+        cut = self.CANONICAL.index("]}")
+        h.feed_chunked(self.CANONICAL[:cut])
+        self.assertEqual([c[1] for c in h.calls], ["spawn_object", "set_color"])
+
+    def test_finish_does_not_double_emit(self):
+        h = _EmitterHarness()
+        h.feed_chunked(self.CANONICAL)
+        h.emitter.finish()
+        self.assertEqual(len(h.calls), 2)
+        self.assertEqual(h.calls[0][2], {"prefab": "cube", "name": "t1"})
+
+    def test_fence_text_never_leaks_into_content(self):
+        h = _EmitterHarness()
+        h.feed_chunked(self.CANONICAL)
+        h.emitter.finish()
+        self.assertNotIn("tool_calls", h.content)
+        self.assertNotIn("```", h.content)
+
+    def test_single_char_feeding(self):
+        h = _EmitterHarness()
+        h.feed_chunked(self.CANONICAL, size=1)
+        h.emitter.finish()
+        self.assertEqual(len(h.calls), 2)
+
+    def test_unterminated_canonical_fence_still_emits_closed_calls(self):
+        h = _EmitterHarness()
+        cut = self.CANONICAL.index("]}")  # stream dies mid-turn
+        h.feed_chunked(self.CANONICAL[:cut])
+        h.emitter.finish()
+        self.assertEqual(len(h.calls), 2)
+
+
+class LiveEmitterNonCanonicalTests(unittest.TestCase):
+    def test_per_call_fenced_object_emitted_at_fence_close(self):
+        text = ('```json\n{"name": "spawn_object", "arguments": {"prefab": "cube"}}\n```')
+        h = _EmitterHarness()
+        h.feed_chunked(text)
+        self.assertEqual(len(h.calls), 1)
+        self.assertEqual(h.calls[0][1], "spawn_object")
+
+    def test_jsonl_fence_emitted_at_fence_close(self):
+        text = ('```json\n'
+                '{"name": "spawn_object", "arguments": {"prefab": "cube"}}\n'
+                '{"name": "set_color", "arguments": {"color": "red"}}\n'
+                '```')
+        h = _EmitterHarness()
+        h.feed_chunked(text)
+        self.assertEqual([c[1] for c in h.calls], ["spawn_object", "set_color"])
+
+    def test_code_fence_released_as_content(self):
+        text = "Here is code:\n```python\nprint('hi')\n```\nthat's it. " + "x" * 400
+        h = _EmitterHarness()
+        h.feed_chunked(text)
+        h.emitter.finish()
+        self.assertEqual(h.calls, [])
+        self.assertIn("print('hi')", h.content)
+        self.assertIn("```python", h.content)
+
+    def test_func_syntax_reconciled_at_finish(self):
+        # The incremental scanner doesn't know codex's name(arg=value) spelling -- the
+        # end-of-turn full parse must still produce the call.
+        text = 'spawn_object(prefab="cube", name="t1")\n' + "padding " * 60
+        h = _EmitterHarness()
+        h.feed_chunked(text)
+        h.emitter.finish()
+        self.assertEqual(len(h.calls), 1)
+        self.assertEqual(h.calls[0][2]["prefab"], "cube")
+
+
+class LiveEmitterHoldbackTests(unittest.TestCase):
+    def test_short_answer_held_until_finish_fallback(self):
+        h = _EmitterHarness()
+        h.emitter.feed("Short answer.")
+        self.assertEqual(h.events, [])  # under holdback: nothing on the wire yet
+        self.assertFalse(h.emitter.wire_started)
+        fallback = h.emitter.finish()
+        self.assertEqual(fallback, "Short answer.")
+        self.assertFalse(h.emitter.any_calls)
+
+    def test_long_answer_streams_after_holdback(self):
+        h = _EmitterHarness()
+        h.feed_chunked("word " * 200)
+        self.assertTrue(h.emitter.wire_started)
+        self.assertTrue(len(h.content) > 0)
+        self.assertIsNone(h.emitter.finish())
+
+    def test_limit_banner_never_reaches_wire(self):
+        banner = "You've hit your session limit · resets 5:40pm"
+        h = _EmitterHarness()
+        h.emitter.feed(banner)
+        self.assertFalse(h.emitter.wire_started)
+        self.assertEqual(h.emitter.raw_text, banner)  # caller checks looks_like_limit_banner
+
+    def test_call_flushes_preceding_prose_first(self):
+        text = ('placing now\n```json\n{"tool_calls": ['
+                '{"name": "spawn_object", "arguments": {"prefab": "cube"}}]}\n```')
+        h = _EmitterHarness()
+        h.feed_chunked(text)
+        self.assertEqual(h.events[0][0], "content")
+        self.assertIn("placing now", h.events[0][1])
+        self.assertEqual(h.events[1][0], "call")
+
+    def test_reset_wipes_unflushed_state(self):
+        h = _EmitterHarness()
+        h.emitter.feed("attempt one partial ```json\n{\"tool_")
+        h.emitter.reset()
+        h.emitter.feed("clean second answer")
+        self.assertEqual(h.emitter.raw_text, "clean second answer")
+        self.assertEqual(h.emitter.finish(), "clean second answer")
+
+
+class StreamTextFilterTests(unittest.TestCase):
+    @staticmethod
+    def _run_filter(lines):
+        import io
+        spec = importlib.util.spec_from_file_location(
+            "stream_text_filter", os.path.join(REPO_ROOT, "stream_text_filter.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        out = io.StringIO()
+        mod.main(stdin=io.StringIO("\n".join(lines) + "\n"), stdout=out)
+        return out.getvalue()
+
+    @staticmethod
+    def _delta(text):
+        return json.dumps({"type": "stream_event",
+                           "event": {"type": "content_block_delta",
+                                     "delta": {"type": "text_delta", "text": text}}})
+
+    def test_deltas_concatenate_with_trailing_newline(self):
+        out = self._run_filter([self._delta("Hel"), self._delta("lo")])
+        self.assertEqual(out, "Hello\n")
+
+    def test_assistant_event_not_duplicated_after_deltas(self):
+        assistant = json.dumps({"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "Hello"}]}})
+        out = self._run_filter([self._delta("Hel"), self._delta("lo"), assistant])
+        self.assertEqual(out, "Hello\n")
+
+    def test_assistant_event_covers_missing_deltas(self):
+        assistant = json.dumps({"type": "assistant", "message": {
+            "content": [{"type": "text", "text": "Full answer"}]}})
+        out = self._run_filter([assistant])
+        self.assertEqual(out, "Full answer\n")
+
+    def test_result_only_printed_when_nothing_else_was(self):
+        result = json.dumps({"type": "result", "result": "limit banner text"})
+        self.assertEqual(self._run_filter([result]), "limit banner text\n")
+        out = self._run_filter([self._delta("real answer"), result])
+        self.assertEqual(out, "real answer\n")
+
+    def test_non_json_lines_pass_through(self):
+        out = self._run_filter(["some CLI error line", self._delta("ok")])
+        self.assertEqual(out, "some CLI error line\nok\n")
+
+    def test_unknown_events_ignored(self):
+        out = self._run_filter([json.dumps({"type": "system", "subtype": "init"}),
+                                self._delta("hi")])
+        self.assertEqual(out, "hi\n")
+
+
+class TailTaskLogTests(unittest.TestCase):
+    """_tail_task_log must forward exactly the text after this run's own output marker, as it
+    is appended, surviving multi-byte characters split across reads."""
+
+    def setUp(self):
+        import tempfile
+        self._saved_logdir = srv.LOGDIR
+        self._tmp = tempfile.mkdtemp()
+        srv.LOGDIR = self._tmp
+
+    def tearDown(self):
+        import shutil
+        srv.LOGDIR = self._saved_logdir
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    class _FakeProc:
+        def __init__(self):
+            self.dead = False
+
+        def poll(self):
+            return 0 if self.dead else None
+
+        def kill(self):
+            self.dead = True
+
+    def test_forwards_only_after_marker_and_in_pieces(self):
+        import threading
+        name = "tail-test"
+        path = os.path.join(self._tmp, name + ".log")
+        proc = self._FakeProc()
+        got = []
+
+        def writer():
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write("header stuff\n> PROMPT: hi\n")
+                f.flush()
+                srv.time.sleep(0.15)
+                f.write(srv.OUTPUT_MARKER + "\n")
+                f.write("Hel")
+                f.flush()
+                srv.time.sleep(0.15)
+                f.write("lo ж")  # multi-byte char near a flush boundary
+                f.flush()
+                srv.time.sleep(0.15)
+            proc.dead = True
+
+        t = threading.Thread(target=writer)
+        t.start()
+        srv._tail_task_log(name, proc, timeout=10, on_delta=got.append)
+        t.join()
+        self.assertEqual("".join(got), "Hello ж")
+        self.assertGreaterEqual(len(got), 2)  # arrived in pieces, not one blob
+
+
 if __name__ == "__main__":
     unittest.main()

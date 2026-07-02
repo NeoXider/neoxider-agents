@@ -41,10 +41,17 @@ THE SESSION MODEL -- one API process = one ongoing chat session, not a fresh age
     recreated whenever a brand-new session starts, unless `--dir` pins a real project path.
 
 WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backend:
-  - Latency is a full CLI subprocess invocation (seconds to low minutes), not a token stream.
-  - `stream: true` replays the finished answer as word-sized SSE deltas -- this is NOT real
-    per-token streaming from the underlying provider, just a wire-compatible reveal of a result
-    that was already fully generated before the first chunk goes out.
+  - First-token latency is a full CLI subprocess start (seconds), even in streaming mode.
+  - `stream: true` on a LIVE-capable engine (claude) forwards REAL token deltas: the provider
+    runs the CLI with `--output-format stream-json --include-partial-messages` piped through
+    stream_text_filter.py so the task log grows as the model generates, the bridge tails that
+    log and emits each new piece as an SSE chunk, and canonical fenced tool calls are converted
+    into `delta.tool_calls` chunks AS EACH CALL'S JSON CLOSES (see LiveToolCallEmitter). The
+    first ~350 chars are held back so a provider limit banner can still become an HTTP 429
+    instead of leaking out as streamed content; a full end-of-turn parse reconciles any calls
+    the incremental scanner could not recognize. `--no-live-stream` disables all of this and
+    falls back to the legacy behavior: replaying the finished answer as word-sized SSE deltas
+    (which is also what every non-live engine, e.g. codex, still does).
   - `tools` / function-calling is EMULATED: the agent is instructed via the prompt to describe a
     tool call as a strict JSON block instead of using its own shell/file tools, which is then
     reformatted into a real OpenAI `tool_calls` response. This is best-effort prompting, not a
@@ -241,6 +248,136 @@ def reply_agent(engine, model, effort, workdir, name, answer, timeout):
     # (error/timeout/rate-limit) DOES grow the log -- and last_output would then return that failed
     # block as if it were the answer. Only accept a reply whose task ended in a good state; anything
     # else (error/stalled, or a timeout that left it still "running") -> None so _run falls back fresh.
+    state = read_meta(name).get("state")
+    if state not in ("done", "waiting"):
+        return None
+    return last_output(after)
+
+
+# --------------------------------------------------------------------------------------------
+# Live streaming (real token deltas). Engines here run their CLI in a streaming output mode
+# (see providers/<engine>/provider.sh + stream_text_filter.py) so the task log GROWS while the
+# model generates; the bridge tails the log and forwards each new piece to the SSE client.
+LIVE_STREAM_ENGINES = {"claude"}
+OUTPUT_MARKER = "---------- output ----------"
+
+
+class LiveStreamDied(Exception):
+    """A live run/resume failed AFTER deltas already reached the client -- it can't be retried
+    invisibly (the client would see the answer twice). The caller finalizes the stream with
+    whatever text was already forwarded."""
+
+
+def _stream_env():
+    env = _chatonly_env()
+    env["AGENT_STREAM_TEXT"] = "1"  # provider switches the CLI to incremental text output
+    return env
+
+
+def _log_path(name):
+    return os.path.join(LOGDIR, name + ".log")
+
+
+def _log_size(name):
+    try:
+        return os.path.getsize(_log_path(name))
+    except OSError:
+        return 0
+
+
+def _tail_task_log(name, proc, timeout, on_delta, start_size=0):
+    """Follows the task log while `proc` (the agent.sh subprocess) runs, forwarding every new
+    piece of ANSWER text (everything after this run's own "---------- output ----------" marker
+    line) to on_delta as it is appended. Byte-offset based with an incremental UTF-8 decoder --
+    a multi-byte character split across two reads must not become mojibake."""
+    import codecs
+    path = _log_path(name)
+    deadline = time.time() + timeout
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pos = start_size
+    pending = ""          # header text before this run's output marker
+    after_marker = False
+    killed = False
+
+    def drain():
+        nonlocal pos, pending, after_marker
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return False
+        if size <= pos:
+            return False
+        with open(path, "rb") as f:
+            f.seek(pos)
+            data = f.read(size - pos)
+        pos = size
+        # \r stripped: on Windows the provider's filter writes CRLF line endings into the log;
+        # the final-answer path normalizes them via text-mode reads, so streamed deltas must
+        # match or the streamed text differs from the reconciled one.
+        text = decoder.decode(data).replace("\r", "")
+        if not text:
+            return True
+        if after_marker:
+            on_delta(text)
+            return True
+        pending += text
+        idx = pending.find(OUTPUT_MARKER + "\n")
+        if idx != -1:
+            after_marker = True
+            rest = pending[idx + len(OUTPUT_MARKER) + 1:]
+            pending = ""
+            if rest:
+                on_delta(rest)
+        return True
+
+    while True:
+        alive = proc.poll() is None
+        if drain():
+            continue  # keep draining back-to-back while data flows
+        if not alive:
+            break
+        if not killed and time.time() > deadline:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            killed = True
+        time.sleep(0.05)
+
+
+def run_agent_live(engine, model, effort, workdir, prompt, name, timeout, on_delta):
+    """run_agent, but with AGENT_STREAM_TEXT=1 and a log tail forwarding answer deltas while
+    the CLI generates. Returns the same final answer text run_agent would."""
+    args = [BASH, SK, "run", "-e", engine, "-C", to_git_bash_path(workdir), "-t", name]
+    if model:
+        args += ["-m", model]
+    if effort:
+        args += ["-f", effort]
+    args.append(prompt)
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            cwd=HERE, env=_stream_env())
+    _tail_task_log(name, proc, timeout, on_delta)
+    return last_output(read_log(name))
+
+
+def reply_agent_live(engine, model, effort, workdir, name, answer, timeout, on_delta):
+    """reply_agent with a live log tail. Same None contract as reply_agent: None when the reply
+    appended nothing or ended in a bad state (the caller decides whether a fresh-run fallback
+    is still invisible to the client or the stream must be finalized as-is)."""
+    args = [BASH, SK, "reply", "-e", engine]
+    if model:
+        args += ["-m", model]
+    if effort:
+        args += ["-f", effort]
+    args += ["-C", to_git_bash_path(workdir), name, answer]
+    before_bytes = _log_size(name)
+    before_text = len(read_log(name))
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            cwd=HERE, env=_stream_env())
+    _tail_task_log(name, proc, timeout, on_delta, start_size=before_bytes)
+    after = read_log(name)
+    if len(after) == before_text:
+        return None
     state = read_meta(name).get("state")
     if state not in ("done", "waiting"):
         return None
@@ -821,6 +958,326 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
     return calls, cleaned.strip()
 
 
+# How much streamed content is held back before the first byte goes to the client. Two jobs:
+# (1) a provider limit banner (always < 300 chars, see looks_like_limit_banner) must still be
+# able to become an HTTP 429 -- impossible once SSE headers are out; (2) very short answers
+# behave exactly like the non-streaming path (parsed once, sent once).
+STREAM_HOLDBACK_CHARS = 350
+
+# The canonical tool-call fence body this bridge's own prompt prescribes -- the ONLY spelling
+# the incremental scanner parses call-by-call. Everything else waits for fence close
+# (complete-fence parse) or end of turn (full-parser reconciliation).
+def _match_canonical_prefix(body):
+    """('yes', end_index) when body starts with the canonical {"tool_calls":[ prefix
+    (end_index = first char after it), ('maybe', -1) while body is still a truncation of that
+    prefix, ('no', -1) otherwise. Whitespace between the JSON tokens is allowed."""
+    want = '{"tool_calls":['
+    wi = 0
+    for i, ch in enumerate(body):
+        if wi < len(want) and ch == want[wi]:
+            wi += 1
+            if wi == len(want):
+                return "yes", i + 1
+        elif ch in " \t\r\n":
+            continue
+        else:
+            return "no", -1
+    return "maybe", -1
+
+
+def _object_end(s, start):
+    """Index just past the matching '}' of the JSON object opening at s[start] (which must be
+    '{'), honoring strings and escapes; -1 while the object is still incomplete."""
+    depth = 0
+    in_str = False
+    i = start
+    while i < len(s):
+        ch = s[i]
+        if in_str:
+            if ch == '"' and not _is_escaped(s, i):
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+class LiveToolCallEmitter:
+    """Splits a streamed answer into SSE content deltas and tool calls emitted AS THEY CLOSE.
+
+    Text outside code fences flows to on_content (after the initial holdback). A fence whose
+    body starts with the canonical {"tool_calls":[ prefix is scanned object-by-object: each
+    completed call object becomes an on_call the moment its closing brace arrives -- THE point
+    of live streaming (a 100-call castle turn is one fence that only closes at the very end of
+    the turn, so per-fence granularity would defeat the feature). Any other fence is held
+    intact until it closes, then either parsed as calls (the non-canonical spellings
+    extract_tool_calls knows) or released verbatim as content. finish() reconciles with the
+    authoritative full parser so a spelling the incremental scanner missed still produces
+    tool_calls -- late, but correct.
+
+    Single-threaded by design (fed from the log-tail loop); not thread-safe."""
+
+    def __init__(self, names, tools, prior, on_content, on_call):
+        self.names = names or set()
+        self.tools = tools
+        self.prior = prior
+        self.on_content = on_content
+        self.on_call = on_call
+        self.raw_parts = []      # every piece fed, verbatim (the full answer so far)
+        self.buf = ""            # unprocessed tail outside a fence
+        self.pending = ""        # content held back until STREAM_HOLDBACK_CHARS
+        self.wire_started = False
+        self.call_index = 0
+        self.emitted_keys = []   # (name, canonical-args) of live-emitted calls, for reconciliation
+        self._reset_fence()
+        self.in_fence = False
+
+    def _reset_fence(self):
+        self.fence_raw = ""      # fence verbatim, including ``` markers and header line
+        self.fence_body = ""     # body text (after the header line)
+        self.header_done = False
+        self.canonical = None    # None undecided / True scanning array / False complete-at-close
+        self.fence_bad = False
+        self.array_tail = ""     # unparsed remainder of the canonical array body
+        self.fence_emitted = 0
+
+    def reset(self):
+        """Forget everything from a failed attempt that never reached the wire -- the retry's
+        stream starts clean. Illegal after wire_started (callers gate retries on that)."""
+        assert not self.wire_started
+        self.raw_parts = []
+        self.buf = ""
+        self.pending = ""
+        self._reset_fence()
+        self.in_fence = False
+
+    @property
+    def raw_text(self):
+        return "".join(self.raw_parts)
+
+    # ---- output helpers -------------------------------------------------------------------
+    def _flush_pending(self):
+        if not self.wire_started and self.pending:
+            self.on_content(self.pending)
+            self.pending = ""
+        self.wire_started = True
+
+    def _content(self, s):
+        if not s:
+            return
+        if self.wire_started:
+            self.on_content(s)
+            return
+        self.pending += s
+        if len(self.pending) >= STREAM_HOLDBACK_CHARS:
+            self._flush_pending()
+
+    def _emit_call_obj(self, obj):
+        converted = _to_calls([obj])
+        if not converted:
+            return
+        call = converted[0]
+        self._flush_pending()  # content that preceded the fence keeps its order
+        self.emitted_keys.append((call["function"]["name"],
+                                  _canonical_args(call["function"]["arguments"])))
+        self.on_call(call, self.call_index)
+        self.call_index += 1
+
+    # ---- input ----------------------------------------------------------------------------
+    def feed(self, piece):
+        if not piece:
+            return
+        self.raw_parts.append(piece)
+        self.buf += piece
+        self._process()
+
+    def _process(self):
+        while True:
+            if not self.in_fence:
+                i = self.buf.find("```")
+                if i == -1:
+                    # Keep the last 2 chars: they may be the start of a fence split across reads.
+                    safe = self.buf[:-2] if len(self.buf) > 2 else ""
+                    if safe:
+                        self._content(safe)
+                        self.buf = self.buf[len(safe):]
+                    return
+                if i > 0:
+                    self._content(self.buf[:i])
+                self.buf = self.buf[i + 3:]
+                self.in_fence = True
+                self._reset_fence()
+                self.fence_raw = "```"
+                continue
+            # inside a fence: take text up to the closing ``` (or all of it, minus a possible
+            # partial backtick run at the very end)
+            j = self.buf.find("```")
+            if j == -1:
+                keep = 0
+                while keep < 2 and len(self.buf) > keep and self.buf[-(keep + 1)] == "`":
+                    keep += 1
+                take = self.buf[:len(self.buf) - keep] if keep else self.buf
+                self.buf = self.buf[len(take):]
+                closed = False
+            else:
+                take = self.buf[:j]
+                self.buf = self.buf[j + 3:]
+                closed = True
+            if take:
+                self.fence_raw += take
+                self._fence_text(take)
+            if not closed:
+                return
+            self.fence_raw += "```"
+            self._fence_closed()
+            self.in_fence = False
+
+    def _fence_text(self, take):
+        """Routes new in-fence text: finish the header line first, then body handling."""
+        if not self.header_done:
+            combined = self.fence_body + take  # fence_body temporarily holds the partial header
+            nl = combined.find("\n")
+            if nl == -1:
+                self.fence_body = combined
+                return
+            self.fence_body = ""
+            body_piece = combined[nl + 1:]
+            self.header_done = True
+            take = body_piece
+            if not take:
+                return
+        self.fence_body += take
+        if self.fence_bad or self.canonical is False:
+            return
+        if self.canonical is None:
+            state, end = _match_canonical_prefix(self.fence_body)
+            if state == "yes":
+                self.canonical = True
+                self.array_tail = self.fence_body[end:]
+                self._scan_array()
+            elif state == "no":
+                self.canonical = False  # some other spelling: parsed whole at fence close
+            return
+        self.array_tail += take
+        self._scan_array()
+
+    def _scan_array(self):
+        """Emits each completed call object of the canonical tool_calls array as it closes."""
+        s = self.array_tail
+        pos = 0
+        n = len(s)
+        while not self.fence_bad:
+            while pos < n and s[pos] in " \t\r\n,":
+                pos += 1
+            if pos >= n:
+                break
+            if s[pos] == "]":
+                pos = n  # array done; the trailing '}' / whitespace is consumed silently
+                break
+            if s[pos] != "{":
+                self.fence_bad = True
+                break
+            end = _object_end(s, pos)
+            if end == -1:
+                break  # object still streaming -- wait for more text
+            try:
+                obj = json.loads(s[pos:end])
+            except ValueError:
+                self.fence_bad = True
+                break
+            shaped = _call_shaped(obj, self.names)
+            if shaped is None:
+                self.fence_bad = True
+                break
+            self._emit_call_obj(shaped)
+            self.fence_emitted += 1
+            pos = end
+        self.array_tail = s[pos:]
+
+    def _fence_calls_complete(self, body):
+        """Complete-fence parse mirroring extract_tool_calls' per-fence logic: returns a list
+        of call-shaped objects, or None when the body is not a recognizable call fence."""
+        body = body.strip()
+        if not body:
+            return None
+        try:
+            obj = json.loads(body)
+        except ValueError:
+            return _parse_call_jsonl(body, self.names)
+        if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list):
+            shaped = [_call_shaped(c, self.names) for c in obj["tool_calls"]]
+            return shaped if shaped and all(shaped) else None
+        if isinstance(obj, dict):
+            one = _call_shaped(obj, self.names)
+            return [one] if one else None
+        if isinstance(obj, list) and obj:
+            shaped = [_call_shaped(c, self.names) for c in obj]
+            return shaped if all(shaped) else None
+        return None
+
+    def _fence_closed(self):
+        if self.canonical and not self.fence_bad:
+            return  # every call already emitted as it closed
+        if self.fence_emitted:
+            # A canonical fence that went bad mid-way: the clean prefix is already emitted and
+            # can't be unsent; drop the remainder -- finish()'s reconciliation emits whatever
+            # the authoritative parser still finds.
+            return
+        calls = self._fence_calls_complete(self.fence_body)
+        if calls:
+            for c in calls:
+                self._emit_call_obj(c)
+        else:
+            self._content(self.fence_raw)
+
+    # ---- end of stream ----------------------------------------------------------------------
+    def finish(self):
+        """End of the CLI turn: flush leftovers and reconcile with the authoritative parser.
+        Returns (extra_calls, fallback_text): calls the live scanner missed (already emitted via
+        on_call here), and -- only when NOTHING was sent to the wire and there are no calls --
+        the parser's cleaned display text to send instead of raw held-back content."""
+        if self.in_fence:
+            if not (self.canonical and not self.fence_bad) and not self.fence_emitted:
+                self._content(self.fence_raw)  # unterminated non-call fence: it's just text
+            self.in_fence = False
+        elif self.buf:
+            self._content(self.buf)
+            self.buf = ""
+        auth_calls, auth_text = extract_tool_calls(self.raw_text, self.names, self.tools,
+                                                   self.prior)
+        remaining = []
+        unmatched = list(self.emitted_keys)
+        for c in auth_calls or []:
+            k = (c["function"]["name"], _canonical_args(c["function"]["arguments"]))
+            if k in unmatched:
+                unmatched.remove(k)
+            else:
+                remaining.append(c)
+        for c in remaining:
+            self._flush_pending()
+            self.emitted_keys.append((c["function"]["name"],
+                                      _canonical_args(c["function"]["arguments"])))
+            self.on_call(c, self.call_index)
+            self.call_index += 1
+        if not self.wire_started:
+            # Nothing (content or calls) reached the client yet: behave exactly like the
+            # non-streaming path -- send the parsed display text once.
+            self.pending = ""
+            return auth_text
+        self._flush_pending()
+        return None
+
+    @property
+    def any_calls(self):
+        return self.call_index > 0
+
+
 CFG = None  # set in main(); read by the request handler
 
 # The one ongoing session this bridge process serves (see the module docstring's "THE SESSION
@@ -912,12 +1369,22 @@ class H(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": {"message": "not found: " + p}})
 
-    def _run(self, messages, tools):
+    def _raw_completion(self, messages, tools, on_delta=None, can_retry=None, on_retry=None):
         """Implements THE SESSION MODEL (see module docstring): continue the existing CLI
         session via `agent.sh reply` when `messages` is a deterministic extension of what we
         saw last time and that session is still healthy; otherwise fall back to a brand-new
         `agent.sh run` with the full history. Holds SESSION_LOCK for the whole CLI call --
-        by design, this bridge serves one conversation at a time."""
+        by design, this bridge serves one conversation at a time.
+
+        With on_delta set (and the engine live-capable, and --no-live-stream not given), the CLI
+        runs in streaming output mode and every new piece of answer text is forwarded to
+        on_delta while it generates. can_retry() gates the invisible fallbacks (resume->fresh,
+        empty->retry): once deltas have reached the client they cannot be retried silently --
+        LiveStreamDied is raised instead so the caller finalizes with what was already sent.
+        on_retry() (if given) resets the caller's incremental state before a permitted retry."""
+        live = (on_delta is not None and CFG.engine in LIVE_STREAM_ENGINES
+                and not getattr(CFG, "no_live_stream", False))
+        retry_ok = can_retry or (lambda: True)
         with SESSION_LOCK:
             supports_resume = bool((PROVIDERS.get(CFG.engine) or {}).get("supports_resume"))
             prev_name = SESSION["task_name"]
@@ -934,12 +1401,25 @@ class H(BaseHTTPRequestHandler):
             if supports_resume and healthy and is_extension(SESSION["messages"], messages):
                 new_turns = messages[len(SESSION["messages"]):]
                 answer = build_prompt(new_turns, tools)
-                raw_text = reply_agent(CFG.engine, CFG.model, CFG.effort, SESSION["dir"], prev_name, answer, CFG.timeout)
+                if live:
+                    raw_text = reply_agent_live(CFG.engine, CFG.model, CFG.effort, SESSION["dir"],
+                                                prev_name, answer, CFG.timeout, on_delta)
+                else:
+                    raw_text = reply_agent(CFG.engine, CFG.model, CFG.effort, SESSION["dir"],
+                                           prev_name, answer, CFG.timeout)
                 if raw_text is not None and not raw_text.strip():
                     # A resume that "succeeded" but produced an EMPTY answer is as useless to the
                     # caller as one that died -- fall back to a fresh run rather than returning "".
                     raw_text = None
                 name = prev_name
+                if raw_text is None and live:
+                    if not retry_ok():
+                        # The resume died/errored but its deltas already reached the client --
+                        # a silent fresh-run would send the answer twice.
+                        SESSION["last_activity"] = time.time()
+                        raise LiveStreamDied()
+                    if on_retry is not None:
+                        on_retry()  # wipe the failed resume's partial state before falling back
             if raw_text is None or not raw_text.strip():
                 # First call, a non-extension, an unhealthy session, OR a resume that appended
                 # nothing (reply_agent returned None). Any of these -> a clean fresh run with the
@@ -952,17 +1432,37 @@ class H(BaseHTTPRequestHandler):
                 SESSION["dir"] = workdir
                 for attempt in range(CFG.retries + 1):
                     name = new_task_name()
-                    raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt, name, CFG.timeout)
+                    if live:
+                        raw_text = run_agent_live(CFG.engine, CFG.model, CFG.effort, workdir,
+                                                  prompt, name, CFG.timeout, on_delta)
+                    else:
+                        raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt,
+                                             name, CFG.timeout)
                     state = read_meta(name).get("state")
                     if raw_text.strip() and state != "error":
                         break
-                    if attempt < CFG.retries:
+                    if attempt < CFG.retries and retry_ok():
                         print("[openai-bridge] empty/errored completion (state=%s), retry %d/%d"
                               % (state, attempt + 1, CFG.retries), file=sys.stderr)
+                        if on_retry is not None:
+                            on_retry()
                         time.sleep(2)
+                    elif not raw_text.strip() and live and not retry_ok():
+                        SESSION["task_name"] = name
+                        SESSION["messages"] = messages
+                        SESSION["last_activity"] = time.time()
+                        raise LiveStreamDied()
+                    else:
+                        break
             SESSION["task_name"] = name
             SESSION["messages"] = messages
             SESSION["last_activity"] = time.time()
+        return raw_text
+
+    def _run(self, messages, tools):
+        # NB: called unbound in tests (H._run(object(), ...)) -- route through the class, not
+        # through self, so a dummy receiver keeps working.
+        raw_text = H._raw_completion(self, messages, tools)
         if looks_like_limit_banner(raw_text):
             raise ProviderLimitError(raw_text.strip())
         tool_calls, text = extract_tool_calls(raw_text, tool_names(tools), tools,
@@ -999,12 +1499,7 @@ class H(BaseHTTPRequestHandler):
             "usage": usage,
         })
 
-    def _stream_response(self, messages, tools):
-        text, tool_calls, _usage = self._run(messages, tools)
-        cid = "chatcmpl-%s" % uuid.uuid4().hex
-        created = int(time.time())
-        label = model_label(CFG.engine, CFG.model, CFG.effort)
-
+    def _sse_headers(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -1015,6 +1510,17 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+
+    def _stream_response(self, messages, tools):
+        if (CFG.engine in LIVE_STREAM_ENGINES and not getattr(CFG, "no_live_stream", False)):
+            return self._stream_response_live(messages, tools)
+        # Legacy/emulated path (non-live engines): run to completion, then replay the finished
+        # answer as word-sized SSE deltas.
+        text, tool_calls, _usage = self._run(messages, tools)
+        cid = "chatcmpl-%s" % uuid.uuid4().hex
+        created = int(time.time())
+        label = model_label(CFG.engine, CFG.model, CFG.effort)
+        self._sse_headers()
 
         def emit(delta, finish_reason=None):
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": label,
@@ -1039,6 +1545,62 @@ class H(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionAbortedError, OSError):
             pass  # client went away mid-stream -- nothing left to do
+
+    def _stream_response_live(self, messages, tools):
+        """REAL streaming: SSE chunks go out while the CLI generates. Headers are sent lazily
+        on the first actual chunk, so a limit banner (held back, see STREAM_HOLDBACK_CHARS) can
+        still surface as a clean HTTP 429 through do_POST's normal error path."""
+        cid = "chatcmpl-%s" % uuid.uuid4().hex
+        created = int(time.time())
+        label = model_label(CFG.engine, CFG.model, CFG.effort)
+        state = {"headers": False, "gone": False}
+
+        def emit(delta, finish_reason=None):
+            if state["gone"]:
+                return
+            try:
+                if not state["headers"]:
+                    state["headers"] = True
+                    self._sse_headers()
+                chunk = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                          "model": label,
+                          "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+                if not state.get("role_sent"):
+                    state["role_sent"] = True
+                    chunk["choices"][0]["delta"] = dict(chunk["choices"][0]["delta"])
+                    chunk["choices"][0]["delta"]["role"] = "assistant"
+                self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionAbortedError, OSError):
+                state["gone"] = True  # client went away: keep draining the CLI, stop writing
+
+        emitter = LiveToolCallEmitter(
+            tool_names(tools), tools, prior_call_keys(messages),
+            on_content=lambda s: emit({"content": s}),
+            on_call=lambda call, idx: emit({"tool_calls": [
+                {"index": idx, "id": call["id"], "type": "function", "function": call["function"]}]}),
+        )
+        try:
+            raw = self._raw_completion(messages, tools, on_delta=emitter.feed,
+                                       can_retry=lambda: not emitter.wire_started,
+                                       on_retry=emitter.reset)
+        except LiveStreamDied:
+            raw = emitter.raw_text  # finalize with what already reached the client
+        if not emitter.wire_started and looks_like_limit_banner(raw):
+            raise ProviderLimitError((raw or "").strip())  # -> 429, headers not sent yet
+        fallback_text = emitter.finish()
+        if fallback_text is not None and not emitter.any_calls:
+            if fallback_text.strip():
+                emit({"content": fallback_text.strip()})
+            else:
+                emit({})  # empty answer: still open the stream so the client gets a valid turn
+        try:
+            emit({}, "tool_calls" if emitter.any_calls else "stop")
+            if not state["gone"]:
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionAbortedError, OSError):
+            pass
 
     def do_POST(self):
         p = urllib.parse.urlparse(self.path).path
@@ -1099,6 +1661,9 @@ def main():
     ap.add_argument("--retries", type=int, default=1,
                      help="how many times to re-run a completion whose CLI invocation came back "
                           "empty or in an error state before giving up (default: 1)")
+    ap.add_argument("--no-live-stream", action="store_true",
+                     help="disable real token streaming for live-capable engines (claude); "
+                          "stream:true then replays the finished answer as word-sized SSE deltas")
     ap.add_argument("--session-ttl", type=int, default=1800,
                      help="seconds of inactivity before the ongoing session is treated as expired and the "
                           "next call starts fresh instead of resuming it (default: 1800 = 30 minutes)")
