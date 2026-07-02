@@ -270,13 +270,18 @@ about this before pointing anything at it:
 - **`tools`/function-calling is emulated via prompting**, not native: when a request
   includes an OpenAI `tools` array, the bridge instructs the agent (in the prompt) to
   reply with either plain prose or a tool call, then parses the call into a real
-  `tool_calls` response. It accepts the call in **two** formats and parses them
-  identically: a fenced/bare JSON `{"tool_calls":[...]}` block, OR literal call lines
-  (one per line) in any of three argument spellings — `name(arg=value, ...)` pairs,
-  `name({"arg": "value", ...})` with one positional JSON object (how gpt-5.5 writes
-  calls — literally the OpenAI-SDK spelling; dropping it used to silently zero whole
-  benchmark groups), or `name("scalar")` mapped onto the schema's sole parameter when
-  the function takes exactly one. The prompt explicitly warns that *describing* an
+  `tool_calls` response. It accepts every call spelling seen from real models, parsed
+  identically: a fenced/bare JSON `{"tool_calls":[...]}` block; **one fenced JSON block
+  per call** shaped like an OpenAI tool-call object (`{"type":"function","function":
+  {...}}` — Sonnet 5's habit; flat `{"name":...,"arguments":{...}}` accepted too, and
+  only KNOWN tool names are eaten so a plain JSON answer survives); literal call lines
+  (one per line) as `name(arg=value, ...)` pairs, `name({"arg": "value", ...})` with
+  one positional JSON object (gpt-5.5's habit — the OpenAI-SDK spelling), or
+  `name("scalar")` mapped onto the schema's sole parameter when the function takes
+  exactly one; and the NAMELESS spelling — the entire message is bare JSON argument
+  objects one per line whose keys fit exactly ONE tool (gpt-5.3-codex-spark's habit in
+  single-tool scenarios). Each of these, before support, silently zeroed whole live
+  benchmark groups. The prompt explicitly warns that *describing* an
   action in prose ("I called X", "Execution succeeded") does nothing and is treated as
   a failure. **Echo protection**: after a tool-result round-trip, models tend to
   restate the calls they already made (in exactly the `name({...})` style the rendered
@@ -297,7 +302,10 @@ about this before pointing anything at it:
   a whole benchmark scenario. A resume that "succeeds" but produces an empty answer
   falls back to a fresh run the same way. An unexpected exception inside the bridge
   returns an OpenAI-style `{"error": {...}}` HTTP 500, never a bare connection reset
-  the client can't tell apart from a network failure.
+  the client can't tell apart from a network failure. A CLI answer that IS the
+  provider's usage-limit banner ("You've hit your session limit · resets ...") becomes
+  an HTTP 429 `rate_limit_error` instead of a normal completion, so a rate-limited
+  account reads as an environment problem, not a model that suddenly scores zero.
 - **The wrapped CLI is locked to text-only completion — no MCP, no shell/file access,
   no skills/subagents of its own.** Every subprocess this bridge launches gets
   `AGENT_CHAT_ONLY=1` in its env, which `providers/{codex,claude}/provider.sh` react to

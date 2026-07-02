@@ -85,18 +85,21 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   as word-sized SSE chunks. It is NOT real per-token streaming from the underlying
   provider.
 - **`tools`/function-calling is emulated via prompting**, not native — best-effort. The
-  bridge accepts the call as EITHER a JSON `{"tool_calls":[...]}` block OR literal call
-  lines in three spellings: `name(arg=value, ...)` pairs (codex's habit),
-  `name({"arg": "value"})` with one positional JSON object (gpt-5.5's habit — the
-  OpenAI-SDK spelling), or `name("scalar")` mapped onto a one-parameter function's sole
-  schema property. The prompt warns that describing an action in prose is
-  ignored/failed. Echo protection: a call-syntax line exactly repeating an
-  already-executed call (same name + canonical args) is summary prose, not re-executed;
-  fenced `{"tool_calls":[...]}` stays exempt. Re-sent on every `tools` call, even a
-  continuation turn.
+  bridge accepts every spelling seen live: a JSON `{"tool_calls":[...]}` block; one
+  fenced OpenAI-shaped call object PER CALL (Sonnet 5's habit; known tool names only);
+  literal call lines as `name(arg=value, ...)` pairs (codex's habit), `name({"arg":
+  "value"})` with one positional JSON object (gpt-5.5's habit), or `name("scalar")`
+  mapped onto a one-parameter function's sole schema property; and whole-message bare
+  argument-object lines whose keys fit exactly one tool (spark's habit). The prompt
+  warns that describing an action in prose is ignored/failed. Echo protection: a
+  call-syntax line exactly repeating an already-executed call (same name + canonical
+  args) is summary prose, not re-executed; fenced `{"tool_calls":[...]}` stays exempt.
+  Re-sent on every `tools` call, even a continuation turn.
 - **Empty completions retry, bridge bugs return OpenAI-style errors.** An empty or
   `error`-state CLI invocation is re-run (`--retries`, default 1); an unexpected bridge
-  exception returns `{"error": {...}}` HTTP 500 instead of a bare connection reset.
+  exception returns `{"error": {...}}` HTTP 500 instead of a bare connection reset; a
+  provider usage-limit banner becomes an HTTP 429 `rate_limit_error`, never a normal
+  completion.
 - **The wrapped CLI is locked to text-only completion — real CLI flags, not just a
   prompt ask.** Every subprocess gets `AGENT_CHAT_ONLY=1`, which makes codex run with
   `--sandbox read-only --ignore-user-config` (no shell/file writes, and skips
