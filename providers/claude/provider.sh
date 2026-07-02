@@ -50,13 +50,17 @@ provider_claude_resolve() {
 # tool-calling completion (still returned a clean fenced JSON tool_calls block).
 _provider_claude_chatonly_args() {
     if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
-        # Skill added after a live Sonnet 5 G6 refusal: the CLI loads the USER'S global skills
-        # into context, and the model declined to emit text tool-calls, offering to run the
-        # user's unity-mcp skill instead. Blocking skill invocation keeps the bridge session a
-        # plain completion endpoint. (SlashCommand is NOT a valid tool name here -- listing it
-        # made the CLI prepend a 'matches no known tool' warning to every answer.)
+        # The denylist covers EVERY tool the CLI registers in -p sessions. Read/Grep/Glob were
+        # originally left allowed (read-only, harmless), but that backfired on a live Sonnet 5
+        # G6 run: seeing ANY native tools, the model concluded the text tool-call protocol in
+        # the prompt was fake ("my actual available tools are Glob, Grep, Read, Skill,
+        # ToolSearch, and Workflow") and refused to emit tool calls at all. With zero tools
+        # registered the model has nothing to contrast against and follows the text protocol.
+        # Skill is blocked for the same reason (it also exposed the user's global skills, e.g.
+        # unity-mcp). (SlashCommand is NOT a valid tool name here -- listing it made the CLI
+        # prepend a 'matches no known tool' warning to every answer.)
         printf '%s\n' --strict-mcp-config --disallowedTools \
-            Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch,Skill
+            Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch,Skill,Read,Grep,Glob,ToolSearch,Workflow
     fi
 }
 
