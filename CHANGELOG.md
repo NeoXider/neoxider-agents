@@ -6,6 +6,22 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- openai-server: prompt rewritten to prescribe ONE canonical tool-call format — a single fenced
+  ```json {"tool_calls":[...]} block — instead of offering multiple. Reduces the format sprawl
+  that kept surfacing new unparsed spellings, and drops the "write the call text for the
+  application to run" framing (which Claude Code's policy layer flagged for some models as
+  duplicating tool-use); the new wording asks for "a structured JSON request the application
+  carries out", which reads as ordinary structured output.
+- openai-server: also accept a JSON ARRAY of call objects in one fence
+  (```json [ {"name":...,"arguments":...}, ... ] ```) — Opus 4.8's dominant spelling, which
+  scored tools=0 across G1/G3/G4/G6/G7 before this. Consumed only when every element is
+  call-shaped, so a plain data array survives as content. +2 tests.
+
+- openai-server: a language-tagged fence that IS the whole answer (little/no prose outside)
+  holds real calls, not an example — spark wraps its actual multiline world_command(...) calls
+  in ```python. Tagged fences are masked as examples only when there is real prose (>=40 chars)
+  outside them. +1 test.
+
 - openai-server: accept the ONE-FENCED-JSON-PER-CALL spelling — each call in its own fenced
   block shaped like an OpenAI tool-call object ({"type":"function","function":{...}}), no
   `tool_calls` wrapper. Observed live from Sonnet 5: every world_command scenario scored

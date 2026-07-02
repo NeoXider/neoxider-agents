@@ -184,10 +184,10 @@ class BuildPromptTests(unittest.TestCase):
         tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
         out = srv.build_prompt(messages, tools)
         self.assertIn('"name": "f"', out)
-        # both accepted call formats must be advertised, and prose-only must be discouraged
-        self.assertIn("tool_calls", out)                 # Format 1 (JSON block)
-        self.assertIn("one literal call per line", out)  # Format 2 (name(arg=value))
-        self.assertIn("does not count", out)             # prose-describes-an-action warning
+        # the single canonical format must be advertised, and prose-only must be discouraged
+        self.assertIn("tool_calls", out)          # the fenced ```json {"tool_calls":[...]} block
+        self.assertIn("```json", out)
+        self.assertIn("does NOT count", out)      # prose-describes-an-action warning
 
 
 class ExtractToolCallsTests(unittest.TestCase):
@@ -999,6 +999,27 @@ class SingleCallFenceTests(unittest.TestCase):
         self.assertEqual(json.loads(calls[2]["function"]["arguments"])["action"], "set_color")
         self.assertNotIn("```", cleaned)
 
+    def test_json_array_of_calls_in_one_fence_parses_all(self):
+        # Verbatim Opus 4.8 shape: a fenced ```json block whose body is a JSON ARRAY of call
+        # objects [ {"name":...,"arguments":...}, ... ]. Not a dict, so it used to fall through
+        # and score tools=0 across G1/G3/G4/G6/G7.
+        text = ('I will build the arena.\n```json\n[\n'
+                '  {"name": "world_command", "arguments": {"action": "spawn", "targetName": "Player", "x": 0}},\n'
+                '  {"name": "world_command", "arguments": {"action": "spawn", "targetName": "Enemy1", "x": 5}},\n'
+                '  {"name": "world_command", "arguments": {"action": "spawn", "targetName": "Enemy2", "x": -5}}\n'
+                ']\n```')
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "Player")
+        self.assertEqual(json.loads(calls[2]["function"]["arguments"])["targetName"], "Enemy2")
+        self.assertNotIn("```", cleaned)
+
+    def test_json_array_of_plain_data_is_not_eaten_as_calls(self):
+        text = '```json\n[{"id": 1, "label": "a"}, {"id": 2, "label": "b"}]\n```'
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertIsNone(calls)
+        self.assertIn("label", cleaned)
+
     def test_jsonl_fence_with_a_non_call_line_is_left_as_content(self):
         text = ('```json\n'
                 '{"name":"world_command","arguments":{"x":1}}\n'
@@ -1066,9 +1087,11 @@ class DeliberateRepeatContractTests(unittest.TestCase):
         calls, _ = srv.extract_tool_calls(text, {"execute_lua"}, None, prior)
         self.assertEqual(len(calls), 1)
 
-    def test_prompt_documents_the_format1_escape_hatch(self):
-        self.assertIn("IDENTICAL", srv.TOOLCALL_INSTRUCTIONS)
-        self.assertIn("Format 1", srv.TOOLCALL_INSTRUCTIONS)
+    def test_prompt_prescribes_the_single_canonical_tool_calls_format(self):
+        # The prompt now steers every model to ONE format: a fenced ```json {"tool_calls":[...]}
+        # block. Fenced JSON is dedup-exempt, so a deliberate identical repeat still executes.
+        self.assertIn("tool_calls", srv.TOOLCALL_INSTRUCTIONS)
+        self.assertIn("```json", srv.TOOLCALL_INSTRUCTIONS)
 
 
 class LimitBannerTests(unittest.TestCase):
@@ -1119,14 +1142,13 @@ class RoughTokensTests(unittest.TestCase):
 
 
 class PromptAntiEchoTests(unittest.TestCase):
-    """The tool-calling instructions must tell the model NOT to restate already-executed calls in
-    call syntax after a tool result -- the prompt-side half of the echo defense (the parser-side
-    half is prior_call_keys dedup; see EchoDedupTests). Guard against the paragraph being lost in
-    a future prompt rewrite."""
+    """After a tool result the prompt must ask for a NEW block only for new actions (the
+    prompt-side half of the echo defense; the parser-side half is prior_call_keys dedup, see
+    EchoDedupTests). Guard against the guidance being lost in a future prompt rewrite."""
 
-    def test_instructions_forbid_restating_executed_calls(self):
-        self.assertIn("Do NOT restate calls", srv.TOOLCALL_INSTRUCTIONS)
-        self.assertIn("NEW calls", srv.TOOLCALL_INSTRUCTIONS)
+    def test_instructions_scope_new_blocks_to_new_actions(self):
+        self.assertIn("TOOL RESULT", srv.TOOLCALL_INSTRUCTIONS)
+        self.assertIn("NEW actions", srv.TOOLCALL_INSTRUCTIONS)
 
 
 class RunRetryAndFallbackTests(unittest.TestCase):

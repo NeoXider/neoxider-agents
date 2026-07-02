@@ -328,41 +328,33 @@ external application's own systems, not to this session.
 """
 
 TOOLCALL_INSTRUCTIONS = """
-The external application also wants you to format part of your answer as a function call, for
-cases where the task calls for one. It runs the call on its own side, after you respond -- your
-job here is only to WRITE the call text in one of the two exact formats below (you have no tool
-of your own that could run it, so nothing happens until the application parses your text).
-Functions it can run:
+When the task needs an action, respond with a structured JSON request that the external
+application will read and carry out on its own side. You are not running anything yourself; you
+are only producing the JSON. These are the actions it understands:
 
 %s
 
-Merely describing an action in your own words does not count: sentences like "I called
-world_command...", "Defined the slot via ...", "Execution succeeded", or "Done." leave no call for
-the application to find, so it scores the turn as a failure even if your reasoning was correct.
-Write as many calls as the task needs (e.g. one per object to place), not just one.
+USE EXACTLY THIS ONE FORMAT -- a single fenced ```json block containing a "tool_calls" array,
+one entry per action, and nothing else in the message:
 
-Decide ONE of:
-(a) No call needed -- answer directly in plain prose (also the right choice when a previous
-    call's result is already shown above and you are now just using/explaining it), or
-(b) Write one or more calls, using EITHER format below (pick one, use it consistently for this
-    message), and nothing else in the message except the call(s):
-
-    Format 1 -- a single fenced JSON block listing every call:
 ```json
-{"tool_calls":[{"name":"<fn>","arguments":{...}},{"name":"<fn>","arguments":{...}}]}
+{"tool_calls":[
+  {"name":"<action>","arguments":{ ... }},
+  {"name":"<action>","arguments":{ ... }}
+]}
 ```
-    Format 2 -- one literal call per line, arguments either as name=value pairs or as a single
-    JSON object (both spellings below are accepted):
-    <fn>(arg="text", num=1.5, flag=true)
-    <fn>({"arg": "other", "num": 2})
 
-Both formats are parsed identically. Do NOT wrap Format 2 in prose -- just the call line(s).
+Rules:
+- Put EVERY action for this turn in the one array (e.g. one entry per object to place) -- do not
+  split them across several blocks or lines.
+- "arguments" is a JSON object of the parameters shown above. Nothing outside the fenced block.
+- Describing an action in prose ("I placed the tower", "Done.") does NOT count -- only the JSON
+  block is read, so a turn with prose but no block scores as no action taken.
+- When no action is needed (e.g. you are only explaining a result already shown above), reply in
+  plain prose with no ```json block.
 
-After a [TOOL RESULT] round-trip, report progress in plain words. Do NOT restate calls you
-already made in call syntax -- an exact repeat of an earlier call reads as summary prose, not a
-new request. Write call syntax only for NEW calls you want executed now. To deliberately run a
-call IDENTICAL to one already executed above, use Format 1 (the fenced JSON block) -- that is
-always executed as written.
+After a [TOOL RESULT] round-trip, summarize in plain words; emit a new ```json block only for
+NEW actions you want carried out now.
 """
 
 
@@ -378,6 +370,9 @@ def build_prompt(messages, tools):
 # the next one, so one bad fence swallowed a following perfectly valid one (calls lost).
 # (?i) so a ```JSON tag (observed from models) is recognized too.
 FENCE_RE = re.compile(r"(?i)```(?:json)?\s*(\{[^`]*\})\s*```")
+# Same, but the body may be a JSON OBJECT ({...}) or a JSON ARRAY ([...]) -- Opus 4.8 emits a
+# fenced array of call objects. Backtick-free body so a malformed fence can't swallow the next.
+FENCE_ANY_RE = re.compile(r"(?i)```(?:json)?\s*([\[{][^`]*[\]}])\s*```")
 # Fallback for a fence whose JSON legitimately CONTAINS a backtick inside a string value (e.g.
 # lua code with `...`), which the strict backtick-free pass above cannot match. Only consulted
 # when the strict pass produced nothing, and a body is only consumed when json.loads accepts it
@@ -707,15 +702,25 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
     calls = None
     cleaned = text
     call_fences = []  # per-fence LISTS of call objects, in reverse text order; un-reversed below
-    for m in reversed(list(FENCE_RE.finditer(text))):
+    for m in reversed(list(FENCE_ANY_RE.finditer(text))):
+        body = m.group(1).strip()
         try:
-            obj = json.loads(m.group(1))
+            obj = json.loads(body)
         except ValueError:
             # Not valid JSON as a whole -- maybe SEVERAL call objects one per line (JSONL,
             # observed live from Opus 4.8). Only consumed when every line is call-shaped.
-            jsonl = _parse_call_jsonl(m.group(1), names)
+            jsonl = _parse_call_jsonl(body, names)
             if jsonl:
                 call_fences.append(jsonl)
+                cleaned = cleaned[:m.start()] + cleaned[m.end():]
+            continue
+        if isinstance(obj, list):
+            # A JSON ARRAY of call objects in one fence (Opus 4.8's dominant spelling:
+            # ```json [ {"name":...,"arguments":...}, ... ] ```). Consumed only when every
+            # element is call-shaped, so a plain data array survives as content.
+            shaped = [_call_shaped(o, names) for o in obj]
+            if obj and all(s is not None for s in shaped):
+                call_fences.append(shaped)
                 cleaned = cleaned[:m.start()] + cleaned[m.end():]
             continue
         if not isinstance(obj, dict):
