@@ -824,7 +824,8 @@ def _call_shaped(obj, names):
         call_name = fn.get("name")
     else:
         keys = set(obj.keys())
-        for name_key in ("name", "action"):
+        # "tool" observed live from GPT-5.5 ({"tool": "world_command", "arguments": {...}}).
+        for name_key in ("name", "action", "tool"):
             for args_key in _ARGS_KEY_ALIASES:
                 if keys == {name_key, args_key}:
                     call_name = obj.get(name_key)
@@ -980,19 +981,38 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
                     break
     if calls is None:
         stripped = cleaned.strip()
-        if stripped.startswith("{") and '"tool_calls"' in stripped:
-            # raw_decode instead of loads: a bare (unfenced) JSON object followed by trailing
+        if stripped.startswith("{") or stripped.startswith("["):
+            # raw_decode instead of loads: a bare (unfenced) JSON value followed by trailing
             # prose ("{...}\nDone.") is still a real call block -- the prose becomes the display
-            # text instead of the whole turn being lost.
+            # text instead of the whole turn being lost. Accepts the same spellings as a fenced
+            # block: any wrapper alias around the call array, a bare array of call objects, or
+            # a bare array of argument objects (unfenced arrays observed live from GPT-5.5 --
+            # whole scenarios scored tools=0 while the calls sat in plain sight as text).
             try:
                 obj, end = json.JSONDecoder().raw_decode(stripped)
-                raw = obj.get("tool_calls") if isinstance(obj, dict) else None
-                if isinstance(raw, list) and raw:
-                    found = _to_calls(raw)
-                    if found:
-                        calls, cleaned = found, stripped[end:]
             except ValueError:
-                pass
+                obj, end = None, 0
+            shaped_list = None
+            if isinstance(obj, dict) and len(obj) == 1:
+                for key in CANONICAL_WRAPPER_KEYS:
+                    raw = obj.get(key)
+                    if isinstance(raw, list) and raw:
+                        if key == "tool_calls":
+                            # The prescribed wrapper is trusted as-is (matches the fenced
+                            # path); alias wrappers are gated on recognizable elements.
+                            shaped_list = raw
+                        else:
+                            shaped = [_call_shaped(o, names) for o in raw]
+                            shaped_list = (shaped if all(shaped)
+                                           else _bare_args_array(raw, tools))
+                        break
+            elif isinstance(obj, list) and obj:
+                shaped = [_call_shaped(o, names) for o in obj]
+                shaped_list = shaped if all(shaped) else _bare_args_array(obj, tools)
+            if shaped_list:
+                found = _to_calls(shaped_list)
+                if found:
+                    calls, cleaned = found, stripped[end:]
     if calls is None and names:
         # Mask language-tagged code fences (```lua, ```python, ...) before scanning ONLY when the
         # model is explaining -- i.e. there is real prose OUTSIDE the fences. Call syntax inside a
@@ -1051,8 +1071,10 @@ STREAM_HOLDBACK_CHARS = 350
 # (complete-fence parse) or end of turn (full-parser reconciliation).
 # Wrapper keys accepted around a call array: "tool_calls" is the prescribed one; the aliases
 # were each observed live ({"actions":[...]} from Fable 5 scored a whole scenario tools=0,
-# {"commands":[...bare arg objects...]} from Haiku 4.5 scored a whole G6 castle tools=0).
-CANONICAL_WRAPPER_KEYS = ("tool_calls", "actions", "calls", "function_calls", "commands")
+# {"commands":[...bare arg objects...]} from Haiku 4.5 scored a whole G6 castle tools=0,
+# {"requests":[{"tool":...}]} from GPT-5.5 scored a whole G5 scenario tools=0).
+CANONICAL_WRAPPER_KEYS = ("tool_calls", "actions", "calls", "function_calls", "commands",
+                          "requests")
 
 
 def _match_canonical_prefix(body):

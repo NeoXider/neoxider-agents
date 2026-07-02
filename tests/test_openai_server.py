@@ -1342,6 +1342,65 @@ class WrapperKeyAliasTests(unittest.TestCase):
         self.assertEqual(len(h.calls), 2, "No double emit after reconciliation.")
 
 
+class UnfencedJsonCallTests(unittest.TestCase):
+    """GPT-5.5 live spellings: real calls as PLAIN TEXT with no fence at all -- an unfenced
+    {"requests":[{"tool":...}]} wrapper and unfenced bare arrays. Whole scenarios scored
+    tools=0 while the calls sat in plain sight as text."""
+
+    NAMES = {"world_command"}
+    TOOLS = [{"type": "function", "function": {
+        "name": "world_command",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string"}, "targetName": {"type": "string"},
+            "prefabKey": {"type": "string"}, "x": {"type": "number"},
+            "y": {"type": "number"}, "z": {"type": "number"}}, "required": ["action"]}}}]
+
+    def test_unfenced_requests_wrapper_with_tool_name_key(self):
+        text = ('{"requests":[{"tool":"world_command","arguments":{"action":"spawn",'
+                '"prefabKey":"Cube","targetName":"Player","x":-2,"y":0,"z":0}},'
+                '{"tool":"world_command","arguments":{"action":"spawn","prefabKey":"Cube",'
+                '"targetName":"Goal","x":2,"y":0,"z":0}}]}')
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, tools=self.TOOLS)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "Player")
+        self.assertEqual(cleaned, "")
+
+    def test_unfenced_bare_array_of_call_objects(self):
+        text = ('[{"name":"world_command","arguments":{"action":"spawn","targetName":"A"}},'
+                '{"name":"world_command","arguments":{"action":"spawn","targetName":"B"}}]')
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, tools=self.TOOLS)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(cleaned, "")
+
+    def test_unfenced_bare_array_of_arg_objects(self):
+        text = ('[\n  {"action": "spawn", "targetName": "Player", "prefabKey": "capsule",'
+                ' "x": 0, "y": 1, "z": 0},\n'
+                '  {"action": "spawn", "targetName": "Goal", "prefabKey": "cube",'
+                ' "x": 3, "y": 0.5, "z": 2}\n]')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, tools=self.TOOLS)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["function"]["name"], "world_command")
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"])["x"], 3)
+
+    def test_unfenced_array_with_trailing_prose_keeps_prose(self):
+        text = '[{"name":"world_command","arguments":{"action":"spawn","targetName":"A"}}]\nDone.'
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, tools=self.TOOLS)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(cleaned.strip(), "Done.")
+
+    def test_unfenced_data_array_stays_content(self):
+        calls, cleaned = srv.extract_tool_calls('["red", "green", "blue"]',
+                                                self.NAMES, tools=self.TOOLS)
+        self.assertIsNone(calls)
+        self.assertIn("green", cleaned)
+
+    def test_unfenced_data_object_stays_content(self):
+        calls, cleaned = srv.extract_tool_calls('{"answer": 42, "reason": "math"}',
+                                                self.NAMES, tools=self.TOOLS)
+        self.assertIsNone(calls)
+        self.assertIn("42", cleaned)
+
+
 class BareArgsArrayTests(unittest.TestCase):
     """Fable 5 live G6 spelling: ONE fenced JSON ARRAY whose elements are bare argument objects
     of a single tool (no function name anywhere) -- a 75-object castle scored tools=0 before
