@@ -386,7 +386,11 @@ FENCE_FALLBACK_RE = re.compile(r"(?i)```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 # A fenced code block with an explicit language tag (```lua, ```python, ...) is example/code
 # content, not a place the model writes real Format-2 calls -- masked out before the func-syntax
 # fallback so `world_command(...)` inside a lua example is not executed (see extract_tool_calls).
+# EXCEPT call-intent tags: models label their real calls with fences like ```function_call /
+# ```tool_call / ```tool_code (observed live from Opus 4.8) -- those are requests, not examples.
 TAGGED_FENCE_RE = re.compile(r"```([A-Za-z][\w+-]*)[^\n]*\n.*?```", re.DOTALL)
+CALL_INTENT_TAGS = {"function_call", "function_calls", "tool_call", "tool_calls",
+                    "tool_code", "tool", "call", "calls", "toolcall", "functioncall"}
 FUNC_HEAD_RE = re.compile(r"([A-Za-z_]\w*)\s*\(")
 IDENT_RE = re.compile(r"^\w+$")
 
@@ -632,6 +636,41 @@ def extract_bare_object_lines(text, tools):
     return [(name, o) for o in objs]
 
 
+def _call_shaped(obj, names):
+    """The object IS one tool call: either the OpenAI shape ({"function": {"name": ...}}, its
+    own marker) or the flat shape with EXACTLY {name, arguments} keys (a data answer with extra
+    fields must survive as content). The name must be a KNOWN declared tool."""
+    if not isinstance(obj, dict):
+        return None
+    fn = obj.get("function") if isinstance(obj.get("function"), dict) else None
+    flat_exact = set(obj.keys()) == {"name", "arguments"}
+    call_name = (fn or {}).get("name") if fn else (obj.get("name") if flat_exact else None)
+    if isinstance(call_name, str) and call_name and names and call_name in names:
+        return obj
+    return None
+
+
+def _parse_call_jsonl(body, names):
+    """A fence whose body is SEVERAL call objects, one per line (JSONL) -- observed live from
+    Opus 4.8 ('the world_command calls (JSONL, one call per line)'), which is not valid JSON as
+    a whole so the whole fence used to be dropped. Every non-blank line must parse as a
+    call-shaped object; anything else rejects the whole body."""
+    objs = []
+    for ln in body.split("\n"):
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            o = json.loads(ln)
+        except ValueError:
+            return None
+        c = _call_shaped(o, names)
+        if c is None:
+            return None
+        objs.append(c)
+    return objs or None
+
+
 def _to_calls(raw_calls):
     out = []
     for c in raw_calls:
@@ -667,33 +706,27 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
     intended."""
     calls = None
     cleaned = text
-    single_call_fences = []  # collected in reverse text order; un-reversed before use
+    call_fences = []  # per-fence LISTS of call objects, in reverse text order; un-reversed below
     for m in reversed(list(FENCE_RE.finditer(text))):
         try:
             obj = json.loads(m.group(1))
         except ValueError:
+            # Not valid JSON as a whole -- maybe SEVERAL call objects one per line (JSONL,
+            # observed live from Opus 4.8). Only consumed when every line is call-shaped.
+            jsonl = _parse_call_jsonl(m.group(1), names)
+            if jsonl:
+                call_fences.append(jsonl)
+                cleaned = cleaned[:m.start()] + cleaned[m.end():]
             continue
         if not isinstance(obj, dict):
             continue
         if "tool_calls" not in obj:
-            # ONE fenced JSON block PER CALL, each shaped like an OpenAI tool-call object --
-            # {"type":"function","function":{"name":...,"arguments":{...}}} (observed live from
-            # Sonnet 5: every world_command scenario scored tools=0 while the transcripts held
-            # perfectly-shaped calls). Also accepts the flat {"name":...,"arguments":{...}}
-            # spelling. Gated on the name being a KNOWN tool so an answer that legitimately IS
-            # a JSON object never gets eaten as a call.
-            fn = obj.get("function") if isinstance(obj.get("function"), dict) else None
-            # The flat spelling is accepted ONLY when the object is exactly {name, arguments}
-            # (no extra keys) — a legitimate JSON data answer that merely HAS name/arguments
-            # among other fields must survive as content. The OpenAI shape carries its own
-            # "function" marker and needs no such restriction.
-            flat_exact = set(obj.keys()) == {"name", "arguments"}
-            call_name = (fn or {}).get("name") if fn else (
-                obj.get("name") if flat_exact else None)
-            # `names` must be non-empty: a request that declared NO tools can never have a
-            # fenced object interpreted as a call, whatever it looks like.
-            if isinstance(call_name, str) and call_name and names and call_name in names:
-                single_call_fences.append(obj)
+            # ONE fenced JSON block PER CALL, shaped like an OpenAI tool-call object (observed
+            # live from Sonnet 5) or the exact flat {name, arguments} spelling -- see
+            # _call_shaped for the gates that keep plain JSON answers intact.
+            c = _call_shaped(obj, names)
+            if c is not None:
+                call_fences.append([c])
                 cleaned = cleaned[:m.start()] + cleaned[m.end():]
             continue
         if calls is None:
@@ -704,9 +737,9 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
         # leading whitespace mid-loop shifted every earlier match's span, garbling the display
         # text when more than one fence was stripped. One strip at the end is enough.
         cleaned = cleaned[:m.start()] + cleaned[m.end():]
-    if calls is None and single_call_fences:
-        calls = _to_calls(list(reversed(single_call_fences)))
-    if calls is None and not single_call_fences and "```" in cleaned:
+    if calls is None and call_fences:
+        calls = _to_calls([o for fence in reversed(call_fences) for o in fence])
+    if calls is None and not call_fences and "```" in cleaned:
         # Strict pass found nothing: retry with the backtick-tolerant fallback so a tool_calls
         # fence whose string values contain backticks still parses. json.loads gates every
         # candidate, so nothing is consumed unless it really is the call block.
@@ -742,7 +775,10 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
         # (a lua example mentioning world_command(...) was executed before this). Same-length
         # replacement keeps every span valid in the REAL `cleaned` text. Untagged fences are
         # scanned normally -- models often wrap their genuine Format-2 call lines in a bare fence.
-        scan_text = TAGGED_FENCE_RE.sub(lambda m: " " * len(m.group(0)), cleaned)
+        scan_text = TAGGED_FENCE_RE.sub(
+            lambda m: m.group(0) if (m.group(1) or "").lower() in CALL_INTENT_TAGS
+            else " " * len(m.group(0)),
+            cleaned)
         found, spans = extract_func_calls(scan_text, names, tool_param_names(tools))
         if found and prior:
             # Drop exact repeats of already-executed calls (echoes of the history's own

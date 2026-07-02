@@ -984,6 +984,44 @@ class SingleCallFenceTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertIn("`hi`", json.loads(calls[0]["function"]["arguments"])["code"])
 
+    def test_jsonl_fence_with_multiple_flat_calls_parses_all_in_order(self):
+        # Verbatim Opus 4.8 shape: several flat call objects, one per line, inside ONE json
+        # fence ("JSONL, one call per line") -- invalid as whole-body JSON, so the whole castle
+        # used to be dropped.
+        text = ('Building now.\n```json\n'
+                '{"name":"world_command","arguments":{"action":"spawn","targetName":"moat","x":0}}\n'
+                '{"name":"world_command","arguments":{"action":"spawn","targetName":"tower_NW","x":-6}}\n'
+                '{"name":"world_command","arguments":{"action":"set_color","targetName":"moat","stringValue":"#3b6ea5"}}\n'
+                '```')
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "moat")
+        self.assertEqual(json.loads(calls[2]["function"]["arguments"])["action"], "set_color")
+        self.assertNotIn("```", cleaned)
+
+    def test_jsonl_fence_with_a_non_call_line_is_left_as_content(self):
+        text = ('```json\n'
+                '{"name":"world_command","arguments":{"x":1}}\n'
+                '{"note":"this line is data, not a call"}\n'
+                '```')
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertIsNone(calls)
+        self.assertIn("data, not a call", cleaned)
+
+    def test_function_call_tagged_fence_is_a_request_not_an_example(self):
+        # Verbatim Opus 4.8 shape: a Format-2 line inside a ```function_call fence -- the
+        # tagged-fence example masking must NOT eat call-intent tags.
+        text = ('I will spawn the objects.\n```function_call\n'
+                'world_command(action="spawn", prefabKey="Cube", targetName="Key")\n```')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, self.TOOLS if hasattr(self, "TOOLS") else None)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "world_command")
+
+    def test_lua_tagged_fence_is_still_an_example(self):
+        text = '```lua\nworld_command(action="spawn", x=1)\n```\nJust explaining, not calling.'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertIsNone(calls)
+
     def test_explicit_tool_calls_block_still_wins_over_singles(self):
         text = ('```json\n{"type": "function", "function": {"name": "world_command", "arguments": {"x": 1}}}\n```\n'
                 '```json\n{"tool_calls":[{"name":"world_command","arguments":{"x": 9}}]}\n```')
