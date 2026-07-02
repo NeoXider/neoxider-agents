@@ -770,15 +770,23 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
             except ValueError:
                 pass
     if calls is None and names:
-        # Mask language-tagged code fences (```lua, ```python, ...) with same-length whitespace
-        # before scanning: call syntax inside them is example/code content, not a real request
-        # (a lua example mentioning world_command(...) was executed before this). Same-length
-        # replacement keeps every span valid in the REAL `cleaned` text. Untagged fences are
-        # scanned normally -- models often wrap their genuine Format-2 call lines in a bare fence.
-        scan_text = TAGGED_FENCE_RE.sub(
-            lambda m: m.group(0) if (m.group(1) or "").lower() in CALL_INTENT_TAGS
-            else " " * len(m.group(0)),
-            cleaned)
+        # Mask language-tagged code fences (```lua, ```python, ...) before scanning ONLY when the
+        # model is explaining -- i.e. there is real prose OUTSIDE the fences. Call syntax inside a
+        # ```lua the model wrote as an EXAMPLE ("here is how you could...") must not execute. But
+        # when the fenced block IS essentially the whole answer (little/no prose around it), it is
+        # the model's actual call, whatever language tag it slapped on (spark wraps real
+        # world_command(...) calls in ```python). Call-intent tags (```function_call) are always
+        # treated as calls. Same-length whitespace replacement keeps every span valid in `cleaned`.
+        prose_outside = TAGGED_FENCE_RE.sub(" ", cleaned)
+        prose_outside = re.sub(r"```[^\n]*|```", " ", prose_outside)  # also drop bare-fence markers
+        explaining = len(prose_outside.strip()) >= 40  # a sentence's worth of prose = an explainer
+        if explaining:
+            scan_text = TAGGED_FENCE_RE.sub(
+                lambda m: m.group(0) if (m.group(1) or "").lower() in CALL_INTENT_TAGS
+                else " " * len(m.group(0)),
+                cleaned)
+        else:
+            scan_text = cleaned  # the fence is the answer -- scan its contents for real calls
         found, spans = extract_func_calls(scan_text, names, tool_param_names(tools))
         if found and prior:
             # Drop exact repeats of already-executed calls (echoes of the history's own

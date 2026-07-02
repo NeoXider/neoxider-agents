@@ -1018,9 +1018,23 @@ class SingleCallFenceTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["name"], "world_command")
 
     def test_lua_tagged_fence_is_still_an_example(self):
-        text = '```lua\nworld_command(action="spawn", x=1)\n```\nJust explaining, not calling.'
+        text = ('Here is how you could build a wall with the tool if you wanted to do it yourself:\n'
+                '```lua\nworld_command(action="spawn", x=1)\n```\n'
+                'But I am only explaining the approach, not actually calling it right now.')
         calls, _ = srv.extract_tool_calls(text, self.NAMES, None)
         self.assertIsNone(calls)
+
+    def test_python_fence_that_IS_the_whole_answer_executes(self):
+        # Verbatim spark shape: the entire message is a ```python fence whose body is the real
+        # multiline world_command(...) calls, with no explaining prose around it. The tagged-fence
+        # example masking must NOT eat these (spawn_arena scored tools=0 before this).
+        text = ('```python\n'
+                'world_command({\n  "action": "spawn",\n  "targetName": "Player",\n  "prefabKey": "Cube"\n})\n'
+                'world_command({\n  "action": "spawn",\n  "targetName": "Goal",\n  "prefabKey": "Cube"\n})\n'
+                '```')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "Player")
 
     def test_explicit_tool_calls_block_still_wins_over_singles(self):
         text = ('```json\n{"type": "function", "function": {"name": "world_command", "arguments": {"x": 1}}}\n```\n'
