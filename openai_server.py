@@ -840,6 +840,47 @@ def _call_shaped(obj, names):
     return None
 
 
+def _salvage_array_calls(body, names, tools):
+    """A JSON ARRAY of calls whose WHOLE-parse failed: one malformed element (observed live
+    from Spark -- a duplicated '"function",' line in element 13 of 75) used to poison the
+    entire castle build to tools=0. Brace-scans each top-level {...} span, parses leniently,
+    keeps the recognizable calls and skips broken elements. A well-formed element that is NOT
+    a recognizable call aborts the salvage (a data array must survive as content). Only used
+    AFTER strict parsing failed."""
+    start = body.find("[")
+    if start == -1:
+        return None
+    calls = []
+    pos, n = start + 1, len(body)
+    while pos < n:
+        ch = body[pos]
+        if ch in " \t\r\n,":
+            pos += 1
+            continue
+        if ch == "]":
+            break
+        if ch != "{":
+            pos += 1
+            continue
+        end = _object_end(body, pos)
+        if end == -1:
+            break
+        try:
+            obj = json.loads(body[pos:end])
+        except ValueError:
+            pos = end  # the malformed element -- skip it, keep salvaging
+            continue
+        shaped = _call_shaped(obj, names)
+        if shaped is None and isinstance(obj, dict) and tools:
+            bare = _bare_args_array([obj], tools)
+            shaped = bare[0] if bare else None
+        if shaped is None:
+            return None  # well-formed non-call element: it's a data answer, not a call array
+        calls.append(shaped)
+        pos = end
+    return calls or None
+
+
 def _parse_call_jsonl(body, names):
     """A fence whose body is SEVERAL call objects, one per line (JSONL) -- observed live from
     Opus 4.8 ('the world_command calls (JSONL, one call per line)'), which is not valid JSON as
@@ -908,7 +949,9 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
         except ValueError:
             # Not valid JSON as a whole -- maybe SEVERAL call objects one per line (JSONL,
             # observed live from Opus 4.8). Only consumed when every line is call-shaped.
-            jsonl = _parse_call_jsonl(body, names)
+            # Failing that, a call ARRAY with one malformed element (Spark live) is salvaged
+            # object-by-object instead of dropping every good call in it.
+            jsonl = _parse_call_jsonl(body, names) or _salvage_array_calls(body, names, tools)
             if jsonl:
                 call_fences.append(jsonl)
                 cleaned = cleaned[:m.start()] + cleaned[m.end():]
@@ -992,6 +1035,14 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
                 obj, end = json.JSONDecoder().raw_decode(stripped)
             except ValueError:
                 obj, end = None, 0
+                if stripped.startswith("["):
+                    # A call array with one malformed element (Spark live): salvage the good
+                    # calls object-by-object instead of losing the whole turn.
+                    salvaged = _salvage_array_calls(stripped, names, tools)
+                    if salvaged:
+                        found = _to_calls(salvaged)
+                        if found:
+                            calls, cleaned = found, ""
             shaped_list = None
             if isinstance(obj, dict) and len(obj) == 1:
                 for key in CANONICAL_WRAPPER_KEYS:
@@ -1351,7 +1402,8 @@ class LiveToolCallEmitter:
         try:
             obj = json.loads(body)
         except ValueError:
-            return _parse_call_jsonl(body, self.names)
+            return (_parse_call_jsonl(body, self.names)
+                    or _salvage_array_calls(body, self.names, self.tools))
         if isinstance(obj, dict):
             for key in CANONICAL_WRAPPER_KEYS:
                 raw = obj.get(key)

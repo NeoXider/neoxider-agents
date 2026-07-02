@@ -1401,6 +1401,40 @@ class UnfencedJsonCallTests(unittest.TestCase):
         self.assertIn("42", cleaned)
 
 
+class SalvageArrayTests(unittest.TestCase):
+    """Spark live G6: an unfenced 75-call array with ONE malformed element (a duplicated
+    '"function",' line) -- the whole castle scored tools=0. Salvage keeps the good calls."""
+
+    NAMES = {"world_command"}
+    TOOLS = [{"type": "function", "function": {
+        "name": "world_command",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string"}, "targetName": {"type": "string"}},
+            "required": ["action"]}}}]
+
+    GOOD = ('{"type":"function","function":{"name":"world_command",'
+            '"parameters":{"action":"spawn","targetName":"%s"}}}')
+    BAD = '{"type":"function","function","function":{"name":"world_command","parameters":{"action":"spawn","targetName":"broken"}}}'
+
+    def test_malformed_element_skipped_good_calls_survive(self):
+        text = "[\n" + self.GOOD % "a" + ",\n" + self.BAD + ",\n" + self.GOOD % "b" + "\n]"
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, tools=self.TOOLS)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "a")
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"])["targetName"], "b")
+
+    def test_fenced_malformed_array_salvaged(self):
+        text = "```json\n[\n" + self.GOOD % "a" + ",\n" + self.BAD + "\n]\n```"
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, tools=self.TOOLS)
+        self.assertEqual(len(calls), 1)
+
+    def test_malformed_data_array_stays_content(self):
+        text = '[{"step": 1, "note": "walk"}, {broken]'
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, tools=self.TOOLS)
+        self.assertIsNone(calls)
+        self.assertIn("walk", cleaned)
+
+
 class BareArgsArrayTests(unittest.TestCase):
     """Fable 5 live G6 spelling: ONE fenced JSON ARRAY whose elements are bare argument objects
     of a single tool (no function name anywhere) -- a 75-object castle scored tools=0 before
