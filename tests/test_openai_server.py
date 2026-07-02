@@ -921,6 +921,52 @@ class BareObjectLinesTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["name"], "world_command")
 
 
+class SingleCallFenceTests(unittest.TestCase):
+    """One fenced JSON block PER CALL, each an OpenAI-shaped tool-call object -- observed live
+    from Sonnet 5 ({\"type\":\"function\",\"function\":{...}} per fence, no tool_calls wrapper);
+    every world_command scenario scored tools=0 before this. Order across fences must be
+    preserved; unknown names must NOT be eaten as calls."""
+
+    NAMES = {"world_command", "execute_lua"}
+
+    def test_verbatim_sonnet_shape_two_fences_two_calls_in_order(self):
+        text = ('I will write the calls for the application.\n'
+                '```json\n{"type": "function", "function": {"name": "world_command", '
+                '"arguments": {"action": "spawn", "targetName": "Player", "x": 0}}}\n```\n'
+                '```json\n{"type": "function", "function": {"name": "world_command", '
+                '"arguments": {"action": "spawn", "targetName": "Gate", "x": 1}}}\n```')
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "Player")
+        self.assertEqual(json.loads(calls[1]["function"]["arguments"])["targetName"], "Gate")
+        self.assertNotIn("```", cleaned)
+
+    def test_flat_name_arguments_fence_also_accepted(self):
+        text = '```json\n{"name": "execute_lua", "arguments": {"code": "print(1)"}}\n```'
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "execute_lua")
+
+    def test_unknown_function_name_fence_is_left_as_content(self):
+        text = '```json\n{"type": "function", "function": {"name": "not_a_tool", "arguments": {}}}\n```'
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertIsNone(calls)
+        self.assertIn("not_a_tool", cleaned)
+
+    def test_plain_json_answer_without_call_shape_is_untouched(self):
+        text = '```json\n{"answer": 42, "reason": "because"}\n```'
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertIsNone(calls)
+        self.assertIn("42", cleaned)
+
+    def test_explicit_tool_calls_block_still_wins_over_singles(self):
+        text = ('```json\n{"type": "function", "function": {"name": "world_command", "arguments": {"x": 1}}}\n```\n'
+                '```json\n{"tool_calls":[{"name":"world_command","arguments":{"x": 9}}]}\n```')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"x": 9})
+
+
 class DeliberateRepeatContractTests(unittest.TestCase):
     """The documented contract for re-running an identical call (echo-dedup's one false
     positive): a Format-2 line that exactly repeats an executed call is ALWAYS summary prose;

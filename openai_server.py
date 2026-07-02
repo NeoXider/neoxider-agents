@@ -662,12 +662,27 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
     intended."""
     calls = None
     cleaned = text
+    single_call_fences = []  # collected in reverse text order; un-reversed before use
     for m in reversed(list(FENCE_RE.finditer(text))):
         try:
             obj = json.loads(m.group(1))
         except ValueError:
             continue
-        if not isinstance(obj, dict) or "tool_calls" not in obj:
+        if not isinstance(obj, dict):
+            continue
+        if "tool_calls" not in obj:
+            # ONE fenced JSON block PER CALL, each shaped like an OpenAI tool-call object --
+            # {"type":"function","function":{"name":...,"arguments":{...}}} (observed live from
+            # Sonnet 5: every world_command scenario scored tools=0 while the transcripts held
+            # perfectly-shaped calls). Also accepts the flat {"name":...,"arguments":{...}}
+            # spelling. Gated on the name being a KNOWN tool so an answer that legitimately IS
+            # a JSON object never gets eaten as a call.
+            fn = obj.get("function") if isinstance(obj.get("function"), dict) else None
+            call_name = (fn or {}).get("name") if fn else (
+                obj.get("name") if "arguments" in obj else None)
+            if isinstance(call_name, str) and call_name and (not names or call_name in names):
+                single_call_fences.append(obj)
+                cleaned = cleaned[:m.start()] + cleaned[m.end():]
             continue
         if calls is None:
             raw = obj.get("tool_calls")
@@ -677,6 +692,8 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
         # leading whitespace mid-loop shifted every earlier match's span, garbling the display
         # text when more than one fence was stripped. One strip at the end is enough.
         cleaned = cleaned[:m.start()] + cleaned[m.end():]
+    if calls is None and single_call_fences:
+        calls = _to_calls(list(reversed(single_call_fences)))
     if calls is None:
         stripped = cleaned.strip()
         if stripped.startswith("{") and '"tool_calls"' in stripped:
