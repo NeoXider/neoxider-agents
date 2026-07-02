@@ -959,6 +959,31 @@ class SingleCallFenceTests(unittest.TestCase):
         self.assertIsNone(calls)
         self.assertIn("42", cleaned)
 
+    def test_no_declared_tools_means_no_fence_is_ever_a_call(self):
+        # Audit finding: with an empty `names` set (request declared no tools), a call-shaped
+        # fence must stay content — nothing to call means nothing to extract.
+        text = '```json\n{"type": "function", "function": {"name": "world_command", "arguments": {"x": 1}}}\n```'
+        calls, cleaned = srv.extract_tool_calls(text, set(), None)
+        self.assertIsNone(calls)
+        self.assertIn("world_command", cleaned)
+
+    def test_flat_shape_with_extra_keys_is_data_not_a_call(self):
+        # Audit finding: a JSON data answer that HAPPENS to have name+arguments among other
+        # fields must survive; only the exact two-key flat shape reads as a call.
+        text = '```json\n{"name": "execute_lua", "arguments": {"code": "x"}, "confidence": 0.9}\n```'
+        calls, cleaned = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertIsNone(calls)
+        self.assertIn("confidence", cleaned)
+
+    def test_tool_calls_fence_with_backtick_in_string_still_parses(self):
+        # Audit finding: the strict backtick-free fence body rejected valid JSON whose string
+        # values contain backticks (lua/markdown code) — the fallback pass must recover it.
+        text = ('```json\n{"tool_calls":[{"name":"execute_lua","arguments":'
+                '{"code":"print(`hi`)"}}]}\n```')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES, None)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("`hi`", json.loads(calls[0]["function"]["arguments"])["code"])
+
     def test_explicit_tool_calls_block_still_wins_over_singles(self):
         text = ('```json\n{"type": "function", "function": {"name": "world_command", "arguments": {"x": 1}}}\n```\n'
                 '```json\n{"tool_calls":[{"name":"world_command","arguments":{"x": 9}}]}\n```')
@@ -1017,6 +1042,13 @@ class LimitBannerTests(unittest.TestCase):
     def test_normal_answer_is_not_a_banner(self):
         self.assertFalse(srv.looks_like_limit_banner("The castle has four towers."))
         self.assertFalse(srv.looks_like_limit_banner(""))
+
+    def test_short_answer_quoting_a_limit_phrase_mid_sentence_is_not_a_banner(self):
+        # Audit finding: the gate must be anchored at the START — a short answer that merely
+        # RELAYS a limit phrase is a normal completion, not a 429.
+        self.assertFalse(srv.looks_like_limit_banner("The API returned: Rate limit exceeded."))
+        self.assertFalse(srv.looks_like_limit_banner(
+            "Set retries because sometimes you see 'usage limit reached' errors."))
 
 
 class RoughTokensTests(unittest.TestCase):

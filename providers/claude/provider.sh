@@ -82,10 +82,13 @@ provider_claude_resume_cmd() {
 # windows Anthropic actually rate-limits on. An estimate of what was SPENT, not what REMAINS
 # (the cap depends on the plan and isn't exposed anywhere locally).
 provider_claude_doctor() {
-    local ver
+    local ver py
     if command -v claude >/dev/null 2>&1; then
         ver="$(claude --version 2>&1 | head -1)"
-        PYTHONIOENCODING=utf-8 python - "$ver" <<'PY'
+        # `python` can resolve to the non-executable WindowsApps shim in some shells; fall back
+        # through real interpreters so the usage estimate works everywhere.
+        py="$(command -v python || command -v python3 || command -v python3.12 || echo python)"
+        PYTHONIOENCODING=utf-8 "$py" - "$ver" <<'PY'
 import glob, io, json, os, sys, time
 ver = sys.argv[1]
 now = time.time()

@@ -378,6 +378,11 @@ def build_prompt(messages, tools):
 # the next one, so one bad fence swallowed a following perfectly valid one (calls lost).
 # (?i) so a ```JSON tag (observed from models) is recognized too.
 FENCE_RE = re.compile(r"(?i)```(?:json)?\s*(\{[^`]*\})\s*```")
+# Fallback for a fence whose JSON legitimately CONTAINS a backtick inside a string value (e.g.
+# lua code with `...`), which the strict backtick-free pass above cannot match. Only consulted
+# when the strict pass produced nothing, and a body is only consumed when json.loads accepts it
+# — so the old cross-fence swallowing cannot silently eat a valid neighbour.
+FENCE_FALLBACK_RE = re.compile(r"(?i)```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 # A fenced code block with an explicit language tag (```lua, ```python, ...) is example/code
 # content, not a place the model writes real Format-2 calls -- masked out before the func-syntax
 # fallback so `world_command(...)` inside a lua example is not executed (see extract_tool_calls).
@@ -678,9 +683,16 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
             # spelling. Gated on the name being a KNOWN tool so an answer that legitimately IS
             # a JSON object never gets eaten as a call.
             fn = obj.get("function") if isinstance(obj.get("function"), dict) else None
+            # The flat spelling is accepted ONLY when the object is exactly {name, arguments}
+            # (no extra keys) — a legitimate JSON data answer that merely HAS name/arguments
+            # among other fields must survive as content. The OpenAI shape carries its own
+            # "function" marker and needs no such restriction.
+            flat_exact = set(obj.keys()) == {"name", "arguments"}
             call_name = (fn or {}).get("name") if fn else (
-                obj.get("name") if "arguments" in obj else None)
-            if isinstance(call_name, str) and call_name and (not names or call_name in names):
+                obj.get("name") if flat_exact else None)
+            # `names` must be non-empty: a request that declared NO tools can never have a
+            # fenced object interpreted as a call, whatever it looks like.
+            if isinstance(call_name, str) and call_name and names and call_name in names:
                 single_call_fences.append(obj)
                 cleaned = cleaned[:m.start()] + cleaned[m.end():]
             continue
@@ -694,6 +706,21 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
         cleaned = cleaned[:m.start()] + cleaned[m.end():]
     if calls is None and single_call_fences:
         calls = _to_calls(list(reversed(single_call_fences)))
+    if calls is None and not single_call_fences and "```" in cleaned:
+        # Strict pass found nothing: retry with the backtick-tolerant fallback so a tool_calls
+        # fence whose string values contain backticks still parses. json.loads gates every
+        # candidate, so nothing is consumed unless it really is the call block.
+        for m in reversed(list(FENCE_FALLBACK_RE.finditer(cleaned))):
+            try:
+                obj = json.loads(m.group(1))
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list) and obj["tool_calls"]:
+                found = _to_calls(obj["tool_calls"])
+                if found:
+                    calls = found
+                    cleaned = cleaned[:m.start()] + cleaned[m.end():]
+                    break
     if calls is None:
         stripped = cleaned.strip()
         if stripped.startswith("{") and '"tool_calls"' in stripped:
@@ -763,15 +790,19 @@ class ProviderLimitError(Exception):
     -- the limit outlives any retry)."""
 
 
-# Deliberately narrow: the whole answer must BE the banner (short), not merely mention limits.
+# Deliberately narrow: the whole answer must BE the banner — short, at most two lines, and the
+# limit wording must appear right at the start (Claude's real banner opens with it). A short
+# answer that merely RELAYS or QUOTES a limit phrase mid-sentence stays a normal completion.
 LIMIT_BANNER_RE = re.compile(
-    r"hit your (session|usage|weekly) limit|usage limit (reached|exceeded)|rate limit (reached|exceeded)",
+    r"^\W{0,8}(you'?ve\s+|you have\s+)?(hit your (session|usage|weekly) limit"
+    r"|usage limit (reached|exceeded)|rate limit (reached|exceeded))",
     re.IGNORECASE)
 
 
 def looks_like_limit_banner(text):
     t = (text or "").strip()
-    return bool(t) and len(t) < 300 and bool(LIMIT_BANNER_RE.search(t))
+    return (bool(t) and len(t) < 300 and t.count("\n") <= 1
+            and bool(LIMIT_BANNER_RE.search(t)))
 
 
 def _rough_tokens(s):
