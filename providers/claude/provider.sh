@@ -50,8 +50,12 @@ provider_claude_resolve() {
 # tool-calling completion (still returned a clean fenced JSON tool_calls block).
 _provider_claude_chatonly_args() {
     if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
+        # Skill/SlashCommand added after a live Sonnet 5 G6 refusal: the CLI loads the USER'S
+        # global skills into context, and the model declined to emit text tool-calls, offering
+        # to run the user's unity-mcp skill instead. Blocking skill invocation keeps the bridge
+        # session a plain completion endpoint.
         printf '%s\n' --strict-mcp-config --disallowedTools \
-            Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch
+            Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch,Skill,SlashCommand
     fi
 }
 
