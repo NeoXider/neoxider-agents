@@ -769,15 +769,24 @@ def extract_bare_object_lines(text, tools):
 
 
 def _call_shaped(obj, names):
-    """The object IS one tool call: either the OpenAI shape ({"function": {"name": ...}}, its
-    own marker) or the flat shape with EXACTLY {name, arguments} keys (a data answer with extra
-    fields must survive as content). The name must be a KNOWN declared tool."""
+    """The object IS one tool call: the OpenAI shape ({"function": {"name": ...}}, its own
+    marker), the flat shape with EXACTLY {name, arguments} keys, or the {action, arguments}
+    alias (Opus 4.8's live spelling -- '{"action": "world_command", "arguments": {...}}' scored
+    tools=0 before this; normalized to {name, arguments} so downstream conversion just works).
+    Exact-keys rules mean a data answer with extra fields survives as content. The name must be
+    a KNOWN declared tool."""
     if not isinstance(obj, dict):
         return None
     fn = obj.get("function") if isinstance(obj.get("function"), dict) else None
     flat_exact = set(obj.keys()) == {"name", "arguments"}
-    call_name = (fn or {}).get("name") if fn else (obj.get("name") if flat_exact else None)
+    alias_exact = set(obj.keys()) == {"action", "arguments"}
+    call_name = ((fn or {}).get("name") if fn
+                 else obj.get("name") if flat_exact
+                 else obj.get("action") if alias_exact
+                 else None)
     if isinstance(call_name, str) and call_name and names and call_name in names:
+        if alias_exact:
+            return {"name": call_name, "arguments": obj.get("arguments")}
         return obj
     return None
 

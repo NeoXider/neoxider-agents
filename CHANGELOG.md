@@ -6,6 +6,11 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- openai-server: accept the {"action": "<tool>", "arguments": {...}} call spelling (Opus 4.8
+  live: G5 Ordered spawn scored tools=0 on a perfectly-shaped 3-call array using "action"
+  instead of "name"). Exact-keys rule as for {name, arguments}; normalized in _call_shaped so
+  every consumer (fence loop, JSONL, arrays, live emitter) inherits it. +5 tests.
+
 - openai-server: REAL token streaming for the `claude` engine. `stream: true` now forwards
   live deltas while the CLI generates instead of replaying the finished answer: the claude
   provider runs `--output-format stream-json --include-partial-messages` piped through the new

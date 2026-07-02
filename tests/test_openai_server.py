@@ -1246,6 +1246,47 @@ class RunRetryAndFallbackTests(unittest.TestCase):
                          usage["prompt_tokens"] + usage["completion_tokens"])
 
 
+class ActionAliasSpellingTests(unittest.TestCase):
+    """Opus 4.8 live spelling: {"action": "<tool>", "arguments": {...}} instead of "name" --
+    G5 Ordered spawn scored tools=0 on a perfectly-shaped 3-call array before this."""
+
+    NAMES = {"world_command"}
+
+    def test_action_alias_is_call_shaped_and_normalized(self):
+        shaped = srv._call_shaped(
+            {"action": "world_command", "arguments": {"action": "spawn", "targetName": "Gate"}},
+            self.NAMES)
+        self.assertEqual(shaped, {"name": "world_command",
+                                  "arguments": {"action": "spawn", "targetName": "Gate"}})
+
+    def test_unknown_action_value_stays_content(self):
+        self.assertIsNone(srv._call_shaped({"action": "fly", "arguments": {}}, self.NAMES))
+
+    def test_extra_keys_stay_content(self):
+        self.assertIsNone(srv._call_shaped(
+            {"action": "world_command", "arguments": {}, "note": "x"}, self.NAMES))
+
+    def test_fenced_array_of_action_alias_calls_extracts(self):
+        text = ('```json\n[\n'
+                '{"action": "world_command", "arguments": {"action": "spawn", "targetName": "Gate"}},\n'
+                '{"action": "world_command", "arguments": {"action": "spawn", "targetName": "Flag"}}\n'
+                ']\n```')
+        calls, _ = srv.extract_tool_calls(text, self.NAMES)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["function"]["name"], "world_command")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"])["targetName"], "Gate")
+
+    def test_live_emitter_streams_action_alias_calls(self):
+        text = ('```json\n{"tool_calls": [\n'
+                '{"action": "world_command", "arguments": {"action": "spawn", "targetName": "Gate"}}\n'
+                ']}\n```')
+        h = _EmitterHarness(names=("world_command",))
+        h.feed_chunked(text)
+        h.emitter.finish()
+        self.assertEqual(len(h.calls), 1)
+        self.assertEqual(h.calls[0][1], "world_command")
+
+
 class MatchCanonicalPrefixTests(unittest.TestCase):
     def test_complete_prefix_yes_with_end_index(self):
         state, end = srv._match_canonical_prefix('{"tool_calls": [{"name":')
