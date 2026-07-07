@@ -7,9 +7,10 @@
 # (engine/model/dir/session/state/exit/files). All replies are APPENDED to the same <name>.log,
 # so the whole conversation with the subagent reads as one file.
 #
-#   agent.sh run    [-e engine] [-m model] [-f effort] [-C dir] [-t name] [--no-progress] "prompt"
+#   agent.sh run    [-e engine] [-m model] [-f effort] [-C dir] [-t name] [--no-progress] [--no-terse] "prompt"
 #                      — new task. By default the agent keeps a PROGRESS.md checkpoint in its working
-#                      dir (resumable after a crash; orchestrator-readable summary). --no-progress opts out.
+#                      dir (resumable after a crash; orchestrator-readable summary) and gets a concision
+#                      directive to save output/turn tokens. --no-progress / --no-terse opt out of each.
 #   agent.sh test-api --base-url <url> --goal "<what to verify>" [-e engine] [-m model]
 #                      [-f effort] [-C dir] [-t name] [--out <path>]  — drive an agent to
 #                      exercise a local HTTP API via its own shell/curl and report a
@@ -76,9 +77,11 @@ cmd="${1:-}"
 [ -n "$cmd" ] || die "usage: agent.sh run|reply|log|last|status|list|clean|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
 shift
 
-engine="codex"; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1
+engine="codex"; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1; terse=1
 # ^ progress=1 by default: every task keeps a PROGRESS.md checkpoint (resumable after a crash,
 # and an orchestrator can read the summary without re-running the agent). Disable with --no-progress.
+# ^ terse=1 by default: append a concision directive (short output, minimal reasoning narration, assume-
+# and-note instead of asking, no re-reading/over-exploring) to save output+turn tokens. Off: --no-terse.
 # ^ PID suffix makes the default name collision-resistant: two processes (e.g. from two
 # different installs/tools sharing one LOGDIR) can never share a PID, so they never race on
 # the same .meta/.log even if they start in the same second. Always give tasks a meaningful
@@ -97,6 +100,7 @@ parse_opts() {
             -P) parent="$2"; shift 2 ;;
             -p) progress=1; shift ;;                 # kept for compat; progress is on by default
             --no-progress) progress=0; shift ;;      # opt out of the PROGRESS.md checkpoint
+            --no-terse|--verbose) terse=0; shift ;;  # opt out of the concision directive
             --base-url) base_url="$2"; shift 2 ;;
             --goal) test_goal="$2"; shift 2 ;;
             --out) out_file="$2"; shift 2 ;;
@@ -133,6 +137,18 @@ progress_proto_reply() {
 
 [Progress] Keep PROGRESS.$1.md current as you continue (summary, checklist, log, conclusions)."
 }
+
+# Concision directive (default on): trims OUTPUT and TURN tokens. It does NOT cut hidden reasoning
+# tokens — that is the effort flag (-f low / -m spark). Appended once on the first turn only; the
+# model keeps it in session context on later replies, so re-sending it every reply would just be
+# boilerplate. Balanced on purpose: the agent may still ask when genuinely blocked, so default-on
+# does not push it into confidently-wrong guesses on ambiguous tasks.
+TERSE_PROTO='
+
+[Style] Work token-efficiently: keep output, explanations, and reasoning narration minimal; do not
+restate the task or your plan back at length; give only what is needed. Do not re-read files you have
+already seen or explore beyond the task. If something is ambiguous, make a reasonable assumption and
+note it in one line rather than stopping — ask only if you are truly blocked and cannot proceed safely.'
 
 # --- meta sidecar (key=value) ---------------------------------------------
 # meta_set's read-modify-write isn't atomic across processes on its own, so we wrap it in a
@@ -336,6 +352,7 @@ case "$cmd" in
         parse_opts "$@"
         prompt="${REST[0]:-}"; [ -n "$prompt" ] || die "run: needs a prompt"
         [ "$progress" = 1 ] && prompt="$prompt$(progress_proto "$name")"
+        [ "$terse" = 1 ] && prompt="$prompt$TERSE_PROTO"
         _do_run_dispatch
         ;;
     test-api)
@@ -347,6 +364,7 @@ case "$cmd" in
         [ -n "$test_goal" ] || die "test-api: needs --goal \"<what to verify>\""
         prompt="$(build_api_test_prompt "$base_url" "$test_goal")"
         [ "$progress" = 1 ] && prompt="$prompt$(progress_proto "$name")"
+        [ "$terse" = 1 ] && prompt="$prompt$TERSE_PROTO"
         task_kind="api-test"
         _do_run_dispatch
         if [ -n "$out_file" ]; then

@@ -15,6 +15,7 @@ only if the task requires the context of the current conversation.
 SK=~/.claude/skills/cli-agents/agent.sh
 bash $SK run  -t fix-readme -C /c/Git/Proj "prompt" # codex, gpt-5.5 medium (default); -t = task name
 bash $SK run  -t big-job -C dir "prompt"            # agent keeps PROGRESS.<task>.md by default (per-task, resumable + orchestrator-readable); --no-progress opts out
+bash $SK run  --no-terse -C dir "prompt"            # terse (concision) directive is ON by default to save output/turn tokens; --no-terse for exploratory/ambiguous work
 bash $SK run  -m spark -C /c/Git/Proj "prompt"      # trivial task -> spark
 bash $SK run  -e claude -m haiku -C dir "prompt"    # a different CLI: claude/opencode/gemini
 bash $SK run  -m sonnet -f low -e claude -C dir "prompt"  # -f <effort>, separate from -m <model>
