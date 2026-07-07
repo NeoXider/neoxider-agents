@@ -19,6 +19,9 @@
 #   agent.sh last   [name]                                               — only the agent's last reply
 #   agent.sh status [name]                                               — state: state/step/changed files/needs reply?
 #   agent.sh list                                                        — task table (state/engine/model/age/files)
+#   agent.sh clean  [--all] [--purge] [-n]                               — delete md clutter (<name>.md +
+#                      PROGRESS.<name>.md) of STOPPED tasks (done/error/stalled). --all also cleans
+#                      waiting tasks; --purge also drops .log/.meta; -n dry-run. Running tasks untouched.
 #   agent.sh doctor                                                      — pre-flight: engines + codex limits (before fan-out)
 #   agent.sh provider-info <engine>                                      — single provider's doctor JSON (used by gui.py)
 #   agent.sh openai-server [-e engine] [-m model] [-f effort] [-p port]  — OpenAI-compatible
@@ -70,7 +73,7 @@ done
 unset _p
 
 cmd="${1:-}"
-[ -n "$cmd" ] || die "usage: agent.sh run|reply|log|last|status|list|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
+[ -n "$cmd" ] || die "usage: agent.sh run|reply|log|last|status|list|clean|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
 shift
 
 engine="codex"; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1
@@ -522,10 +525,52 @@ PY
         export AGENT_SH_BASH="$(cygpath -w "$BASH" 2>/dev/null || echo bash)"
         exec python "$(dirname "$0")/openai_server.py" "$@"
         ;;
+    clean|prune)
+        # Remove md clutter left by STOPPED tasks: the generated <name>.md thread in LOGDIR and the
+        # agent's per-task PROGRESS.<name>.md in its working dir. Only stopped tasks (done/error/
+        # stalled) are touched; running and waiting (needs-reply) tasks are left intact. Only the
+        # unambiguously agent-generated PROGRESS.<name>.md is removed -- a generic PROGRESS.md is
+        # never touched.
+        #   --all     also clean waiting (needs-reply) tasks
+        #   --purge   also delete each task's .log and .meta record (fully forget it)
+        #   -n        dry run: list what would be removed, delete nothing
+        incl_waiting=0; purge=0; dry=0
+        for a in "$@"; do case "$a" in
+            --all) incl_waiting=1 ;;
+            --purge) purge=1 ;;
+            -n|--dry-run) dry=1 ;;
+            *) die "clean: unknown option '$a' (use --all, --purge, -n)" ;;
+        esac; done
+        tasks=0; files=0
+        for f in "$LOGDIR"/*.meta; do
+            [ -e "$f" ] || continue
+            n="$(basename "$f" .meta)"; st="$(eff_state "$n")"
+            case "$st" in
+                running) continue ;;
+                waiting) [ "$incl_waiting" = 1 ] || continue ;;
+            esac
+            d="$(meta_get "$n" dir)"
+            targets=("$LOGDIR/$n.md")
+            [ -n "$d" ] && targets+=("$d/PROGRESS.$n.md")
+            [ "$purge" = 1 ] && targets+=("$LOGDIR/$n.log" "$f")
+            hit=0
+            for t in "${targets[@]}"; do
+                [ -n "$t" ] && [ -f "$t" ] || continue
+                if [ "$dry" = 1 ]; then echo "  would remove: $t"; else rm -f "$t"; fi
+                files=$((files+1)); hit=1
+            done
+            [ "$hit" = 1 ] && tasks=$((tasks+1))
+        done
+        if [ "$dry" = 1 ]; then
+            echo "[agent.sh] clean (dry-run): $files file(s) across $tasks stopped task(s) would be removed" >&2
+        else
+            echo "[agent.sh] clean: removed $files file(s) across $tasks stopped task(s)" >&2
+        fi
+        ;;
     help|--help|-h)
         # print this file's own header comment as the command reference -- one source of
         # truth instead of a duplicated usage string that can drift out of sync.
-        sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
         ;;
     *) die "unknown command: $cmd (see: agent.sh help)" ;;
 esac

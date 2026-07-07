@@ -29,6 +29,8 @@ bash $SK log  -l fix-readme                         # only the last step
 bash $SK last fix-readme                            # only the agent's last answer
 bash $SK status fix-readme                          # state: state/stage/changed files/whether a reply is needed
 bash $SK list                                       # table: state / engine / model / age / files / session
+bash $SK clean                                      # delete md clutter (<name>.md + PROGRESS.<name>.md) of STOPPED
+                                                     # tasks; --all incl. waiting, --purge also .log/.meta, -n dry-run
 bash $SK doctor                                     # pre-flight: engines + codex limits (before fanning out!)
 bash $SK gui [port]                                 # web control panel over all providers (stable default :8765,
                                                      # or $AGENT_GUI_PORT, or a one-off port arg)
