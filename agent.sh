@@ -120,6 +120,13 @@ finished steps. Keep it current as you work, with these sections:
 Update it BEFORE starting and AFTER finishing each significant step (not only at the very end), so a
 crash mid-step still leaves a usable trail. Keep it concise — facts over prose. Do NOT run git commit.'
 
+# On `reply` the agent already has the full protocol (from the first turn + its own PROGRESS.md), so
+# re-sending PROGRESS_PROTO every follow-up is ~250 tokens of pure boilerplate per turn. A one-line
+# reminder is enough to keep it writing — this is the single biggest per-turn token saving here.
+PROGRESS_PROTO_REPLY='
+
+[Progress] Keep PROGRESS.md current as you continue (summary, checklist, log, conclusions).'
+
 # --- meta sidecar (key=value) ---------------------------------------------
 # meta_set's read-modify-write isn't atomic across processes on its own, so we wrap it in a
 # portable mkdir-based mutex (mkdir is atomic on every POSIX filesystem; no dependency on
@@ -363,7 +370,7 @@ except Exception:
         parse_opts "$@"
         if [ ${#REST[@]} -ge 2 ]; then ref="${REST[0]}"; answer="${REST[1]}"; else ref=""; answer="${REST[0]:-}"; fi
         [ -n "$answer" ] || die "reply: needs an answer text"
-        [ "$progress" = 1 ] && answer="$answer$PROGRESS_PROTO"
+        [ "$progress" = 1 ] && answer="$answer$PROGRESS_PROTO_REPLY"
         if [ -z "$ref" ]; then tname="$(latest_task)"; [ -n "$tname" ] || die "reply: no tasks — specify name/session id"
         elif [[ "$ref" =~ ^[0-9a-f-]{36}$ ]]; then tname="$(name_by_session "$ref")"
         else tname="$ref"; fi
