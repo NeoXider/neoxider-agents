@@ -103,29 +103,33 @@ parse_opts() {
     REST=("$@")
 }
 
-# PROGRESS.md protocol: the agent keeps its own checkpoint in the working dir -> resumable after shutdown
-PROGRESS_PROTO='
+# PROGRESS checkpoint protocol: each task keeps its OWN file, NAMED BY TASK (PROGRESS.<task>.md), so
+# several agents sharing one working directory never clobber each other's progress and resume stays
+# per-task. $1 = task name. Emitting per-task avoids the "everyone writes one PROGRESS.md" collision.
+progress_proto() {
+    printf '%s' "
 
-[Progress protocol] Maintain a Markdown file PROGRESS.md in the working directory as a durable
-checkpoint, so this task can be resumed after any interruption (crash, shutdown, timeout) and an
+[Progress protocol] Maintain a Markdown checkpoint file named EXACTLY PROGRESS.$1.md in the working
+directory — one file PER TASK, never a shared PROGRESS.md, so parallel agents in the same directory
+never collide. It is a durable record: this task can be resumed after any interruption, and an
 orchestrator can read what you did and concluded WITHOUT re-running you.
-If PROGRESS.md already exists, READ IT FIRST and continue from where it left off — do not redo
-finished steps. Keep it current as you work, with these sections:
-  1. Summary (TL;DR) — 2-4 lines an orchestrator can read at a glance: the goal, current status,
-     and the headline result/conclusion so far.
-  2. Checklist — the concrete steps, each marked [x] done / [ ] todo / [~] in-progress.
-  3. Log — one short entry per meaningful step: what you did, the outcome, and any finding, error,
-     or decision (include key file paths, commands run, and error messages verbatim).
-  4. Conclusions / next steps — what you concluded and what still remains.
-Update it BEFORE starting and AFTER finishing each significant step (not only at the very end), so a
-crash mid-step still leaves a usable trail. Keep it concise — facts over prose. Do NOT run git commit.'
+If PROGRESS.$1.md already exists, READ IT FIRST and continue where it left off — do not redo finished
+steps. Keep it current with these sections:
+  1. Summary (TL;DR) — 2-4 lines: goal, current status, headline result/conclusion.
+  2. Checklist — the steps, each marked [x] done / [ ] todo / [~] in-progress.
+  3. Log — one short entry per meaningful step: what you did, the outcome, and any finding, error, or
+     decision (key file paths, commands run, error messages verbatim).
+  4. Conclusions / next steps.
+Update it BEFORE and AFTER each significant step, not only at the end. Keep it concise. Do NOT git commit."
+}
 
-# On `reply` the agent already has the full protocol (from the first turn + its own PROGRESS.md), so
-# re-sending PROGRESS_PROTO every follow-up is ~250 tokens of pure boilerplate per turn. A one-line
-# reminder is enough to keep it writing — this is the single biggest per-turn token saving here.
-PROGRESS_PROTO_REPLY='
+# reply: the agent already has the full protocol (turn 1 + its own file), so a one-line reminder is
+# enough — avoids re-sending ~250 tokens of boilerplate every follow-up. $1 = task name.
+progress_proto_reply() {
+    printf '%s' "
 
-[Progress] Keep PROGRESS.md current as you continue (summary, checklist, log, conclusions).'
+[Progress] Keep PROGRESS.$1.md current as you continue (summary, checklist, log, conclusions)."
+}
 
 # --- meta sidecar (key=value) ---------------------------------------------
 # meta_set's read-modify-write isn't atomic across processes on its own, so we wrap it in a
@@ -328,7 +332,7 @@ case "$cmd" in
     run)
         parse_opts "$@"
         prompt="${REST[0]:-}"; [ -n "$prompt" ] || die "run: needs a prompt"
-        [ "$progress" = 1 ] && prompt="$prompt$PROGRESS_PROTO"
+        [ "$progress" = 1 ] && prompt="$prompt$(progress_proto "$name")"
         _do_run_dispatch
         ;;
     test-api)
@@ -339,7 +343,7 @@ case "$cmd" in
         [ -n "$base_url" ] || die "test-api: needs --base-url <url>"
         [ -n "$test_goal" ] || die "test-api: needs --goal \"<what to verify>\""
         prompt="$(build_api_test_prompt "$base_url" "$test_goal")"
-        [ "$progress" = 1 ] && prompt="$prompt$PROGRESS_PROTO"
+        [ "$progress" = 1 ] && prompt="$prompt$(progress_proto "$name")"
         task_kind="api-test"
         _do_run_dispatch
         if [ -n "$out_file" ]; then
@@ -370,7 +374,6 @@ except Exception:
         parse_opts "$@"
         if [ ${#REST[@]} -ge 2 ]; then ref="${REST[0]}"; answer="${REST[1]}"; else ref=""; answer="${REST[0]:-}"; fi
         [ -n "$answer" ] || die "reply: needs an answer text"
-        [ "$progress" = 1 ] && answer="$answer$PROGRESS_PROTO_REPLY"
         if [ -z "$ref" ]; then tname="$(latest_task)"; [ -n "$tname" ] || die "reply: no tasks — specify name/session id"
         elif [[ "$ref" =~ ^[0-9a-f-]{36}$ ]]; then tname="$(name_by_session "$ref")"
         else tname="$ref"; fi
@@ -380,6 +383,7 @@ except Exception:
             meng="$(meta_get "$tname" engine)"; [ -n "$meng" ] && [ "$engine" = codex ] && engine="$meng"
             log="$LOGDIR/$tname.log"
         else session="$ref"; tname="session-$ref"; log="$LOGDIR/$tname.log"; meta_set "$tname" dir "$dir"; fi
+        [ "$progress" = 1 ] && answer="$answer$(progress_proto_reply "$tname")"   # per-task reminder; needs resolved $tname
         [ -n "${session:-}" ] || [ "$engine" = claude ] || die "reply: could not find a session id (task '$tname'); specify uuid explicitly"
         touch "$log"; meta_set "$tname" state running; meta_set "$tname" pid "$$"
         echo "[agent.sh] ▶ reply task=$tname session=$session dir=$dir" >&2
