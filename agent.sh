@@ -7,7 +7,9 @@
 # (engine/model/dir/session/state/exit/files). All replies are APPENDED to the same <name>.log,
 # so the whole conversation with the subagent reads as one file.
 #
-#   agent.sh run    [-e engine] [-m model] [-f effort] [-C dir] [-t name] "prompt"   — new task
+#   agent.sh run    [-e engine] [-m model] [-f effort] [-C dir] [-t name] [--no-progress] "prompt"
+#                      — new task. By default the agent keeps a PROGRESS.md checkpoint in its working
+#                      dir (resumable after a crash; orchestrator-readable summary). --no-progress opts out.
 #   agent.sh test-api --base-url <url> --goal "<what to verify>" [-e engine] [-m model]
 #                      [-f effort] [-C dir] [-t name] [--out <path>]  — drive an agent to
 #                      exercise a local HTTP API via its own shell/curl and report a
@@ -71,7 +73,9 @@ cmd="${1:-}"
 [ -n "$cmd" ] || die "usage: agent.sh run|reply|log|last|status|list|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
 shift
 
-engine="codex"; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=0
+engine="codex"; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1
+# ^ progress=1 by default: every task keeps a PROGRESS.md checkpoint (resumable after a crash,
+# and an orchestrator can read the summary without re-running the agent). Disable with --no-progress.
 # ^ PID suffix makes the default name collision-resistant: two processes (e.g. from two
 # different installs/tools sharing one LOGDIR) can never share a PID, so they never race on
 # the same .meta/.log even if they start in the same second. Always give tasks a meaningful
@@ -88,7 +92,8 @@ parse_opts() {
             -C) dir="$2"; shift 2 ;;
             -t) name="$2"; shift 2 ;;
             -P) parent="$2"; shift 2 ;;
-            -p) progress=1; shift ;;
+            -p) progress=1; shift ;;                 # kept for compat; progress is on by default
+            --no-progress) progress=0; shift ;;      # opt out of the PROGRESS.md checkpoint
             --base-url) base_url="$2"; shift 2 ;;
             --goal) test_goal="$2"; shift 2 ;;
             --out) out_file="$2"; shift 2 ;;
@@ -101,7 +106,19 @@ parse_opts() {
 # PROGRESS.md protocol: the agent keeps its own checkpoint in the working dir -> resumable after shutdown
 PROGRESS_PROTO='
 
-[Progress protocol] Maintain a file PROGRESS.md in the working directory. If it already exists, read it FIRST and continue from where it left off (do not redo finished steps). As you work, keep it updated with: the goal, a checklist of steps with done/todo status, and any decisions made. Keep it concise. Do NOT run git commit.'
+[Progress protocol] Maintain a Markdown file PROGRESS.md in the working directory as a durable
+checkpoint, so this task can be resumed after any interruption (crash, shutdown, timeout) and an
+orchestrator can read what you did and concluded WITHOUT re-running you.
+If PROGRESS.md already exists, READ IT FIRST and continue from where it left off — do not redo
+finished steps. Keep it current as you work, with these sections:
+  1. Summary (TL;DR) — 2-4 lines an orchestrator can read at a glance: the goal, current status,
+     and the headline result/conclusion so far.
+  2. Checklist — the concrete steps, each marked [x] done / [ ] todo / [~] in-progress.
+  3. Log — one short entry per meaningful step: what you did, the outcome, and any finding, error,
+     or decision (include key file paths, commands run, and error messages verbatim).
+  4. Conclusions / next steps — what you concluded and what still remains.
+Update it BEFORE starting and AFTER finishing each significant step (not only at the very end), so a
+crash mid-step still leaves a usable trail. Keep it concise — facts over prose. Do NOT run git commit.'
 
 # --- meta sidecar (key=value) ---------------------------------------------
 # meta_set's read-modify-write isn't atomic across processes on its own, so we wrap it in a

@@ -14,7 +14,7 @@ only if the task requires the context of the current conversation.
 ```bash
 SK=~/.claude/skills/cli-agents/agent.sh
 bash $SK run  -t fix-readme -C /c/Git/Proj "prompt" # codex, gpt-5.5 medium (default); -t = task name
-bash $SK run  -p -t big-job -C dir "prompt"         # -p: agent maintains PROGRESS.md (resumable after shutdown)
+bash $SK run  -t big-job -C dir "prompt"            # agent keeps PROGRESS.md by default (resumable + orchestrator-readable); --no-progress opts out
 bash $SK run  -m spark -C /c/Git/Proj "prompt"      # trivial task -> spark
 bash $SK run  -e claude -m haiku -C dir "prompt"    # a different CLI: claude/opencode/gemini
 bash $SK run  -m sonnet -f low -e claude -C dir "prompt"  # -f <effort>, separate from -m <model>
@@ -186,8 +186,10 @@ to watch it: `agent.sh log -f <name>`.
 **Durable checkpoint (survives shutdown).** After every step a `<name>.md` is generated — a
 human-readable markdown file: a header (state/engine/session/dir/changed files/resume command) + the
 whole thread. Plus the codex/claude sessions themselves live on disk (`~/.codex/sessions`), so even
-after a reboot the task continues via `agent.sh reply <name> "continue"`. For long tasks the `-p` flag
-makes the agent maintain its own `PROGRESS.md` in the working directory and read it on resume.
+after a reboot the task continues via `agent.sh reply <name> "continue"`. By default the agent also
+maintains its own `PROGRESS.md` in the working directory (Summary/TL;DR, checklist, step-by-step log
+with findings, conclusions) and reads it on resume — resumable after a crash and readable by an
+orchestrator without re-running the agent. Pass `--no-progress` to disable it for trivial one-shots.
 
 **"Agent asked a question" detection.** If the last lines of output look like a question, `state=waiting`
 and the wrapper prints `⏳ the agent appears to have ASKED a question — reply: agent.sh reply <name> "..."`.
