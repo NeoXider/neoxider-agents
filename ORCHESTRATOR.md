@@ -46,7 +46,7 @@ matters more than prompt wording.
 | Regular coding / refactor / docs | `-e codex` (default `gpt-5.6-sol`, medium) **or** `-e claude -m sonnet` | Sonnet is a fine everyday default too; use it when Codex limits are tight. |
 | Harder reasoning / tricky bug / careful refactor | `-e codex -m high` (`gpt-5.6-sol`, high effort) | Bump effort, not necessarily model. |
 | Deepest / architecture / security review | `-e claude -m opus`, or keep it yourself | Reserve top-tier for genuinely hard work. |
-| 5.6 variant A/B or if `sol` is rate-limited | `-m luna` (`gpt-5.6-luna`) / `-m terra` (`gpt-5.6-terra`) | Alternative 5.6 models; try them if `sol` is throttled or to compare. |
+| 5.6 variant A/B or if `sol` is rate-limited | `-m luna` (`gpt-5.6-luna`) / `-m terra` (`gpt-5.6-terra`) | Alternative 5.6 models. **Observed speed (n=1): luna 41s < sol 56s < terra 105s.** In that same run only `sol` produced code whose own tests passed (luna/terra picked non-palindrome examples) — so keep `sol` the default and verify luna/terra output. |
 | Fallback to previous generation | `-e codex -m 5.5` (`gpt-5.5`) | If a 5.6 model misbehaves. |
 | Local / offline / free | `-e opencode -m lmstudio/<model>` or `-m zai/<model>` | opencode's free `opencode/*` models work but are slow; prefer an authed model. |
 
