@@ -131,18 +131,28 @@ fi
 section "provider_codex_resolve"
 # ============================================================================================
 
-for alias_in in "" "5.5" "default"; do
+for alias_in in "" "default"; do
     P_MODEL=""; P_EFFORT=""
     provider_codex_resolve "$alias_in"
-    assert_eq "codex alias '$alias_in' -> model gpt-5.5" "gpt-5.5" "$P_MODEL"
+    assert_eq "codex alias '$alias_in' -> model gpt-5.6-sol" "gpt-5.6-sol" "$P_MODEL"
     assert_eq "codex alias '$alias_in' -> effort medium" "medium" "$P_EFFORT"
 done
 
-for alias_in in "5.5-high" "high"; do
+P_MODEL=""; P_EFFORT=""
+provider_codex_resolve "high"
+assert_eq "codex alias 'high' -> model gpt-5.6-sol" "gpt-5.6-sol" "$P_MODEL"
+assert_eq "codex alias 'high' -> effort high" "high" "$P_EFFORT"
+
+for alias_in in "luna" "5.6-luna"; do
     P_MODEL=""; P_EFFORT=""
     provider_codex_resolve "$alias_in"
-    assert_eq "codex alias '$alias_in' -> model gpt-5.5" "gpt-5.5" "$P_MODEL"
-    assert_eq "codex alias '$alias_in' -> effort high" "high" "$P_EFFORT"
+    assert_eq "codex alias '$alias_in' -> model gpt-5.6-luna" "gpt-5.6-luna" "$P_MODEL"
+done
+
+for alias_in in "terra" "5.6-terra"; do
+    P_MODEL=""; P_EFFORT=""
+    provider_codex_resolve "$alias_in"
+    assert_eq "codex alias '$alias_in' -> model gpt-5.6-terra" "gpt-5.6-terra" "$P_MODEL"
 done
 
 for alias_in in "spark" "5.3"; do

@@ -238,10 +238,10 @@ Gotchas (verified):
 | `high` | `gpt-5.6-sol`, effort high | harder than usual (rare; big stuff is better done yourself) |
 | `luna` | `gpt-5.6-luna` | 5.6 variant |
 | `terra` | `gpt-5.6-terra` | 5.6 variant |
-| `5.5` | `gpt-5.5`, effort medium | fallback to the previous generation |
 | `spark` / `5.3` | `gpt-5.3-codex-spark` | very simple: renames, minor text/docs edits, one-line fixes |
 
-If the user explicitly names a model ("codex luna", "5.5", "spark 5.3") — use that one.
+If the user explicitly names a model ("codex luna", "spark 5.3") — use that one. A raw model id still
+passes through unchanged, so `-m gpt-5.5` reaches the older model on demand.
 The 5.6 family (`sol`/`luna`/`terra`) requires **codex-cli >= 0.144** (older CLIs get a 400
 "requires a newer version of Codex"); update with `npm install -g @openai/codex@latest`.
 

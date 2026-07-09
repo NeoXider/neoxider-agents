@@ -11,8 +11,8 @@ PROVIDER_CODEX_RESUME_NEEDS_MODEL=1
 # alias -> real model + effort. Sets globals P_MODEL / P_EFFORT (P_EFFORT may be empty).
 # The 5.6 family (luna/sol/terra) needs codex-cli >= 0.144 -- older CLIs get a 400
 # "The '<model>' model requires a newer version of Codex" from the server. gpt-5.6-sol is the
-# default, matching Codex's own current default (config.toml model = "gpt-5.6-sol"). 5.5 stays
-# reachable via its explicit alias for fallback.
+# default, matching Codex's own current default (config.toml model = "gpt-5.6-sol"). A raw model
+# id passed via -m still falls through unchanged (e.g. -m gpt-5.5 for an older model on demand).
 provider_codex_resolve() {
     local alias="${1:-5.6-sol}"; P_EFFORT="medium"
     case "$alias" in
@@ -20,8 +20,6 @@ provider_codex_resolve() {
         5.6-high|high)              P_MODEL="gpt-5.6-sol"; P_EFFORT="high" ;;
         5.6-luna|luna)              P_MODEL="gpt-5.6-luna" ;;
         5.6-terra|terra)            P_MODEL="gpt-5.6-terra" ;;
-        5.5)                        P_MODEL="gpt-5.5" ;;
-        5.5-high)                   P_MODEL="gpt-5.5"; P_EFFORT="high" ;;
         spark|5.3|5.3-spark|codex-spark) P_MODEL="gpt-5.3-codex-spark" ;;
         *) P_MODEL="$alias" ;;
     esac

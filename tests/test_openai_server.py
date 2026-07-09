@@ -111,7 +111,7 @@ class ModelLabelRealProviderDataTests(unittest.TestCase):
         self.assertEqual(srv.model_label("codex", "spark", ""), "codex/GPT-5.3 Codex Spark")
 
     def test_codex_default_model_shows_version_number(self):
-        self.assertEqual(srv.model_label("codex", "5.5", "medium"), "codex/GPT-5.5 (medium)")
+        self.assertEqual(srv.model_label("codex", "sol", "medium"), "codex/GPT-5.6 Sol (medium)")
 
 
 class ContentTextTests(unittest.TestCase):

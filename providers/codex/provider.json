@@ -1,6 +1,6 @@
 {
   "label": "Codex",
-  "models": ["sol", "luna", "terra", "5.5", "spark"],
+  "models": ["sol", "luna", "terra", "spark"],
   "efforts": ["medium", "high"],
   "default_model": "sol",
   "default_effort": "medium",
@@ -10,7 +10,6 @@
     "sol": "GPT-5.6 Sol",
     "luna": "GPT-5.6 Luna",
     "terra": "GPT-5.6 Terra",
-    "5.5": "GPT-5.5",
     "spark": "GPT-5.3 Codex Spark"
   },
   "supports_resume": true
