@@ -122,15 +122,37 @@ ver = sys.argv[1]
 now = time.time()
 h5, d7 = now - 5 * 3600, now - 7 * 86400
 sums = {"5h": [0, 0], "7d": [0, 0]}  # [in+out, cache read+creation]
+MAXLINE = 4_000_000  # a usage-bearing line is tiny; skip pathological giant lines (a single huge
+                     # tool-result/attachment line was read whole by `for line in open(...)` -> MemoryError)
+def bounded_lines(path):
+    with io.open(path, 'rb') as fb:
+        buf = b''; skipping = False
+        while True:
+            data = fb.read(1 << 20)
+            if not data:
+                break
+            buf += data
+            while True:
+                nl = buf.find(b'\n')
+                if nl < 0:
+                    if len(buf) > MAXLINE:
+                        buf = b''; skipping = True   # drop the start of an oversized line, keep sync
+                    break
+                seg = buf[:nl]; buf = buf[nl + 1:]
+                if skipping:
+                    skipping = False                 # this seg is the tail of the dropped line
+                    continue
+                if len(seg) <= MAXLINE:
+                    yield seg
 for f in glob.glob(os.path.expanduser('~/.claude/projects/**/*.jsonl'), recursive=True):
     try:
         if os.path.getmtime(f) < d7:
             continue
-        for line in io.open(f, encoding='utf-8', errors='ignore'):
-            if '"usage"' not in line or '"assistant"' not in line:
+        for raw in bounded_lines(f):
+            if b'"usage"' not in raw or b'"assistant"' not in raw:
                 continue
             try:
-                o = json.loads(line)
+                o = json.loads(raw.decode('utf-8', 'ignore'))
             except ValueError:
                 continue
             u = (o.get('message') or {}).get('usage') or {}

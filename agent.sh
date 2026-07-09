@@ -23,7 +23,7 @@
 #   agent.sh clean  [--all] [--purge] [-n]                               — delete md clutter (<name>.md +
 #                      PROGRESS.<name>.md) of STOPPED tasks (done/error/stalled). --all also cleans
 #                      waiting tasks; --purge also drops .log/.meta; -n dry-run. Running tasks untouched.
-#   agent.sh doctor                                                      — pre-flight: engines + codex limits (before fan-out)
+#   agent.sh doctor                                                      — pre-flight: engines + codex limits + claude usage (before fan-out)
 #   agent.sh provider-info <engine>                                      — single provider's doctor JSON (used by gui.py)
 #   agent.sh openai-server [-e engine] [-m model] [-f effort] [-p port]  — OpenAI-compatible
 #                      /v1/chat/completions bridge over a CLI subagent (see openai_server.py's
@@ -523,6 +523,13 @@ fmt(rl.get('secondary'), 'secondary')
 hi = max((rl.get('primary') or {}).get('used_percent',0), (rl.get('secondary') or {}).get('used_percent',0))
 if hi >= 80: print("  WARNING: limits nearly exhausted - hold off on subagent fan-out")
 PY
+        # Claude exposes no remaining-limit API, so surface the provider's local usage estimate
+        # (tokens burned in the 5h / 7d windows) -- previously computed but never printed here.
+        if declare -F provider_claude_doctor >/dev/null 2>&1; then
+            echo "=== claude usage (local transcript estimate) ==="
+            claude_note="$(json_field note "$(provider_claude_doctor 2>/dev/null)")"
+            if [ -n "$claude_note" ]; then echo "  $claude_note"; else echo "  (no claude usage data)"; fi
+        fi
         ;;
     gui)
         # lightweight local web dashboard over all providers: http://127.0.0.1:<port>
