@@ -15,7 +15,7 @@ pick up the same baseline instructions without extra setup.
 
 ```bash
 SK=./agent.sh
-bash $SK run  -t <name> -C <dir> "<prompt>"     # new task (codex/gpt-5.5 by default)
+bash $SK run  -t <name> -C <dir> "<prompt>"     # new task (codex/gpt-5.6-sol by default)
 bash $SK run  -e claude -t <name> -C <dir> "..." # -e: codex|claude|opencode|gemini
 bash $SK reply <name> "<answer>"                 # continue a task by name
 bash $SK log  -f <name>                          # follow a task live

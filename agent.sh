@@ -284,7 +284,7 @@ provider_dispatch_resume() {
     # other provider opts out by simply not setting this flag, so reply never overwrites their
     # model= meta.
     # CAVEAT for providers that DO opt in: a bare `reply` with no explicit -m resolves to that
-    # provider's DEFAULT alias (e.g. codex -> gpt-5.5 medium), not whatever model the task
+    # provider's DEFAULT alias (e.g. codex -> gpt-5.6-sol medium), not whatever model the task
     # actually started with -- confirmed live: a codex session started with `-m spark` silently
     # ran under gpt-5.5 on a `reply` that didn't repeat `-m spark`. Callers that need to guarantee
     # the SAME model across every turn (e.g. openai_server.py) must pass -m/-f explicitly on every
