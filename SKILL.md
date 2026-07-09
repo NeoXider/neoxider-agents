@@ -9,6 +9,9 @@ For subagent tasks use **Codex CLI** through the wrapper
 `C:\Users\User\.claude\skills\cli-agents\agent.sh` (git-bash). Use Claude subagents (Agent tool)
 only if the task requires the context of the current conversation.
 
+> **Orchestrating?** See [ORCHESTRATOR.md](ORCHESTRATOR.md) for a paste-ready "work as an orchestrator"
+> prompt and a which-model-for-what matrix.
+
 ## Commands
 
 ```bash
