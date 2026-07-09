@@ -1,6 +1,6 @@
 ---
 name: cli-agents
-description: Delegating tasks to CLI subagents (Codex by default; also Claude Code, opencode, gemini) through the agent.sh wrapper — launching, model selection (gpt-5.5 medium by default, spark for trivial tasks), answering agent questions via resume, logs.
+description: Delegating tasks to CLI subagents (Codex by default; also Claude Code, opencode, gemini) through the agent.sh wrapper — launching, model selection (gpt-5.6-sol medium by default, spark for trivial tasks), answering agent questions via resume, logs.
 ---
 
 # CLI Subagents (Codex Orchestration)
@@ -13,7 +13,7 @@ only if the task requires the context of the current conversation.
 
 ```bash
 SK=~/.claude/skills/cli-agents/agent.sh
-bash $SK run  -t fix-readme -C /c/Git/Proj "prompt" # codex, gpt-5.5 medium (default); -t = task name
+bash $SK run  -t fix-readme -C /c/Git/Proj "prompt" # codex, gpt-5.6-sol medium (default); -t = task name
 bash $SK run  -t big-job -C dir "prompt"            # agent keeps PROGRESS.<task>.md by default (per-task, resumable + orchestrator-readable); --no-progress opts out
 bash $SK run  --no-terse -C dir "prompt"            # terse (concision) directive is ON by default to save output/turn tokens; --no-terse for exploratory/ambiguous work
 bash $SK run  -m spark -C /c/Git/Proj "prompt"      # trivial task -> spark
@@ -231,12 +231,16 @@ Gotchas (verified):
 
 | Alias | Model | When |
 |---|---|---|
-| `5.5` (default) | `gpt-5.5`, effort medium | regular tasks |
-| `5.5-high` | `gpt-5.5`, effort high | harder than usual (rare; big stuff is better done yourself) |
+| `5.6-sol` / `sol` (default) | `gpt-5.6-sol`, effort medium | regular tasks |
+| `high` | `gpt-5.6-sol`, effort high | harder than usual (rare; big stuff is better done yourself) |
+| `luna` | `gpt-5.6-luna` | 5.6 variant |
+| `terra` | `gpt-5.6-terra` | 5.6 variant |
+| `5.5` | `gpt-5.5`, effort medium | fallback to the previous generation |
 | `spark` / `5.3` | `gpt-5.3-codex-spark` | very simple: renames, minor text/docs edits, one-line fixes |
 
-If the user explicitly names a model ("codex spark 5.3", "5.5") — use that one.
-`gpt-5.5-codex` is NOT available on this ChatGPT account — only `gpt-5.5`.
+If the user explicitly names a model ("codex luna", "5.5", "spark 5.3") — use that one.
+The 5.6 family (`sol`/`luna`/`terra`) requires **codex-cli >= 0.144** (older CLIs get a 400
+"requires a newer version of Codex"); update with `npm install -g @openai/codex@latest`.
 
 **Claude** (`-e claude`):
 
