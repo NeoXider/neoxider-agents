@@ -1659,9 +1659,10 @@ class H(BaseHTTPRequestHandler):
             SESSION["last_activity"] = time.time()
         return raw_text
 
-    def _run(self, messages, tools):
+    def _run(self, messages, tools, _retry_left=1):
         # NB: called unbound in tests (H._run(object(), ...)) -- route through the class, not
-        # through self, so a dummy receiver keeps working.
+        # through self, so a dummy receiver keeps working. _retry_left is threaded as an argument
+        # (not a self attribute) for the same reason: a dummy object() has no __dict__.
         raw_text = H._raw_completion(self, messages, tools)
         if looks_like_limit_banner(raw_text):
             raise ProviderLimitError(raw_text.strip())
@@ -1672,6 +1673,26 @@ class H(BaseHTTPRequestHandler):
         usage = {"prompt_tokens": usage_prompt, "completion_tokens": usage_completion,
                  "total_tokens": usage_prompt + usage_completion,
                  "neoxider_estimated": True}
+
+        # No-tool-call recovery. When the request DECLARED tools but the model emitted NONE while clearly
+        # intending to act -- its prose names one of the offered tools -- it almost always described the
+        # call in words (or produced a fenced block even the salvage pass could not parse) instead of
+        # emitting the block. This is the single biggest source of "0 tool calls -> scenario fails" on the
+        # agentic Claude CLI (it sometimes treats the text protocol as optional). Retry ONCE with an explicit
+        # nudge; keep the retry only if it actually produced calls, so a legitimate prose answer that happens
+        # to mention a tool name is never worsened. Gated off with AGENT_TOOLCALL_RETRY=0.
+        if (tools and not tool_calls and _retry_left > 0
+                and os.environ.get("AGENT_TOOLCALL_RETRY", "1") not in ("0", "false", "no", "")):
+            low = (raw_text or "").lower()
+            if any(n and n.lower() in low for n in tool_names(tools)):
+                nudge = ("You described an action but did not emit a tool call. If the task requires an "
+                         "action, respond with ONLY the fenced ```json {\"tool_calls\":[...]} block from the "
+                         "instructions -- no prose before or after -- and nothing else.")
+                retry_messages = list(messages) + [{"role": "user", "content": nudge}]
+                r_text, r_calls, r_usage = H._run(self, retry_messages, tools, _retry_left=0)
+                if r_calls:
+                    return r_text, r_calls, r_usage
+
         return text, tool_calls, usage
 
     def _reset_session(self):

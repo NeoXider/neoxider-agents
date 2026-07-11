@@ -1236,6 +1236,33 @@ class RunRetryAndFallbackTests(unittest.TestCase):
         text, _calls, _usage = self._call(first + [{"role": "user", "content": "and?"}])
         self.assertEqual(text, "FRESH ANSWER")
 
+    def test_no_tool_call_but_tool_named_in_prose_is_retried_and_recovers(self):
+        attempts = []
+        fence = '```json\n{"tool_calls":[{"name":"world_command","arguments":{"action":"spawn"}}]}\n```'
+
+        def fake_run(engine, model, effort, workdir, prompt, name, timeout):
+            attempts.append(name)
+            # 1st turn: prose that NAMES the tool but emits no block; 2nd (nudged) turn: the real block.
+            return "I'll call world_command to spawn the player." if len(attempts) == 1 else fence
+
+        srv.run_agent = fake_run
+        tools = [{"type": "function", "function": {
+            "name": "world_command", "parameters": {"type": "object", "properties": {}}}}]
+        _text, calls, _usage = self._call([{"role": "user", "content": "spawn a player"}], tools)
+        self.assertIsNotNone(calls)
+        self.assertEqual(calls[0]["function"]["name"], "world_command")
+        self.assertEqual(len(attempts), 2)  # one recovery retry
+
+    def test_prose_answer_not_naming_a_tool_is_not_retried(self):
+        attempts = []
+        srv.run_agent = lambda *a, **k: attempts.append("x") or "The capital of France is Paris."
+        tools = [{"type": "function", "function": {
+            "name": "world_command", "parameters": {"type": "object", "properties": {}}}}]
+        text, calls, _usage = self._call([{"role": "user", "content": "capital?"}], tools)
+        self.assertIsNone(calls)
+        self.assertEqual(text, "The capital of France is Paris.")
+        self.assertEqual(len(attempts), 1)  # no retry: a legitimate prose answer never named a tool
+
     def test_usage_is_a_flagged_nonzero_estimate(self):
         srv.run_agent = lambda *a, **k: "four token answer here"
         _text, _calls, usage = self._call([{"role": "user", "content": "hi"}])
