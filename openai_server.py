@@ -1845,7 +1845,17 @@ class H(BaseHTTPRequestHandler):
         if (tools and not tool_calls and _retry_left > 0
                 and os.environ.get("AGENT_TOOLCALL_RETRY", "1") not in ("0", "false", "no", "")):
             low = (raw_text or "").lower()
-            if any(n and n.lower() in low for n in tool_names(tools)):
+            names_tool = any(n and n.lower() in low for n in tool_names(tools))
+            # Also recover the common free-build case where the model NARRATES its plan instead of
+            # emitting the block ("I'll build a castle. Starting with the walls...") without ever naming
+            # the tool -- observed live on smaller/free models on open-ended G6-style tasks (0 tool calls).
+            # Safe to broaden: the retry is only KEPT if it actually produces calls (below), so a genuine
+            # no-action prose answer that stays prose on retry is returned unchanged (just one wasted call).
+            intent_markers = ("i'll ", "i will ", "let me ", "let's ", "i'm going to ", "i am going to ",
+                              "starting with", "first, i", "first i", "next, i", "now i", "here's the plan",
+                              "i'll start", "step 1", "to build", "let me build", "let me create")
+            action_intent = bool(low.strip()) and any(k in low for k in intent_markers)
+            if names_tool or action_intent:
                 nudge = ("You described an action but did not emit a tool call. If the task requires an "
                          "action, respond with ONLY the fenced ```json {\"tool_calls\":[...]} block from the "
                          "instructions -- no prose before or after -- and nothing else.")
