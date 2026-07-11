@@ -11,6 +11,10 @@
 #                      — new task. By default the agent keeps a PROGRESS.md checkpoint in its working
 #                      dir (resumable after a crash; orchestrator-readable summary) and gets a concision
 #                      directive to save output/turn tokens. --no-progress / --no-terse opt out of each.
+#   agent.sh fan    [-e engine] [-m model] [-f effort] [-C dir] [-t base] "prompt1" "prompt2" ...
+#                      — fan out: launch every prompt as its OWN parallel background `run` task
+#                      (named <base>-01, -02, ...). Shared engine/model/effort/dir. Returns at once;
+#                      poll with `list` / `status`. Replaces writing a bash loop of `run ... &` by hand.
 #   agent.sh test-api --base-url <url> --goal "<what to verify>" [-e engine] [-m model]
 #                      [-f effort] [-C dir] [-t name] [--out <path>]  — drive an agent to
 #                      exercise a local HTTP API via its own shell/curl and report a
@@ -75,7 +79,7 @@ done
 unset _p
 
 cmd="${1:-}"
-[ -n "$cmd" ] || die "usage: agent.sh run|reply|log|last|status|list|clean|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
+[ -n "$cmd" ] || die "usage: agent.sh run|fan|reply|log|last|status|list|clean|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
 shift
 
 engine="codex"; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1; terse=1
@@ -309,7 +313,7 @@ _do_run_dispatch() {
     log="$LOGDIR/$name.log"; : > "$log"
     meta_set "$name" engine "$engine"; meta_set "$name" model "${model:-default}"
     meta_set "$name" dir "$dir"; meta_set "$name" state running
-    meta_set "$name" pid "$$"; meta_set "$name" started "$(now)"
+    meta_set "$name" pid "$BASHPID"; meta_set "$name" started "$(now)"
     [ -n "$parent" ] && meta_set "$name" parent "$parent"
     [ -n "$task_kind" ] && meta_set "$name" kind "$task_kind"
     echo "[agent.sh] ▶ run task=$name engine=$engine model=${model:-default} dir=$dir" >&2
@@ -355,6 +359,25 @@ case "$cmd" in
         [ "$progress" = 1 ] && prompt="$prompt$(progress_proto "$name")"
         [ "$terse" = 1 ] && prompt="$prompt$TERSE_PROTO"
         _do_run_dispatch
+        ;;
+    fan)
+        # Launch N agents IN PARALLEL from one call: each positional prompt becomes its own
+        # background `run` task, named <base>-01, <base>-02, ... (base = -t NAME, else the default).
+        # Shared -e/-m/-f/-C options apply to all. Returns immediately; poll with `agent.sh list`
+        # / `status <name>`. Saves writing a bash loop of backgrounded `run &` calls by hand.
+        parse_opts "$@"
+        [ ${#REST[@]} -ge 1 ] || die "fan: needs >=1 prompt (agent.sh fan [opts] \"p1\" \"p2\" ...)"
+        fan_base="$name"; fan_i=0
+        for fan_p in "${REST[@]}"; do
+            fan_i=$((fan_i+1))
+            fan_n="$fan_base-$(printf '%02d' "$fan_i")"
+            fan_prompt="$fan_p"
+            [ "$progress" = 1 ] && fan_prompt="$fan_prompt$(progress_proto "$fan_n")"
+            [ "$terse" = 1 ] && fan_prompt="$fan_prompt$TERSE_PROTO"
+            ( name="$fan_n"; prompt="$fan_prompt"; _do_run_dispatch ) >/dev/null 2>&1 &
+            echo "[agent.sh] ⇉ fanned $fan_n (pid $!)" >&2
+        done
+        echo "[agent.sh] launched $fan_i parallel task(s) under '$fan_base'. Poll: agent.sh list" >&2
         ;;
     test-api)
         # Thin wrapper on top of `run`, not a new provider: builds a prompt instructing the
