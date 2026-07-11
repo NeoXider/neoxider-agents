@@ -76,7 +76,7 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
 (does not import gui.py) so the two servers can run/fail independently.
 """
-import argparse, glob, json, os, re, shutil, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
+import argparse, glob, json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -382,6 +382,157 @@ def reply_agent_live(engine, model, effort, workdir, name, answer, timeout, on_d
     if state not in ("done", "waiting"):
         return None
     return last_output(after)
+
+
+# ======================================================================================
+# opencode NATIVE backend -- talk to `opencode serve`'s HTTP API instead of spawning the
+# `opencode run` CLI per request. Default ON for engine=opencode (--no-opencode-native opts out).
+# Wins: no CLI process per completion (much lower latency) and REAL token streaming from the
+# server's global event bus (session.next.text.delta) instead of buffered chunking.
+# Flow: POST /api/session {model} -> subscribe SSE GET /api/event -> POST /api/session/{id}/prompt
+#       -> collect this session's text.delta fragments until session.next.step.ended.
+# ======================================================================================
+import urllib.request as _urlreq
+import urllib.error as _urlerr
+
+# Default ON for opencode; set OPENCODE_NO_NATIVE=1 to force the legacy `opencode run` CLI path.
+OPENCODE_NATIVE = os.environ.get("OPENCODE_NO_NATIVE") != "1"
+_OC = {"base": None, "proc": None, "lock": threading.Lock()}
+
+
+def _free_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _ensure_opencode_server():
+    """Boot one headless `opencode serve` (via the same bash the CLI path uses, so PATH/shims
+    resolve identically on Windows) and cache its base URL. Reused across all requests."""
+    with _OC["lock"]:
+        if _OC["base"] and _OC["proc"] and _OC["proc"].poll() is None:
+            return _OC["base"]
+        port = _free_port()
+        proc = subprocess.Popen(
+            [BASH, "-lc", "opencode serve --port %d --hostname 127.0.0.1" % port],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        base = "http://127.0.0.1:%d" % port
+        # wait for /api/health
+        for _ in range(120):
+            try:
+                with _urlreq.urlopen(base + "/api/health", timeout=2) as r:
+                    if r.status == 200:
+                        _OC["base"] = base
+                        _OC["proc"] = proc
+                        print("[openai-bridge] opencode serve ready at %s" % base, file=sys.stderr)
+                        return base
+            except Exception:
+                time.sleep(0.5)
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        raise RuntimeError("opencode serve did not become healthy on %s" % base)
+
+
+def _oc_json(base, path, method="GET", body=None, timeout=30):
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = _urlreq.Request(base + path, data=data, method=method,
+                          headers={"Content-Type": "application/json"})
+    with _urlreq.urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode("utf-8", "replace")
+    return json.loads(raw) if raw.strip() else {}
+
+
+def opencode_native_complete(model, prompt, timeout, on_delta=None):
+    """One completion through opencode's native server. `model` is provider/model (first '/'
+    splits providerID from modelID). Streams real text deltas to on_delta when given; returns the
+    full assistant text. Raises on transport/boot failure so the caller's retry logic still runs."""
+    base = _ensure_opencode_server()
+    provider_id, _, model_id = (model or "").partition("/")
+    if not model_id:  # bare model -> let opencode use its configured default
+        provider_id, model_id = None, None
+    sess_body = {}
+    if provider_id and model_id:
+        sess_body["model"] = {"providerID": provider_id, "id": model_id}
+    sid = _oc_json(base, "/api/session", "POST", sess_body, timeout=15)["data"]["id"]
+
+    pieces = []
+    done = threading.Event()
+    err = {}
+
+    def _pump():
+        # Subscribe to the GLOBAL event bus and keep only our session's text deltas.
+        try:
+            req = _urlreq.Request(base + "/api/event", headers={"Accept": "text/event-stream"})
+            with _urlreq.urlopen(req, timeout=timeout) as r:
+                for bline in r:
+                    if done.is_set():
+                        break
+                    line = bline.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        o = json.loads(line[5:].strip())
+                    except Exception:
+                        continue
+                    d = o.get("data") or {}
+                    if d.get("sessionID") != sid:
+                        continue
+                    t = o.get("type", "")
+                    if t == "session.next.text.delta":
+                        frag = d.get("delta")
+                        if isinstance(frag, str) and frag:
+                            pieces.append(frag)
+                            if on_delta is not None:
+                                try:
+                                    on_delta(frag)
+                                except Exception:
+                                    pass
+                    elif t in ("session.next.step.ended", "session.next.error"):
+                        done.set()
+                        break
+        except Exception as e:
+            err["e"] = e
+        finally:
+            done.set()
+
+    th = threading.Thread(target=_pump, daemon=True)
+    th.start()
+    time.sleep(0.4)  # let the SSE connection establish before prompting (avoid missing early deltas)
+    _oc_json(base, "/api/session/%s/prompt" % sid, "POST", {"prompt": {"text": prompt}}, timeout=15)
+    done.wait(timeout=timeout)
+    done.set()
+    th.join(timeout=3)
+    text = "".join(pieces)
+    if not text.strip():
+        # nothing streamed (early miss / non-text answer) -> read the finished message as a fallback
+        try:
+            msg = _oc_json(base, "/api/session/%s/message" % sid, "GET", timeout=15)
+            acc = []
+
+            def _walk(o):
+                if isinstance(o, dict):
+                    if o.get("type") == "text" and isinstance(o.get("text"), str):
+                        acc.append(o["text"])
+                    for v in o.values():
+                        _walk(v)
+                elif isinstance(o, list):
+                    for v in o:
+                        _walk(v)
+            _walk(msg.get("data", msg))
+            text = acc[-1] if acc else text
+            if on_delta is not None and text:
+                on_delta(text)
+        except Exception:
+            pass
+    return text
+
+
+def _use_opencode_native():
+    return OPENCODE_NATIVE and CFG.engine == "opencode"
 
 
 def model_label(engine, model, effort):
@@ -1582,7 +1733,8 @@ class H(BaseHTTPRequestHandler):
         empty->retry): once deltas have reached the client they cannot be retried silently --
         LiveStreamDied is raised instead so the caller finalizes with what was already sent.
         on_retry() (if given) resets the caller's incremental state before a permitted retry."""
-        live = (on_delta is not None and CFG.engine in LIVE_STREAM_ENGINES
+        live = (on_delta is not None
+                and (CFG.engine in LIVE_STREAM_ENGINES or _use_opencode_native())
                 and not getattr(CFG, "no_live_stream", False))
         retry_ok = can_retry or (lambda: True)
         with SESSION_LOCK:
@@ -1632,13 +1784,22 @@ class H(BaseHTTPRequestHandler):
                 SESSION["dir"] = workdir
                 for attempt in range(CFG.retries + 1):
                     name = new_task_name()
-                    if live:
+                    if _use_opencode_native():
+                        try:
+                            raw_text = opencode_native_complete(
+                                CFG.model, prompt, CFG.timeout, on_delta if live else None)
+                            state = "done" if raw_text.strip() else "error"
+                        except Exception as _oce:
+                            print("[openai-bridge] opencode native error: %s" % _oce, file=sys.stderr)
+                            raw_text, state = "", "error"
+                    elif live:
                         raw_text = run_agent_live(CFG.engine, CFG.model, CFG.effort, workdir,
                                                   prompt, name, CFG.timeout, on_delta)
+                        state = read_meta(name).get("state")
                     else:
                         raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt,
                                              name, CFG.timeout)
-                    state = read_meta(name).get("state")
+                        state = read_meta(name).get("state")
                     if raw_text.strip() and state != "error":
                         break
                     if attempt < CFG.retries and retry_ok():
@@ -1733,7 +1894,8 @@ class H(BaseHTTPRequestHandler):
         self.close_connection = True
 
     def _stream_response(self, messages, tools):
-        if (CFG.engine in LIVE_STREAM_ENGINES and not getattr(CFG, "no_live_stream", False)):
+        if ((CFG.engine in LIVE_STREAM_ENGINES or _use_opencode_native())
+                and not getattr(CFG, "no_live_stream", False)):
             return self._stream_response_live(messages, tools)
         # Legacy/emulated path (non-live engines): run to completion, then replay the finished
         # answer as word-sized SSE deltas.
