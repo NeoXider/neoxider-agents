@@ -205,7 +205,7 @@ def _chatonly_env():
 
 
 def run_agent(engine, model, effort, workdir, prompt, name, timeout):
-    args = [BASH, SK, "run", "-e", engine, "-C", to_git_bash_path(workdir), "-t", name]
+    args = [BASH, SK, "run", "--no-progress", "-e", engine, "-C", to_git_bash_path(workdir), "-t", name]
     if model:
         args += ["-m", model]
     if effort:
@@ -348,7 +348,7 @@ def _tail_task_log(name, proc, timeout, on_delta, start_size=0):
 def run_agent_live(engine, model, effort, workdir, prompt, name, timeout, on_delta):
     """run_agent, but with AGENT_STREAM_TEXT=1 and a log tail forwarding answer deltas while
     the CLI generates. Returns the same final answer text run_agent would."""
-    args = [BASH, SK, "run", "-e", engine, "-C", to_git_bash_path(workdir), "-t", name]
+    args = [BASH, SK, "run", "--no-progress", "-e", engine, "-C", to_git_bash_path(workdir), "-t", name]
     if model:
         args += ["-m", model]
     if effort:
