@@ -3,7 +3,7 @@
 A ready-to-paste prompt for running a session as an **orchestrator** that delegates work to CLI
 subagents via `agent.sh` (neoxider), plus a matrix of which model fits which task.
 
-`SK=~/.claude/skills/cli-agents/agent.sh` (or the `neoxider` command).
+`SK=~/.claude/skills/neoxider-agents/agent.sh` (or the `neoxider` command).
 
 ---
 
@@ -20,6 +20,8 @@ subagents via `agent.sh` (neoxider), plus a matrix of which model fits which tas
 >    usage limits. If Codex is near its limit, route to `-e claude -m sonnet` or `-e opencode`.
 > 3. **Route.** Pick the engine/model per task using the matrix below. Trivial → cheap model.
 > 4. **Delegate.** `agent.sh run -e <engine> -m <model> -t <name> -C <dir> "<scoped prompt>"`.
+>    For a batch of parallel workers use one `agent.sh fan -t <base> -C <dir> "p1" "p2" ...`
+>    (spawns `<base>-01`, `<base>-02`, ... in the background) instead of hand-looping `run`.
 >    Give parallel workers only NON-overlapping files. Each keeps its own `PROGRESS.<task>.md`.
 > 5. **Watch.** `agent.sh list` / `agent.sh status <name>`. If a task is `waiting`, answer it with
 >    `agent.sh reply <name> "<answer>"`. If `stalled`/`error`, read its log and re-scope.
