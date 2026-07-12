@@ -1,6 +1,6 @@
 ---
 name: neoxider-agents
-description: Delegating tasks to CLI subagents (Codex by default; also Claude Code, opencode, gemini) through the agent.sh wrapper — launching, model selection (gpt-5.6-sol medium by default, spark for trivial tasks), answering agent questions via resume, logs.
+description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (Codex by default; also Claude Code, opencode, gemini) through the agent.sh wrapper, then verify and integrate their results. Covers launching (run/fan), model selection (gpt-5.6-sol medium by default, spark for trivial tasks), answering agent questions via resume, logs. Use whenever work can be parallelized or offloaded to subagents instead of doing everything in one session.
 ---
 
 # CLI Subagents (Codex Orchestration)
@@ -10,8 +10,33 @@ For subagent tasks use **Codex CLI** through the wrapper
 `./agent.sh`). Use Claude subagents (Agent tool) only if the task requires the context of
 the current conversation.
 
-> **Orchestrating?** See [ORCHESTRATOR.md](ORCHESTRATOR.md) for a paste-ready "work as an orchestrator"
-> prompt and a which-model-for-what matrix.
+## Work as an orchestrator (default mode)
+
+With this skill you are the **orchestrator**, not the implementer. Your value is planning,
+routing, verification and integration — not typing code that a subagent could type. Before
+touching a multi-part task yourself, ask: "which pieces can I hand off right now?" Only keep
+for yourself what genuinely needs this conversation's context or top-tier reasoning
+(architecture, security, tricky debugging).
+
+The loop:
+
+1. **Plan.** Decompose the request into small, independent, precisely-scoped tasks — exact
+   file paths, exact signatures, "change nothing else", "Do NOT run git commit". A vague task
+   wastes a subagent; a precise one almost always succeeds.
+2. **Pre-flight.** `agent.sh doctor` before any fan-out (engines up? codex limits OK?).
+   Near the limit → route to `-e claude -m sonnet` or `-e opencode`.
+3. **Route.** Cheapest model that will succeed (matrix in [ORCHESTRATOR.md](ORCHESTRATOR.md)):
+   trivial → `spark`/`haiku`, regular → default `sol`/`sonnet`, hard → `-m high`/`opus`.
+4. **Delegate.** `run` for one task, `fan` for a parallel batch. Parallel workers only on
+   NON-overlapping files. Each keeps its own `PROGRESS.<task>.md`.
+5. **Watch.** `list` / `status <name>`; a `waiting` task gets `reply <name> "..."`,
+   a `stalled`/`error` one gets its log read and the task re-scoped.
+6. **Verify.** Read every finished task's diff yourself — never trust "done" blindly. Run
+   builds/tests. Reject and re-delegate anything wrong.
+7. **Integrate & commit.** YOU own git: stage, review, commit. Workers must not commit.
+
+> Paste-ready orchestrator system prompt + full which-model-for-what matrix:
+> [ORCHESTRATOR.md](ORCHESTRATOR.md).
 
 ## Commands
 
@@ -224,13 +249,12 @@ e.g. `opus-high`. Implementation — `provider_claude_resolve()` in `providers/c
 
 ## Rules for setting tasks
 
-- **Small, precisely doable tasks**: one file/one topic, exact paths, exact signatures,
-  "do exactly this, nothing more." Don't hand agents tasks with security/architecture decisions "to
-  think over."
-- In every prompt: **"Do NOT run git commit"** (only the orchestrator commits, after verification).
-- After every worker, check the `git diff` of its files; the orchestrator runs the build/tests.
-- Parallel workers — only on non-overlapping files.
+The scoping/verification/git rules live in the orchestrator loop above — follow them for every
+delegation, plus:
+
 - Do not include secrets/tokens in prompts.
+- Don't hand agents security or architecture decisions "to think over" — decide yourself,
+  delegate the mechanical execution.
 
 ## For the user (launching from a terminal)
 
