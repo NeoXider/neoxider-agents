@@ -17,6 +17,7 @@ pick up the same baseline instructions without extra setup.
 SK=./agent.sh
 bash $SK run  -t <name> -C <dir> "<prompt>"     # new task (codex/gpt-5.6-sol by default)
 bash $SK run  -e claude -t <name> -C <dir> "..." # -e: codex|claude|opencode|gemini
+bash $SK fan  -t <base> -C <dir> "p1" "p2" ...   # N parallel background tasks (<base>-01, -02, ...)
 bash $SK reply <name> "<answer>"                 # continue a task by name
 bash $SK log  -f <name>                          # follow a task live
 bash $SK status <name>                           # state / current step / needs a reply?
