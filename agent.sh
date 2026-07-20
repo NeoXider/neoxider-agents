@@ -38,8 +38,8 @@
 #                      `reply`, not a fresh agent every call) -- `POST .../reset` clears it.
 #
 # Models (alias -> real):
-#   codex:  5.6-sol|sol|default -> gpt-5.6-sol (effort medium) [DEFAULT]; high -> effort high;
-#           luna -> gpt-5.6-luna; terra -> gpt-5.6-terra; spark|5.3 -> gpt-5.3-codex-spark (very simple
+#   codex:  5.6-terra|terra|default -> gpt-5.6-terra (effort medium) [DEFAULT]; sol -> gpt-5.6-sol;
+#           high -> sol at effort high; luna -> gpt-5.6-luna; spark|5.3 -> gpt-5.3-codex-spark (very simple
 #           tasks); anything else -> passed through as-is (e.g. -m gpt-5.5). (5.6 family needs codex-cli >= 0.144.)
 #   claude: sonnet|default -> claude-sonnet-5, effort HIGH [DEFAULT]; sonnet-medium/-low -> lower effort;
 #           opus|haiku -> same alias, effort as given (no suffix -> CLI default); <model>-<effort> is the general pattern
