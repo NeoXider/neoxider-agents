@@ -45,10 +45,10 @@ matters more than prompt wording.
 | Task type | First choice | Notes / alternatives |
 |---|---|---|
 | Trivial: rename, one-line fix, text/doc tweak, run tests | `-e codex -m spark` (`gpt-5.3-codex-spark`) or `-e claude -m haiku` | Cheapest. "не жалко" for test runs. |
-| Regular coding / refactor / docs | `-e codex` (default `gpt-5.6-sol`, medium) **or** `-e claude -m sonnet` | Sonnet is a fine everyday default too; use it when Codex limits are tight. |
+| Regular coding / refactor / docs | `-e codex` (default `gpt-5.6-terra`, medium) **or** `-e claude -m sonnet` | Sonnet is a fine everyday default too; use it when Codex limits are tight. |
 | Harder reasoning / tricky bug / careful refactor | `-e codex -m high` (`gpt-5.6-sol`, high effort) | Bump effort, not necessarily model. |
 | Deepest / architecture / security review | `-e claude -m opus`, or keep it yourself | Reserve top-tier for genuinely hard work. |
-| 5.6 variant A/B or if `sol` is rate-limited | `-m luna` (`gpt-5.6-luna`) / `-m terra` (`gpt-5.6-terra`) | Alternative 5.6 models. **Observed speed (n=1): luna 41s < sol 56s < terra 105s.** In that same run only `sol` produced code whose own tests passed (luna/terra picked non-palindrome examples) — so keep `sol` the default and verify luna/terra output. |
+| 5.6 variant A/B or if `terra` is rate-limited | `-m sol` (`gpt-5.6-sol`) / `-m luna` (`gpt-5.6-luna`) | Alternative 5.6 models. **Observed speed (n=1): luna 41s < sol 56s < terra 105s.** In that same run only `sol` produced code whose own tests passed (luna/terra picked non-palindrome examples) — `terra` is the default per user preference, so still verify its output. |
 | Local / offline / free | `-e opencode -m lmstudio/<model>` or `-m zai/<model>` | opencode's free `opencode/*` models work but are slow; prefer an authed model. |
 
 **Engine quick facts (verified 2026-07-09):**
