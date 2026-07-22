@@ -7,8 +7,13 @@ description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tas
 
 For subagent tasks use **Codex CLI** through the wrapper
 `~/.claude/skills/neoxider-agents/agent.sh` (git-bash; when working inside this repo use
-`./agent.sh`). Use Claude subagents (Agent tool) only if the task requires the context of
-the current conversation.
+`./agent.sh`).
+
+**NATIVE-FIRST RULE (user, 2026-07-22, permanent):** every orchestrator spawns its OWN
+engine's subagents natively; the agent.sh wrapper is ONLY for foreign engines.
+- From Claude Code: claude models (opus/sonnet/haiku) → **native Agent tool** (never
+  `agent.sh run -e claude`); codex/opencode/gemini → agent.sh.
+- From Codex: codex models → native codex subagents; claude/opencode/gemini → agent.sh.
 
 ## Work as an orchestrator (default mode)
 
