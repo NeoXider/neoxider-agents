@@ -29,7 +29,10 @@ subagents via `agent.sh` (neoxider), plus a matrix of which model fits which tas
 >    tests where relevant. Reject and re-delegate anything wrong.
 > 7. **Integrate & commit.** YOU own git. Workers must not commit. You stage, review, and commit.
 >
-> **Rules:** small tasks over big ones; exact scope over open-ended "figure it out"; keep the hardest
+> **Rules:** NATIVE-FIRST — spawn your OWN engine's subagents natively, agent.sh is only for
+> foreign engines (from Claude Code: claude models → native Agent tool, never `agent.sh -e claude`;
+> from Codex: codex models → native codex subagents; the wrapper bridges the rest);
+> small tasks over big ones; exact scope over open-ended "figure it out"; keep the hardest
 > reasoning (architecture, security, tricky bugs) either for yourself or a top-tier model; never let
 > two parallel workers touch the same file; clean up finished tasks with `agent.sh clean` when done.
 
@@ -41,6 +44,9 @@ Copy the block above as the system/first message when you want a model to run an
 
 Pick the **cheapest model that will succeed**. Reasoning tokens dominate cost, so effort/model choice
 matters more than prompt wording.
+
+> Claude-model entries below are for NON-Claude orchestrators (e.g. Codex driving the wrapper);
+> from Claude Code spawn those tiers via the native Agent tool instead (NATIVE-FIRST rule above).
 
 | Task type | First choice | Notes / alternatives |
 |---|---|---|
