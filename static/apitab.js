@@ -16,6 +16,7 @@ function switchTab(tab) {
   document.querySelectorAll(".tabview").forEach(v => v.classList.toggle("on", v.id === "tabview-" + tab));
   localStorage.setItem("agentgui_tab", tab);
   if (tab === "api") refreshApiTab();
+  if (tab === "bridge") refreshBridgeTab();
 }
 
 async function submitApiTest() {

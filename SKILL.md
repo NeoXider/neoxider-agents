@@ -184,7 +184,9 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
 **GUI (`agent.sh gui`).** A lightweight local web control panel (python-stdlib, zero
 dependencies): project→subagents tree, chat with each agent, launching new tasks, provider
 limits and `doctor` — one GUI covers all providers, shared `LOGDIR`, safe alongside CLI-launched
-tasks (paths are normalized, meta writes are locked). Task status is conveyed by the
+tasks (paths are normalized, meta writes are locked). An **"LLM API" tab** starts/stops
+`openai-server` bridges from the browser — pick provider+model+port, get a running-bridges list
+with live `/health`, a copy-`/v1`-URL button and a stop button (no CLI needed). Task status is conveyed by the
 activity/topic emoji (✅⏳❌⚠️📖✏️🔧💭🐛🧪…) plus strikethrough for finished tasks. Stable
 port: CLI arg > `$AGENT_GUI_PORT` > `8765`; re-running `gui` while one is up just opens the
 browser. Providers are plugins (`providers/<name>/provider.json` + `provider.sh`) — adding a

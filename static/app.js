@@ -124,6 +124,10 @@ function onLocaleChanged() {
   syncModels();
   if (SEL) { lastLog = ""; refresh(); }
   apiSnippets();
+  if (typeof syncBridgeModels === "function" && $("#brg-engine") && $("#brg-engine").options.length) {
+    syncBridgeModels();
+    if (localStorage.getItem("agentgui_tab") === "bridge") refreshBridgeTab();
+  }
 }
 
 makeResizer("rez-left", "left", "left");
@@ -144,10 +148,19 @@ $("#api-goal").addEventListener("input", apiSnippets);
     $("#api-engine").innerHTML = ENGINES.map(e => `<option value="${e}">${esc((PROVIDERS[e] || {}).label || e)}</option>`).join("");
     syncApiModels();
   }
+  if (!$("#brg-engine").options.length) {
+    // default the bridge provider to opencode when present (its dynamic catalog is the point)
+    $("#brg-engine").innerHTML = ENGINES.map(e => `<option value="${e}">${esc((PROVIDERS[e] || {}).label || e)}</option>`).join("");
+    if (ENGINES.includes("opencode")) $("#brg-engine").value = "opencode";
+    $("#brg-dir").value = CWD;
+    syncBridgeModels();
+  }
   applyApiFieldDefaults();
   apiSnippets();
   switchTab(savedTab);
 
   setInterval(refresh, 3000);
   setInterval(() => loadProvider(), 15000);
+  // keep the bridge list fresh (health/session) only while that tab is visible
+  setInterval(() => { if (localStorage.getItem("agentgui_tab") === "bridge") refreshBridgeTab(); }, 4000);
 })();

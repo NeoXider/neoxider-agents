@@ -20,6 +20,7 @@
 <div class="tabbar">
   <button class="tabbtn on" data-tab="tasks" onclick="switchTab('tasks')" data-i18n="tabs.tasks">Tasks</button>
   <button class="tabbtn" data-tab="api" onclick="switchTab('api')" data-i18n="tabs.api">API</button>
+  <button class="tabbtn" data-tab="bridge" onclick="switchTab('bridge')" data-i18n="tabs.bridge">LLM API</button>
 </div>
 
 <div class="tabview on" id="tabview-tasks">
@@ -104,6 +105,35 @@
   </div>
 </div>
 
+<div class="tabview" id="tabview-bridge">
+  <div class="apiwrap">
+    <div class="box">
+      <h3 data-i18n="bridge.title">Start an OpenAI-compatible API</h3>
+      <p class="subtitle" data-i18n="bridge.subtitle">Expose any CLI provider/model as an OpenAI /v1/chat/completions endpoint — point Cursor, Continue, or any OpenAI client at it. Runs in the background.</p>
+      <div class="fld" style="display:flex;gap:8px">
+        <div style="flex:1"><label data-i18n="form.provider">provider</label><select id="brg-engine" onchange="syncBridgeModels()"></select></div>
+        <div style="flex:2"><label data-i18n="form.model">model</label><input id="brg-model" list="brg-models" data-i18n-placeholder="form.auto" placeholder="auto"></div>
+        <div style="flex:1"><label data-i18n="form.effort">effort</label><select id="brg-effort"></select></div>
+      </div>
+      <datalist id="brg-models"></datalist>
+      <div class="fld" style="display:flex;gap:8px">
+        <div style="width:120px"><label data-i18n="bridge.port">port</label><input id="brg-port" value="8801"></div>
+        <div style="flex:1"><label data-i18n="form.project">project (working dir)</label>
+          <div class="dirfld"><input id="brg-dir"><button class="mini" onclick="openBrowse('pick-bridge')">📂</button></div></div>
+      </div>
+      <div class="fld" style="display:flex;flex-direction:column;gap:6px">
+        <label class="chk"><input type="checkbox" id="brg-localhost" checked> <span data-i18n="bridge.localhost">this machine only (uncheck to expose on the LAN)</span></label>
+        <label class="chk"><input type="checkbox" id="brg-term"> <span data-i18n="form.terminal">open in a terminal (see the live chat)</span></label>
+      </div>
+      <button class="primary" id="btn-brg-start" style="width:100%" onclick="submitBridgeStart()"><span data-i18n="bridge.start">▶ start bridge</span></button>
+    </div>
+    <div class="box">
+      <h3 data-i18n="bridge.running">Running bridges<button class="mini icon" onclick="refreshBridgeTab()" style="margin-left:8px" title="refresh">⟳</button></h3>
+      <div id="brg-list"><span class="empty" data-i18n="bridge.none">no bridges running</span></div>
+    </div>
+  </div>
+</div>
+
 <!-- doctor modal: all providers + limits -->
 <div class="modal" id="m-doc"><div class="card">
   <h2>🩺 <span data-i18n="doctor.title">doctor — engines and limits</span><span class="sp"></span>
@@ -144,6 +174,7 @@
 <script src="/static/modals.js"></script>
 <script src="/static/splitters.js"></script>
 <script src="/static/apitab.js"></script>
+<script src="/static/bridgetab.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
