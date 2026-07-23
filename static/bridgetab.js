@@ -55,10 +55,13 @@ async function submitBridgeStart() {
       toast("error", t("toast.not_started"), r.error);
       return;
     }
-    toast("success", t("bridge.started"), r.base_url);
-    // the bridge writes its registry file only after it binds -- give it a beat, then refresh
-    setTimeout(refreshBridgeTab, 1200);
-    setTimeout(refreshBridgeTab, 3000);
+    toast("success", t("bridge.started"),
+      r.reassigned ? `${r.base_url} (${t("bridge.port_reassigned")} ${r.asked_port})` : r.base_url);
+    // bump the port field so the next launch doesn't collide with this one
+    $("#brg-port").value = (r.port || body.port) + 1;
+    // the bridge writes its registry file only after it binds (opencode warms up `opencode serve`
+    // first) -- poll a few times so a slower-binding bridge still shows up without a manual refresh
+    [800, 1600, 2600, 4000, 6000].forEach(ms => setTimeout(refreshBridgeTab, ms));
   } finally {
     btn.disabled = false;
     btn.innerHTML = old;
@@ -182,6 +185,9 @@ async function refreshBridgeTab() {
         <div class="kv"><span>${t("form.model")}</span><b>${esc(b.label || b.model || "?")}</b></div>
         <div class="kv"><span>${t("bridge.status")}</span><b>${esc(sess)}</b></div>
         ${reqLine}
+        ${(b.lan && (b.lan_urls || []).length)
+          ? b.lan_urls.map(u => `<div class="kv"><span>${t("bridge.lan_url")}</span><b class="mono">${esc(u + "/v1")} <button class="mini" onclick="copyText(this, ${JSON.stringify(u + "/v1").replace(/"/g, "&quot;")})">${t("bridge.copy_url")}</button></b></div>`).join("")
+          : (b.lan ? `<div class="kv"><span>${t("bridge.lan_url")}</span><b>${t("bridge.lan_unknown")}</b></div>` : "")}
         ${b.dir ? `<div class="kv"><span>${t("form.project")}</span><b class="mono">${esc(b.dir)}</b></div>` : ""}
         <div class="snippet"><pre class="mono">${esc(bridgeCurl(b))}</pre><button class="mini" onclick="copyText(this, ${JSON.stringify(bridgeCurl(b)).replace(/"/g, "&quot;")})">${t("api.copy")}</button></div>
       </div>`;

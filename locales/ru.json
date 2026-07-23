@@ -101,5 +101,8 @@
   "bridge.opencode_proxy": "проксируется в opencode serve (без лога на запрос)",
   "bridge.log_prompt": "запрос",
   "bridge.log_output": "ответ",
-  "bridge.busy": "занят (обрабатывает запрос)"
+  "bridge.busy": "занят (обрабатывает запрос)",
+  "bridge.port_reassigned": "порт был занят, перенесён с",
+  "bridge.lan_url": "LAN-адрес",
+  "bridge.lan_unknown": "слушает все интерфейсы (LAN-IP не определён)"
 }

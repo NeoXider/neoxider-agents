@@ -6,6 +6,18 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- gui: **fix "clicked start, nothing appeared" + show the LAN address.** A busy default port
+  (8801) used to fail silently; now `start_bridge` walks up to the next free port and the toast
+  says which port it landed on, and the port field auto-bumps after each launch. The port-free
+  check was also wrong on Windows for LAN bridges — it bind-tested 127.0.0.1, which Windows lets
+  you bind even while 0.0.0.0 holds the port, so a busy LAN port read as free (two bridges raced
+  for the same port and died). It now binds 0.0.0.0 with SO_EXCLUSIVEADDRUSE, a strict "is anything
+  on this port" test. LAN bridges now record their reachable **LAN URLs** (`_lan_ips()`), shown per
+  row with a copy button so a phone/other PC can reach the endpoint (127.0.0.1 only works locally).
+  After launch the list polls a few times so a slower-binding opencode bridge still appears without
+  a manual refresh. Also: `model_label` no longer doubles the prefix (`opencode/opencode/big-pickle`
+  → `opencode/big-pickle`).
+
 - gui: **fold the two API tabs into one.** Removed the standalone "Test API" tab from the GUI
   (the `agent.sh test-api` feature stays in the CLI) and renamed the bridge tab to just **"API"** —
   one place to serve models, no more confusing near-duplicate tabs. Each running bridge now

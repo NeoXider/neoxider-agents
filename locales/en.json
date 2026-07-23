@@ -101,5 +101,8 @@
   "bridge.opencode_proxy": "proxied to opencode serve (no per-request task log)",
   "bridge.log_prompt": "prompt",
   "bridge.log_output": "output",
-  "bridge.busy": "busy (handling a request)"
+  "bridge.busy": "busy (handling a request)",
+  "bridge.port_reassigned": "port was busy, moved from",
+  "bridge.lan_url": "LAN address",
+  "bridge.lan_unknown": "bound to all interfaces (LAN IP not detected)"
 }
