@@ -77,7 +77,7 @@
   "api.copy": "копировать",
   "api.copied": "скопировано ✓",
   "api.copy_failed": "не удалось скопировать",
-  "tabs.bridge": "LLM API",
+  "tabs.bridge": "API",
   "bridge.title": "Запустить OpenAI-совместимый API",
   "bridge.subtitle": "Выставляет любого CLI-провайдера/модель как OpenAI /v1/chat/completions — направьте на него Cursor, Continue или любой OpenAI-клиент. Работает в фоне.",
   "bridge.port": "порт",
@@ -98,5 +98,8 @@
   "bridge.requests": "запросы",
   "bridge.logs": "логи",
   "bridge.no_requests": "запросов пока не было",
-  "bridge.opencode_proxy": "проксируется в opencode serve (без лога на запрос)"
+  "bridge.opencode_proxy": "проксируется в opencode serve (без лога на запрос)",
+  "bridge.log_prompt": "запрос",
+  "bridge.log_output": "ответ",
+  "bridge.busy": "занят (обрабатывает запрос)"
 }

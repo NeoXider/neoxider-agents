@@ -371,23 +371,31 @@ def list_bridges():
         # each bridge request (claude/codex/gemini engines) spawns an `openai-<port>-<hex>` task
         # whose full transcript lands in LOGDIR -- surface the count so the user knows requests
         # are logged and can jump to them. opencode proxies to `opencode serve` and logs nothing here.
+        port = rec.get("port", 0)
         try:
-            rec["requests"] = len(glob.glob(os.path.join(LOGDIR, "openai-%d-*.log" % rec.get("port", 0))))
+            rec["requests"] = len(glob.glob(os.path.join(LOGDIR, "openai-%d-*.log" % port)))
         except Exception:
             rec["requests"] = 0
         health = _bridge_health(rec.get("base_url") or "")
-        if health is None:
-            # give a just-launched bridge a moment before pruning it as dead
-            if (nowt - rec.get("started", 0)) > 5:
-                try:
-                    os.remove(bf)
-                except OSError:
-                    pass
-                continue
-            rec["live"] = False
-        else:
+        if health is not None:
             rec["live"] = True
             rec["health"] = health
+        elif not port_available(port, "127.0.0.1"):
+            # /health didn't answer but the port is still bound -> the bridge is ALIVE but busy
+            # handling a request (a completion holds its lock; /health is momentarily slow). Do
+            # NOT prune it -- that was deleting live bridges mid-request. Show it as busy instead.
+            rec["live"] = True
+            rec["busy"] = True
+        elif (nowt - rec.get("started", 0)) > 5:
+            # port is genuinely free (nothing listening) and it's not a just-launched bridge
+            # still binding -> the process is gone; remove the stale registry file.
+            try:
+                os.remove(bf)
+            except OSError:
+                pass
+            continue
+        else:
+            rec["live"] = False
         out.append(rec)
     out.sort(key=lambda r: r.get("started", 0), reverse=True)
     return out

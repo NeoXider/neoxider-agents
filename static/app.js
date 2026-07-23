@@ -123,7 +123,6 @@ async function loadProvider(force) {
 function onLocaleChanged() {
   syncModels();
   if (SEL) { lastLog = ""; refresh(); }
-  apiSnippets();
   if (typeof syncBridgeModels === "function" && $("#brg-engine") && $("#brg-engine").options.length) {
     syncBridgeModels();
     if (localStorage.getItem("agentgui_tab") === "bridge") refreshBridgeTab();
@@ -133,30 +132,24 @@ function onLocaleChanged() {
 makeResizer("rez-left", "left", "left");
 makeResizer("rez-right", "right", "right");
 
-$("#api-url").addEventListener("input", apiSnippets);
-$("#api-goal").addEventListener("input", apiSnippets);
-
 (async function init() {
   await initI18n();
   updateHistBadge();
   await refresh(); // awaited once so CWD/ENGINES/PROVIDERS are populated before the API tab reads them
   loadProvider();
 
-  const savedTab = localStorage.getItem("agentgui_tab") || "tasks";
-  $("#api-dir").value = CWD;
-  if (!$("#api-engine").options.length) {
-    $("#api-engine").innerHTML = ENGINES.map(e => `<option value="${e}">${esc((PROVIDERS[e] || {}).label || e)}</option>`).join("");
-    syncApiModels();
-  }
+  let savedTab = localStorage.getItem("agentgui_tab") || "tasks";
+  if (savedTab !== "tasks" && savedTab !== "bridge") savedTab = "tasks";  // migrate the removed "api" tab
   if (!$("#brg-engine").options.length) {
-    // default the bridge provider to opencode when present (its dynamic catalog is the point)
+    // default the bridge provider to opencode + big-pickle when present (its dynamic catalog is the point)
     $("#brg-engine").innerHTML = ENGINES.map(e => `<option value="${e}">${esc((PROVIDERS[e] || {}).label || e)}</option>`).join("");
-    if (ENGINES.includes("opencode")) $("#brg-engine").value = "opencode";
+    if (ENGINES.includes("opencode")) {
+      $("#brg-engine").value = "opencode";
+      if (!$("#brg-model").value) $("#brg-model").value = "opencode/big-pickle";
+    }
     $("#brg-dir").value = CWD;
     syncBridgeModels();
   }
-  applyApiFieldDefaults();
-  apiSnippets();
   switchTab(savedTab);
 
   setInterval(refresh, 3000);

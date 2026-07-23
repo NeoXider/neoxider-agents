@@ -6,6 +6,19 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- gui: **fold the two API tabs into one.** Removed the standalone "Test API" tab from the GUI
+  (the `agent.sh test-api` feature stays in the CLI) and renamed the bridge tab to just **"API"** —
+  one place to serve models, no more confusing near-duplicate tabs. Each running bridge now
+  **browses its own request logs inline**: the "logs (N)" button expands the port's requests under
+  the row, and clicking one shows that call's full prompt+output in place (no jump to the Tasks
+  tab). Default bridge model is now **opencode/big-pickle**.
+
+- gui/openai-server: **fix live bridges vanishing mid-request.** `/health` acquired SESSION_LOCK,
+  which a completion holds for its entire CLI call, so a status probe hung and the GUI pruned the
+  (alive, busy) bridge from its registry. `/health` now reads session state lock-free (instant even
+  mid-completion), and `list_bridges` only prunes a registry file when the port is genuinely free
+  (nothing listening) — a bound-but-slow port is shown as **busy**, never deleted.
+
 - gui: **new "LLM API" tab — start/stop OpenAI-compatible bridges from the web panel.** Pick a
   provider + model (+ effort, port, working dir, localhost-vs-LAN) and launch an
   `agent.sh openai-server` in the background; the running-bridges list shows each endpoint's

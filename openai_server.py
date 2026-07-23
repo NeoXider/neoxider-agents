@@ -1705,14 +1705,21 @@ class H(BaseHTTPRequestHandler):
         p = urllib.parse.urlparse(self.path).path
         label = model_label(CFG.engine, CFG.model, CFG.effort)
         if p == "/health":
-            with SESSION_LOCK:
-                active, turns = bool(SESSION["task_name"]), len(SESSION["messages"])
+            # WHY lock-free: a completion holds SESSION_LOCK for its whole CLI call (seconds+),
+            # so acquiring it here would make /health hang for the duration -- and a status probe
+            # (e.g. the GUI's bridge list) would time out and wrongly treat a busy-but-live bridge
+            # as dead. A momentarily inconsistent read of these simple fields is fine for /health.
+            active, turns = bool(SESSION.get("task_name")), len(SESSION.get("messages") or ())
+            try:
                 idle = session_idle_seconds()
+            except Exception:
+                idle = None
             self._send_json(200, {"ok": True, "engine": CFG.engine, "model": label,
                                    "session_active": active, "session_turns": turns,
                                    "session_idle_seconds": None if idle is None else int(idle),
                                    "session_ttl_seconds": CFG.session_ttl,
-                                   "timeout_seconds": CFG.timeout, "retries": CFG.retries})
+                                   "timeout_seconds": CFG.timeout, "retries": CFG.retries,
+                                   "busy": active})
         elif p.endswith("/models"):
             self._send_json(200, {"object": "list", "data": [{"id": label, "object": "model", "owned_by": "neoxider-agents"}]})
         elif p == "/":
