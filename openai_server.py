@@ -2075,13 +2075,16 @@ def main():
                           "wiped and recreated each time a brand-new session starts). Pin this "
                           "to a real project path if the agent should operate there instead.")
     ap.add_argument("-p", "--port", type=int, default=int(os.environ.get("AGENT_OPENAI_PORT") or 8801))
-    ap.add_argument("--host", default="127.0.0.1",
-                     help="interface to bind (default: 127.0.0.1 = localhost only). Use --lan to bind "
-                          "all interfaces for other devices on your network.")
+    ap.add_argument("--host", default=os.environ.get("AGENT_OPENAI_HOST") or "0.0.0.0",
+                     help="interface to bind (default: 0.0.0.0 = all interfaces, reachable over the LAN "
+                          "from a phone/APK or another computer). Set AGENT_OPENAI_HOST to change the "
+                          "default, or pass --localhost to restrict to this machine only.")
     ap.add_argument("--lan", action="store_true",
-                     help="bind all interfaces (0.0.0.0) so other devices on your LAN -- a phone/APK or "
-                          "another computer -- can reach the bridge; prints this host's LAN URL on start. "
-                          "Overrides --host. Only use on a trusted network (see the printed warning).")
+                     help="explicitly bind all interfaces (0.0.0.0). This is already the default; kept "
+                          "for clarity and to override AGENT_OPENAI_HOST/--host back to LAN.")
+    ap.add_argument("--localhost", action="store_true",
+                     help="restrict to 127.0.0.1 (this machine only). Use when you do NOT want other "
+                          "devices on the network to reach the bridge.")
     ap.add_argument("--timeout", type=int, default=240, help="max seconds to wait for one completion (default: 240)")
     ap.add_argument("--retries", type=int, default=1,
                      help="how many times to re-run a completion whose CLI invocation came back "
@@ -2096,6 +2099,8 @@ def main():
     CFG.retries = max(0, CFG.retries)  # a negative value would skip the run loop entirely
     if getattr(CFG, "lan", False):
         CFG.host = "0.0.0.0"
+    if getattr(CFG, "localhost", False):
+        CFG.host = "127.0.0.1"
 
     try:
         srv = ThreadingHTTPServer((CFG.host, CFG.port), H)

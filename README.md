@@ -213,12 +213,13 @@ machinery as everything else in this file). Point any OpenAI-compatible client's
 `base_url` at it and it drives your CLI-agent subscription as the "model" — no
 separate provider API key needed.
 
-**Reaching it from a phone/APK or another PC (LAN).** The bridge binds `127.0.0.1`
-(localhost only) by default. Add `--lan` (alias for `--host 0.0.0.0`) to bind all
-interfaces; the startup banner then prints this host's LAN URL (e.g.
-`http://192.168.1.115:8801/v1`) to set as the `base_url` on the other device, plus the
-`New-NetFirewallRule` command to open the port. LAN only, never the internet — and since
-the bridge runs a CLI agent with your credentials/tools, only use it on a trusted network.
+**Reaching it from a phone/APK or another PC (LAN).** The bridge binds `0.0.0.0` (all
+interfaces) by default, so other devices on your network can reach it out of the box; the
+startup banner prints this host's LAN URL (e.g. `http://192.168.1.115:8801/v1`) to set as
+the `base_url` on the other device, plus the `New-NetFirewallRule` command to open the
+port. LAN only, never the internet — and since the bridge runs a CLI agent with your
+credentials/tools, only use it on a trusted network. Pass `--localhost` (or set
+`AGENT_OPENAI_HOST=127.0.0.1`) to restrict it back to this machine only.
 
 **Verifying it end to end**: `tests/test_openai_server.py` covers the pure logic
 (message rendering, tool-call parsing, session-extension detection, model labels) with
