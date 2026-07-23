@@ -76,7 +76,7 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
 (does not import gui.py) so the two servers can run/fail independently.
 """
-import argparse, atexit, glob, json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
+import argparse, atexit, glob, json, os, queue, re, shlex, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -537,6 +537,177 @@ def opencode_native_complete(model, prompt, timeout, on_delta=None):
 
 def _use_opencode_native():
     return OPENCODE_NATIVE and CFG.engine == "opencode"
+
+
+# ======================================================================================
+# Native claude path: ONE persistent `claude -p --input/output-format stream-json` process
+# instead of a fresh CLI spawn per completion. A cold `claude` start boots the full agent
+# environment (~24k tokens of tools/skills/memory, measured 7-11s wall); the persistent
+# process pays that ONCE, then each turn costs only inference (~3.5s measured on Opus) and
+# keeps the provider prompt cache warm across turns. Same trick `opencode serve` uses.
+# Disable with CLAUDE_NO_NATIVE=1 to fall back to the agent.sh spawn-per-call path.
+# ======================================================================================
+CLAUDE_NATIVE = os.environ.get("CLAUDE_NO_NATIVE") != "1"
+CLAUDE_NATIVE_TASK = "__claude_native__"
+_CL = {"proc": None, "queue": None, "lock": threading.Lock()}
+
+
+def _use_claude_native():
+    return CLAUDE_NATIVE and CFG.engine == "claude"
+
+
+def _claude_native_cmd():
+    # Chat-only lockdown mirrors AGENT_CHAT_ONLY (no shell/file/MCP tools), --verbose is
+    # REQUIRED by --print + stream-json, partial messages give live deltas for stream:true.
+    cmd = ("claude -p --verbose --input-format stream-json --output-format stream-json "
+           "--include-partial-messages --strict-mcp-config --disable-slash-commands "
+           "--disallowedTools Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch,"
+           "Glob,Grep,Read,PowerShell,Skill,ToolSearch")
+    if CFG.model:
+        cmd += " --model " + shlex.quote(CFG.model)
+    if CFG.effort:
+        cmd += " --effort " + shlex.quote(CFG.effort)
+    return cmd
+
+
+def claude_native_alive():
+    p = _CL["proc"]
+    return p is not None and p.poll() is None
+
+
+def claude_native_kill():
+    p = _CL["proc"]
+    _CL["proc"] = None
+    _CL["queue"] = None
+    if p is not None:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
+def _claude_native_ensure():
+    """Start (or reuse) the persistent claude process; a reader thread pumps stdout lines into
+    a queue so turns can be awaited with a real timeout (blocking readline has none)."""
+    if claude_native_alive():
+        return
+    q = queue.Queue()
+    proc = subprocess.Popen(
+        [BASH, "-lc", _claude_native_cmd()],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, encoding="utf-8", errors="replace", cwd=SESSION.get("dir") or None)
+
+    def _pump(p=proc, q=q):
+        try:
+            for line in p.stdout:
+                q.put(line)
+        except Exception:
+            pass
+        finally:
+            q.put(None)  # EOF sentinel
+
+    threading.Thread(target=_pump, daemon=True).start()
+    _CL["proc"] = proc
+    _CL["queue"] = q
+
+
+def claude_native_send(prompt, timeout, on_delta=None):
+    """One turn against the persistent process: write a stream-json user message, read events
+    until the matching "result". Forwards partial text deltas to on_delta when given. Returns
+    the final answer text ("" on failure -- caller decides whether to retry after a kill)."""
+    _claude_native_ensure()
+    p, q = _CL["proc"], _CL["queue"]
+    try:
+        p.stdin.write(json.dumps(
+            {"type": "user", "message": {"role": "user", "content": prompt}},
+            ensure_ascii=False) + "\n")
+        p.stdin.flush()
+    except OSError:
+        claude_native_kill()
+        return ""
+    deadline = time.time() + max(30, timeout)
+    texts = []
+    while time.time() < deadline:
+        try:
+            line = q.get(timeout=max(0.5, deadline - time.time()))
+        except queue.Empty:
+            break
+        if line is None:  # process exited mid-turn
+            claude_native_kill()
+            return ""
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        typ = o.get("type")
+        if typ == "stream_event" and on_delta is not None:
+            ev = o.get("event") or {}
+            if ev.get("type") == "content_block_delta":
+                frag = (ev.get("delta") or {}).get("text")
+                if isinstance(frag, str) and frag:
+                    try:
+                        on_delta(frag)
+                    except Exception:
+                        pass
+        elif typ == "assistant":
+            for c in ((o.get("message") or {}).get("content") or []):
+                if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
+                    texts.append(c["text"])
+        elif typ == "result":
+            final = o.get("result")
+            if isinstance(final, str) and final.strip():
+                return final
+            return "\n".join(texts)
+    # Timed out waiting for the result -- the process state is unknown; restart next call.
+    claude_native_kill()
+    return ""
+
+
+def _claude_native_raw(messages, tools, on_delta, can_retry, on_retry, live):
+    """The session model (see _raw_completion) implemented against the persistent process:
+    an extension of the previous messages sends ONLY the new turns to the SAME process (true
+    resume, no re-boot); anything else restarts the process with the full history."""
+    retry_ok = can_retry or (lambda: True)
+    with SESSION_LOCK:
+        prev = SESSION["messages"]
+        extension = (SESSION["task_name"] == CLAUDE_NATIVE_TASK
+                     and not session_expired()
+                     and claude_native_alive()
+                     and is_extension(prev, messages))
+        if extension:
+            prompt = build_prompt(messages[len(prev):], tools)
+        else:
+            claude_native_kill()
+            if not SESSION.get("dir"):
+                SESSION["dir"] = fresh_session_dir()
+            prompt = build_prompt(messages, tools)
+        raw = ""
+        for attempt in range(CFG.retries + 1):
+            raw = claude_native_send(prompt, CFG.timeout, on_delta if live else None)
+            if raw.strip():
+                break
+            if attempt < CFG.retries and retry_ok():
+                print("[openai-bridge] claude native empty turn, retry %d/%d"
+                      % (attempt + 1, CFG.retries), file=sys.stderr)
+                if on_retry is not None:
+                    on_retry()
+                claude_native_kill()
+                prompt = build_prompt(messages, tools)  # resume impossible after a kill
+                time.sleep(1)
+            else:
+                if live and not raw.strip() and not retry_ok():
+                    SESSION["task_name"] = CLAUDE_NATIVE_TASK
+                    SESSION["messages"] = messages
+                    SESSION["last_activity"] = time.time()
+                    raise LiveStreamDied()
+                break
+        SESSION["task_name"] = CLAUDE_NATIVE_TASK
+        SESSION["messages"] = messages
+        SESSION["last_activity"] = time.time()
+        return raw
 
 
 def model_label(engine, model, effort):
@@ -1751,6 +1922,8 @@ class H(BaseHTTPRequestHandler):
         live = (on_delta is not None
                 and (CFG.engine in LIVE_STREAM_ENGINES or _use_opencode_native())
                 and not getattr(CFG, "no_live_stream", False))
+        if _use_claude_native():
+            return _claude_native_raw(messages, tools, on_delta, can_retry, on_retry, live)
         retry_ok = can_retry or (lambda: True)
         with SESSION_LOCK:
             supports_resume = bool((PROVIDERS.get(CFG.engine) or {}).get("supports_resume"))
@@ -1883,6 +2056,7 @@ class H(BaseHTTPRequestHandler):
 
     def _reset_session(self):
         with SESSION_LOCK:
+            claude_native_kill()
             old_dir = SESSION["dir"]
             SESSION["task_name"] = None
             SESSION["messages"] = []
@@ -2200,6 +2374,7 @@ def main():
 
     register_bridge(CFG)
     atexit.register(unregister_bridge, CFG.port)
+    atexit.register(claude_native_kill)
 
     label = model_label(CFG.engine, CFG.model, CFG.effort)
     all_ifaces = CFG.host in ("0.0.0.0", "::")
