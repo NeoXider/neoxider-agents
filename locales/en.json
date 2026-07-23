@@ -77,7 +77,7 @@
   "api.copy": "copy",
   "api.copied": "copied ✓",
   "api.copy_failed": "copy failed",
-  "tabs.bridge": "LLM API",
+  "tabs.bridge": "API",
   "bridge.title": "Start an OpenAI-compatible API",
   "bridge.subtitle": "Expose any CLI provider/model as an OpenAI /v1/chat/completions endpoint — point Cursor, Continue, or any OpenAI client at it. Runs in the background.",
   "bridge.port": "port",
@@ -98,5 +98,8 @@
   "bridge.requests": "requests",
   "bridge.logs": "logs",
   "bridge.no_requests": "no requests logged yet",
-  "bridge.opencode_proxy": "proxied to opencode serve (no per-request task log)"
+  "bridge.opencode_proxy": "proxied to opencode serve (no per-request task log)",
+  "bridge.log_prompt": "prompt",
+  "bridge.log_output": "output",
+  "bridge.busy": "busy (handling a request)"
 }

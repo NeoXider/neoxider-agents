@@ -1,8 +1,18 @@
-/* "LLM API" tab: start/stop OpenAI-compatible bridges (agent.sh openai-server) and see the
-   ones already running. Each bridge exposes a chosen CLI provider+model as a standard
-   /v1/chat/completions endpoint you can point Cursor/Continue/any OpenAI client at.
-   Depends on $/esc/spin/jget/jpost (util.js), t() (i18n.js), toast() (toast.js), PROVIDERS
-   (populated by refresh() in tree.js) -- must load after them (see gui.html script order). */
+/* "API" tab: start/stop OpenAI-compatible bridges (agent.sh openai-server), see the ones
+   already running, and browse each bridge's request logs inline. Each bridge exposes a chosen
+   CLI provider+model as a standard /v1/chat/completions endpoint you can point Cursor/Continue/
+   any OpenAI client at. Depends on $/esc/spin/jget/jpost (util.js), t() (i18n.js), toast()
+   (toast.js), parseThread()/md() (chat.js), PROVIDERS (populated by refresh() in tree.js) --
+   must load after them (see gui.html script order). */
+
+// Tab switcher (the two remaining tabs: Tasks + API). Kept here since the API tab is the only
+// non-Tasks view now that the standalone test-api tab was folded away.
+function switchTab(tab) {
+  document.querySelectorAll(".tabbtn").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
+  document.querySelectorAll(".tabview").forEach(v => v.classList.toggle("on", v.id === "tabview-" + tab));
+  localStorage.setItem("agentgui_tab", tab);
+  if (tab === "bridge") refreshBridgeTab();
+}
 
 // opencode has a rich dynamic catalog (provider/model) fetched server-side; other engines use
 // the static provider.json list. Populate the datalist + effort dropdown for the picked engine.
@@ -63,19 +73,58 @@ async function stopBridge(port, e) {
   setTimeout(refreshBridgeTab, 400);
 }
 
-// Jump to the Tasks tab and open the newest request transcript for this bridge. Every request
-// (claude/codex/gemini) is a full task named openai-<port>-<hex> -- so the entire prompt+answer
-// of each call is already browsable there, no separate log viewer needed.
-async function viewBridgeLogs(port) {
-  switchTab("tasks");
+// Toggle an inline request-log panel under a bridge row. Every request (claude/codex/gemini) is
+// a full task named openai-<port>-<hex>, so the whole prompt+answer of each call is browsable
+// right here -- no jumping to the Tasks tab. Click a request to expand its transcript in place.
+async function toggleBridgeLogs(port, btn) {
+  const row = btn.closest(".api-run");
+  const existing = row.querySelector(".brg-logs");
+  if (existing) { existing.remove(); return; }
+  const panel = document.createElement("div");
+  panel.className = "brg-logs";
+  panel.innerHTML = spin(t("limits.loading"));
+  row.querySelector(".api-run-body").appendChild(panel);
+  let reqs = [];
   try {
     const d = await jget("/api/tasks");
-    const mine = (d.tasks || [])
+    reqs = (d.tasks || [])
       .filter(x => x.name && x.name.indexOf("openai-" + port + "-") === 0)
       .sort((a, b) => (b.updated || 0) - (a.updated || 0));
-    if (mine.length) select(mine[0].name);
-    else toast("success", t("bridge.logs"), t("bridge.no_requests"));
   } catch (e) {}
+  if (!reqs.length) {
+    panel.innerHTML = `<div class="note">${t("bridge.no_requests")}</div>`;
+    return;
+  }
+  const pfx = "openai-" + port + "-";
+  panel.innerHTML = reqs
+    .map(r => `<div class="brg-req">
+        <div class="brg-req-hd" onclick="toggleBridgeReq(this, '${esc(r.name)}')">
+          <span class="em">${r.act || "•"}</span>
+          <span class="mono">${esc(r.name.slice(pfx.length))}</span>
+          <span class="sp"></span>
+          <span class="note">${esc(r.state)}</span>
+        </div></div>`)
+    .join("");
+}
+
+// Expand/collapse one request's full transcript (prompt + model output) inline.
+async function toggleBridgeReq(hd, name) {
+  const req = hd.parentElement;
+  const open = req.querySelector(".brg-req-body");
+  if (open) { open.remove(); return; }
+  const body = document.createElement("div");
+  body.className = "brg-req-body";
+  body.innerHTML = spin();
+  req.appendChild(body);
+  let log = "";
+  try { log = (await jget("/api/thread?task=" + encodeURIComponent(name))).log || ""; } catch (e) {}
+  const msgs = parseThread(log);
+  const last = msgs[msgs.length - 1] || { inp: [], out: [] };
+  const prompt = last.inp.join("\n").trim() || "—";
+  const out = last.out.join("\n").trim() || "—";
+  body.innerHTML =
+    `<div class="note">${t("bridge.log_prompt")}</div><pre class="mono brg-pre">${esc(prompt)}</pre>` +
+    `<div class="note">${t("bridge.log_output")}</div><pre class="mono brg-pre">${esc(out)}</pre>`;
 }
 
 function bridgeCurl(rec) {
@@ -101,16 +150,18 @@ async function refreshBridgeTab() {
   list.innerHTML = "";
   for (const b of bridges) {
     const h = b.health || {};
-    const statusEm = b.live ? "🟢" : "⚠️";
-    const sess = b.live
-      ? (h.session_active ? `${t("bridge.session_on")} · ${h.session_turns || 0} ${t("bridge.turns")}` : t("bridge.session_idle"))
-      : t("bridge.unreachable");
+    const statusEm = !b.live ? "⚠️" : b.busy ? "🟡" : "🟢";
+    const sess = !b.live
+      ? t("bridge.unreachable")
+      : b.busy
+      ? t("bridge.busy")
+      : h.session_active ? `${t("bridge.session_on")} · ${h.session_turns || 0} ${t("bridge.turns")}` : t("bridge.session_idle");
     const v1 = b.base_url + "/v1";
     // opencode proxies to `opencode serve` and doesn't create per-request task logs; every other
     // engine spawns an openai-<port>-* task whose full transcript shows up in the Tasks tab.
     const logsBtn = b.engine === "opencode"
       ? ""
-      : `<button class="mini" onclick="viewBridgeLogs(${b.port})">${t("bridge.logs")} (${b.requests || 0})</button>`;
+      : `<button class="mini" onclick="toggleBridgeLogs(${b.port}, this)">${t("bridge.logs")} (${b.requests || 0})</button>`;
     const reqLine = b.engine === "opencode"
       ? `<div class="kv"><span>${t("bridge.requests")}</span><b>${t("bridge.opencode_proxy")}</b></div>`
       : `<div class="kv"><span>${t("bridge.requests")}</span><b>${b.requests || 0}</b></div>`;

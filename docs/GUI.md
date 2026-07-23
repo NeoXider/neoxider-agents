@@ -29,17 +29,23 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   path differently (`C:\Git\X` vs `C:/Git/X` vs `/c/Git/X`). `gui.py`'s `to_git_bash_path()` converts
   ANY path to unix-style (`/c/...`) at the moment it's sent to `-C` / saved to `projects.json` — otherwise
   tasks from the GUI would be grouped separately from tasks in the same folder launched from the CLI.
-- **"LLM API" tab (OpenAI bridges)**: start/stop `agent.sh openai-server` bridges without the CLI.
-  Pick provider+model (+effort/port/dir, localhost-vs-LAN) → `POST /api/bridge/start` spawns the
-  bridge in the background. Each bridge self-registers a `bridges/bridge-<port>.json` in `LOGDIR`
-  (see `openai_server.py`'s `register_bridge`); `GET /api/bridges` lists them and probes each one's
-  `/health` for live status (session active/idle + turns), pruning files whose port stopped
-  answering. `POST /api/bridge/stop` kills the recorded pid (`taskkill /F /T` on Windows) and drops
-  the file. The port is bind-checked (`port_available`) before launch so a busy/reserved port fails
-  fast with a clear message. opencode's model list is fetched live via `GET /api/models?engine=`
-  (`opencode models` through git-bash, since the npm shim isn't resolvable by native-Windows python);
-  other engines fall back to `provider.json`. Frontend: `static/bridgetab.js` (ids are `brg-*` to
-  avoid colliding with the folder-browser's `br-*` ids).
+- **"API" tab (OpenAI bridges)**: start/stop `agent.sh openai-server` bridges without the CLI. This
+  is the only non-Tasks tab — the old standalone test-api tab was folded away (that feature lives in
+  the CLI); `switchTab` now lives in `bridgetab.js`. Pick provider+model (default opencode/big-pickle,
+  +effort/port/dir, localhost-vs-LAN) → `POST /api/bridge/start` spawns the bridge in the background.
+  Each bridge self-registers a `bridges/bridge-<port>.json` in `LOGDIR` (see `openai_server.py`'s
+  `register_bridge`); `GET /api/bridges` lists them and probes each one's `/health` for live status
+  (session active/idle + turns). **Pruning is port-based, not health-based**: a registry file is
+  removed only when `port_available()` says nothing is listening — a bound-but-slow bridge (busy
+  handling a request, whose `/health` is momentarily unresponsive) is shown as **busy**, never
+  deleted. (`/health` itself is lock-free so it stays instant even mid-completion.) Each row browses
+  its request logs **inline**: `toggleBridgeLogs` lists the port's `openai-<port>-*` tasks and
+  `toggleBridgeReq` expands one call's prompt+output in place. `POST /api/bridge/stop` kills the
+  recorded pid (`taskkill /F /T` on Windows) and drops the file. The port is bind-checked before
+  launch so a busy/reserved port fails fast. opencode's model list is fetched live via
+  `GET /api/models?engine=` (`opencode models` through git-bash, since the npm shim isn't resolvable
+  by native-Windows python); other engines fall back to `provider.json`. Frontend:
+  `static/bridgetab.js` (ids are `brg-*` to avoid colliding with the folder-browser's `br-*` ids).
 - **Providers are plugins**: each CLI lives entirely under `providers/<name>/` — `provider.json`
   (label/models/**efforts**/limits/default_model/default_effort) drives the GUI's dropdown, model
   list, **separate effort dropdown**, and adaptive limits panel; `provider.sh` defines

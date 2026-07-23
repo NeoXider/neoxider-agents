@@ -19,8 +19,7 @@
 </header>
 <div class="tabbar">
   <button class="tabbtn on" data-tab="tasks" onclick="switchTab('tasks')" data-i18n="tabs.tasks">Tasks</button>
-  <button class="tabbtn" data-tab="api" onclick="switchTab('api')" data-i18n="tabs.api">API</button>
-  <button class="tabbtn" data-tab="bridge" onclick="switchTab('bridge')" data-i18n="tabs.bridge">LLM API</button>
+  <button class="tabbtn" data-tab="bridge" onclick="switchTab('bridge')" data-i18n="tabs.bridge">API</button>
 </div>
 
 <div class="tabview on" id="tabview-tasks">
@@ -73,36 +72,6 @@
     </div>
   </div>
 </main>
-</div>
-
-<div class="tabview" id="tabview-api">
-  <div class="apiwrap">
-    <div class="box">
-      <h3 data-i18n="api.title">Test a local HTTP API</h3>
-      <p class="subtitle" data-i18n="api.subtitle">Drive an agent to exercise your app's local API and get a structured pass/fail result — the same endpoint below is callable from your own programs/tests too.</p>
-      <div class="fld"><label data-i18n="api.base_url">base URL</label><input id="api-url" placeholder="http://127.0.0.1:8080"></div>
-      <div class="fld"><label data-i18n="api.goal">goal (what to verify)</label>
-        <textarea id="api-goal" rows="2" data-i18n-placeholder="api.goal_placeholder" placeholder="e.g. check /health returns ok, then POST /item and GET it back"></textarea></div>
-      <div class="fld" style="display:flex;gap:8px">
-        <div style="flex:1"><label data-i18n="form.provider">provider</label><select id="api-engine" onchange="syncApiModels()"></select></div>
-        <div style="flex:1"><label data-i18n="form.model">model</label><input id="api-model" list="api-models" data-i18n-placeholder="form.auto" placeholder="auto"></div>
-        <div style="flex:1"><label data-i18n="form.effort">effort</label><select id="api-effort"></select></div>
-      </div>
-      <datalist id="api-models"></datalist>
-      <div class="fld"><label data-i18n="form.project">project (working dir)</label><input id="api-dir"></div>
-      <button class="primary" id="btn-api-run" style="width:100%" onclick="submitApiTest()"><span data-i18n="api.run">▶ run API test</span></button>
-    </div>
-    <div class="box">
-      <h3 data-i18n="api.results">Past runs</h3>
-      <div id="api-results"><span class="empty" data-i18n="api.no_runs">no API test runs yet</span></div>
-    </div>
-    <div class="box">
-      <h3 data-i18n="api.snippets">Use from your own code</h3>
-      <p class="subtitle" data-i18n="api.snippets_hint">This GUI's /api/test-api endpoint is the same one the button above calls — point your own test suite at it directly.</p>
-      <div class="snippet"><pre id="api-curl" class="mono"></pre><button class="mini" onclick="copyText(this, $('#api-curl').textContent)" data-i18n="api.copy">copy</button></div>
-      <div class="snippet"><pre id="api-csharp" class="mono"></pre><button class="mini" onclick="copyText(this, $('#api-csharp').textContent)" data-i18n="api.copy">copy</button></div>
-    </div>
-  </div>
 </div>
 
 <div class="tabview" id="tabview-bridge">
@@ -173,7 +142,6 @@
 <script src="/static/chat.js"></script>
 <script src="/static/modals.js"></script>
 <script src="/static/splitters.js"></script>
-<script src="/static/apitab.js"></script>
 <script src="/static/bridgetab.js"></script>
 <script src="/static/app.js"></script>
 </body>
