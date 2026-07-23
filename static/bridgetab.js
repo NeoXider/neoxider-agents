@@ -76,17 +76,36 @@ async function stopBridge(port, e) {
   setTimeout(refreshBridgeTab, 400);
 }
 
-// Toggle an inline request-log panel under a bridge row. Every request (claude/codex/gemini) is
-// a full task named openai-<port>-<hex>, so the whole prompt+answer of each call is browsable
-// right here -- no jumping to the Tasks tab. Click a request to expand its transcript in place.
-async function toggleBridgeLogs(port, btn) {
-  const row = btn.closest(".api-run");
-  const existing = row.querySelector(".brg-logs");
-  if (existing) { existing.remove(); return; }
-  const panel = document.createElement("div");
-  panel.className = "brg-logs";
-  panel.innerHTML = spin(t("limits.loading"));
-  row.querySelector(".api-run-body").appendChild(panel);
+// Inline request logs. Every request (claude/codex/gemini) is a full task named
+// openai-<port>-<hex>, so the whole prompt+answer of each call is browsable right here -- no
+// jumping to the Tasks tab. Open/expanded state is kept in module Sets so it SURVIVES the tab's
+// periodic full rebuild (the list re-renders every few seconds; without this the panel would
+// pop open then vanish on the next refresh -- the "opens and immediately closes" bug). Content
+// caches make the restore instant (no spinner flash) each time the row is rebuilt.
+const BRG_OPEN_LOGS = new Set();   // ports whose log panel is open
+const BRG_OPEN_REQS = new Set();   // request task names whose transcript is expanded
+const _reqListCache = {};          // port -> requests-list innerHTML
+const _reqBodyCache = {};          // name -> transcript innerHTML
+
+// A real toggle: flip the port's open state, then (re)render to match it.
+async function toggleBridgeLogs(port) {
+  if (BRG_OPEN_LOGS.has(port)) BRG_OPEN_LOGS.delete(port);
+  else BRG_OPEN_LOGS.add(port);
+  await renderBridgeLogs(port);
+}
+
+// Reconcile one bridge's log panel with BRG_OPEN_LOGS. Safe to call after any list rebuild.
+async function renderBridgeLogs(port) {
+  const row = document.querySelector(`#brg-list .api-run[data-port="${port}"]`);
+  if (!row) return;
+  let panel = row.querySelector(".brg-logs");
+  if (!BRG_OPEN_LOGS.has(port)) { if (panel) panel.remove(); return; }
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.className = "brg-logs";
+    row.querySelector(".api-run-body").appendChild(panel);
+  }
+  if (!panel.innerHTML) panel.innerHTML = _reqListCache[port] || spin(t("limits.loading"));
   let reqs = [];
   try {
     const d = await jget("/api/tasks");
@@ -95,39 +114,55 @@ async function toggleBridgeLogs(port, btn) {
       .sort((a, b) => (b.updated || 0) - (a.updated || 0));
   } catch (e) {}
   if (!reqs.length) {
-    panel.innerHTML = `<div class="note">${t("bridge.no_requests")}</div>`;
+    if (BRG_OPEN_LOGS.has(port)) panel.innerHTML = `<div class="note">${t("bridge.no_requests")}</div>`;
     return;
   }
   const pfx = "openai-" + port + "-";
-  panel.innerHTML = reqs
-    .map(r => `<div class="brg-req">
-        <div class="brg-req-hd" onclick="toggleBridgeReq(this, '${esc(r.name)}')">
+  const html = reqs
+    .map(r => `<div class="brg-req" data-name="${esc(r.name)}">
+        <div class="brg-req-hd" onclick="toggleBridgeReq('${esc(r.name)}', this)">
           <span class="em">${r.act || "•"}</span>
           <span class="mono">${esc(r.name.slice(pfx.length))}</span>
           <span class="sp"></span>
           <span class="note">${esc(r.state)}</span>
         </div></div>`)
     .join("");
+  _reqListCache[port] = html;
+  if (!BRG_OPEN_LOGS.has(port) || !document.body.contains(panel)) return;  // closed while fetching
+  panel.innerHTML = html;
+  panel.querySelectorAll(".brg-req").forEach(req => {
+    if (BRG_OPEN_REQS.has(req.dataset.name)) renderBridgeReq(req.dataset.name, req);
+  });
 }
 
-// Expand/collapse one request's full transcript (prompt + model output) inline.
-async function toggleBridgeReq(hd, name) {
-  const req = hd.parentElement;
-  const open = req.querySelector(".brg-req-body");
-  if (open) { open.remove(); return; }
-  const body = document.createElement("div");
-  body.className = "brg-req-body";
-  body.innerHTML = spin();
-  req.appendChild(body);
+// A real toggle for one request's transcript, likewise state-tracked so it survives rebuilds.
+async function toggleBridgeReq(name, hd) {
+  if (BRG_OPEN_REQS.has(name)) BRG_OPEN_REQS.delete(name);
+  else BRG_OPEN_REQS.add(name);
+  await renderBridgeReq(name, hd.closest(".brg-req"));
+}
+
+async function renderBridgeReq(name, req) {
+  if (!req) return;
+  let body = req.querySelector(".brg-req-body");
+  if (!BRG_OPEN_REQS.has(name)) { if (body) body.remove(); return; }
+  if (!body) {
+    body = document.createElement("div");
+    body.className = "brg-req-body";
+    req.appendChild(body);
+  }
+  if (!body.innerHTML) body.innerHTML = _reqBodyCache[name] || spin();  // instant restore from cache
   let log = "";
   try { log = (await jget("/api/thread?task=" + encodeURIComponent(name))).log || ""; } catch (e) {}
   const msgs = parseThread(log);
   const last = msgs[msgs.length - 1] || { inp: [], out: [] };
   const prompt = last.inp.join("\n").trim() || "—";
   const out = last.out.join("\n").trim() || "—";
-  body.innerHTML =
+  const html =
     `<div class="note">${t("bridge.log_prompt")}</div><pre class="mono brg-pre">${esc(prompt)}</pre>` +
     `<div class="note">${t("bridge.log_output")}</div><pre class="mono brg-pre">${esc(out)}</pre>`;
+  _reqBodyCache[name] = html;
+  if (BRG_OPEN_REQS.has(name) && document.body.contains(body)) body.innerHTML = html;
 }
 
 function bridgeCurl(rec) {
@@ -164,12 +199,13 @@ async function refreshBridgeTab() {
     // engine spawns an openai-<port>-* task whose full transcript shows up in the Tasks tab.
     const logsBtn = b.engine === "opencode"
       ? ""
-      : `<button class="mini" onclick="toggleBridgeLogs(${b.port}, this)">${t("bridge.logs")} (${b.requests || 0})</button>`;
+      : `<button class="mini" onclick="toggleBridgeLogs(${b.port})">${t("bridge.logs")} (${b.requests || 0})</button>`;
     const reqLine = b.engine === "opencode"
       ? `<div class="kv"><span>${t("bridge.requests")}</span><b>${t("bridge.opencode_proxy")}</b></div>`
       : `<div class="kv"><span>${t("bridge.requests")}</span><b>${b.requests || 0}</b></div>`;
     const row = document.createElement("div");
     row.className = "api-run";
+    row.dataset.port = b.port;   // lets renderBridgeLogs find this row after a rebuild
     row.innerHTML = `
       <div class="api-run-hd">
         <span class="em">${statusEm}</span>
@@ -203,6 +239,11 @@ async function refreshBridgeTab() {
     list.appendChild(row);
     fillSwitchModels(row.querySelector(".brg-sw-model"), b.engine, b.model);
   }
+  // Restore inline log panels the user had open -- the rebuild above wiped them from the DOM, but
+  // the open state lives in BRG_OPEN_LOGS so we re-render it (this is what makes "logs" a real
+  // toggle instead of a panel that reappears-then-vanishes on every periodic refresh).
+  for (const p of [...BRG_OPEN_LOGS]) if (!bridges.some(b => b.port === p)) BRG_OPEN_LOGS.delete(p);
+  for (const p of BRG_OPEN_LOGS) renderBridgeLogs(p);
 }
 
 // --- switch a running bridge's model / local-vs-LAN binding in place (stop + relaunch same port) ---

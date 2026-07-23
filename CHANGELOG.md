@@ -6,6 +6,12 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- gui: **make the bridge "logs" button a real toggle that survives the periodic refresh.** The
+  request-log panel opened then vanished within a few seconds because the API tab rebuilds its
+  whole list on a timer, wiping any expanded panel from the DOM. Open/expanded state now lives in
+  module Sets (`BRG_OPEN_LOGS`/`BRG_OPEN_REQS`) and is re-applied after every rebuild, with content
+  caches so the restore is flicker-free. Clicking again closes it and it stays closed.
+
 - gui: **fix "clicked start, nothing appeared" + show the LAN address.** A busy default port
   (8801) used to fail silently; now `start_bridge` walks up to the next free port and the toast
   says which port it landed on, and the port field auto-bumps after each launch. The port-free
