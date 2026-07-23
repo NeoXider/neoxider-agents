@@ -63,6 +63,21 @@ async function stopBridge(port, e) {
   setTimeout(refreshBridgeTab, 400);
 }
 
+// Jump to the Tasks tab and open the newest request transcript for this bridge. Every request
+// (claude/codex/gemini) is a full task named openai-<port>-<hex> -- so the entire prompt+answer
+// of each call is already browsable there, no separate log viewer needed.
+async function viewBridgeLogs(port) {
+  switchTab("tasks");
+  try {
+    const d = await jget("/api/tasks");
+    const mine = (d.tasks || [])
+      .filter(x => x.name && x.name.indexOf("openai-" + port + "-") === 0)
+      .sort((a, b) => (b.updated || 0) - (a.updated || 0));
+    if (mine.length) select(mine[0].name);
+    else toast("success", t("bridge.logs"), t("bridge.no_requests"));
+  } catch (e) {}
+}
+
 function bridgeCurl(rec) {
   const model = rec.model || (PROVIDERS[rec.engine] || {}).default_model || "default";
   return `curl ${rec.base_url}/v1/chat/completions \\
@@ -91,6 +106,14 @@ async function refreshBridgeTab() {
       ? (h.session_active ? `${t("bridge.session_on")} · ${h.session_turns || 0} ${t("bridge.turns")}` : t("bridge.session_idle"))
       : t("bridge.unreachable");
     const v1 = b.base_url + "/v1";
+    // opencode proxies to `opencode serve` and doesn't create per-request task logs; every other
+    // engine spawns an openai-<port>-* task whose full transcript shows up in the Tasks tab.
+    const logsBtn = b.engine === "opencode"
+      ? ""
+      : `<button class="mini" onclick="viewBridgeLogs(${b.port})">${t("bridge.logs")} (${b.requests || 0})</button>`;
+    const reqLine = b.engine === "opencode"
+      ? `<div class="kv"><span>${t("bridge.requests")}</span><b>${t("bridge.opencode_proxy")}</b></div>`
+      : `<div class="kv"><span>${t("bridge.requests")}</span><b>${b.requests || 0}</b></div>`;
     const row = document.createElement("div");
     row.className = "api-run";
     row.innerHTML = `
@@ -101,11 +124,13 @@ async function refreshBridgeTab() {
         ${b.lan ? `<span class="pill" title="exposed on the LAN">LAN</span>` : ""}
         <span class="sp"></span>
         <button class="mini" onclick="copyText(this, ${JSON.stringify(v1).replace(/"/g, "&quot;")})">${t("bridge.copy_url")}</button>
+        ${logsBtn}
         <button class="mini danger" onclick="stopBridge(${b.port}, event)">${t("bridge.stop")}</button>
       </div>
       <div class="api-run-body">
         <div class="kv"><span>${t("form.model")}</span><b>${esc(b.label || b.model || "?")}</b></div>
         <div class="kv"><span>${t("bridge.status")}</span><b>${esc(sess)}</b></div>
+        ${reqLine}
         ${b.dir ? `<div class="kv"><span>${t("form.project")}</span><b class="mono">${esc(b.dir)}</b></div>` : ""}
         <div class="snippet"><pre class="mono">${esc(bridgeCurl(b))}</pre><button class="mini" onclick="copyText(this, ${JSON.stringify(bridgeCurl(b)).replace(/"/g, "&quot;")})">${t("api.copy")}</button></div>
       </div>`;

@@ -60,7 +60,7 @@
   "toast.not_added": "не добавлено",
   "toast.project_added": "проект добавлен",
   "tabs.tasks": "Задачи",
-  "tabs.api": "API",
+  "tabs.api": "Тест API",
   "api.title": "Проверка локального HTTP API",
   "api.subtitle": "Агент прогоняет ваш локальный API и возвращает структурированный pass/fail результат — тот же эндпоинт ниже можно вызывать из своих программ/тестов напрямую.",
   "api.base_url": "базовый URL",
@@ -94,5 +94,9 @@
   "bridge.session_on": "сессия активна",
   "bridge.session_idle": "простой (нет сессии)",
   "bridge.unreachable": "недоступен — не отвечает",
-  "bridge.turns": "ходов"
+  "bridge.turns": "ходов",
+  "bridge.requests": "запросы",
+  "bridge.logs": "логи",
+  "bridge.no_requests": "запросов пока не было",
+  "bridge.opencode_proxy": "проксируется в opencode serve (без лога на запрос)"
 }

@@ -15,6 +15,12 @@ All notable changes to this project are documented here. Format follows
   model catalog (`opencode models`, 27+ ids across every configured backend) is fetched live to
   populate the model datalist; other engines use provider.json. New endpoints: `GET /api/bridges`,
   `GET /api/models?engine=`, `POST /api/bridge/start`, `POST /api/bridge/stop`. EN+RU localized.
+  Renamed the old **"API" tab to "Test API"** so it no longer reads as a duplicate of "LLM API"
+  (they are different: Test API drives an agent to *check* a local HTTP API; LLM API *serves* a
+  model as one). Each running bridge now shows a live **request count** and a **"logs" button**
+  that jumps to the Tasks tab and opens that call's full transcript — every bridge request
+  (claude/codex/gemini) is already an `openai-<port>-<hex>` task with the whole prompt+answer
+  logged; opencode proxies to `opencode serve` and is labelled as such (no per-request task log).
 
 - openai-server: **self-register a `bridges/bridge-<port>.json` in LOGDIR on bind, remove it on
   clean exit** — so the GUI (and any tool) can discover, inspect and stop bridges it didn't
