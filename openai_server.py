@@ -2076,6 +2076,32 @@ def _lan_ips():
     return ips
 
 
+_PUBLIC_IP_CACHE = {"ip": None, "done": False}
+
+
+def _public_ip():
+    """Best-effort public/WAN IPv4 of this host via a short query to an external echo service,
+    cached for the process lifetime. Returns None when offline or the lookup fails. NOTE: this is
+    the router's internet address -- reaching the bridge through it ALSO needs a port-forward on
+    the router, and exposing an agent-driving bridge to the internet is dangerous."""
+    if _PUBLIC_IP_CACHE["done"]:
+        return _PUBLIC_IP_CACHE["ip"]
+    ip = None
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            with _urlreq.urlopen(url, timeout=2.5) as r:
+                cand = r.read().decode("utf-8", "replace").strip()
+            parts = cand.split(".")
+            if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+                ip = cand
+                break
+        except Exception:
+            continue
+    _PUBLIC_IP_CACHE["ip"] = ip
+    _PUBLIC_IP_CACHE["done"] = True
+    return ip
+
+
 def _bridge_file(port):
     return os.path.join(BRIDGES_DIR, "bridge-%d.json" % int(port))
 
@@ -2090,11 +2116,15 @@ def register_bridge(cfg):
         # when bound to all interfaces, record the LAN URLs so the GUI can show a reachable
         # address for a phone/other PC (127.0.0.1 only works on this machine).
         lan_urls = ["http://%s:%d" % (ip, cfg.port) for ip in _lan_ips()] if all_ifaces else []
+        # public/WAN address too (only reachable with a router port-forward; see _public_ip note)
+        public_ip = _public_ip() if all_ifaces else None
+        public_url = "http://%s:%d" % (public_ip, cfg.port) if public_ip else ""
         rec = {
             "port": cfg.port,
             "host": cfg.host,
             "base_url": "http://%s:%d" % (shown_host, cfg.port),
             "lan_urls": lan_urls,
+            "public_url": public_url,
             "engine": cfg.engine,
             "model": cfg.model,
             "effort": cfg.effort,
@@ -2184,6 +2214,10 @@ def main():
                 print("[openai-bridge] LAN: reachable from other devices (phone/APK, another PC) at http://%s:%d/v1" % (ip, CFG.port))
         else:
             print("[openai-bridge] LAN: bound to all interfaces on port %d (could not autodetect this host's LAN IP)" % CFG.port)
+        pub = _public_ip()
+        if pub:
+            print("[openai-bridge] PUBLIC: this host's internet IP is http://%s:%d/v1 -- only reachable from" % (pub, CFG.port))
+            print("[openai-bridge]         outside your network if you add a router port-forward for TCP %d." % CFG.port)
         print("[openai-bridge] WARNING: bound to all interfaces -- this bridge drives a CLI agent with your")
         print("[openai-bridge]          credentials/tools. Only expose it on a trusted network, and open the")
         print("[openai-bridge]          port in the firewall (Windows PowerShell, as admin):")

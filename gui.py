@@ -483,6 +483,25 @@ def stop_bridge(port):
         pass
     return {"ok": True, "killed": killed, "port": int(port)}
 
+def restart_bridge(data):
+    """Stop the bridge on <port> and relaunch it on the SAME port with new engine/model/effort/
+    localhost/dir -- lets the GUI switch a running bridge's model (and local/LAN binding) in place
+    without retyping the whole form. Waits for the OS to release the port before rebinding."""
+    try:
+        port = int(data.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not port:
+        return {"error": "port required"}
+    stop_bridge(port)
+    for _ in range(20):  # give the kernel up to ~3s to free the port after the kill
+        if port_available(port):
+            break
+        time.sleep(0.15)
+    data = dict(data)
+    data["port"] = port
+    return start_bridge(data)
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):  # silent
         pass
@@ -670,6 +689,8 @@ class H(BaseHTTPRequestHandler):
             if port in (None, ""):
                 return self._send(400, json.dumps({"error": "port required"}))
             self._send(200, json.dumps(stop_bridge(port)))
+        elif u.path == "/api/bridge/restart":
+            self._send(200, json.dumps(restart_bridge(data)))
         else:
             self._send(404, "not found")
 

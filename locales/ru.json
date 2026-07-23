@@ -104,5 +104,12 @@
   "bridge.busy": "занят (обрабатывает запрос)",
   "bridge.port_reassigned": "порт был занят, перенесён с",
   "bridge.lan_url": "LAN-адрес",
-  "bridge.lan_unknown": "слушает все интерфейсы (LAN-IP не определён)"
+  "bridge.lan_unknown": "слушает все интерфейсы (LAN-IP не определён)",
+  "bridge.public_url": "Публичный адрес (интернет)",
+  "bridge.public_unknown": "публичный IP не определён (нет сети?)",
+  "bridge.public_hint": "Доступен извне вашей сети только если пробросить этот TCP-порт на роутере. Открывать наружу мост, управляющий агентом, — рискованно.",
+  "bridge.switch_model": "сменить модель:",
+  "bridge.localhost_short": "только локально",
+  "bridge.switch": "🔄 переключить",
+  "bridge.switched": "мост переключён"
 }
