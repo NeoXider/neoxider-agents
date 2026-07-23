@@ -186,3 +186,7 @@ main{flex:1;display:flex;min-height:0}
 #hist-list .hrow{padding:8px 4px;border-bottom:1px solid var(--line);font-size:12px;display:flex;gap:8px}
 #hist-list .time{color:var(--dim);font-size:11px}
 #hist-list .hicon{flex:none}
+
+/* running-bridge inline model switcher */
+.brg-switch{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0}
+.brg-switch .brg-sw-model{max-width:260px}

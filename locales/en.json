@@ -104,5 +104,12 @@
   "bridge.busy": "busy (handling a request)",
   "bridge.port_reassigned": "port was busy, moved from",
   "bridge.lan_url": "LAN address",
-  "bridge.lan_unknown": "bound to all interfaces (LAN IP not detected)"
+  "bridge.lan_unknown": "bound to all interfaces (LAN IP not detected)",
+  "bridge.public_url": "Public address (internet)",
+  "bridge.public_unknown": "public IP not detected (offline?)",
+  "bridge.public_hint": "Only reachable from outside your network if you add a router port-forward for this TCP port. Exposing an agent-driving bridge to the internet is risky.",
+  "bridge.switch_model": "switch model:",
+  "bridge.localhost_short": "local only",
+  "bridge.switch": "🔄 switch",
+  "bridge.switched": "bridge switched"
 }

@@ -188,9 +188,58 @@ async function refreshBridgeTab() {
         ${(b.lan && (b.lan_urls || []).length)
           ? b.lan_urls.map(u => `<div class="kv"><span>${t("bridge.lan_url")}</span><b class="mono">${esc(u + "/v1")} <button class="mini" onclick="copyText(this, ${JSON.stringify(u + "/v1").replace(/"/g, "&quot;")})">${t("bridge.copy_url")}</button></b></div>`).join("")
           : (b.lan ? `<div class="kv"><span>${t("bridge.lan_url")}</span><b>${t("bridge.lan_unknown")}</b></div>` : "")}
+        ${b.public_url
+          ? `<div class="kv"><span>${t("bridge.public_url")}</span><b class="mono">${esc(b.public_url + "/v1")} <button class="mini" onclick="copyText(this, ${JSON.stringify(b.public_url + "/v1").replace(/"/g, "&quot;")})">${t("bridge.copy_url")}</button></b></div><div class="note">${t("bridge.public_hint")}</div>`
+          : (b.lan ? `<div class="kv"><span>${t("bridge.public_url")}</span><b>${t("bridge.public_unknown")}</b></div>` : "")}
         ${b.dir ? `<div class="kv"><span>${t("form.project")}</span><b class="mono">${esc(b.dir)}</b></div>` : ""}
+        <div class="brg-switch">
+          <span class="note">${t("bridge.switch_model")}</span>
+          <select class="brg-sw-model"></select>
+          <label class="chk"><input type="checkbox" class="brg-sw-local" ${b.lan ? "" : "checked"}> <span>${t("bridge.localhost_short")}</span></label>
+          <button class="mini" data-engine="${esc(b.engine)}" data-effort="${esc(b.effort || "")}" data-dir="${esc(b.dir || "")}" onclick="restartBridge(${b.port}, this)">${t("bridge.switch")}</button>
+        </div>
         <div class="snippet"><pre class="mono">${esc(bridgeCurl(b))}</pre><button class="mini" onclick="copyText(this, ${JSON.stringify(bridgeCurl(b)).replace(/"/g, "&quot;")})">${t("api.copy")}</button></div>
       </div>`;
     list.appendChild(row);
+    fillSwitchModels(row.querySelector(".brg-sw-model"), b.engine, b.model);
+  }
+}
+
+// --- switch a running bridge's model / local-vs-LAN binding in place (stop + relaunch same port) ---
+const _swModelCache = {};
+
+async function fillSwitchModels(sel, engine, current) {
+  if (!sel) return;
+  let models = _swModelCache[engine];
+  if (!models) {
+    try { models = (await jget("/api/models?engine=" + encodeURIComponent(engine))).models || []; }
+    catch (e) { models = (PROVIDERS[engine] || {}).models || []; }
+    _swModelCache[engine] = models;
+  }
+  const cur = current || "";
+  const opts = (cur && !models.includes(cur)) ? [cur, ...models] : models.slice();
+  sel.innerHTML = opts.length
+    ? opts.map(m => `<option value="${esc(m)}" ${m === cur ? "selected" : ""}>${esc(m)}</option>`).join("")
+    : `<option value="">${t("form.auto")}</option>`;
+}
+
+async function restartBridge(port, btn) {
+  const box = btn.closest(".brg-switch");
+  const model = box.querySelector(".brg-sw-model").value;
+  const localhost = box.querySelector(".brg-sw-local").checked;
+  const old = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = spin();
+  try {
+    const r = await jpost("/api/bridge/restart", {
+      port, model, localhost,
+      engine: btn.dataset.engine, effort: btn.dataset.effort, dir: btn.dataset.dir,
+    });
+    if (r.error) { toast("error", t("bridge.stop_failed"), r.error); return; }
+    toast("success", t("bridge.switched"), (r.base_url || "") + " · " + (model || t("form.auto")));
+    [700, 1500, 2600, 4000, 6000].forEach(ms => setTimeout(refreshBridgeTab, ms));
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = old;
   }
 }
