@@ -550,6 +550,10 @@ def model_label(engine, model, effort):
     label = (p.get("model_labels") or {}).get(alias, alias)
     if effort:
         label = "%s (%s)" % (label, effort)
+    # avoid a doubled prefix like "opencode/opencode/big-pickle" when the model id already
+    # carries its own provider segment (opencode's catalog is "<backend>/<model>").
+    if label.startswith(engine + "/"):
+        return label
     return "%s/%s" % (engine, label)
 
 
@@ -2083,10 +2087,14 @@ def register_bridge(cfg):
         os.makedirs(BRIDGES_DIR, exist_ok=True)
         all_ifaces = cfg.host in ("0.0.0.0", "::")
         shown_host = "127.0.0.1" if all_ifaces else cfg.host
+        # when bound to all interfaces, record the LAN URLs so the GUI can show a reachable
+        # address for a phone/other PC (127.0.0.1 only works on this machine).
+        lan_urls = ["http://%s:%d" % (ip, cfg.port) for ip in _lan_ips()] if all_ifaces else []
         rec = {
             "port": cfg.port,
             "host": cfg.host,
             "base_url": "http://%s:%d" % (shown_host, cfg.port),
+            "lan_urls": lan_urls,
             "engine": cfg.engine,
             "model": cfg.model,
             "effort": cfg.effort,

@@ -380,7 +380,7 @@ def list_bridges():
         if health is not None:
             rec["live"] = True
             rec["health"] = health
-        elif not port_available(port, "127.0.0.1"):
+        elif not port_available(port):
             # /health didn't answer but the port is still bound -> the bridge is ALIVE but busy
             # handling a request (a completion holds its lock; /health is momentarily slow). Do
             # NOT prune it -- that was deleting live bridges mid-request. Show it as busy instead.
@@ -400,13 +400,18 @@ def list_bridges():
     out.sort(key=lambda r: r.get("started", 0), reverse=True)
     return out
 
-def port_available(port, host="127.0.0.1"):
-    """True if we can bind host:port right now -- lets the GUI reject a busy/reserved port
-    (e.g. Windows excluded ranges -> WinError 10013) with an instant, clear error instead of
-    spawning a bridge that dies silently in the background."""
+def port_available(port, host="0.0.0.0"):
+    """True if the port is genuinely free right now. Binds 0.0.0.0 with SO_EXCLUSIVEADDRUSE on
+    Windows so the test fails if ANYTHING already holds the port -- a bridge bound to 127.0.0.1
+    (localhost mode) OR to 0.0.0.0 (LAN mode). WHY not 127.0.0.1: Windows lets you bind
+    127.0.0.1:P even while 0.0.0.0:P is in use, so a loopback bind-test missed LAN bridges and
+    reported a busy port as free. Also catches Windows reserved ranges (WinError 10013)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
         s.bind((host, int(port)))
         return True
     except OSError:
@@ -438,8 +443,19 @@ def start_bridge(data):
     port = int(data.get("port") or 8801)
     localhost_only = data.get("localhost", True)
     host = "127.0.0.1" if localhost_only else "0.0.0.0"
-    if not port_available(port, "127.0.0.1"):
-        return {"error": "port %d is busy or reserved on this machine" % port}
+    # A busy/reserved port used to fail silently ("clicked start, nothing appeared"). Instead,
+    # walk up to the next free port so the click always launches something; tell the client which
+    # port was actually used (and whether it differs from what was asked).
+    asked = port
+    if not port_available(port):
+        found = None
+        for cand in range(port + 1, port + 50):
+            if port_available(cand):
+                found = cand
+                break
+        if found is None:
+            return {"error": "no free port near %d" % asked}
+        port = found
     args = ["openai-server", "-e", engine, "-p", str(port)]
     if data.get("model"):  args += ["-m", str(data["model"]).strip()]
     if data.get("effort"): args += ["-f", str(data["effort"]).strip()]
@@ -448,7 +464,8 @@ def start_bridge(data):
     args += ["--localhost"] if localhost_only else ["--lan"]
     spawn(args, terminal=bool(data.get("terminal")))
     shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
-    return {"ok": True, "base_url": "http://%s:%d" % (shown, port), "port": port}
+    return {"ok": True, "base_url": "http://%s:%d" % (shown, port),
+            "port": port, "asked_port": asked, "reassigned": port != asked}
 
 def stop_bridge(port):
     """Kill the bridge on <port> (by its registered pid) and remove its registry file."""
