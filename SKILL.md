@@ -100,19 +100,20 @@ bash $SK openai-server -e claude -m sonnet -f low -p 8801
 ```
 
 **Reaching the bridge from a phone/APK or another computer (LAN).** By default the bridge
-binds `127.0.0.1` (localhost only), so nothing off this machine can connect. Add `--lan` to
-bind all interfaces and print this host's LAN URL to point the other device at:
+now binds `0.0.0.0` (all interfaces), so other devices on the same network can connect out of
+the box. On start it prints this host's LAN URL to point the other device at:
 
 ```bash
-bash $SK openai-server -e claude -m sonnet -p 8801 --lan
+bash $SK openai-server -e claude -m sonnet -p 8801
 # prints e.g. "LAN: reachable ... at http://192.168.1.115:8801/v1"
 # -> set that as the base_url in the APK / on the other PC
 ```
 
-`--lan` is equivalent to `--host 0.0.0.0`. It only exposes the bridge on the local network,
-not the internet. Because the bridge drives a CLI agent with your credentials/tools, use it
-only on a trusted network, and open the port in the firewall (the startup banner prints the
-exact `New-NetFirewallRule` command for Windows).
+It only exposes the bridge on the local network, not the internet. Because the bridge drives
+a CLI agent with your credentials/tools, only run it on a trusted network, and open the port
+in the firewall (the startup banner prints the exact `New-NetFirewallRule` command for
+Windows). To restrict back to this machine only, pass `--localhost` (or set
+`AGENT_OPENAI_HOST=127.0.0.1`); `--lan` forces all-interfaces explicitly.
 
 This starts a standalone HTTP server that translates `/v1/chat/completions` calls into
 `agent.sh run`/`agent.sh reply` invocations of the chosen CLI subagent and translates
