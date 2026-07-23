@@ -76,13 +76,17 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
 (does not import gui.py) so the two servers can run/fail independently.
 """
-import argparse, glob, json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
+import argparse, atexit, glob, json, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SK = os.path.join(HERE, "agent.sh").replace("\\", "/")
 PROVIDERS_DIR = os.path.join(HERE, "providers")
 LOGDIR = os.environ.get("AGENT_CLI_LOGS") or os.path.expanduser("~/.claude/agent-cli-logs")
+# WHY: each running bridge drops a bridge-<port>.json here so the GUI (gui.py) can list, inspect
+# and stop bridges it didn't launch itself -- the process self-registers on bind and removes its
+# own file on a clean exit; the GUI prunes files whose port no longer answers /health.
+BRIDGES_DIR = os.path.join(LOGDIR, "bridges")
 
 BASH = os.environ.get("AGENT_SH_BASH")
 if not BASH:
@@ -2061,6 +2065,47 @@ def _lan_ips():
     return ips
 
 
+def _bridge_file(port):
+    return os.path.join(BRIDGES_DIR, "bridge-%d.json" % int(port))
+
+
+def register_bridge(cfg):
+    """Write this bridge's metadata so the GUI can discover/stop it. Best-effort: a failure
+    here must never stop the bridge from serving, so every error is swallowed."""
+    try:
+        os.makedirs(BRIDGES_DIR, exist_ok=True)
+        all_ifaces = cfg.host in ("0.0.0.0", "::")
+        shown_host = "127.0.0.1" if all_ifaces else cfg.host
+        rec = {
+            "port": cfg.port,
+            "host": cfg.host,
+            "base_url": "http://%s:%d" % (shown_host, cfg.port),
+            "engine": cfg.engine,
+            "model": cfg.model,
+            "effort": cfg.effort,
+            "label": model_label(cfg.engine, cfg.model, cfg.effort),
+            "dir": cfg.dir,
+            "lan": all_ifaces,
+            "pid": os.getpid(),
+            "started": time.time(),
+            "timeout": cfg.timeout,
+            "session_ttl": cfg.session_ttl,
+        }
+        tmp = _bridge_file(cfg.port) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(rec, f, ensure_ascii=False)
+        os.replace(tmp, _bridge_file(cfg.port))
+    except Exception:
+        pass
+
+
+def unregister_bridge(port):
+    try:
+        os.remove(_bridge_file(port))
+    except OSError:
+        pass
+
+
 def main():
     global CFG
     ap = argparse.ArgumentParser(
@@ -2108,6 +2153,9 @@ def main():
         print("[openai-bridge] could not bind %s:%d: %s" % (CFG.host, CFG.port, e), file=sys.stderr)
         sys.exit(1)
 
+    register_bridge(CFG)
+    atexit.register(unregister_bridge, CFG.port)
+
     label = model_label(CFG.engine, CFG.model, CFG.effort)
     all_ifaces = CFG.host in ("0.0.0.0", "::")
     shown_host = "127.0.0.1" if all_ifaces else CFG.host
@@ -2129,6 +2177,8 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n[openai-bridge] stopped")
+    finally:
+        unregister_bridge(CFG.port)
 
 
 if __name__ == "__main__":

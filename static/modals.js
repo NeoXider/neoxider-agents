@@ -27,7 +27,10 @@ function refreshDoctor() {
 async function openBrowse(mode) {
   BROWSE_MODE = mode;
   $("#m-browse").classList.add("on");
-  await goBrowse(mode === "pick-field" ? $("#f-dir").value || CWD : activeDir);
+  const start = mode === "pick-field" ? $("#f-dir").value || CWD
+    : mode === "pick-bridge" ? $("#brg-dir").value || CWD
+    : activeDir;
+  await goBrowse(start);
 }
 async function goBrowse(path) {
   $("#br-list").innerHTML = `<div class="direntry">${spin(t("browse.loading"))}</div>`;
@@ -67,6 +70,8 @@ async function chooseBrowsed() {
       toast("success", t("toast.project_added"), base(path));
     }
     setTimeout(refresh, 300);
+  } else if (BROWSE_MODE === "pick-bridge") {
+    $("#brg-dir").value = path;
   } else {
     $("#f-dir").value = path;
   }

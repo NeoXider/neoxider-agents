@@ -30,6 +30,7 @@ button:hover{border-color:var(--accent)} button:disabled{opacity:.55;cursor:defa
 button:active:not(:disabled){transform:scale(.96)}
 button.primary{background:linear-gradient(180deg,#6bb0f9,var(--accent));border-color:var(--accent);color:#04101f;font-weight:600}
 button.mini{padding:1px 7px;font-size:12px;line-height:1.4}
+button.danger{color:#ff8a8a;border-color:#5a2b2b} button.danger:hover{border-color:#ff8a8a;background:#2a1414}
 button.icon{padding:4px 8px;position:relative}
 input,select,textarea{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit;width:100%}
 textarea{resize:vertical}

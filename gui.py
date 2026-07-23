@@ -13,7 +13,7 @@ per-provider info (version/login/rate limits) is fetched by shelling out to
 `agent.sh provider-info <engine>` — the plugin's own provider.sh owns that logic, gui.py
 does not hardcode any per-engine behavior.
 """
-import json, os, re, sys, time, subprocess, urllib.parse, glob
+import json, os, re, sys, time, subprocess, socket, urllib.parse, urllib.request, glob
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def to_git_bash_path(p):
@@ -46,6 +46,7 @@ if not BASH:
         BASH = "bash"
 LOGDIR = os.environ.get("AGENT_CLI_LOGS") or os.path.expanduser("~/.claude/agent-cli-logs")
 PROJECTS_FILE = os.path.join(LOGDIR, "projects.json")
+BRIDGES_DIR = os.path.join(LOGDIR, "bridges")  # openai_server.py drops bridge-<port>.json here
 STALE_SEC = 300  # running + no log activity for longer than this -> treat as stalled
 
 _DEFAULT_PROVIDERS = {
@@ -310,10 +311,145 @@ def doctor_text(force=False):
     text, cached = _cached("doctor", lambda: run_sync(["doctor"], timeout=25), force)
     return text, cached
 
+def engine_models(engine, force=False):
+    """Selectable model ids for a provider. opencode exposes a rich dynamic catalog
+    (provider/model across every configured backend) via `opencode models` -- surface it so
+    the bridge form can offer real choices instead of a blank free-text box. Other engines
+    fall back to the static list in provider.json. Cached (60s) since `opencode models` shells
+    out to the CLI."""
+    static = list((PROVIDERS.get(engine) or {}).get("models") or [])
+    if engine != "opencode":
+        return static
+    def compute():
+        # WHY via git-bash: `opencode` is an npm shim (opencode.cmd) that native-Windows python
+        # subprocess can't resolve by bare name; the same git-bash agent.sh uses finds it on PATH.
+        try:
+            p = subprocess.run([BASH, "-lc", "opencode models"], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=20, cwd=HERE)
+            got = [l.strip() for l in (p.stdout or "").splitlines()
+                   if l.strip() and "/" in l and " " not in l.strip()]
+            return got or static
+        except Exception:
+            return static
+    models, _ = _cached("models:" + engine, compute, force)
+    return models
+
 def codex_limits():
     """primary/secondary codex rate-limits only, via the same provider-info plugin path
     (kept for the standalone /api/limits endpoint)."""
     return provider_info("codex").get("limits")
+
+# ---- OpenAI-compatible bridges (agent.sh openai-server) ---------------------------------
+# Each running bridge self-registers a bridge-<port>.json in BRIDGES_DIR (see openai_server.py).
+# The GUI lists them, probes /health for live status, and can start/stop them.
+
+def _bridge_health(base_url, timeout=1.5):
+    """GET <base_url>/health. Returns the parsed dict if the bridge answers, else None
+    (unreachable = dead/stale)."""
+    try:
+        with urllib.request.urlopen(base_url.rstrip("/") + "/health", timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+def list_bridges():
+    """All known bridges with a live/stale flag. A file whose port no longer answers /health
+    and is older than a few seconds is pruned (the process died without cleaning up, e.g. it
+    was force-killed) so the panel doesn't accumulate ghosts."""
+    out = []
+    try:
+        files = sorted(glob.glob(os.path.join(BRIDGES_DIR, "bridge-*.json")))
+    except OSError:
+        files = []
+    nowt = time.time()
+    for bf in files:
+        try:
+            with open(bf, encoding="utf-8") as f:
+                rec = json.load(f)
+        except Exception:
+            continue
+        health = _bridge_health(rec.get("base_url") or "")
+        if health is None:
+            # give a just-launched bridge a moment before pruning it as dead
+            if (nowt - rec.get("started", 0)) > 5:
+                try:
+                    os.remove(bf)
+                except OSError:
+                    pass
+                continue
+            rec["live"] = False
+        else:
+            rec["live"] = True
+            rec["health"] = health
+        out.append(rec)
+    out.sort(key=lambda r: r.get("started", 0), reverse=True)
+    return out
+
+def port_available(port, host="127.0.0.1"):
+    """True if we can bind host:port right now -- lets the GUI reject a busy/reserved port
+    (e.g. Windows excluded ranges -> WinError 10013) with an instant, clear error instead of
+    spawning a bridge that dies silently in the background."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        s.bind((host, int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+def kill_pid(pid):
+    """Terminate a bridge process by pid. taskkill /T on Windows (the bash launcher exec's into
+    python, so the recorded pid IS python, but /T also reaps any stragglers); SIGTERM elsewhere."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, timeout=10)
+        else:
+            os.kill(pid, 15)
+        return True
+    except Exception:
+        return False
+
+def start_bridge(data):
+    """Spawn `agent.sh openai-server` in the background from the GUI's form. Returns a dict
+    with ok/error and the resolved base_url."""
+    engine = data.get("engine") or "codex"
+    port = int(data.get("port") or 8801)
+    localhost_only = data.get("localhost", True)
+    host = "127.0.0.1" if localhost_only else "0.0.0.0"
+    if not port_available(port, "127.0.0.1"):
+        return {"error": "port %d is busy or reserved on this machine" % port}
+    args = ["openai-server", "-e", engine, "-p", str(port)]
+    if data.get("model"):  args += ["-m", str(data["model"]).strip()]
+    if data.get("effort"): args += ["-f", str(data["effort"]).strip()]
+    rdir = to_git_bash_path(data.get("dir") or "")
+    if rdir:               args += ["-C", rdir]
+    args += ["--localhost"] if localhost_only else ["--lan"]
+    spawn(args, terminal=bool(data.get("terminal")))
+    shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    return {"ok": True, "base_url": "http://%s:%d" % (shown, port), "port": port}
+
+def stop_bridge(port):
+    """Kill the bridge on <port> (by its registered pid) and remove its registry file."""
+    bf = os.path.join(BRIDGES_DIR, "bridge-%d.json" % int(port))
+    rec = {}
+    try:
+        with open(bf, encoding="utf-8") as f:
+            rec = json.load(f)
+    except Exception:
+        pass
+    killed = kill_pid(rec.get("pid")) if rec.get("pid") else False
+    try:
+        os.remove(bf)
+    except OSError:
+        pass
+    return {"ok": True, "killed": killed, "port": int(port)}
 
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):  # silent
@@ -357,6 +493,12 @@ class H(BaseHTTPRequestHandler):
             eng = (q.get("engine") or ["codex"])[0]
             force = (q.get("force") or ["0"])[0] == "1"
             self._send(200, json.dumps(provider_info(eng, force)))
+        elif u.path == "/api/bridges":
+            self._send(200, json.dumps({"bridges": list_bridges(), "now": time.time()}))
+        elif u.path == "/api/models":
+            eng = (q.get("engine") or ["codex"])[0]
+            force = (q.get("force") or ["0"])[0] == "1"
+            self._send(200, json.dumps({"engine": eng, "models": engine_models(eng, force)}))
         elif u.path == "/api/locales":
             self._send(200, json.dumps({"locales": list_locales()}))
         elif u.path == "/api/wait":
@@ -489,6 +631,13 @@ class H(BaseHTTPRequestHandler):
             if data.get("effort"): args += ["-f", data["effort"]]
             spawn(args, terminal=bool(data.get("terminal")))
             self._send(200, json.dumps({"ok": True, "name": name}))
+        elif u.path == "/api/bridge/start":
+            self._send(200, json.dumps(start_bridge(data)))
+        elif u.path == "/api/bridge/stop":
+            port = data.get("port")
+            if port in (None, ""):
+                return self._send(400, json.dumps({"error": "port required"}))
+            self._send(200, json.dumps(stop_bridge(port)))
         else:
             self._send(404, "not found")
 

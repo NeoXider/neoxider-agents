@@ -6,6 +6,21 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- gui: **new "LLM API" tab — start/stop OpenAI-compatible bridges from the web panel.** Pick a
+  provider + model (+ effort, port, working dir, localhost-vs-LAN) and launch an
+  `agent.sh openai-server` in the background; the running-bridges list shows each endpoint's
+  live `/health` (session active/idle, turns), a copy-`/v1`-URL button, a ready curl snippet,
+  and a stop button. The bridge port is bind-checked first, so a busy/reserved port (e.g.
+  Windows WinError 10013) is rejected instantly instead of dying silently. opencode's dynamic
+  model catalog (`opencode models`, 27+ ids across every configured backend) is fetched live to
+  populate the model datalist; other engines use provider.json. New endpoints: `GET /api/bridges`,
+  `GET /api/models?engine=`, `POST /api/bridge/start`, `POST /api/bridge/stop`. EN+RU localized.
+
+- openai-server: **self-register a `bridges/bridge-<port>.json` in LOGDIR on bind, remove it on
+  clean exit** — so the GUI (and any tool) can discover, inspect and stop bridges it didn't
+  launch. Records engine/model/effort/dir/pid/port/base_url; the GUI probes `/health` for
+  liveness and prunes stale files whose port stopped answering.
+
 - openai-server: accept "parameters"/"params"/"input" as argument-key aliases (Haiku 4.5 live:
   {"function": {"name": ..., "parameters": {...}}} silently produced EMPTY arguments -- every
   call failed schema validation, "9 failed, 0 spawns"). _call_shaped normalizes every accepted
