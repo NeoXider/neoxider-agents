@@ -368,6 +368,13 @@ def list_bridges():
                 rec = json.load(f)
         except Exception:
             continue
+        # each bridge request (claude/codex/gemini engines) spawns an `openai-<port>-<hex>` task
+        # whose full transcript lands in LOGDIR -- surface the count so the user knows requests
+        # are logged and can jump to them. opencode proxies to `opencode serve` and logs nothing here.
+        try:
+            rec["requests"] = len(glob.glob(os.path.join(LOGDIR, "openai-%d-*.log" % rec.get("port", 0))))
+        except Exception:
+            rec["requests"] = 0
         health = _bridge_health(rec.get("base_url") or "")
         if health is None:
             # give a just-launched bridge a moment before pruning it as dead

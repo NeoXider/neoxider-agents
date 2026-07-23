@@ -60,7 +60,7 @@
   "toast.not_added": "not added",
   "toast.project_added": "project added",
   "tabs.tasks": "Tasks",
-  "tabs.api": "API",
+  "tabs.api": "Test API",
   "api.title": "Test a local HTTP API",
   "api.subtitle": "Drive an agent to exercise your app's local API and get a structured pass/fail result — the same endpoint below is callable from your own programs/tests too.",
   "api.base_url": "base URL",
@@ -94,5 +94,9 @@
   "bridge.session_on": "session active",
   "bridge.session_idle": "idle (no session)",
   "bridge.unreachable": "unreachable — not answering",
-  "bridge.turns": "turns"
+  "bridge.turns": "turns",
+  "bridge.requests": "requests",
+  "bridge.logs": "logs",
+  "bridge.no_requests": "no requests logged yet",
+  "bridge.opencode_proxy": "proxied to opencode serve (no per-request task log)"
 }
