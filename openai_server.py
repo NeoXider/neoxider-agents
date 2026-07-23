@@ -2035,6 +2035,32 @@ class H(BaseHTTPRequestHandler):
                 pass
 
 
+def _lan_ips():
+    """Best-effort list of this host's LAN IPv4 addresses, for printing a reachable base_url when
+    the bridge is bound to all interfaces. Uses a connect-less UDP socket (no packets are sent);
+    falls back to resolving the hostname. Returns [] if nothing non-loopback is found."""
+    ips = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                ips.append(ip)
+        finally:
+            s.close()
+    except Exception:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and ip not in ips and not ip.startswith("127."):
+                ips.append(ip)
+    except Exception:
+        pass
+    return ips
+
+
 def main():
     global CFG
     ap = argparse.ArgumentParser(
@@ -2049,7 +2075,13 @@ def main():
                           "wiped and recreated each time a brand-new session starts). Pin this "
                           "to a real project path if the agent should operate there instead.")
     ap.add_argument("-p", "--port", type=int, default=int(os.environ.get("AGENT_OPENAI_PORT") or 8801))
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="127.0.0.1",
+                     help="interface to bind (default: 127.0.0.1 = localhost only). Use --lan to bind "
+                          "all interfaces for other devices on your network.")
+    ap.add_argument("--lan", action="store_true",
+                     help="bind all interfaces (0.0.0.0) so other devices on your LAN -- a phone/APK or "
+                          "another computer -- can reach the bridge; prints this host's LAN URL on start. "
+                          "Overrides --host. Only use on a trusted network (see the printed warning).")
     ap.add_argument("--timeout", type=int, default=240, help="max seconds to wait for one completion (default: 240)")
     ap.add_argument("--retries", type=int, default=1,
                      help="how many times to re-run a completion whose CLI invocation came back "
@@ -2062,6 +2094,8 @@ def main():
                           "next call starts fresh instead of resuming it (default: 1800 = 30 minutes)")
     CFG = ap.parse_args()
     CFG.retries = max(0, CFG.retries)  # a negative value would skip the run loop entirely
+    if getattr(CFG, "lan", False):
+        CFG.host = "0.0.0.0"
 
     try:
         srv = ThreadingHTTPServer((CFG.host, CFG.port), H)
@@ -2070,9 +2104,22 @@ def main():
         sys.exit(1)
 
     label = model_label(CFG.engine, CFG.model, CFG.effort)
-    base = "http://%s:%d" % (CFG.host, CFG.port)
+    all_ifaces = CFG.host in ("0.0.0.0", "::")
+    shown_host = "127.0.0.1" if all_ifaces else CFG.host
+    base = "http://%s:%d" % (shown_host, CFG.port)
     print("[openai-bridge] %s  ->  %s  (Ctrl-C to stop)" % (base, label))
     print("[openai-bridge] point an OpenAI-compatible client's base_url at %s/v1 (or %s -- both work)" % (base, base))
+    if all_ifaces:
+        lan = _lan_ips()
+        if lan:
+            for ip in lan:
+                print("[openai-bridge] LAN: reachable from other devices (phone/APK, another PC) at http://%s:%d/v1" % (ip, CFG.port))
+        else:
+            print("[openai-bridge] LAN: bound to all interfaces on port %d (could not autodetect this host's LAN IP)" % CFG.port)
+        print("[openai-bridge] WARNING: bound to all interfaces -- this bridge drives a CLI agent with your")
+        print("[openai-bridge]          credentials/tools. Only expose it on a trusted network, and open the")
+        print("[openai-bridge]          port in the firewall (Windows PowerShell, as admin):")
+        print("[openai-bridge]          New-NetFirewallRule -DisplayName 'agent-openai %d' -Direction Inbound -Action Allow -Protocol TCP -LocalPort %d" % (CFG.port, CFG.port))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
