@@ -65,7 +65,12 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
 - **Doctor/limits are cached** (30s TTL) server-side, so switching providers or an idle poll doesn't
   re-shell-out to `agent.sh` every few seconds; a ⟳ refresh button next to the limits panel and inside
   the doctor modal forces a fresh fetch (`?force=1`). The panel never blanks while refreshing — it
-  keeps the last-known-good data with a small spinner until new data arrives.
+  keeps the last-known-good data until new data arrives.
+- **The doctor modal is cache-first** (stale-while-revalidate): on open it paints the cached text
+  instantly via a non-blocking `/api/doctor?cached=1` (which never shells out — it returns `empty=1`
+  only when nothing is cached yet), then loads fresh data on top and replaces once it arrives. A small
+  header spinner shows while that fresh load is in flight over the cache; the body "running doctor…"
+  spinner appears only on the genuine empty-cache first open (before prewarm has populated it).
 - **i18n**: English by default, Russian as a second locale (`locales/en.json`/`ru.json`), switchable
   via the header picker (persisted in localStorage). Adding a locale is a drop-in `locales/<code>.json`
   — any key it doesn't cover falls back to English automatically, so a partial translation still works.

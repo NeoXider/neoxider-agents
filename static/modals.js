@@ -22,12 +22,18 @@ async function openDoctor(force) {
     const c = await jget("/api/doctor?cached=1");
     if (!c.empty) { p.textContent = c.text; p.dataset.loaded = "1"; }
   }
-  // 2) only blank to a spinner when we have nothing to show at all
+  // 2) only blank the body to a spinner when we have nothing to show at all;
+  //    otherwise show a small header spinner so a fresh-data load is still visible over the cache
   if (!p.dataset.loaded) p.innerHTML = spin(t("doctor.loading"));
+  $("#doc-busy").innerHTML = spin();
   // 3) load fresh data on top of the cache; replace once it actually arrives
-  const d = await jget("/api/doctor" + (force ? "?force=1" : ""));
-  p.textContent = d.text + (d.cached ? "\n\n" + t("limits.cached") : "");
-  p.dataset.loaded = "1";
+  try {
+    const d = await jget("/api/doctor" + (force ? "?force=1" : ""));
+    p.textContent = d.text + (d.cached ? "\n\n" + t("limits.cached") : "");
+    p.dataset.loaded = "1";
+  } finally {
+    $("#doc-busy").innerHTML = "";
+  }
 }
 function refreshDoctor() {
   openDoctor(true);
