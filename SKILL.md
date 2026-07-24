@@ -1,11 +1,11 @@
 ---
 name: neoxider-agents
-description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (Codex by default; also Claude Code, opencode, gemini) through the agent.sh wrapper, then verify and integrate their results. Covers launching (run/fan), model selection (gpt-5.6-sol medium by default, spark for trivial tasks), answering agent questions via resume, logs. Use whenever work can be parallelized or offloaded to subagents instead of doing everything in one session.
+description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (Claude Code / Opus 5 by default; also Codex, opencode, gemini) through the agent.sh wrapper, then verify and integrate their results. Covers launching (run/fan), model selection (Opus 5 by default, -e codex for the gpt-5.6 family, spark/haiku for trivial tasks), answering agent questions via resume, logs. Use whenever work can be parallelized or offloaded to subagents instead of doing everything in one session.
 ---
 
 # CLI Subagents (Codex Orchestration)
 
-For subagent tasks use **Codex CLI** through the wrapper
+For subagent tasks use **Claude Code CLI (Opus 5)** through the wrapper
 `~/.claude/skills/neoxider-agents/agent.sh` (git-bash; when working inside this repo use
 `./agent.sh`).
 
@@ -31,7 +31,7 @@ The loop:
 2. **Pre-flight.** `agent.sh doctor` before any fan-out (engines up? codex limits OK?).
    Near the limit → route to `-e claude -m sonnet` or `-e opencode`.
 3. **Route.** Cheapest model that will succeed (matrix in [ORCHESTRATOR.md](ORCHESTRATOR.md)):
-   trivial → `spark`/`haiku`, regular → default `sol`/`sonnet`, hard → `-m high`/`opus`.
+   trivial → `-m haiku` (or `-e codex -m spark`), regular → `-m sonnet`, hard → the default `opus5`.
 4. **Delegate.** `run` for one task, `fan` for a parallel batch. Parallel workers only on
    NON-overlapping files. Each keeps its own `PROGRESS.<task>.md`.
 5. **Watch.** `list` / `status <name>`; a `waiting` task gets `reply <name> "..."`,
@@ -47,7 +47,7 @@ The loop:
 
 ```bash
 SK=~/.claude/skills/neoxider-agents/agent.sh
-bash $SK run  -t fix-readme -C /c/Git/Proj "prompt" # codex, gpt-5.6-sol medium (default); -t = task name
+bash $SK run  -t fix-readme -C /c/Git/Proj "prompt" # claude, claude-opus-5 (default); -t = task name
 bash $SK fan  -t audit -C dir "prompt A" "prompt B" # N parallel background tasks from one call
                                                      # (audit-01, audit-02, ...); shared -e/-m/-f/-C;
                                                      # returns at once — poll with list/status.
@@ -245,7 +245,7 @@ Gotchas (verified):
 
 ## Model selection
 
-**Codex** (`-e codex`, the default engine):
+**Codex** (`-e codex`; no longer the default engine):
 
 | Alias | Model | When |
 |---|---|---|
@@ -260,13 +260,14 @@ passes through unchanged, so `-m gpt-5.5` reaches the older model on demand.
 The 5.6 family (`sol`/`luna`/`terra`) requires **codex-cli >= 0.144** (older CLIs get a 400
 "requires a newer version of Codex"); update with `npm install -g @openai/codex@latest`.
 
-**Claude** (`-e claude`):
+**Claude** (`-e claude`, **the default engine**):
 
 | Alias | Model / effort | When |
 |---|---|---|
-| `sonnet` (default) | `claude-sonnet-5`, effort **high** | regular tasks — the new Sonnet 5, default per the user's request |
+| `opus5` (default) | `claude-opus-5` | everything, unless a cheaper model clearly suffices — the default per the user's request |
+| `sonnet` | `claude-sonnet-5`, effort **high** | cheaper/faster than Opus 5 for routine work |
 | `sonnet-medium` / `sonnet-low` | `claude-sonnet-5`, effort medium/low | cheaper/faster, when high is overkill |
-| `opus` / `haiku` | no explicit effort (CLI default) | opus — harder than usual; haiku — trivial tasks |
+| `opus` / `haiku` | no explicit effort (CLI default) | `opus` is the OLD Opus 4.8 alias (kept deliberately); haiku — trivial tasks |
 
 General pattern: `<model>-<effort>` (low/medium/high/xhigh/max) on any alias overrides the effort,
 e.g. `opus-high`. Implementation — `provider_claude_resolve()` in `providers/claude/provider.sh`.

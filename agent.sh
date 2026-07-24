@@ -82,7 +82,8 @@ cmd="${1:-}"
 [ -n "$cmd" ] || die "usage: agent.sh run|fan|reply|log|last|status|list|clean|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
 shift
 
-engine="codex"; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1; terse=1
+engine="claude"; engine_explicit=0; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1; terse=1
+# ^ engine=claude by default -> Opus 5 (see providers/claude). Pass -e codex for the gpt-5.6 family.
 # ^ progress=1 by default: every task keeps a PROGRESS.md checkpoint (resumable after a crash,
 # and an orchestrator can read the summary without re-running the agent). Disable with --no-progress.
 # ^ terse=1 by default: append a concision directive (short output, minimal reasoning narration, assume-
@@ -97,7 +98,7 @@ task_kind=""; base_url=""; test_goal=""; out_file=""   # test-api only (see that
 parse_opts() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            -e) engine="$2"; shift 2 ;;
+            -e) engine="$2"; engine_explicit=1; shift 2 ;;
             -m) model="$2"; shift 2 ;;
             -f) effort_override="$2"; shift 2 ;;
             -C) dir="$2"; shift 2 ;;
@@ -425,7 +426,7 @@ except Exception:
         if [ -n "${tname:-}" ]; then
             session="$(resolve_session "$tname")"
             mdir="$(meta_get "$tname" dir)"; [ -n "$mdir" ] && dir="$mdir"
-            meng="$(meta_get "$tname" engine)"; [ -n "$meng" ] && [ "$engine" = codex ] && engine="$meng"
+            meng="$(meta_get "$tname" engine)"; [ -n "$meng" ] && [ "$engine_explicit" = 0 ] && engine="$meng"
             log="$LOGDIR/$tname.log"
         else session="$ref"; tname="session-$ref"; log="$LOGDIR/$tname.log"; meta_set "$tname" dir "$dir"; fi
         [ "$progress" = 1 ] && answer="$answer$(progress_proto_reply "$tname")"   # per-task reminder; needs resolved $tname
