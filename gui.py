@@ -311,6 +311,17 @@ def doctor_text(force=False):
     text, cached = _cached("doctor", lambda: run_sync(["doctor"], timeout=25), force)
     return text, cached
 
+def doctor_cached_only():
+    """Return whatever doctor text is already in the cache WITHOUT shelling out -- fresh or
+    stale, it comes back instantly. This is what lets the GUI paint the last-known-good doctor
+    output the moment the modal opens, then load fresh data on top, instead of blanking the
+    panel behind a slow `agent.sh doctor` run. Returns (text, empty): empty=True only when the
+    cache has never been populated (first open before prewarm finished)."""
+    hit = _CACHE.get("doctor")
+    if hit:
+        return hit["value"], False
+    return "", True
+
 def engine_models(engine, force=False):
     """Selectable model ids for a provider. opencode exposes a rich dynamic catalog
     (provider/model across every configured backend) via `opencode models` -- surface it so
@@ -535,9 +546,14 @@ class H(BaseHTTPRequestHandler):
             name = (q.get("task") or [""])[0]
             self._send(200, json.dumps({"name": name, "log": read_log(name)}))
         elif u.path == "/api/doctor":
-            force = (q.get("force") or ["0"])[0] == "1"
-            text, cached = doctor_text(force)
-            self._send(200, json.dumps({"text": text, "cached": cached}))
+            if (q.get("cached") or ["0"])[0] == "1":
+                # non-blocking: hand back the cached text immediately (or empty=1 if none yet)
+                text, empty = doctor_cached_only()
+                self._send(200, json.dumps({"text": text, "cached": True, "empty": empty}))
+            else:
+                force = (q.get("force") or ["0"])[0] == "1"
+                text, cached = doctor_text(force)
+                self._send(200, json.dumps({"text": text, "cached": cached}))
         elif u.path == "/api/limits":
             self._send(200, json.dumps({"limits": codex_limits(), "now": time.time()}))
         elif u.path == "/api/provider":
