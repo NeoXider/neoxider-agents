@@ -6,8 +6,8 @@
 # takes no model flag at all) -> opt in to resolve-on-resume in agent.sh's generic dispatch.
 PROVIDER_CLAUDE_RESUME_NEEDS_MODEL=1
 
-# claude: default (no -m) -> sonnet + effort HIGH (new Sonnet 5). Suffix -low/-medium/-high/-xhigh/-max
-# on any alias overrides effort; without a suffix, opus/haiku go without --effort (CLI default).
+# claude: default (no -m) -> Opus 5. Suffix -low/-medium/-high/-xhigh/-max on any alias overrides
+# effort; without a suffix, opus/opus5/haiku go without --effort (CLI default).
 # Sets globals P_MODEL / P_EFFORT (P_EFFORT may be empty).
 provider_claude_resolve() {
     local alias="${1:-}" base eff=""
@@ -20,10 +20,11 @@ provider_claude_resolve() {
         *-max)    base="${alias%-max}";     eff="max" ;;
     esac
     case "$base" in
-        # NB: alias "sonnet" on this CLI resolves to the legacy claude-sonnet-4-6 (verified),
-        # so the default pins the explicit id of the new Sonnet 5. The "opus" alias is current
-        # (-> claude-opus-4-8), leave it alone.
-        ""|default|sonnet) P_MODEL="claude-sonnet-5"; [ -z "$eff" ] && eff="high" ;;
+        # NB: bare aliases on this CLI can resolve to a legacy generation ("sonnet" -> claude-sonnet-4-6,
+        # verified), so every current model pins its explicit id. The bare "opus" alias still points at
+        # claude-opus-4-8, hence the separate opus5 id.
+        ""|default|opus5) P_MODEL="claude-opus-5" ;;
+        sonnet) P_MODEL="claude-sonnet-5"; [ -z "$eff" ] && eff="high" ;;
         opus)  P_MODEL="opus" ;;
         haiku) P_MODEL="haiku" ;;
         *) P_MODEL="$base" ;;
