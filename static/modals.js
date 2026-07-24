@@ -8,13 +8,23 @@ document.addEventListener("keydown", e => {
   if (e.key === "Escape") { closeModal("m-doc"); closeModal("m-hist"); closeModal("m-browse"); }
 });
 
-/* ---------- doctor (cached; force=1 bypasses the cache) ---------- */
+/* ---------- doctor (cache-first; then loads fresh data on top) ----------
+   Two phases so the panel never sits blank behind the slow `agent.sh doctor` run:
+   1) paint the cached text instantly (non-blocking /api/doctor?cached=1),
+   2) load fresh data on top and replace once it arrives.
+   The spinner ("running doctor…") shows ONLY when there is no cache yet -- exactly the
+   empty first-open case. On a manual refresh we skip straight to the fresh fetch. */
 async function openDoctor(force) {
   $("#m-doc").classList.add("on");
   const p = $("#doc");
-  // keep showing the last-known-good text while a refresh is in flight -- only replace it
-  // once the new data actually arrives, instead of blanking the panel on every open/refresh.
+  // 1) cache-first paint (skipped on an explicit refresh -- that wants fresh data outright)
+  if (!force) {
+    const c = await jget("/api/doctor?cached=1");
+    if (!c.empty) { p.textContent = c.text; p.dataset.loaded = "1"; }
+  }
+  // 2) only blank to a spinner when we have nothing to show at all
   if (!p.dataset.loaded) p.innerHTML = spin(t("doctor.loading"));
+  // 3) load fresh data on top of the cache; replace once it actually arrives
   const d = await jget("/api/doctor" + (force ? "?force=1" : ""));
   p.textContent = d.text + (d.cached ? "\n\n" + t("limits.cached") : "");
   p.dataset.loaded = "1";
