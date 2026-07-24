@@ -269,8 +269,13 @@ about this before pointing anything at it:
   `session_ttl_seconds`. Verified live with `--session-ttl 8`: an extension sent after
   12s idle correctly fell back to a fresh `agent.sh run` with the full history (task
   count incremented) instead of resuming — the answer was still correct either way.
-- **First-token latency is a full CLI subprocess start** — a few seconds even when
-  streaming; the CLI process itself has to boot before the first delta can exist.
+- **First-token latency depends on the engine.** On native `claude` the bridge keeps
+  ONE persistent `claude -p` process (stream-json), so the ~7–11 s agent-environment
+  boot is paid once and each turn afterwards costs only inference (~3.5 s measured on
+  Opus), keeping the provider prompt cache warm across turns (`CLAUDE_NO_NATIVE=1` opts
+  back out). The other engines (codex/opencode/gemini) spawn a fresh CLI subprocess per
+  completion, so their first token waits a few seconds for that process to boot — even
+  when streaming.
 - **`stream: true` is REAL token streaming on live-capable engines** (currently
   `claude`): the provider runs the CLI with `--output-format stream-json
   --include-partial-messages` piped through `stream_text_filter.py`, so the task log
