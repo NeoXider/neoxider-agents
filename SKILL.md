@@ -1,6 +1,6 @@
 ---
 name: neoxider-agents
-description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (Claude Code / Opus 5 by default; also Codex, opencode, gemini) through the agent.sh wrapper, then verify and integrate their results. Covers launching (run/fan), model selection (Opus 5 by default, -e codex for the gpt-5.6 family, spark/haiku for trivial tasks), answering agent questions via resume, logs. Use whenever work can be parallelized or offloaded to subagents instead of doing everything in one session.
+description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (Claude Code / Opus 5 by default; also Kimi Code / Kimi K3, Codex, opencode, and Gemini) through the agent.sh wrapper, then verify and integrate their results. Covers run/fan, model selection, resume/reply, logs, and verification. Use whenever work can be parallelized or offloaded to CLI agents instead of doing everything in one session.
 ---
 
 # CLI Subagents (Codex Orchestration)
@@ -12,8 +12,8 @@ For subagent tasks use **Claude Code CLI (Opus 5)** through the wrapper
 **NATIVE-FIRST RULE (user, 2026-07-22, permanent):** every orchestrator spawns its OWN
 engine's subagents natively; the agent.sh wrapper is ONLY for foreign engines.
 - From Claude Code: claude models (opus/sonnet/haiku) → **native Agent tool** (never
-  `agent.sh run -e claude`); codex/opencode/gemini → agent.sh.
-- From Codex: codex models → native codex subagents; claude/opencode/gemini → agent.sh.
+  `agent.sh run -e claude`); kimi/codex/opencode/gemini → agent.sh.
+- From Codex: codex models → native codex subagents; kimi/claude/opencode/gemini → agent.sh.
 
 ## Work as an orchestrator (default mode)
 
@@ -57,6 +57,8 @@ bash $SK run  --no-terse -C dir "prompt"            # terse (concision) directiv
 bash $SK run  -m spark -C /c/Git/Proj "prompt"      # trivial task -> spark
 bash $SK run  -e claude -m haiku -C dir "prompt"    # a different CLI: claude/opencode/gemini
 bash $SK run  -m sonnet -f low -e claude -C dir "prompt"  # -f <effort>, separate from -m <model>
+bash $SK run  -e kimi -C dir "prompt"              # Kimi Code, Kimi K3 by default
+bash $SK run  -e kimi -m k2.5 -C dir "prompt"      # explicit Kimi K2.5 fallback
 bash $SK test-api --base-url http://127.0.0.1:8080 --goal "check /health, then POST+GET /item" --out r.json
                                                      # thin wrapper on `run`: agent exercises a local
                                                      # HTTP API via its own curl/shell, returns strict JSON
@@ -127,7 +129,7 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   the new tail, instead of resending the whole growing history via a brand-new
   `agent.sh run`. Any mismatch (edited history, an unrelated conversation, the first
   call, or a dead/errored session) falls back safely to a fresh `agent.sh run` with the
-  full history. Only `claude`/`codex` support this (`provider.json`'s
+  full history. `claude`/`codex`/`kimi` support this (`provider.json`'s
   `supports_resume`); `opencode`/`gemini` always take the fresh-run path.
 - **Trade-off: one bridge process serves one conversation at a time** — a lock
   serializes every request, so don't point multiple unrelated tasks at the same bridge
@@ -144,7 +146,7 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   `delta.tool_calls` chunks as each call's JSON closes. A short holdback keeps limit
   banners convertible to HTTP 429, and an end-of-turn full parse reconciles any
   non-canonical call spellings (they arrive late but correct). `--no-live-stream`
-  reverts to the legacy replay; non-live engines (codex/opencode/gemini) always use
+  reverts to the legacy replay; non-live engines (codex/kimi/opencode/gemini) always use
   the legacy replay of the finished answer as word-sized SSE chunks.
 - **`tools`/function-calling is emulated via prompting**, not native — best-effort. The
   bridge accepts every spelling seen live: a JSON `{"tool_calls":[...]}` block; one
@@ -166,8 +168,9 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   prompt ask.** Every subprocess gets `AGENT_CHAT_ONLY=1`, which makes codex run with
   `--sandbox read-only --ignore-user-config` (no shell/file writes, and skips
   `~/.codex/config.toml` so real configured MCP servers like a live `unityMCP` aren't
-  reachable) and claude run with `--strict-mcp-config --disallowedTools
-  Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`. Only applies to bridge
+  reachable), claude runs with `--strict-mcp-config --disallowedTools
+  Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, and Kimi uses an explicit
+  `tools: []` agent profile. Only applies to bridge
   subprocesses — a normal `agent.sh run` keeps full access. Verified live: `-c
   mcp_servers={}` alone did NOT stop a real MCP call from succeeding; the flags above
   do.
@@ -177,7 +180,8 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   its startup banner/session-id/error-log/"tokens used" chrome (and a cp866-mojibake line
   on Windows) into the answer, so its provider runs `codex exec --json` and extracts only
   the final agent message (`_provider_codex_emit`) — this also cleaned up `agent.sh last`
-  and the GUI chat view for codex. `claude`/`opencode`/`gemini` were already clean.
+  and the GUI chat view for codex. Kimi's stream-json provider performs the same clean extraction;
+  `claude`/`opencode`/`gemini` were already clean.
 - One process = one fixed engine/model/effort for its whole lifetime. To compare
   models, run the command again with different `-e/-m/-f/-p` on another port.
 
@@ -206,7 +210,7 @@ to watch it: `agent.sh log -f <name>`.
 
 **Durable checkpoint (survives shutdown).** After every step a `<name>.md` is generated — a
 human-readable markdown file: a header (state/engine/session/dir/changed files/resume command) + the
-whole thread. Plus the codex/claude sessions themselves live on disk (`~/.codex/sessions`), so even
+whole thread. Plus the codex/claude/kimi sessions themselves live on disk, so even
 after a reboot the task continues via `agent.sh reply <name> "continue"`. By default the agent also
 maintains its own **per-task** `PROGRESS.<task>.md` in the working directory (Summary/TL;DR, checklist,
 step-by-step log with findings, conclusions) and reads it on resume — resumable after a crash and
@@ -220,7 +224,8 @@ This makes it visible that the subagent is waiting for an answer rather than stu
 shows the question itself and the current stage of work.
 
 **Pre-flight `doctor`.** Before launching a batch of subagents, run `agent.sh doctor`: it checks the
-presence and versions of the CLIs (codex/claude/opencode/gemini), codex login, and codex's **remaining
+presence and versions of the CLIs (codex/claude/kimi/opencode/gemini), login state where available,
+and codex's **remaining
 limits** — primary (5h window) and secondary (weekly) with % and time until reset (from session-jsonl).
 At >80% it prints a warning — in that case it's better to throttle the fan-out.
 
@@ -271,6 +276,17 @@ The 5.6 family (`sol`/`luna`/`terra`) requires **codex-cli >= 0.144** (older CLI
 
 General pattern: `<model>-<effort>` (low/medium/high/xhigh/max) on any alias overrides the effort,
 e.g. `opus-high`. Implementation — `provider_claude_resolve()` in `providers/claude/provider.sh`.
+
+**Kimi Code** (`-e kimi`):
+
+| Alias | Model | When |
+|---|---|---|
+| `k3` / `default` (default) | `kimi-code/kimi-k3` | regular and hard agentic work |
+| `k2.5` | `kimi-code/kimi-k2.5` | explicit fallback for accounts that expose it |
+
+Kimi has no CLI effort flag, so `-f` is ignored. Authenticate once with `kimi login`; then verify
+the provisioned aliases with `kimi provider list`. Do not invent a `k2.7` alias: it is not present
+in the official Kimi Code catalog/docs as of 2026-08-09. Raw configured aliases pass through.
 
 ## Rules for setting tasks
 

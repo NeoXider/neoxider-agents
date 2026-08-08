@@ -52,6 +52,7 @@ STALE_SEC = 300  # running + no log activity for longer than this -> treat as st
 _DEFAULT_PROVIDERS = {
     "codex":   {"label": "Codex", "models": ["5.5", "5.5-high", "spark"], "limits": "codex"},
     "claude":  {"label": "Claude", "models": ["sonnet", "opus", "haiku"], "limits": None},
+    "kimi":    {"label": "Kimi Code", "models": ["k3", "k2.5"], "limits": None},
     "opencode":{"label": "opencode", "models": [], "limits": None},
     "gemini":  {"label": "Gemini", "models": [], "limits": None},
 }

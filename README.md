@@ -1,7 +1,7 @@
 # neoxider-agents
 
 A tiny local control room for AI coding subagents across multiple CLI providers —
-**Codex, Claude Code, opencode, Gemini CLI** (and any future CLI you add) — from one
+**Codex, Claude Code, Kimi Code, opencode, Gemini CLI** (and any future CLI you add) — from one
 non-interactive bash wrapper, an optional zero-dependency web GUI, and an
 **OpenAI-compatible HTTP bridge** that turns any of those CLI subscriptions into a
 `/v1/chat/completions` endpoint (so a benchmark or test harness can consume a CLI
@@ -64,7 +64,7 @@ this project fills.
   already the full multi-turn conversation (every `run`/`reply` appends to the same
   log with a timestamped header) — `/api/thread?task=<name>` exposes it as-is, nothing
   extra to build. Tool calls = the underlying CLI's own real shell/file actions (each
-  provider — Codex/Claude/opencode/Gemini — already executes real commands and edits
+  provider — Codex/Claude/Kimi/opencode/Gemini — already executes real commands and edits
   when it runs a task; those show up verbatim in the log, there's no separate
   "tool call" schema layered on top). Streaming = `/api/stream` below, and synchronous
   waiting = `/api/wait` below — both consume that same log/state, they don't add a new
@@ -121,7 +121,8 @@ CLIs below):
 - Python 3 (any recent version; standard library only, needed only for the GUI, not
   for `agent.sh` itself)
 - At least one of the CLIs it wraps: [Codex CLI](https://github.com/openai/codex),
-  [Claude Code](https://github.com/anthropics/claude-code), opencode, or the Gemini CLI
+  [Claude Code](https://github.com/anthropics/claude-code), [Kimi Code](https://github.com/MoonshotAI/kimi-code),
+  opencode, or the Gemini CLI
   — install and log in to whichever one(s) you plan to use, `agent.sh doctor` will tell
   you what it can see.
 
@@ -208,7 +209,7 @@ agent.sh openai-server -e claude -m sonnet -f low -p 8801
 
 Starts a standalone, zero-dependency HTTP server that exposes an OpenAI-compatible
 `POST .../chat/completions` endpoint (plus `GET /health`, `GET .../models`, `GET /`)
-backed by a CLI subagent (claude/codex/opencode/gemini, via the same `agent.sh run`
+backed by a CLI subagent (claude/codex/kimi/opencode/gemini, via the same `agent.sh run`
 machinery as everything else in this file). Point any OpenAI-compatible client's
 `base_url` at it and it drives your CLI-agent subscription as the "model" — no
 separate provider API key needed.
@@ -243,7 +244,7 @@ about this before pointing anything at it:
   first call ever, or a previous session that ended in an `error`/`stalled` state —
   falls back safely to a brand-new `agent.sh run` with the full history; it never
   resumes onto a session that might disagree with what the caller thinks happened.
-  Only `claude` and `codex` support this continuation (`provider.json`'s
+  `claude`, `codex`, and `kimi` support this continuation (`provider.json`'s
   `"supports_resume"` — `opencode`/`gemini` are `false` and always take the fresh-run
   path). Verified live: Claude's underlying task log showed one `[run]` block followed
   by a `[reply]` block containing only the new tail, the task-file count stayed at 1
@@ -273,7 +274,7 @@ about this before pointing anything at it:
   ONE persistent `claude -p` process (stream-json), so the ~7–11 s agent-environment
   boot is paid once and each turn afterwards costs only inference (~3.5 s measured on
   Opus), keeping the provider prompt cache warm across turns (`CLAUDE_NO_NATIVE=1` opts
-  back out). The other engines (codex/opencode/gemini) spawn a fresh CLI subprocess per
+  back out). The other engines (codex/kimi/opencode/gemini) spawn a fresh CLI subprocess per
   completion, so their first token waits a few seconds for that process to boot — even
   when streaming.
 - **`stream: true` is REAL token streaming on live-capable engines** (currently
@@ -290,7 +291,7 @@ about this before pointing anything at it:
   scanner didn't recognize (non-canonical spellings arrive late but correct); invisible
   retries/resume-fallbacks are only allowed while nothing has reached the client yet.
   `--no-live-stream` is an emergency switch back to the legacy behavior. Non-live
-  engines (codex/opencode/gemini) keep that legacy behavior: the finished answer is
+  engines (codex/kimi/opencode/gemini) keep that legacy behavior: the finished answer is
   replayed as word-sized SSE chunks ending in `data: [DONE]`. The connection is
   explicitly closed after `[DONE]` so plain HTTP clients that don't know that sentinel
   convention don't hang.
@@ -437,10 +438,11 @@ When adding a provider, find and pass that flag:
 |---|---|
 | Codex | `--sandbox workspace-write --skip-git-repo-check` |
 | Claude Code | `--permission-mode acceptEdits` |
+| Kimi Code | `-p` uses the built-in auto permission policy (`--auto` must not be combined with it) |
 | Gemini CLI | `--yolo` (auto-approve all tool actions) |
 | opencode | `--dangerously-skip-permissions` |
 
-See `providers/codex/` and `providers/claude/` for full worked examples (alias
+See `providers/codex/`, `providers/claude/`, and `providers/kimi/` for full worked examples (alias
 resolution, effort suffixes, and codex's rate-limit JSON parsing).
 
 ## Development

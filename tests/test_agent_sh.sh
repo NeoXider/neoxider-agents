@@ -134,7 +134,7 @@ section "provider_codex_resolve"
 for alias_in in "" "default"; do
     P_MODEL=""; P_EFFORT=""
     provider_codex_resolve "$alias_in"
-    assert_eq "codex alias '$alias_in' -> model gpt-5.6-sol" "gpt-5.6-sol" "$P_MODEL"
+    assert_eq "codex alias '$alias_in' -> model gpt-5.6-terra" "gpt-5.6-terra" "$P_MODEL"
     assert_eq "codex alias '$alias_in' -> effort medium" "medium" "$P_EFFORT"
 done
 
@@ -167,18 +167,39 @@ provider_codex_resolve "some-other-model"
 assert_eq "codex unknown alias passes through verbatim as model" "some-other-model" "$P_MODEL"
 
 # ============================================================================================
+section "provider_kimi_resolve"
+# ============================================================================================
+
+for alias_in in "" "default" "k3" "kimi-k3"; do
+    P_MODEL=""; P_EFFORT=""
+    provider_kimi_resolve "$alias_in"
+    assert_eq "kimi alias '$alias_in' -> K3" "kimi-code/kimi-k3" "$P_MODEL"
+    assert_eq "kimi alias '$alias_in' -> no effort flag" "" "$P_EFFORT"
+done
+
+for alias_in in "k2.5" "k2_5" "kimi-k2.5"; do
+    P_MODEL=""; P_EFFORT=""
+    provider_kimi_resolve "$alias_in"
+    assert_eq "kimi alias '$alias_in' -> K2.5" "kimi-code/kimi-k2.5" "$P_MODEL"
+done
+
+provider_kimi_resolve "custom-provider/custom-model"
+assert_eq "kimi unknown alias passes through verbatim" \
+    "custom-provider/custom-model" "$P_MODEL"
+
+# ============================================================================================
 section "provider_claude_resolve"
 # ============================================================================================
 
 P_MODEL=""; P_EFFORT=""
 provider_claude_resolve ""
-assert_eq "claude default (no alias) -> model claude-sonnet-5" "claude-sonnet-5" "$P_MODEL"
-assert_eq "claude default (no alias) -> effort high" "high" "$P_EFFORT"
+assert_eq "claude default (no alias) -> model claude-opus-5" "claude-opus-5" "$P_MODEL"
+assert_eq "claude default (no alias) -> CLI effort default" "" "$P_EFFORT"
 
 P_MODEL=""; P_EFFORT=""
 provider_claude_resolve "default"
-assert_eq "claude alias 'default' -> model claude-sonnet-5" "claude-sonnet-5" "$P_MODEL"
-assert_eq "claude alias 'default' -> effort high" "high" "$P_EFFORT"
+assert_eq "claude alias 'default' -> model claude-opus-5" "claude-opus-5" "$P_MODEL"
+assert_eq "claude alias 'default' -> CLI effort default" "" "$P_EFFORT"
 
 P_MODEL=""; P_EFFORT=""
 provider_claude_resolve "sonnet"
@@ -294,6 +315,61 @@ assert_match "answer containing the marker line keeps its last line" 'line three
 emit_mojibake="$(printf '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}\n\x93\xe0\xaf\xa5\n' | _provider_codex_emit \
     | awk '/^---------- output ----------$/{buf=""; next}{buf=buf $0 ORS} END{printf "%s", buf}' | sed 's/[[:space:]]*$//')"
 assert_eq "non-UTF-8 mojibake line does not crash the parser" "ok" "$emit_mojibake"
+
+# ============================================================================================
+section "_provider_kimi_emit (Kimi stream-json cleanup)"
+# ============================================================================================
+
+kimi_emit="$(_provider_kimi_emit <<'KIMI_JSON'
+{"role":"assistant","content":"checking","tool_calls":[{"type":"function","id":"tc_1","function":{"name":"Shell","arguments":"{}"}}]}
+{"role":"tool","tool_call_id":"tc_1","content":"ok"}
+{"role":"assistant","content":"final answer"}
+{"role":"meta","type":"session.resume_hint","session_id":"ses_abc123","command":"kimi -r ses_abc123","content":"To resume this session"}
+KIMI_JSON
+)"
+assert_match "kimi emitter exposes session id" '^session id: ses_abc123' "$kimi_emit"
+kimi_answer="$(printf '%s\n' "$kimi_emit" | awk '/^---------- output ----------$/{buf=""; next}{buf=buf $0 ORS} END{printf "%s", buf}' | sed 's/[[:space:]]*$//')"
+assert_eq "kimi emitter keeps only final assistant answer" "final answer" "$kimi_answer"
+
+kimi_error="$(printf '%s\n' 'Authentication required. Run kimi login.' | _provider_kimi_emit)"
+kimi_error_rc=$?
+assert_match "kimi emitter surfaces auth errors" 'Authentication required' "$kimi_error"
+assert_eq "kimi emitter returns non-zero without an answer" "3" "$kimi_error_rc"
+
+printf 'engine=kimi\nsession=ses_meta123\n' > "$SCRATCH_LOGDIR/kimi_session.meta"
+assert_eq "resolve_session accepts Kimi ses_ ids from meta" "ses_meta123" "$(resolve_session kimi_session)"
+
+unset AGENT_CHAT_ONLY
+mapfile -t kimi_normal < <(_provider_kimi_run_args)
+assert_eq "kimi normal run has no chat-only profile" "0" "${#kimi_normal[@]}"
+AGENT_CHAT_ONLY=1
+mapfile -t kimi_chatonly < <(_provider_kimi_run_args)
+assert_eq "kimi bridge uses explicit no-tools agent profile" "--agent-file $HERE/providers/kimi/chat-only-agent.md" "${kimi_chatonly[*]}"
+unset AGENT_CHAT_ONLY
+
+# Full provider command wiring with a fake CLI: lock in Kimi's real constraint that --prompt
+# cannot be combined with --auto, plus clean output and resumable session extraction.
+KIMI_ARGS_FILE="$SCRATCH_LOGDIR/kimi-args"
+kimi() {
+    printf '%s\n' "$*" > "$KIMI_ARGS_FILE"
+    printf '%s\n' \
+        '{"role":"assistant","content":"KIMI_WRAPPER_OK"}' \
+        '{"role":"meta","type":"session.resume_hint","session_id":"ses_fake","command":"kimi -r ses_fake","content":"resume"}'
+}
+kimi_run_output="$(provider_kimi_run_cmd "$SCRATCH_LOGDIR" "kimi-code/kimi-k3" "" "hello")"
+assert_eq "kimi provider fake run exits cleanly" "0" "$?"
+assert_match "kimi provider passes K3 model and prompt mode" '-m kimi-code/kimi-k3 -p hello --output-format stream-json' "$(cat "$KIMI_ARGS_FILE")"
+if grep -q -- '--auto' "$KIMI_ARGS_FILE"; then
+    fail "kimi prompt-mode command must not include incompatible --auto"
+else
+    pass "kimi prompt-mode command omits incompatible --auto"
+fi
+assert_match "kimi provider fake run emits clean answer" 'KIMI_WRAPPER_OK' "$kimi_run_output"
+
+kimi_resume_output="$(provider_kimi_resume_cmd "$SCRATCH_LOGDIR" "ses_fake" "continue")"
+assert_match "kimi resume passes the concrete ses_ id" '--session ses_fake -p continue' "$(cat "$KIMI_ARGS_FILE")"
+assert_match "kimi provider fake resume emits clean answer" 'KIMI_WRAPPER_OK' "$kimi_resume_output"
+unset -f kimi
 
 # ============================================================================================
 section "AGENT_CHAT_ONLY sandboxing (codex + claude provider flags)"

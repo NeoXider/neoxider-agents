@@ -41,8 +41,9 @@
 #   codex:  5.6-terra|terra|default -> gpt-5.6-terra (effort medium) [DEFAULT]; sol -> gpt-5.6-sol;
 #           high -> sol at effort high; luna -> gpt-5.6-luna; spark|5.3 -> gpt-5.3-codex-spark (very simple
 #           tasks); anything else -> passed through as-is (e.g. -m gpt-5.5). (5.6 family needs codex-cli >= 0.144.)
-#   claude: sonnet|default -> claude-sonnet-5, effort HIGH [DEFAULT]; sonnet-medium/-low -> lower effort;
+#   claude: opus5|default -> claude-opus-5 [DEFAULT]; sonnet -> claude-sonnet-5, effort high;
 #           opus|haiku -> same alias, effort as given (no suffix -> CLI default); <model>-<effort> is the general pattern
+#   kimi: k3|default -> kimi-code/kimi-k3 [DEFAULT]; k2.5 -> kimi-code/kimi-k2.5
 #   opencode/gemini: passed through as-is (-m provider/model)
 #
 # Providers are plugins: each providers/<name>/provider.sh defines provider_<name>_resolve,
@@ -183,7 +184,7 @@ meta_get()  { grep -m1 "^$2=" "$(meta_file "$1")" 2>/dev/null | cut -d= -f2- ; }
 
 resolve_session() {
     local n="$1" s; s="$(meta_get "$n" session)"; [ -n "$s" ] && { echo "$s"; return; }
-    grep -m1 -oE 'session id: [0-9a-f-]{36}' "$LOGDIR/$n.log" 2>/dev/null | cut -d' ' -f3
+    grep -m1 -oE 'session id: [[:alnum:]_.-]+' "$LOGDIR/$n.log" 2>/dev/null | cut -d' ' -f3
 }
 name_by_session() { local s="$1" f
     for f in "$LOGDIR"/*.meta; do [ -e "$f" ] || continue
@@ -321,15 +322,15 @@ _do_run_dispatch() {
     hdr run "engine=$engine model=${model:-default} dir=$dir" PROMPT "$prompt" "$log"
     rc=0
     provider_dispatch_run "$engine" "$model" "$dir" "$prompt" "$name"
-    if [ "$engine" = codex ]; then
-        sid=$(grep -m1 -oE 'session id: [0-9a-f-]{36}' "$log" | cut -d' ' -f3)
-        [ -n "$sid" ] && meta_set "$name" session "$sid"
-    fi
+    # Every resumable provider emits a normalized `session id: ...` line. Capture it
+    # generically so adding a provider does not require another engine special-case.
+    sid=$(grep -m1 -oE 'session id: [[:alnum:]_.-]+' "$log" 2>/dev/null | cut -d' ' -f3)
+    [ -n "$sid" ] && meta_set "$name" session "$sid"
     finish_step "$name" "$rc"
 }
 
 # builds the instructive prompt for `test-api`: exercise a local HTTP API via the agent's own
-# shell/tool-use capability (curl et al. -- all four providers' non-interactive modes already
+# shell/tool-use capability (curl et al. -- all bundled providers' non-interactive modes already
 # support this, no new architecture needed), and report back one strict JSON object.
 build_api_test_prompt() {
     local url="$1" goal="$2"
@@ -421,7 +422,7 @@ except Exception:
         if [ ${#REST[@]} -ge 2 ]; then ref="${REST[0]}"; answer="${REST[1]}"; else ref=""; answer="${REST[0]:-}"; fi
         [ -n "$answer" ] || die "reply: needs an answer text"
         if [ -z "$ref" ]; then tname="$(latest_task)"; [ -n "$tname" ] || die "reply: no tasks — specify name/session id"
-        elif [[ "$ref" =~ ^[0-9a-f-]{36}$ ]]; then tname="$(name_by_session "$ref")"
+        elif [[ "$ref" =~ ^[0-9a-f-]{36}$|^ses_[[:alnum:]_.-]+$|^session_[[:alnum:]_.-]+$ ]]; then tname="$(name_by_session "$ref")"
         else tname="$ref"; fi
         if [ -n "${tname:-}" ]; then
             session="$(resolve_session "$tname")"
@@ -512,14 +513,14 @@ print(v if v is not None else "")
             info="$("$fn" 2>/dev/null)"
             avail="$(json_field available "$info")"
             ver="$(json_field version "$info")"
+            provider_login="$(json_field login "$info")"
             if [ "$avail" = "True" ]; then
                 printf '  %-9s ok   %s\n' "$eng" "$ver"
+                [ -n "$provider_login" ] && printf '  %-9s auth %s\n' "$eng" "$provider_login"
             else
                 printf '  %-9s —    (not in PATH)\n' "$eng"
             fi
         done
-        codex_login="$(json_field login "$(provider_codex_doctor 2>/dev/null)")"
-        [ -n "$codex_login" ] && echo "  codex login: $codex_login"
         echo "=== codex rate limits (from latest session) ==="
         codex_info="$(provider_codex_doctor 2>/dev/null)"
         PYTHONIOENCODING=utf-8 python - "$codex_info" <<'PY' 2>/dev/null || echo "  (could not read limits - need python + at least one codex session)"

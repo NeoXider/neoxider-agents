@@ -113,6 +113,9 @@ class ModelLabelRealProviderDataTests(unittest.TestCase):
     def test_codex_default_model_shows_version_number(self):
         self.assertEqual(srv.model_label("codex", "sol", "medium"), "codex/GPT-5.6 Sol (medium)")
 
+    def test_kimi_default_model_shows_k3(self):
+        self.assertEqual(srv.model_label("kimi", "", ""), "kimi/Kimi K3")
+
 
 class ContentTextTests(unittest.TestCase):
     def test_plain_string(self):
