@@ -173,15 +173,13 @@ section "provider_kimi_resolve"
 for alias_in in "" "default" "k3" "kimi-k3"; do
     P_MODEL=""; P_EFFORT=""
     provider_kimi_resolve "$alias_in"
-    assert_eq "kimi alias '$alias_in' -> K3" "kimi-code/kimi-k3" "$P_MODEL"
+    assert_eq "kimi alias '$alias_in' -> K3" "kimi-code/k3" "$P_MODEL"
     assert_eq "kimi alias '$alias_in' -> no effort flag" "" "$P_EFFORT"
 done
 
-for alias_in in "k2.5" "k2_5" "kimi-k2.5"; do
-    P_MODEL=""; P_EFFORT=""
-    provider_kimi_resolve "$alias_in"
-    assert_eq "kimi alias '$alias_in' -> K2.5" "kimi-code/kimi-k2.5" "$P_MODEL"
-done
+assert_eq "kimi k3-256k alias" "kimi-code/k3-256k" "$(provider_kimi_resolve k3-256k; printf '%s' "$P_MODEL")"
+assert_eq "kimi coding alias" "kimi-code/kimi-for-coding" "$(provider_kimi_resolve coding; printf '%s' "$P_MODEL")"
+assert_eq "kimi highspeed alias" "kimi-code/kimi-for-coding-highspeed" "$(provider_kimi_resolve highspeed; printf '%s' "$P_MODEL")"
 
 provider_kimi_resolve "custom-provider/custom-model"
 assert_eq "kimi unknown alias passes through verbatim" \
@@ -356,9 +354,9 @@ kimi() {
         '{"role":"assistant","content":"KIMI_WRAPPER_OK"}' \
         '{"role":"meta","type":"session.resume_hint","session_id":"ses_fake","command":"kimi -r ses_fake","content":"resume"}'
 }
-kimi_run_output="$(provider_kimi_run_cmd "$SCRATCH_LOGDIR" "kimi-code/kimi-k3" "" "hello")"
+kimi_run_output="$(provider_kimi_run_cmd "$SCRATCH_LOGDIR" "kimi-code/k3" "" "hello")"
 assert_eq "kimi provider fake run exits cleanly" "0" "$?"
-assert_match "kimi provider passes K3 model and prompt mode" '-m kimi-code/kimi-k3 -p hello --output-format stream-json' "$(cat "$KIMI_ARGS_FILE")"
+assert_match "kimi provider passes K3 model and prompt mode" '-m kimi-code/k3 -p hello --output-format stream-json' "$(cat "$KIMI_ARGS_FILE")"
 if grep -q -- '--auto' "$KIMI_ARGS_FILE"; then
     fail "kimi prompt-mode command must not include incompatible --auto"
 else

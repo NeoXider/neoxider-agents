@@ -1,6 +1,6 @@
 {
   "label": "Kimi Code",
-  "models": ["k3", "k2.5"],
+  "models": ["k3", "k3-256k", "coding", "highspeed"],
   "efforts": [],
   "default_model": "k3",
   "default_effort": "",
@@ -8,7 +8,9 @@
   "resolved_label": "Kimi K3",
   "model_labels": {
     "k3": "Kimi K3",
-    "k2.5": "Kimi K2.5"
+    "k3-256k": "Kimi K3 256K",
+    "coding": "Kimi for Coding",
+    "highspeed": "Kimi for Coding Highspeed"
   },
   "supports_resume": true
 }

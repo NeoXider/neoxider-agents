@@ -2,16 +2,18 @@
 # Contract: provider_kimi_resolve, provider_kimi_run_cmd, provider_kimi_resume_cmd,
 # provider_kimi_doctor. Kimi Code 0.34+ is required for structured prompt output.
 
-# Kimi's -m flag expects a configured model alias. OAuth-managed models use the
-# kimi-code/<model-id> shape. K3 is the default; K2.5 is retained as an explicit fallback.
-# K2.7 is intentionally not aliased because it is not present in the official Kimi Code model
-# catalog/documentation as of 2026-08-09. Raw configured aliases still pass through unchanged.
+# Kimi's -m flag expects a configured model alias. These ids are verified against the live
+# managed:kimi-code catalog (Kimi Code 0.34.0, 2026-08-09). K3 is the wrapper default.
+# K2.5/K2.7 are intentionally not aliased because the managed catalog does not expose them.
+# Raw configured aliases still pass through unchanged.
 provider_kimi_resolve() {
     local alias="${1:-k3}"
     P_EFFORT=""
     case "$alias" in
-        ""|default|k3|kimi-k3) P_MODEL="kimi-code/kimi-k3" ;;
-        k2.5|k2_5|kimi-k2.5)   P_MODEL="kimi-code/kimi-k2.5" ;;
+        ""|default|k3|kimi-k3)              P_MODEL="kimi-code/k3" ;;
+        k3-256k)                             P_MODEL="kimi-code/k3-256k" ;;
+        coding|kimi-for-coding)              P_MODEL="kimi-code/kimi-for-coding" ;;
+        highspeed|kimi-for-coding-highspeed) P_MODEL="kimi-code/kimi-for-coding-highspeed" ;;
         *) P_MODEL="$alias" ;;
     esac
 }

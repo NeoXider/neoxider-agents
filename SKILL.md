@@ -58,7 +58,7 @@ bash $SK run  -m spark -C /c/Git/Proj "prompt"      # trivial task -> spark
 bash $SK run  -e claude -m haiku -C dir "prompt"    # a different CLI: claude/opencode/gemini
 bash $SK run  -m sonnet -f low -e claude -C dir "prompt"  # -f <effort>, separate from -m <model>
 bash $SK run  -e kimi -C dir "prompt"              # Kimi Code, Kimi K3 by default
-bash $SK run  -e kimi -m k2.5 -C dir "prompt"      # explicit Kimi K2.5 fallback
+bash $SK run  -e kimi -m highspeed -C dir "prompt" # explicit managed high-speed coding model
 bash $SK test-api --base-url http://127.0.0.1:8080 --goal "check /health, then POST+GET /item" --out r.json
                                                      # thin wrapper on `run`: agent exercises a local
                                                      # HTTP API via its own curl/shell, returns strict JSON
@@ -281,12 +281,14 @@ e.g. `opus-high`. Implementation — `provider_claude_resolve()` in `providers/c
 
 | Alias | Model | When |
 |---|---|---|
-| `k3` / `default` (default) | `kimi-code/kimi-k3` | regular and hard agentic work |
-| `k2.5` | `kimi-code/kimi-k2.5` | explicit fallback for accounts that expose it |
+| `k3` / `default` (default) | `kimi-code/k3` | regular and hard agentic work |
+| `k3-256k` | `kimi-code/k3-256k` | explicit smaller-context K3 route |
+| `coding` | `kimi-code/kimi-for-coding` | managed coding route |
+| `highspeed` | `kimi-code/kimi-for-coding-highspeed` | managed high-speed coding route |
 
 Kimi has no CLI effort flag, so `-f` is ignored. Authenticate once with `kimi login`; then verify
-the provisioned aliases with `kimi provider list`. Do not invent a `k2.7` alias: it is not present
-in the official Kimi Code catalog/docs as of 2026-08-09. Raw configured aliases pass through.
+the provisioned aliases with `kimi provider list`. Do not invent K2.5/K2.7 aliases: they are not
+present in the live managed catalog verified on 2026-08-09. Raw configured aliases pass through.
 
 ## Rules for setting tasks
 
