@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible /v1/chat/completions bridge over a CLI subagent (claude/codex/opencode/gemini).
+"""OpenAI-compatible /v1/chat/completions bridge over a CLI subagent (claude/codex/kimi/opencode/gemini).
 
 Run:   agent.sh openai-server -e claude -m sonnet -f high -p 8801
        (or directly: python openai_server.py -e codex -m spark -p 8802)

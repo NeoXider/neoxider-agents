@@ -1,7 +1,7 @@
 # neoxider-agents — agent instructions
 
 This repo is `agent.sh` + `gui.py`/`gui.html`: a non-interactive wrapper for launching
-and managing CLI coding subagents (Codex, Claude Code, opencode, Gemini CLI) across a
+and managing CLI coding subagents (Codex, Claude Code, Kimi Code, opencode, Gemini CLI) across a
 shared thread-per-task log, plus an optional zero-dependency local web GUI.
 
 If you (an AI agent) are working *in* this repo, see [`SKILL.md`](SKILL.md) for the
@@ -15,8 +15,9 @@ pick up the same baseline instructions without extra setup.
 
 ```bash
 SK=./agent.sh
-bash $SK run  -t <name> -C <dir> "<prompt>"     # new task (codex/gpt-5.6-sol by default)
-bash $SK run  -e claude -t <name> -C <dir> "..." # -e: codex|claude|opencode|gemini
+bash $SK run  -t <name> -C <dir> "<prompt>"     # new task (Claude Code / Opus 5 by default)
+bash $SK run  -e kimi -t <name> -C <dir> "..."  # Kimi Code, Kimi K3 by default
+bash $SK run  -e claude -t <name> -C <dir> "..." # -e: codex|claude|kimi|opencode|gemini
 bash $SK fan  -t <base> -C <dir> "p1" "p2" ...   # N parallel background tasks (<base>-01, -02, ...)
 bash $SK reply <name> "<answer>"                 # continue a task by name
 bash $SK log  -f <name>                          # follow a task live
@@ -51,7 +52,7 @@ agent every call — when a new call's `messages` is a deterministic extension o
 it saw last time (exact prefix match, not a guess), it resumes the *same* underlying
 CLI session via `agent.sh reply` with only the new tail; any mismatch (edited history,
 an unrelated conversation, the first call, or a dead/errored session) falls back safely
-to a brand-new `agent.sh run` with the full history. Only `claude`/`codex` support this
+to a brand-new `agent.sh run` with the full history. `claude`/`codex`/`kimi` support this
 resume (`opencode`/`gemini` always take the fresh-run path). Consequence: **one bridge
 process serves one conversation at a time** — a lock serializes every request, so don't
 point multiple unrelated tasks at the same port expecting independence (run one process
@@ -72,8 +73,9 @@ provider runs `codex exec --json` and extracts only the final agent message — 
 cleaned up `agent.sh last`/the GUI for codex). One process = one fixed engine/model/effort
 — run it again on another port to compare models. **The wrapped CLI is locked to
 text-only completion for bridge calls**: `AGENT_CHAT_ONLY=1` makes codex run
-`--sandbox read-only --ignore-user-config` and claude run `--strict-mcp-config
---disallowedTools Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, so it can't
+`--sandbox read-only --ignore-user-config`, claude runs `--strict-mcp-config
+--disallowedTools Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, and Kimi uses a
+`tools: []` agent profile, so the bridge can't
 reach a real MCP server (verified live against a configured `unityMCP`) or write files
 instead of answering in the expected format — a normal `agent.sh run` outside the
 bridge is unaffected.

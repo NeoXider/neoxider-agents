@@ -6,6 +6,11 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- provider: add Kimi Code CLI as a first-class engine (`-e kimi`) with Kimi K3 as the default,
+  K2.5 as an explicit fallback, clean stream-json output, resumable `ses_*` sessions, doctor/GUI
+  metadata, and a no-tools profile for OpenAI-bridge calls. Session-id capture is now provider-
+  agnostic. Added provider/parser/resume/model-label tests and refreshed stale default-model tests.
+
 - gui: **make the bridge "logs" button a real toggle that survives the periodic refresh.** The
   request-log panel opened then vanished within a few seconds because the API tab rebuilds its
   whole list on a timer, wiping any expanded panel from the DOM. Open/expanded state now lives in
