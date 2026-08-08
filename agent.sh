@@ -43,7 +43,7 @@
 #           tasks); anything else -> passed through as-is (e.g. -m gpt-5.5). (5.6 family needs codex-cli >= 0.144.)
 #   claude: opus5|default -> claude-opus-5 [DEFAULT]; sonnet -> claude-sonnet-5, effort high;
 #           opus|haiku -> same alias, effort as given (no suffix -> CLI default); <model>-<effort> is the general pattern
-#   kimi: k3|default -> kimi-code/kimi-k3 [DEFAULT]; k2.5 -> kimi-code/kimi-k2.5
+#   kimi: k3|default -> kimi-code/k3 [DEFAULT]; k3-256k/coding/highspeed are explicit alternatives
 #   opencode/gemini: passed through as-is (-m provider/model)
 #
 # Providers are plugins: each providers/<name>/provider.sh defines provider_<name>_resolve,
