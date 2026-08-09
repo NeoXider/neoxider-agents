@@ -47,7 +47,7 @@ if not BASH:
 LOGDIR = os.environ.get("AGENT_CLI_LOGS") or os.path.expanduser("~/.claude/agent-cli-logs")
 PROJECTS_FILE = os.path.join(LOGDIR, "projects.json")
 BRIDGES_DIR = os.path.join(LOGDIR, "bridges")  # openai_server.py drops bridge-<port>.json here
-STALE_SEC = 300  # running + no log activity for longer than this -> treat as stalled
+STALE_SEC = 300  # retained for UI age hints; quiet output alone is not proof of a dead process
 
 _DEFAULT_PROVIDERS = {
     "codex":   {"label": "Codex", "models": ["5.5", "5.5-high", "spark"], "limits": "codex"},
@@ -122,10 +122,10 @@ def read_meta(name):
     return d
 
 def eff_state(meta, log_mtime, nowt):
-    """Liveness via the log's mtime (a git-bash pid isn't comparable to a win-pid in python)."""
+    """Return persisted state; agent.sh owns process-liveness classification."""
     st = meta.get("state", "?")
-    if st == "running" and log_mtime and (nowt - log_mtime) > STALE_SEC:
-        return "stalled"
+    # A provider may legitimately be quiet for minutes while a tool call is running. Only agent.sh,
+    # which can check its MSYS wrapper PID, may classify a task as stalled; log age alone must not.
     return st
 
 def first_prompt(name):

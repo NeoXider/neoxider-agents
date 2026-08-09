@@ -440,10 +440,14 @@ When adding a provider, find and pass that flag:
 | Claude Code | `--permission-mode acceptEdits` |
 | Kimi Code | `-p` uses the built-in auto permission policy (`--auto` must not be combined with it) |
 | Gemini CLI | `--yolo` (auto-approve all tool actions) |
-| opencode | `--dangerously-skip-permissions` |
+| opencode | `--auto` |
 
 See `providers/codex/`, `providers/claude/`, and `providers/kimi/` for full worked examples (alias
 resolution, effort suffixes, and codex's rate-limit JSON parsing).
+
+The opencode provider keeps its JSON stdout clean but forwards prefixed stderr diagnostics and writes
+throttled activity heartbeats before the final output marker. Runs have a 30-minute hard timeout by
+default; set `AGENT_OPENCODE_TIMEOUT_SEC=<seconds>` to change it or `0` to disable it.
 
 ## Development
 

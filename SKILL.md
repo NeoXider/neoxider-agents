@@ -208,6 +208,11 @@ If `state=running` but the process is dead (the machine was shut down / it was k
 `⚠ stalled` with the hint `agent.sh reply <name> "continue"`. A live process shows `▶ running (alive)`;
 to watch it: `agent.sh log -f <name>`.
 
+opencode emits throttled activity heartbeats into that log while preserving a clean final-answer block.
+Its unattended run has a 30-minute hard deadline by default; override it with
+`AGENT_OPENCODE_TIMEOUT_SEC=<seconds>` (`0` disables the deadline). opencode stderr is retained with an
+`[opencode]` prefix, so auth/network/plugin failures are diagnosable instead of looking like silent hangs.
+
 **Durable checkpoint (survives shutdown).** After every step a `<name>.md` is generated — a
 human-readable markdown file: a header (state/engine/session/dir/changed files/resume command) + the
 whole thread. Plus the codex/claude/kimi sessions themselves live on disk, so even

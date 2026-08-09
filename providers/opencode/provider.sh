@@ -17,20 +17,22 @@ _provider_opencode_python() {
 }
 
 # _provider_opencode_emit — reads opencode `--format json` JSONL on stdin and emits the agent.sh
-# output contract: a `session id: <id>` line (for reference), a fresh `---------- output ----------`
-# marker, then ONLY the assistant's final text (the concatenated `text` parts). This strips
-# opencode's TUI chrome (ANSI colour codes, the "> build · model" header, tool-call/permission noise)
-# that otherwise leaks into the bridge/benchmark response. No usable python -> raw passthrough.
+# output contract: a `session id: <id>` line (for reference), throttled activity heartbeats while
+# the tool loop is running, then a fresh `---------- output ----------` marker followed by ONLY the
+# assistant's final text (the concatenated `text` parts). Heartbeats deliberately precede the final
+# marker, so agent.sh last/openai_server still see a clean answer while status/log -f no longer look
+# frozen for the whole run. No usable python -> raw passthrough.
 _provider_opencode_emit() {
     if ! _provider_opencode_python; then cat; return 0; fi
     PYTHONIOENCODING=utf-8 "$_PROVIDER_OPENCODE_PY" -c '
-import sys, json
+import sys, json, time
 try:
     sys.stdin.reconfigure(errors="ignore")
 except Exception:
     pass
 MARK = "---------- output ----------"
 sid = None; parts = {}; order = []; raw = []
+last_activity = 0.0
 for line in sys.stdin:
     raw.append(line)
     s = line.strip()
@@ -42,6 +44,12 @@ for line in sys.stdin:
         continue
     if o.get("sessionID") and sid is None:
         sid = o["sessionID"]
+        print("session id: %s" % sid, flush=True)
+    event_type = o.get("type") or "event"
+    now = time.monotonic()
+    if now - last_activity >= 10.0:
+        print("[opencode] activity: %s" % event_type, flush=True)
+        last_activity = now
     if o.get("type") == "text":
         p = o.get("part") or {}
         txt = p.get("text")
@@ -55,8 +63,6 @@ if not msg:
     sys.stdout.write("".join(raw))   # nothing clean -> surface raw for debugging
     raise SystemExit(3)              # non-zero -> agent.sh marks the task failed
 msg = "\n".join((ln + " ") if ln == MARK else ln for ln in msg.split("\n"))
-if sid:
-    print("session id: %s" % sid)
 print(MARK)
 sys.stdout.write(msg)
 if not msg.endswith("\n"):
@@ -74,11 +80,32 @@ if not msg.endswith("\n"):
 # flag now fails `opencode run` with "Unexpected server error".
 provider_opencode_run_cmd() {
     local dir="$1" model="$2" effort="$3" prompt="$4"
+    local timeout_sec="${AGENT_OPENCODE_TIMEOUT_SEC:-1800}"
     local args=(--auto --format json)
     [ -n "$model" ] && args+=(-m "$model")
     [ -n "$effort" ] && args+=(--variant "$effort")
-    # stdout carries the JSONL we parse; stderr (logs) is dropped so it can't corrupt the stream.
-    ( cd "$dir" && opencode run "${args[@]}" "$prompt" </dev/null 2>/dev/null ) | _provider_opencode_emit
+    # stdout carries JSONL only. Keep stderr visible without corrupting that stream: diagnostics are
+    # prefixed and sent through the provider stderr, which generic dispatch records in the task log.
+    # A bounded default prevents an unattended provider/plugin deadlock from living forever. Set
+    # AGENT_OPENCODE_TIMEOUT_SEC=0 to disable it (also useful for shell-function test doubles).
+    local -a command=(opencode run "${args[@]}" "$prompt")
+    local -a statuses
+    if [ "$timeout_sec" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
+        ( cd "$dir" && timeout --foreground --kill-after=10s "${timeout_sec}s" "${command[@]}" </dev/null \
+            2> >(while IFS= read -r line; do printf '[opencode] %s\n' "$line" >&2; done) \
+        ) | _provider_opencode_emit
+    else
+        ( cd "$dir" && "${command[@]}" </dev/null \
+            2> >(while IFS= read -r line; do printf '[opencode] %s\n' "$line" >&2; done) \
+        ) | _provider_opencode_emit
+    fi
+    statuses=("${PIPESTATUS[@]}")
+    if [ "${statuses[0]}" -eq 124 ]; then
+        printf '[opencode] timed out after %ss\n' "$timeout_sec" >&2
+        return 124
+    fi
+    [ "${statuses[0]}" -ne 0 ] && return "${statuses[0]}"
+    return "${statuses[1]}"
 }
 
 # provider_opencode_doctor — prints a single-line JSON object to stdout.
