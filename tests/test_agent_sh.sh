@@ -370,6 +370,81 @@ assert_match "kimi provider fake resume emits clean answer" 'KIMI_WRAPPER_OK' "$
 unset -f kimi
 
 # ============================================================================================
+section "_provider_opencode_emit / provider wiring"
+# ============================================================================================
+# opencode can spend minutes in tool calls. The JSONL parser must expose session/activity before
+# EOF, while keeping the final answer behind a fresh output marker for last_output/openai_server.
+OPENCODE_STREAM_FILE="$SCRATCH_LOGDIR/opencode-stream"
+(
+    {
+        printf '%s\n' '{"type":"step_start","sessionID":"ses_stream"}'
+        sleep 2
+        printf '%s\n' '{"type":"text","sessionID":"ses_stream","part":{"id":"p1","text":"final answer"}}'
+    } | _provider_opencode_emit > "$OPENCODE_STREAM_FILE"
+) &
+opencode_stream_pid=$!
+for _ in $(seq 1 15); do
+    [ -s "$OPENCODE_STREAM_FILE" ] && break
+    sleep 0.1
+done
+if grep -q '^session id: ses_stream$' "$OPENCODE_STREAM_FILE" 2>/dev/null; then
+    pass "opencode emitter flushes session id before EOF"
+else
+    fail "opencode emitter buffered session id until EOF"
+fi
+if grep -q '^\[opencode\] activity: step_start$' "$OPENCODE_STREAM_FILE" 2>/dev/null; then
+    pass "opencode emitter flushes an activity heartbeat before EOF"
+else
+    fail "opencode emitter did not expose activity before EOF"
+fi
+wait "$opencode_stream_pid"
+opencode_clean="$(awk '/^---------- output ----------$/{buf=""; next}{buf=buf $0 ORS} END{printf "%s", buf}' \
+    "$OPENCODE_STREAM_FILE" | sed 's/[[:space:]]*$//')"
+assert_eq "opencode last output remains clean after heartbeats" "final answer" "$opencode_clean"
+
+# Fake CLI locks in exact model/variant/prompt argv and verifies stderr remains diagnosable.
+OPENCODE_ARGS_FILE="$SCRATCH_LOGDIR/opencode-args"
+opencode() {
+    printf '%s\n' "$*" > "$OPENCODE_ARGS_FILE"
+    printf 'provider diagnostic\n' >&2
+    printf '%s\n' '{"type":"text","sessionID":"ses_fake","part":{"id":"p1","text":"OPENCODE_WRAPPER_OK"}}'
+}
+AGENT_OPENCODE_TIMEOUT_SEC=0
+export AGENT_OPENCODE_TIMEOUT_SEC
+opencode_stderr="$SCRATCH_LOGDIR/opencode-stderr"
+opencode_run_output="$(provider_opencode_run_cmd "$SCRATCH_LOGDIR" \
+    "opencode/deepseek-v4-flash-free" "high" "inspect this" 2>"$opencode_stderr")"
+assert_eq "opencode provider fake run exits cleanly" "0" "$?"
+assert_match "opencode provider preserves exact DeepSeek model, variant and prompt" \
+    '--auto --format json -m opencode/deepseek-v4-flash-free --variant high inspect this' \
+    "$(cat "$OPENCODE_ARGS_FILE")"
+assert_match "opencode provider emits clean final answer" 'OPENCODE_WRAPPER_OK' "$opencode_run_output"
+assert_match "opencode provider keeps prefixed stderr diagnostics" \
+    '^\[opencode\] provider diagnostic' "$(cat "$opencode_stderr")"
+unset -f opencode
+unset AGENT_OPENCODE_TIMEOUT_SEC
+
+# A real executable test double exercises GNU timeout (shell functions cannot be exec'd by timeout).
+OPENCODE_FAKE_BIN="$SCRATCH_LOGDIR/opencode-bin"
+mkdir -p "$OPENCODE_FAKE_BIN"
+printf '%s\n' '#!/usr/bin/env bash' 'sleep 30' > "$OPENCODE_FAKE_BIN/opencode"
+chmod +x "$OPENCODE_FAKE_BIN/opencode"
+old_path="$PATH"
+PATH="$OPENCODE_FAKE_BIN:$PATH"
+export PATH
+AGENT_OPENCODE_TIMEOUT_SEC=1
+export AGENT_OPENCODE_TIMEOUT_SEC
+timeout_output="$(provider_opencode_run_cmd "$SCRATCH_LOGDIR" \
+    "opencode/deepseek-v4-flash-free" "" "timeout probe" 2>&1)"
+timeout_rc=$?
+assert_eq "opencode provider returns GNU timeout exit code" "124" "$timeout_rc"
+assert_match "opencode provider reports the configured timeout" \
+    '\[opencode\] timed out after 1s' "$timeout_output"
+PATH="$old_path"
+export PATH
+unset AGENT_OPENCODE_TIMEOUT_SEC
+
+# ============================================================================================
 section "AGENT_CHAT_ONLY sandboxing (codex + claude provider flags)"
 # ============================================================================================
 # openai_server.py sets AGENT_CHAT_ONLY=1 for every subprocess it launches; the provider scripts

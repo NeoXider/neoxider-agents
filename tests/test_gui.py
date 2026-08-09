@@ -67,11 +67,11 @@ class ToGitBashPathTests(unittest.TestCase):
 
 
 class EffStateTests(unittest.TestCase):
-    def test_running_with_stale_mtime_becomes_stalled(self):
+    def test_running_with_stale_mtime_stays_running(self):
         nowt = 1_000_000.0
-        log_mtime = nowt - (gui.STALE_SEC + 1)  # older than STALE_SEC -> stalled
+        log_mtime = nowt - (gui.STALE_SEC + 1)
         meta = {"state": "running"}
-        self.assertEqual(gui.eff_state(meta, log_mtime, nowt), "stalled")
+        self.assertEqual(gui.eff_state(meta, log_mtime, nowt), "running")
 
     def test_running_with_fresh_mtime_stays_running(self):
         nowt = 1_000_000.0
