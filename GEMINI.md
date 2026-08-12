@@ -83,12 +83,15 @@ provider runs `codex exec --json` and extracts only the final agent message — 
 cleaned up `agent.sh last`/the GUI for codex). One process = one fixed engine/model/effort
 — run it again on another port to compare models. **The wrapped CLI is locked to
 text-only completion for bridge calls**: `AGENT_CHAT_ONLY=1` makes codex run
-`--sandbox read-only --ignore-user-config`, claude runs `--strict-mcp-config
---disallowedTools Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, and Kimi uses a
+`--sandbox read-only --ignore-user-config`, claude keeps `--permission-mode acceptEdits`
+and runs `--strict-mcp-config --disallowedTools
+Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, and Kimi uses a
 `tools: []` agent profile, so the bridge can't
 reach a real MCP server (verified live against a configured `unityMCP`) or write files
 instead of answering in the expected format — a normal `agent.sh run` outside the
-bridge is unaffected.
+bridge is unaffected. Chat-only ignores `AGENT_CODEX_SANDBOX` and
+`AGENT_CLAUDE_PERMISSION`: this HTTP-to-CLI boundary must never let arbitrary callers
+gain write, shell, or permission-bypass access through the environment.
 
 ## Rules for using this tool as a subagent orchestrator
 
@@ -96,9 +99,11 @@ bridge is unaffected.
   (`task-<timestamp>-<pid>`) is collision-safe but not descriptive.
 - Always `reply` by task name (or session id) — never rely on "last task" when more
   than one subagent might be running, or you'll answer into the wrong session.
-- Every provider runs fully unattended (no approval prompts — see `providers/*/provider.sh`
+- Every provider runs fully unattended: Codex defaults to `--sandbox danger-full-access`,
+  Claude to `--dangerously-skip-permissions`, Gemini to `--yolo`, opencode to `--auto`,
+  and Kimi to its auto policy (see `providers/*/provider.sh`
   and the "Adding a provider" section of [`README.md`](README.md) for the exact flag
-  each one uses, e.g. Gemini's own `--yolo`). Do not remove those flags; a subagent's
+  and the Codex/Claude opt-down variables). Do not remove those flags; a subagent's
   stdin is always closed, so a provider that blocks on a prompt hangs forever instead
   of failing loudly.
 - Keep this file, `AGENTS.md`, and `SKILL.md` in sync when the tool's interface changes

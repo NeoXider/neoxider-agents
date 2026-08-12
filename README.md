@@ -82,12 +82,12 @@ this project fills.
   that tails a task's `.log` file in real time and pushes each new line as a `data:
   ...` event as the agent produces output, instead of requiring the client to poll
   `/api/thread`. It ends (an `event: done` message, then closes) once the task's state
-  leaves `running`, or after a fixed idle timeout with no new lines. Consumable from
+  leaves the live states (`running`/`idle`), or after a fixed idle timeout with no new lines. Consumable from
   any language that can read an SSE/chunked HTTP stream — `EventSource` in JS, or a
   simple line-buffered HTTP GET in curl/Python/C#.
 - **`/api/wait?task=<name>&timeout=<sec>`** — a convenience blocking-poll endpoint:
   holds the HTTP response open (polling the task's `.meta` state server-side every
-  ~0.5s) until the task's state leaves `running` or `timeout` seconds elapse (capped
+  ~0.5s) until the task leaves the live states (`running`/`idle`) or `timeout` seconds elapse (capped
   at 300s), then returns one JSON object `{"name":..., "state":..., "model":...,
   "log":...}`. Turns a kick-off call (`/api/test-api` or `/api/run`) plus one
   `/api/wait` call into a synchronous round-trip, for callers like a test harness or a
@@ -380,10 +380,14 @@ about this before pointing anything at it:
   by adding real CLI-level restrictions (not just a prompt request): codex gets
   `--sandbox read-only --ignore-user-config` (blocks file/shell execution and skips
   loading `~/.codex/config.toml`, where this machine's real `[mcp_servers.*]` — e.g. a
-  live `unityMCP` — are defined); claude gets `--strict-mcp-config` (zero MCP servers)
-  plus `--disallowedTools Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`. This
-  only applies to bridge-launched subprocesses — a normal `agent.sh run`/`reply` outside
-  the bridge is untouched and keeps full file/shell/MCP access for real coding work.
+  live `unityMCP` — are defined); claude keeps `--permission-mode acceptEdits` and gets
+  `--strict-mcp-config` (zero MCP servers) plus `--disallowedTools
+  Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`. This
+  mode also ignores `AGENT_CODEX_SANDBOX` and `AGENT_CLAUDE_PERMISSION`. That is a
+  non-negotiable security boundary: the HTTP endpoint turns arbitrary callers into CLI
+  invocations, so environment overrides must never grant it write, shell, or permission-bypass
+  access. These restrictions only apply to bridge-launched subprocesses — a normal
+  `agent.sh run`/`reply` outside the bridge keeps full file/shell/MCP access for real coding work.
   Why this matters: without it, a model could reach for a REAL tool (e.g. an actual
   Unity Editor via `unityMCP`) instead of answering in the expected `tool_calls` format
   — silently mutating live state outside the calling application's own control, and
@@ -476,11 +480,21 @@ When adding a provider, find and pass that flag:
 
 | Provider | Flag |
 |---|---|
-| Codex | `--sandbox workspace-write --skip-git-repo-check` |
-| Claude Code | `--permission-mode acceptEdits` |
+| Codex | `--sandbox danger-full-access --skip-git-repo-check` (override normal runs with `AGENT_CODEX_SANDBOX=workspace-write` or `read-only`) |
+| Claude Code | `--dangerously-skip-permissions` (override normal runs with `AGENT_CLAUDE_PERMISSION="--permission-mode acceptEdits"`) |
 | Kimi Code | `-p` uses the built-in auto permission policy (`--auto` must not be combined with it) |
 | Gemini CLI | `--yolo` (auto-approve all tool actions) |
 | opencode | `--auto` |
+
+Full auto is the only workable default because stdin is closed: no caller can answer an approval
+question, so a prompting run hangs until the watchdog kills it. Codex's full-access default is also
+the repository owner's explicit standing decision for Windows. Its sandbox helper rejected every
+write with `patch rejected: writing is blocked by read-only sandbox; rejected by user approval
+settings` (and previously `windows sandbox: helper_unknown_error: setup refresh had errors`), so the
+agent could run commands and report a fix but never apply it. The OpenAI bridge is the deliberate
+exception: `AGENT_CHAT_ONLY=1` always forces Codex read-only and Claude `acceptEdits` with tools
+disabled, ignoring both override variables because arbitrary HTTP callers must never gain write or
+shell access.
 
 See `providers/codex/`, `providers/claude/`, and `providers/kimi/` for full worked examples (alias
 resolution, effort suffixes, and codex's rate-limit JSON parsing).
