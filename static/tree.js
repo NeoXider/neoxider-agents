@@ -6,7 +6,10 @@ function notifyTransitions(tasks) {
     const prev = prevStates[task.name];
     if (!firstLoad && prev && prev !== task.state) {
       if (task.state === "done") toast("success", "✔ " + task.name, t("toast.task_done") + (task.files && task.files !== "0" ? ` · ${task.files} files` : ""));
-      else if (task.state === "error") toast("error", "✖ " + task.name, t("toast.task_error") + " " + (task.exit || "?"));
+      else if (task.state === "error")
+        toast("error", "✖ " + task.name,
+              task.timeout ? t("toast.task_timeout").replace("{s}", task.timeout)
+                           : t("toast.task_error") + " " + (task.exit || "?"));
       else if (task.state === "waiting") toast("warning", "⏳ " + task.name, t("toast.task_waiting"));
       else if (task.state === "stalled") toast("warning", "⚠ " + task.name, t("toast.task_stalled"));
     }
@@ -65,7 +68,7 @@ async function refresh() {
       const renderTask = x => {
         const sub = kids[x.name] ? `<div class="tasks">${sortU(kids[x.name]).map(renderTask).join("")}</div>` : "";
         return `<div class="task ${x.name === SEL ? "sel" : ""} ${isStrike(x.state) ? "strike" : ""}" onclick="select('${x.name}',event)">
-        <span class="em ${x.state === "running" ? "running" : ""}" title="${x.state}">${x.act || ""}${x.topic || ""}</span>
+        <span class="em ${isLive(x.state) ? "running" : ""}" title="${esc(stateLabel(x.state, x.idle_sec))}">${x.act || ""}${x.topic || ""}</span>
         <span class="nm" title="${esc(x.name)}">${esc(x.title || x.name)}</span>
         <span class="pill pe-${x.engine}">${x.engine}/${esc(x.model)}</span>
       </div>${sub}`;

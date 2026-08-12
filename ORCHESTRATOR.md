@@ -59,7 +59,7 @@ matters more than prompt wording.
 | Local / offline / free | `-e opencode -m lmstudio/<model>` or `-m zai/<model>` | opencode's free `opencode/*` models work but are slow; prefer an authed model. |
 
 **Engine quick facts (verified 2026-07-09):**
-- **codex** — opt in with `-e codex`; the 5.6 family needs **codex-cli >= 0.144**. Watch usage limits (`agent.sh doctor`).
+- **codex** — opt in with `-e codex`; the 5.6 family needs **codex-cli >= 0.144**. Watch usage limits (`agent.sh doctor`). Runs are launched with `--ignore-user-config`: `~/.codex/config.toml` (owned by the ChatGPT desktop app) hangs codex's tool router on the very first shell command. Need one of its MCP servers back → `AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp"`.
 - **claude** — default engine, `opus5` by default; `sonnet`, legacy `opus`, and `haiku` are explicit alternatives.
 - **kimi** — `k3` by default (`kimi-code/k3`); `k3-256k`, `coding`, and `highspeed` are verified alternatives; supports named-task resume.
 - **opencode** — works via `--auto`; **pass an authed `-m`** (`zai/...`, `lmstudio/...`); free models are slow.
@@ -68,3 +68,24 @@ matters more than prompt wording.
 **Token economy (already on by default):** `--terse` (concise output) and per-task `PROGRESS.md` are
 on by default. Add `--no-terse` for exploratory work, `--no-progress` for throwaway one-shots. The
 biggest lever is still model/effort — drop to `spark`/`haiku`/`-f low` for easy work.
+
+---
+
+## Watching a fan-out: what the states mean
+
+A delegated step can never hang silently forever — `AGENT_TIMEOUT_SEC` (default 30 min) kills the whole
+process tree and ends the task as `error`/`exit=124` with a `!! TIMEOUT …` line in the log. So when you
+poll `agent.sh list` / `status <name>`:
+
+| State | What it means | What you do |
+|---|---|---|
+| `running` (`▶`) | alive and producing output | wait; `agent.sh log -f <name>` to watch |
+| `running (no output for Nm)` (`▷`, meta state `idle`) | alive but quiet — normal for a long codex/claude step, whose log only flushes when the step ends | wait; only worry if N approaches your `AGENT_TIMEOUT_SEC` |
+| `waiting` (`⏳`) | the agent asked a question | `agent.sh reply <name> "…"` |
+| `stalled` (`⚠`) | the process is gone (reboot/kill) | `agent.sh reply <name> "continue"` |
+| `error` + `⏱ killed by the step watchdog` | it hit the deadline | re-scope the task, or re-run with a bigger `AGENT_TIMEOUT_SEC` |
+
+The CLI and the web panel compute this identically, so the two never contradict each other. Before a
+big fan-out on a new machine (or after a codex-cli upgrade) run `agent.sh doctor --deep`: it makes each
+engine actually execute a shell command, which is the only way to catch an engine that answers happily
+while every command it runs hangs.

@@ -63,6 +63,8 @@ async function loadThread(task) {
     ${task.state === "waiting" ? `<span class="pill" style="color:var(--wait);border-color:var(--wait)">${t("chat.waiting")}</span>` : ""}
     ${task.state === "stalled" ? `<span class="pill" style="color:var(--stall)">${t("chat.stalled")}</span>` : ""}
     ${task.state === "running" ? '<span class="pill" style="color:var(--run);border-color:var(--run)">' + spin(t("chat.running")) + "</span>" : ""}
+    ${task.state === "idle" ? '<span class="pill" style="color:var(--run);border-color:var(--run)">' + spin(stateLabel("idle", task.idle_sec)) + "</span>" : ""}
+    ${task.state === "error" && task.timeout ? `<span class="pill" style="color:var(--stall)">${t("chat.timeout").replace("{s}", task.timeout)}</span>` : ""}
     <span class="sp"></span><span class="pill" title="dir">${esc(base(task.dir))}</span>`;
   $("#replybar").style.display = "flex";
   if (d.log === lastLog) return; // don't touch the DOM/scroll if nothing changed

@@ -6,6 +6,66 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- codex: **stop every shell command from hanging forever — isolate codex from `~/.codex/config.toml`.**
+  Symptom: `agent.sh run -e codex …` started, the model answered, and then every command it issued
+  blocked forever; the task stayed `state=running` for hours with a log that never grew (sometimes
+  reported as `windows sandbox: helper_unknown_error: setup refresh had errors`). Diagnosed live on
+  codex-cli 0.144.0/Windows: the ChatGPT desktop app owns that config file and declares a stdio MCP
+  `node_repl` — the "code-mode host" — plus a `notify` hook and HTTP MCP servers that only answer
+  while the app runs. Started from a plain shell that host is unreachable and codex's tool router
+  blocks on the first exec call (`error=code-mode host closed its stdout`); the identical command
+  with `--ignore-user-config` returned in 360 ms. Normal runs AND resumes now pass
+  `--ignore-user-config` (previously only chat-only/bridge runs did); auth is unaffected
+  (`CODEX_HOME` still supplies it), and a trivial run also got ~2.5x faster (37s -> 15s). Escape
+  hatches: `AGENT_CODEX_USER_CONFIG=1` restores the old behaviour, and
+  `AGENT_CODEX_MCP="name=url,name2=url2"` re-adds only the MCP servers you actually want as
+  `-c mcp_servers.<name>.url=…` (names validated, malformed entries reported on stderr).
+
+- agent.sh: **a step can no longer hang silently — `AGENT_TIMEOUT_SEC` (default 1800s) watchdog.**
+  Every `run`/`reply` provider call goes through `_guarded_run`, which enforces a wall-clock
+  deadline, appends `!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=<N>s and was killed` to the task
+  log, and ends the task as `state=error exit=124` with `timeout=<N>` in `.meta` (surfaced by
+  `status` as `⏱ killed by the step watchdog after <N>s`, and in the GUI as a pill/toast instead of
+  a bare exit code). The kill is a real tree kill: on git-bash the CLI is a native Windows
+  grandchild (`bash → npm shim → codex.exe → powershell.exe`) that plain `kill`/coreutils `timeout`
+  leaves orphaned, so `_kill_tree` recurses over msys children AND `taskkill /F /T`s the process's
+  Windows pid (`/proc/<pid>/winpid`). Verified live: a real codex run killed at 8s left no
+  `codex.exe` behind. `AGENT_TIMEOUT_SEC=0` disables the deadline. `openai-server` now passes its
+  own `--timeout` down (minus 5s), so a hung bridge call can no longer leave an orphaned CLI
+  grandchild appending to the log.
+
+- agent.sh/gui: **one liveness truth — the CLI and the panel cannot contradict each other anymore.**
+  `agent.sh status` reported `▶ running (alive, pid N)` for the very same task the web panel showed
+  as `stalled`: the CLI looked only at the pid, the GUI only at the log's mtime — and a codex step
+  buffers its output, flushing the log only when the step ENDS, so every honest long task looked
+  dead in the panel. Both sides now run the same state machine (`eff_state` in `agent.sh`, mirrored
+  in `gui.py`): pid dead → `stalled`; pid alive but silent longer than `AGENT_STALE_SEC` (300s) →
+  the new honest state `idle`, rendered identically on both sides as `running (no output for Nm)`
+  (icon `▷`); otherwise `running`. `idle` counts as live everywhere (`/api/wait`, the SSE log
+  stream, the tree spinner). The pid check crosses the git-bash↔python boundary through a new
+  `winpid=` field in `.meta`, since a git-bash pid means nothing to native python — and
+  `pid_alive()` probes it with `OpenProcess`/`GetExitCodeProcess`, never `os.kill(pid, 0)`, which
+  on Windows *terminates* the process instead of probing it.
+
+- doctor: **`agent.sh doctor --deep` — the check that actually catches a broken engine.** Everything
+  the old doctor printed was metadata (binary, version, login, limits), none of which notices "the
+  model answers but every shell command hangs". `--deep` runs one real, cheap, read-only one-shot
+  per engine implementing the new `provider_<engine>_doctor_deep` hook (codex today): a throwaway
+  temp dir holding one randomly-named file, and the model is asked to list the directory — the
+  random name can only come back if the whole tool-call round trip works. Prints
+  `codex shell: ok (…, 10s, real command executed)` or `codex shell: BROKEN — <reason>` plus the
+  config-isolation hint, under a hard 60s deadline (`AGENT_CODEX_DOCTOR_TIMEOUT`/`_MODEL`). Plain
+  `doctor` stays instant and just points at `--deep`. `agent.sh help` now prints its whole header
+  comment instead of a hardcoded line range that silently truncated it as the header grew.
+
+- gui: **`agent.sh gui` no longer pretends to have started on a port someone else owns.** Any bind
+  failure used to be read as "the panel is already running", so with an unrelated WebSocket server
+  squatting on the default 8765 the command printed success and opened a browser tab that died with
+  `invalid Connection header`. `choose_port()` now identifies the occupant first (`is_our_panel()`
+  probes `/api/tasks` for its shape, so an older running panel is still recognized) and either
+  reuses it, or moves to the next free port and prints the real URL in an unmissable banner. Port
+  priority is unchanged: CLI arg > `$AGENT_GUI_PORT` > 8765.
+
 - provider: add Kimi Code CLI as a first-class engine (`-e kimi`) with Kimi K3 as the default,
   verified managed alternatives, clean stream-json output, resumable `ses_*` sessions, doctor/GUI
   metadata, and a no-tools profile for OpenAI-bridge calls. Session-id capture is now provider-

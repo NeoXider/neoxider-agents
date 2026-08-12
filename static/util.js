@@ -5,6 +5,13 @@ const $ = s => document.querySelector(s);
 const esc = s => (s ?? "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 const base = p => (!p ? t("tree.no_project") : p.replace(/[\/\\]+$/, "").split(/[\/\\]/).pop() || p);
 const isStrike = st => st === "done" || st === "stalled" || st === "error";
+/* "idle" = the task's process is ALIVE but has produced no output for a while (agent.sh and
+   gui.py compute it identically -- see eff_state in both). A live task, not a dead one. */
+const isLive = st => st === "running" || st === "idle";
+/* Same wording `agent.sh status` prints, so the panel and the terminal never describe the
+   same task differently. */
+const stateLabel = (st, idleSec) =>
+  st === "idle" ? t("chat.no_output").replace("{m}", Math.floor((idleSec || 0) / 60)) : st;
 const spin = text => `<span class="spinner"></span>${text ? " " + esc(text) : ""}`;
 
 async function jget(u) {

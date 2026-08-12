@@ -28,9 +28,15 @@ this project fills.
 - **One thread per task.** `run` creates `<name>.log` + `<name>.meta`; every `reply`
   appends to the *same* log with a timestamped header, so the whole conversation with
   a subagent reads as one file — no session hunting.
-- **Live state, not just logs.** `running` / `waiting` (agent asked a question) /
-  `done` / `error` / `stalled` (process died — e.g. the machine was turned off),
-  detected automatically and shown everywhere.
+- **Live state, not just logs.** `running` / `running (no output for Nm)` (alive but
+  quiet) / `waiting` (agent asked a question) / `done` / `error` / `stalled` (process
+  died — e.g. the machine was turned off), detected automatically and shown everywhere.
+  The CLI and the GUI run the *same* liveness rules, so they cannot disagree about a task.
+- **No silent forever-hangs.** Every step runs under a wall-clock deadline
+  (`AGENT_TIMEOUT_SEC`, default 30 min). On expiry the whole process tree is killed —
+  including the native Windows grandchildren that a plain `timeout` leaves orphaned — the
+  log gets an explicit `!! TIMEOUT …` line and the task ends as `error` with exit code
+  124, instead of sitting in `running` for hours with nobody noticing.
 - **Durable checkpoints.** A markdown snapshot (`<name>.md`) is written after every
   step. Combined with the CLI's own resumable sessions, a task survives a reboot —
   `agent.sh reply <name> "continue"` picks up where it left off. `-p` makes the agent
@@ -40,6 +46,9 @@ this project fills.
   subagents. Claude exposes no remaining-limit API, so its panel shows a **local usage
   estimate** instead — tokens burned in the current 5h window and the last 7 days
   (in+out and cache separately), summed from the CLI's own transcript files, ccusage-style.
+  `doctor --deep` goes further and makes an engine actually **execute a shell command**
+  in a throwaway directory — the only check that catches a CLI that answers normally
+  while every command it runs hangs forever.
 - **Web GUI** (`neoxider` / `agent.sh gui`): a project tree of subagents (activity +
   topic emoji, no redundant status dot), a chat-style thread view with basic markdown,
   a provider/model/**effort** picker whose cached, manually-refreshable rate-limit
@@ -172,6 +181,13 @@ bookmarkable across restarts instead of drifting between manual invocations. Set
 different fixed port once via `export AGENT_GUI_PORT=9000`, or override it for a
 single launch with `neoxider gui 9000` (equivalently `agent.sh gui 9000`).
 
+If that port is already taken, the panel first checks **who** holds it. Its own already-
+running instance → it just opens the browser there (one GUI is enough). Anything else
+(8765 is a popular port — an unrelated WebSocket server squatting on it used to make
+`gui` claim success while the browser tab failed with `invalid Connection header`) → it
+moves to the next free port and prints the URL it actually bound in a banner you cannot
+miss.
+
 ### Multiple installs / shared machines
 
 All state (`.meta`/`.log`/`.md` per task) lives under `AGENT_CLI_LOGS`
@@ -197,8 +213,32 @@ instructions with no extra setup.
 ## CLI reference
 
 See [`SKILL.md`](SKILL.md) for the full command reference (model aliases, the
-question-detection heuristic, path-normalization notes, and known trade-offs) — it
-doubles as the operating manual an AI agent reads before using this tool.
+question-detection heuristic, path-normalization notes, environment knobs such as
+`AGENT_TIMEOUT_SEC`, and known trade-offs) — it doubles as the operating manual an AI
+agent reads before using this tool.
+
+### Troubleshooting: codex answers but every shell command hangs
+
+If a codex task replies normally yet never finishes — no log growth, `state=running` for
+hours — the cause is almost certainly `~/.codex/config.toml`. On a machine with the
+ChatGPT desktop app installed, that file is owned by the app and declares a stdio MCP
+"code-mode host" (`node_repl`, under `AppData\Local\OpenAI\Codex\runtimes\cua_node\…`)
+plus HTTP MCP servers that only answer while the app is running. Launched from a plain
+shell, codex's tool router blocks on the first exec call forever
+(`ERROR codex_core::tools::router: error=code-mode host closed its stdout`).
+
+The wrapper therefore runs codex with `--ignore-user-config` by default (auth is
+unaffected — that flag skips `config.toml` only, `CODEX_HOME` still provides the
+credentials). Confirm with `agent.sh doctor --deep`. To bring a specific MCP server back:
+`AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp"`. To restore the old behaviour
+entirely (not recommended): `AGENT_CODEX_USER_CONFIG=1`.
+
+Unrelated but often seen on the same machines: `codex doctor` itself may die with
+`memory allocation of … bytes failed` on a stale models cache
+(`failed to renew cache TTL: missing field 'base_instructions'`), and `~/.codex/` can
+accumulate multi-megabyte orphaned `..codex-global-state.json.tmp-*` files. Neither
+affects agent.sh; clean them up yourself if `codex doctor` matters to you — this tool
+never touches your `~/.codex/`.
 
 ## OpenAI-compatible bridge (`openai-server`)
 

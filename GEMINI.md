@@ -23,8 +23,18 @@ bash $SK reply <name> "<answer>"                 # continue a task by name
 bash $SK log  -f <name>                          # follow a task live
 bash $SK status <name>                           # state / current step / needs a reply?
 bash $SK doctor                                   # engines + codex rate limits, before a batch
+bash $SK doctor --deep                            # + one REAL run per engine that must EXECUTE a shell command
 bash $SK gui                                      # web GUI (stable default port 8765; or: ./bin/neoxider gui)
 ```
+
+**Never a silent hang.** Every step runs under `AGENT_TIMEOUT_SEC` (default 1800s): on
+expiry the whole process tree is killed, the log gets a `!! TIMEOUT …` line and the task
+ends `state=error exit=124`. A task that is alive but quiet longer than `AGENT_STALE_SEC`
+(300s) is reported as `running (no output for Nm)` — the same wording in the CLI and the
+GUI, which share one liveness rule. Codex runs are isolated from `~/.codex/config.toml`
+(`--ignore-user-config`), because the ChatGPT desktop app's config there hangs codex's
+tool router on the first shell command; re-add a specific MCP server with
+`AGENT_CODEX_MCP="name=url"`, or opt out entirely with `AGENT_CODEX_USER_CONFIG=1`.
 
 **Self-testing your own work.** If you (the agent reading this) just built or modified
 a local web service/API, you can verify it yourself before declaring the task done:
