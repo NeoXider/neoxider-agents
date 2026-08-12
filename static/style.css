@@ -185,6 +185,20 @@ main{flex:1;display:flex;min-height:0}
 @keyframes modalCardIn{from{opacity:0;transform:translateY(28px) scale(.97)}to{opacity:1;transform:translateY(0) scale(1)}}
 .card h2{margin:0 0 10px;font-size:14px;display:flex;align-items:center;gap:8px}
 .card pre{margin:0;overflow:auto;white-space:pre-wrap;font-size:12px;flex:1}
+/* ---- doctor: structured limits first, compact engine rows second ---- */
+#doc{overflow:auto;min-height:180px;font-size:12px;flex:1}
+.doctor-status{color:var(--dim);font-size:11px;margin:-4px 0 10px}
+.doctor-limits{display:grid;gap:8px;margin-bottom:12px}
+.doctor-limit{border:1px solid var(--line);border-radius:7px;padding:8px;background:#0a0e15}
+.doctor-limit-head{display:flex;justify-content:space-between;gap:8px;font-weight:600}
+.doctor-limit-meta{margin-top:3px;color:var(--dim);font-size:11px}
+.doctor-section{font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--dim);margin:12px 0 5px}
+.doctor-engines{border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.doctor-engine{display:grid;grid-template-columns:12px minmax(76px,1fr) minmax(120px,2fr) minmax(90px,1.2fr);gap:8px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--line)}
+.doctor-engine:last-child{border-bottom:0}.doctor-engine-name{font-weight:600}.doctor-engine-meta{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.doctor-dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}.doctor-dot.ok{background:var(--done)}.doctor-dot.not_installed,.doctor-dot.not_logged_in{background:var(--err)}.doctor-dot.checking{background:var(--wait)}
+.doctor-note{color:var(--dim);font-size:11px;line-height:1.45;margin:5px 0 0}.doctor-raw{margin-top:10px}.doctor-raw summary{cursor:pointer;color:var(--dim)}.doctor-raw pre{margin:6px 0 0;white-space:pre-wrap;overflow:auto;font-size:11px;color:var(--dim)}
+@media(max-width:620px){.doctor-engine{grid-template-columns:12px 1fr;gap:4px 8px}.doctor-engine-meta{grid-column:2}}
 
 /* ---- folder browser ---- */
 .crumbs{display:flex;flex-wrap:wrap;gap:2px;font-size:12px;margin-bottom:8px;color:var(--dim)}

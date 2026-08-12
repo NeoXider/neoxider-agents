@@ -669,6 +669,18 @@ fi
 rm -f "$SCRATCH_LOGDIR/st_clean_idle.md"
 
 # ============================================================================================
+section "doctor structured output contract"
+# ============================================================================================
+
+# These are source-level contract checks: running a real doctor here would spawn every installed
+# CLI and make the pure-logic suite slow/flaky. The GUI tests exercise the resulting JSON parser.
+doctor_source="$(sed -n '/    doctor)/,/    gui)/p' "$HERE/agent.sh")"
+assert_match "doctor accepts a machine-readable --json mode" '--json' "$doctor_source"
+assert_match "doctor launches provider probes in background jobs" 'doctor_pids.*\$!' "$doctor_source"
+assert_match "doctor waits for every background provider probe" 'wait.*doctor_pid' "$doctor_source"
+assert_match "doctor emits one structured payload with engines and raw fallback" '"engines": engines.*"raw"' "$doctor_source"
+
+# ============================================================================================
 section "summary"
 # ============================================================================================
 TOTAL=$((PASS + FAIL))

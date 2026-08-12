@@ -127,22 +127,22 @@ provider_claude_resume_cmd() {
     _provider_claude_invoke "$dir" "$answer" "${cargs[@]}"
 }
 
-# provider_claude_doctor — prints a single-line JSON object to stdout. The Claude CLI exposes no
-# remaining-limit API, so instead of "no data" the note carries a LOCAL USAGE ESTIMATE summed from
-# the CLI's own transcript files (~/.claude/projects/**/*.jsonl carry a per-assistant-message
-# `usage` block + timestamp): tokens burned in the current 5h window and the last 7 days — the two
-# windows Anthropic actually rate-limits on. An estimate of what was SPENT, not what REMAINS
-# (the cap depends on the plan and isn't exposed anywhere locally).
+# provider_claude_doctor — prints a single-line JSON object to stdout. Claude Code 2.1.198 has no
+# usage/limits/quota CLI command, but its own binary fetches subscription utilization from the
+# authenticated GET /api/oauth/usage endpoint. Use that real source when the persisted OAuth access
+# token is still current; never refresh/rotate credentials from a read-only doctor command. The
+# fallback is an explicitly labelled LOCAL USAGE-SO-FAR estimate from transcript usage blocks.
 provider_claude_doctor() {
-    local ver py
+    local ver auth py
     if command -v claude >/dev/null 2>&1; then
         ver="$(claude --version 2>&1 | head -1)"
+        auth="$(claude auth status --json 2>/dev/null || true)"
         # `python` can resolve to the non-executable WindowsApps shim in some shells; fall back
         # through real interpreters so the usage estimate works everywhere.
         py="$(command -v python || command -v python3 || command -v python3.12 || echo python)"
-        PYTHONIOENCODING=utf-8 "$py" - "$ver" <<'PY'
-import glob, io, json, os, sys, time
-ver = sys.argv[1]
+        PYTHONIOENCODING=utf-8 "$py" - "$ver" "$auth" <<'PY'
+import glob, io, json, os, sys, time, urllib.error, urllib.request
+ver, auth_raw = sys.argv[1:3]
 now = time.time()
 h5, d7 = now - 5 * 3600, now - 7 * 86400
 sums = {"5h": [0, 0], "7d": [0, 0]}  # [in+out, cache read+creation]
@@ -198,11 +198,51 @@ def fmt(n):
     if n >= 1e9:
         return '%.1fB' % (n / 1e9)
     return '%.1fM' % (n / 1e6) if n >= 1e6 else ('%.0fk' % (n / 1e3) if n >= 1e3 else str(n))
-note = ('usage burned (local transcript estimate): 5h window ~%s in+out (+%s cache) / '
-        'last 7d ~%s in+out (+%s cache). Claude CLI exposes no remaining-limit %%.'
+usage = {"source": "local_transcripts", "estimated": True,
+         "windows": [{"label": "5h", "window_minutes": 300,
+                       "input_output_tokens": sums['5h'][0], "cache_tokens": sums['5h'][1]},
+                      {"label": "7d", "window_minutes": 10080,
+                       "input_output_tokens": sums['7d'][0], "cache_tokens": sums['7d'][1]}]}
+note = ('Local transcript estimate (usage so far, not a provider limit): '
+        '5h ~%s input+output (+%s cache); 7d ~%s input+output (+%s cache).'
         % (fmt(sums['5h'][0]), fmt(sums['5h'][1]), fmt(sums['7d'][0]), fmt(sums['7d'][1])))
+try:
+    auth = json.loads(auth_raw)
+except ValueError:
+    auth = {}
+login = "CLI ok" if auth.get("loggedIn") else "not logged in"
+limits = None
+# The CLI refreshes OAuth credentials internally, but doctor is read-only: only use an access token
+# that is already valid. A stale token falls back honestly instead of rotating a refresh token.
+try:
+    creds = json.load(open(os.path.expanduser('~/.claude/.credentials.json'), encoding='utf-8'))
+    oauth = creds.get('claudeAiOauth') or {}
+    if oauth.get('accessToken') and (oauth.get('expiresAt') or 0) / 1000 > now + 30:
+        req = urllib.request.Request('https://api.anthropic.com/api/oauth/usage', headers={
+            'Authorization': 'Bearer ' + oauth['accessToken'],
+            'anthropic-beta': 'oauth-2025-04-20', 'User-Agent': 'claude-code/' + ver.split()[0]})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            live = json.load(response)
+        def window(key, label, minutes):
+            value = live.get(key) or {}
+            percent = value.get('utilization')
+            if percent is None:
+                percent = value.get('used_percentage')
+            if percent is None:
+                return None
+            return {"label": label, "used_percent": float(percent),
+                    "window_minutes": minutes, "resets_at": value.get('resets_at')}
+        windows = [w for w in (window('five_hour', '5h', 300),
+                               window('seven_day', '7d', 10080)) if w]
+        if windows:
+            limits = {"source": "provider", "plan_type": oauth.get('subscriptionType') or
+                      auth.get('subscriptionType') or "?", "windows": windows}
+            note = "Live remaining-limit utilization from Claude's authenticated /api/oauth/usage endpoint."
+except (OSError, ValueError, urllib.error.URLError, TimeoutError):
+    pass
 print(json.dumps({"engine": "claude", "version": ver, "available": True,
-                   "login": "CLI ok", "limits": None, "note": note}, separators=(",", ":")))
+                   "login": login, "limits": limits, "usage": usage,
+                   "note": note}, separators=(",", ":")))
 PY
     else
         printf '{"engine":"claude","version":"NOT_FOUND","available":false,"login":"","limits":null,"note":""}\n'

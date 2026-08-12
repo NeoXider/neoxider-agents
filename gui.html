@@ -108,8 +108,9 @@
   <h2>🩺 <span data-i18n="doctor.title">doctor — engines and limits</span>
     <span id="doc-busy"></span><span class="sp"></span>
     <button class="mini" onclick="refreshDoctor()" data-i18n-title="doctor.refresh" title="refresh">⟳</button>
+    <button class="mini" onclick="deepDoctor()" data-i18n-title="doctor.deep" title="run deep checks" data-i18n="doctor.deep">deep check</button>
     <button class="mini" onclick="closeModal('m-doc')">✕</button></h2>
-  <pre id="doc" class="mono"><span class="spinner"></span> <span data-i18n="doctor.loading">running doctor…</span></pre>
+  <div id="doc"><span class="spinner"></span> <span data-i18n="doctor.loading">running doctor…</span></div>
 </div></div>
 
 <!-- toast history modal -->

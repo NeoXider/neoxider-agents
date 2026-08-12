@@ -13,7 +13,7 @@ per-provider info (version/login/rate limits) is fetched by shelling out to
 `agent.sh provider-info <engine>` — the plugin's own provider.sh owns that logic, gui.py
 does not hardcode any per-engine behavior.
 """
-import json, os, re, sys, time, subprocess, socket, urllib.parse, urllib.request, glob
+import json, os, re, sys, time, subprocess, socket, urllib.parse, urllib.request, glob, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def to_git_bash_path(p):
@@ -47,6 +47,7 @@ if not BASH:
 LOGDIR = os.environ.get("AGENT_CLI_LOGS") or os.path.expanduser("~/.claude/agent-cli-logs")
 PROJECTS_FILE = os.path.join(LOGDIR, "projects.json")
 BRIDGES_DIR = os.path.join(LOGDIR, "bridges")  # openai_server.py drops bridge-<port>.json here
+DOCTOR_CACHE_FILE = os.path.join(LOGDIR, "gui-doctor-cache.json")
 # Silence threshold, shared with agent.sh (same env var, same default): a still-alive task that
 # has not written anything for this long is reported as "running (no output for Nm)".
 STALE_SEC = int(os.environ.get("AGENT_STALE_SEC") or 300)
@@ -687,6 +688,8 @@ def run_sync(args, timeout=30):
 # recompute, so a transient error doesn't blank out a panel that was showing good data.
 _CACHE = {}
 _CACHE_TTL = 30
+_DOCTOR_REFRESHING = False
+_DOCTOR_LOCK = threading.Lock()
 
 def _cached(key, compute, force=False):
     now = time.time()
@@ -714,20 +717,151 @@ def provider_info(engine, force=False):
     info["cached"] = cached
     return info
 
-def doctor_text(force=False):
-    text, cached = _cached("doctor", lambda: run_sync(["doctor"], timeout=25), force)
-    return text, cached
+def parse_doctor_text(text):
+    """Best-effort parser for pre-JSON doctor output and old persistent caches. New agent.sh
+    returns structured JSON, but keeping this makes upgrades cache-safe and prevents a malformed
+    probe from turning into a raw error box."""
+    payload = {"generated_at": time.time(), "engines": [], "raw": text or "",
+               "deep_engines": []}
+    by_name = {}
+    in_engines = False
+    current_limit_engine = None
+    for line in (text or "").splitlines():
+        if line.startswith("=== engines"):
+            in_engines = True; current_limit_engine = None; continue
+        if line.startswith("==="):
+            in_engines = False
+            m = re.match(r"===\s+(codex|claude)\s+", line)
+            current_limit_engine = m.group(1) if m else None
+            continue
+        if in_engines:
+            m = re.match(r"\s*(\w+)\s+(ok|-|—)\s+(.*)", line)
+            if m:
+                name, marker, version = m.groups()
+                info = by_name.setdefault(name, {"engine": name, "version": "", "available": True,
+                                                  "login": "", "limits": None, "note": ""})
+                info["available"] = marker == "ok"
+                info["version"] = version if marker == "ok" else "NOT_FOUND"
+                info["state"] = "ok" if marker == "ok" else "not_installed"
+                continue
+            m = re.match(r"\s*(\w+)\s+auth\s+(.*)", line)
+            if m and m.group(1) in by_name:
+                info = by_name[m.group(1)]; info["login"] = m.group(2)
+                if re.search(r"required|not logged|logged out", info["login"], re.I):
+                    info["state"] = "not_logged_in"
+        elif current_limit_engine:
+            m = re.match(r"\s*(\w+)\s+\[[#-]+\]\s+([\d.]+)%\s+\(window\s+(\d+)([dhm])\)(?:\s+resets in\s+(\d+)h(\d+)m)?", line)
+            if m and current_limit_engine in by_name:
+                label, used, amount, unit, hours, minutes = m.groups()
+                scale = {"m": 1, "h": 60, "d": 1440}[unit]
+                win = {"label": label, "used_percent": float(used),
+                       "window_minutes": int(amount) * scale, "resets_at": None}
+                if hours is not None:
+                    win["resets_at"] = time.time() + int(hours) * 3600 + int(minutes) * 60
+                limits = by_name[current_limit_engine].setdefault("limits", None)
+                if not limits:
+                    limits = {"source": "legacy_text", "plan_type": "?", "windows": []}
+                    by_name[current_limit_engine]["limits"] = limits
+                limits["windows"].append(win)
+    payload["engines"] = list(by_name.values())
+    return payload
 
-def doctor_cached_only():
-    """Return whatever doctor text is already in the cache WITHOUT shelling out -- fresh or
-    stale, it comes back instantly. This is what lets the GUI paint the last-known-good doctor
-    output the moment the modal opens, then load fresh data on top, instead of blanking the
-    panel behind a slow `agent.sh doctor` run. Returns (text, empty): empty=True only when the
-    cache has never been populated (first open before prewarm finished)."""
+def _doctor_valid(payload):
+    return isinstance(payload, dict) and isinstance(payload.get("engines"), list) and \
+           isinstance(payload.get("raw"), str)
+
+def _load_doctor_cache(path=None):
+    path = path or DOCTOR_CACHE_FILE
+    try:
+        with open(path, encoding="utf-8") as f:
+            hit = json.load(f)
+        if isinstance(hit.get("at"), (int, float)) and _doctor_valid(hit.get("value")):
+            _CACHE["doctor"] = hit
+            return True
+    except (OSError, ValueError, TypeError):
+        pass
+    return False
+
+def _save_doctor_cache(hit, path=None):
+    path = path or DOCTOR_CACHE_FILE
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(hit, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError:
+        pass                         # memory cache still works on a read-only/unavailable log dir
+
+def _compute_doctor():
+    raw = run_sync(["doctor", "--json"], timeout=60)
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        payload = parse_doctor_text(raw)
+    if not _doctor_valid(payload) or not payload["engines"] or raw.startswith("error:"):
+        raise ValueError("doctor returned no usable data")
+    return payload
+
+def _refresh_doctor_worker():
+    global _DOCTOR_REFRESHING
+    try:
+        payload = _compute_doctor()
+        hit = {"value": payload, "at": time.time()}
+        with _DOCTOR_LOCK:
+            _CACHE["doctor"] = hit
+        _save_doctor_cache(hit)
+    except Exception:
+        pass                         # never replace last-known-good data with an error/timeout
+    finally:
+        with _DOCTOR_LOCK:
+            _DOCTOR_REFRESHING = False
+
+def _start_doctor_refresh(force=False):
+    global _DOCTOR_REFRESHING
     hit = _CACHE.get("doctor")
-    if hit:
-        return hit["value"], False
-    return "", True
+    if not force and hit and time.time() - hit["at"] < _CACHE_TTL:
+        return False
+    with _DOCTOR_LOCK:
+        if _DOCTOR_REFRESHING:
+            return False
+        _DOCTOR_REFRESHING = True
+    threading.Thread(target=_refresh_doctor_worker, daemon=True).start()
+    return True
+
+def _empty_doctor_payload():
+    return {"generated_at": 0, "engines": [
+        {"engine": eng, "version": "", "available": None, "login": "", "limits": None,
+         "note": "", "state": "checking"} for eng in ENGINES],
+        "raw": "", "deep_engines": []}
+
+def doctor_cached_only(refresh=False, force=False):
+    """Return last-known-good structured data immediately, including across panel restarts.
+    Optionally start a refresh in a daemon thread; this function itself never waits for a CLI."""
+    if "doctor" not in _CACHE:
+        _load_doctor_cache()
+    if refresh:
+        _start_doctor_refresh(force)
+    hit = _CACHE.get("doctor")
+    value = dict(hit["value"]) if hit else _empty_doctor_payload()
+    age = max(0, time.time() - hit["at"]) if hit else None
+    value.update({"cached": bool(hit), "stale": age is None or age >= _CACHE_TTL,
+                  "age_seconds": age, "refreshing": _DOCTOR_REFRESHING})
+    return value
+
+def doctor_text(force=False):
+    """Synchronous compatibility helper used by tests/older callers; timeout is deliberately
+    well above measured runtime and errors never overwrite a good cache."""
+    if not force and "doctor" in _CACHE and time.time() - _CACHE["doctor"]["at"] < _CACHE_TTL:
+        return _CACHE["doctor"]["value"]["raw"], True
+    try:
+        payload = _compute_doctor()
+        hit = {"value": payload, "at": time.time()}
+        _CACHE["doctor"] = hit; _save_doctor_cache(hit)
+        return payload["raw"], False
+    except Exception:
+        hit = _CACHE.get("doctor")
+        return (hit["value"]["raw"], True) if hit else ("", True)
 
 def engine_models(engine, force=False):
     """Selectable model ids for a provider. opencode exposes a rich dynamic catalog
@@ -972,14 +1106,15 @@ class H(BaseHTTPRequestHandler):
                                                                    "text": read_log(name)}]}],
                                             "parse_error": str(e)}))
         elif u.path == "/api/doctor":
-            if (q.get("cached") or ["0"])[0] == "1":
-                # non-blocking: hand back the cached text immediately (or empty=1 if none yet)
-                text, empty = doctor_cached_only()
-                self._send(200, json.dumps({"text": text, "cached": True, "empty": empty}))
+            if (q.get("deep") or ["0"])[0] == "1":
+                # Explicit user action only: this costs a real model call and may take minutes.
+                self._send(200, json.dumps({"raw": run_sync(["doctor", "--deep"], timeout=240)}))
             else:
                 force = (q.get("force") or ["0"])[0] == "1"
-                text, cached = doctor_text(force)
-                self._send(200, json.dumps({"text": text, "cached": cached}))
+                cached_only = (q.get("cached") or ["0"])[0] == "1"
+                # Always return immediately. The normal/force route merely starts a background
+                # refresh; browser polling paints the new snapshot when it is ready.
+                self._send(200, json.dumps(doctor_cached_only(not cached_only, force)))
         elif u.path == "/api/limits":
             self._send(200, json.dumps({"limits": codex_limits(), "now": time.time()}))
         elif u.path == "/api/provider":
@@ -1140,15 +1275,13 @@ class Srv(ThreadingHTTPServer):
     allow_reuse_address = False  # so we detect "already running" instead of starting a second server on top
 
 def prewarm_cache():
-    """Populate the doctor/provider-info cache for every known engine in the background on
-    startup, so switching providers in the GUI doesn't eat a ~9s cold shell-out the first
-    time you pick one that isn't cached yet -- everything is warm within a few seconds of
-    the server starting, not on first click."""
+    """Start only one doctor refresh on startup. Doctor already probes every provider, while
+    eagerly launching five separate provider-info calls duplicates Windows process creation and
+    can exhaust a busy machine; the right-panel provider cache remains lazy."""
     import threading
     def run():
-        doctor_text()
-        for eng in ENGINES:
-            provider_info(eng)
+        # Disk cache is loaded synchronously and the expensive probe starts in its own thread.
+        doctor_cached_only(refresh=True)
     threading.Thread(target=run, daemon=True).start()
 
 def is_our_panel(port):
