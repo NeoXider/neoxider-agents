@@ -6,6 +6,16 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- gui/doctor: **limits are now usable at a glance.** `doctor` probes provider hooks concurrently
+  and `doctor --json` supplies an ordered structured snapshot to the panel, cutting the measured
+  Windows run from 32.637s to 8.885s. The modal is persistent cache-first/stale-while-revalidate:
+  `gui-doctor-cache.json` survives a panel restart, refresh runs in the background, and an error never
+  replaces last-known-good data. It renders Codex/Claude limits first (progress, percentage, window,
+  reset), compact engine state/version/login rows next, and keeps raw output behind a toggle. Claude
+  uses its authenticated `/api/oauth/usage` utilization only when an existing OAuth token is valid;
+  otherwise it explicitly labels local transcript totals as usage-so-far, never as remaining quota.
+  `doctor --deep` is available only from an explicit panel button.
+
 - gui: **the chat tab now shows the whole subagent conversation, Claude-Code-style.** New
   `GET /api/dialog?task=<name>[&full=1]` parses a task's `.log` into ordered steps (every
   `run`/`reply` with its full prompt and output) and ordered blocks (text / tool call /

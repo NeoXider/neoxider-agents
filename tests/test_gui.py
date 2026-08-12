@@ -646,5 +646,66 @@ class DialogPayloadTests(unittest.TestCase):
         self.assertEqual(sent["code"], 400)
 
 
+class DoctorTests(unittest.TestCase):
+    """Doctor snapshots are structured, cache-first, and never replace good data with errors."""
+
+    def setUp(self):
+        self.scratch = tempfile.mkdtemp()
+        self.orig_cache = dict(gui._CACHE)
+        self.orig_path = gui.DOCTOR_CACHE_FILE
+        self.orig_start = gui._start_doctor_refresh
+        self.orig_run = gui.run_sync
+        gui._CACHE.clear()
+        gui.DOCTOR_CACHE_FILE = os.path.join(self.scratch, "doctor.json")
+
+    def tearDown(self):
+        gui._CACHE.clear(); gui._CACHE.update(self.orig_cache)
+        gui.DOCTOR_CACHE_FILE = self.orig_path
+        gui._start_doctor_refresh = self.orig_start
+        gui.run_sync = self.orig_run
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def _payload(self):
+        return {"generated_at": 1, "raw": "raw doctor", "deep_engines": ["codex"], "engines": [
+            {"engine": "codex", "version": "1", "available": True, "login": "ok", "state": "ok",
+             "limits": {"plan_type": "pro", "primary": {"used_percent": 42, "window_minutes": 300,
+                        "resets_at": 2_000_000_000}}, "note": ""},
+            {"engine": "claude", "version": "2", "available": True, "login": "CLI ok", "state": "ok",
+             "limits": None, "usage": {"source": "local_transcripts", "estimated": True,
+                       "windows": [{"label": "5h", "input_output_tokens": 1200, "cache_tokens": 3400}]},
+             "note": "Local transcript estimate."}]}
+
+    def test_parses_legacy_doctor_text_into_engine_and_limit_rows(self):
+        got = gui.parse_doctor_text("=== engines (CLI) ===\n  codex     ok   1.0\n  codex     auth ok\n"
+                                    "=== codex rate limits (latest session) ===\n"
+                                    "  primary   [####------]   42% (window 5h) resets in 1h02m\n")
+        self.assertEqual(got["engines"][0]["engine"], "codex")
+        self.assertEqual(got["engines"][0]["limits"]["windows"][0]["used_percent"], 42.0)
+
+    def test_cache_first_loads_persistent_snapshot_and_starts_refresh_without_waiting(self):
+        hit = {"value": self._payload(), "at": 1}
+        gui._save_doctor_cache(hit)
+        calls = []
+        gui._start_doctor_refresh = lambda force=False: calls.append(force) or True
+        got = gui.doctor_cached_only(refresh=True)
+        self.assertTrue(got["cached"])
+        self.assertEqual(got["engines"][0]["engine"], "codex")
+        self.assertEqual(calls, [False])
+
+    def test_failed_refresh_keeps_last_good_raw_snapshot(self):
+        gui._CACHE["doctor"] = {"value": self._payload(), "at": 0}
+        gui.run_sync = lambda args, timeout=0: "error: Command timed out"
+        raw, cached = gui.doctor_text(force=True)
+        self.assertTrue(cached)
+        self.assertEqual(raw, "raw doctor")
+
+    def test_doctor_frontend_renders_structured_limits_and_keeps_raw_toggle(self):
+        with open(os.path.join(REPO_ROOT, "static", "modals.js"), encoding="utf-8") as f:
+            js = f.read()
+        self.assertIn("doctor-limit", js)
+        self.assertIn("doctor-engine", js)
+        self.assertIn("doctor-raw", js)
+
+
 if __name__ == "__main__":
     unittest.main()

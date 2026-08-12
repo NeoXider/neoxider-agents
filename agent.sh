@@ -649,93 +649,133 @@ except Exception:
     doctor)
         # --deep: additionally run each provider's real one-shot check (see the deep-checks block
         # at the end). Off by default because it costs a real (cheap) model call per engine.
-        deep=0
+        deep=0; doctor_json=0
         for a in "$@"; do case "$a" in
             --deep) deep=1 ;;
-            *) die "doctor: unknown option '$a' (use --deep)" ;;
+            --json) doctor_json=1 ;;
+            *) die "doctor: unknown option '$a' (use --deep or --json)" ;;
         esac; done
-        # extract a top-level string/bool field from a provider doctor JSON blob (whitespace-tolerant,
-        # unlike a hand-rolled grep regex — provider plugins may emit JSON with or without spaces).
-        json_field() { PYTHONIOENCODING=utf-8 python -c '
-import json, sys
-try:
-    o = json.loads(sys.argv[2])
-except Exception:
-    o = {}
-v = o.get(sys.argv[1])
-print(v if v is not None else "")
-' "$1" "$2" 2>/dev/null; }
-        echo "=== engines (CLI) ==="
+        [ "$deep" = 1 ] && [ "$doctor_json" = 1 ] && die "doctor: --deep and --json cannot be combined"
+
+        # Provider CLIs are slow to spawn on Windows. Probe each engine concurrently into its own
+        # file (so output can never interleave), wait once, then parse/render every JSON object in a
+        # single Python process. The old implementation serialized all probes, spawned Python three
+        # times per JSON object, and then repeated Codex + Claude for their limit blocks.
+        doctor_tmp="$(mktemp -d "${TMPDIR:-/tmp}/agent-doctor.XXXXXX")" || die "doctor: cannot create temp dir"
+        doctor_engines=(); doctor_pids=(); doctor_deep_engines=()
         for pdir in "$PROVIDERS_DIR"/*/; do
             [ -d "$pdir" ] || continue
             eng="$(basename "$pdir")"
             fn="provider_${eng}_doctor"
             declare -F "$fn" >/dev/null 2>&1 || continue
-            info="$("$fn" 2>/dev/null)"
-            avail="$(json_field available "$info")"
-            ver="$(json_field version "$info")"
-            provider_login="$(json_field login "$info")"
-            if [ "$avail" = "True" ]; then
-                printf '  %-9s ok   %s\n' "$eng" "$ver"
-                [ -n "$provider_login" ] && printf '  %-9s auth %s\n' "$eng" "$provider_login"
-            else
-                printf '  %-9s —    (not in PATH)\n' "$eng"
-            fi
+            doctor_engines+=("$eng")
+            ( "$fn" >"$doctor_tmp/$eng.json" 2>/dev/null ||
+              printf '{"engine":%s,"version":"ERROR","available":false,"login":"","limits":null,"note":"probe failed"}\n' \
+                "$(_json_str "$eng")" >"$doctor_tmp/$eng.json" ) &
+            doctor_pids+=("$!")
+            declare -F "provider_${eng}_doctor_deep" >/dev/null 2>&1 && doctor_deep_engines+=("$eng")
         done
-        echo "=== codex rate limits (from latest session) ==="
-        codex_info="$(provider_codex_doctor 2>/dev/null)"
-        PYTHONIOENCODING=utf-8 python - "$codex_info" <<'PY' 2>/dev/null || echo "  (could not read limits - need python + at least one codex session)"
-import json, sys, time
-try:
-    info = json.loads(sys.argv[1])
-except Exception:
-    info = {}
-rl = info.get("limits")
-if not rl:
-    print("  no rate-limit data in recent sessions"); raise SystemExit
-def fmt(win, lbl):
-    if not win: return
-    up = win.get('used_percent') or 0; wm = win.get('window_minutes'); ra = win.get('resets_at')
-    left = ''
-    if ra:
-        d = ra - int(time.time())
-        left = ('  resets in %dh%02dm' % (d//3600, (d%3600)//60)) if d > 0 else '  resets soon'
-    wl = ('%dh' % (wm//60)) if wm and wm % 60 == 0 and wm < 1440 else (('%dd' % (wm//1440)) if wm else '?')
-    n = int(up//10); bar = '#'*n + '-'*(10-n)
-    print("  %-9s [%s] %4.0f%% (window %s)%s" % (lbl, bar, up, wl, left))
-print("  plan: %s" % rl.get('plan_type','?'))
-fmt(rl.get('primary'),   'primary')
-fmt(rl.get('secondary'), 'secondary')
-hi = max((rl.get('primary') or {}).get('used_percent',0), (rl.get('secondary') or {}).get('used_percent',0))
-if hi >= 80: print("  WARNING: limits nearly exhausted - hold off on subagent fan-out")
+        for doctor_pid in "${doctor_pids[@]}"; do wait "$doctor_pid" 2>/dev/null || true; done
+
+        doctor_engine_csv="$(IFS=,; echo "${doctor_engines[*]}")"
+        doctor_deep_csv="$(IFS=,; echo "${doctor_deep_engines[*]}")"
+        PYTHONIOENCODING=utf-8 python - "$doctor_tmp" "$doctor_json" "$doctor_engine_csv" "$doctor_deep_csv" "$deep" <<'PY'
+import json, os, sys, time
+root, as_json, engine_csv, deep_csv, deep = sys.argv[1:6]
+now = time.time()
+engines = []
+for name in filter(None, engine_csv.split(',')):
+    try:
+        with open(os.path.join(root, name + '.json'), encoding='utf-8') as f:
+            info = json.load(f)
+    except Exception:
+        info = {"engine": name, "version": "ERROR", "available": False, "login": "",
+                "limits": None, "note": "probe returned invalid JSON"}
+    info.setdefault('engine', name)
+    login = (info.get('login') or '').lower()
+    if not info.get('available'):
+        info['state'] = 'not_installed'
+    elif any(x in login for x in ('required', 'not logged', 'logged out')):
+        info['state'] = 'not_logged_in'
+    else:
+        info['state'] = 'ok'
+    engines.append(info)
+
+def windows(info):
+    limits = info.get('limits') or {}
+    if isinstance(limits.get('windows'), list):
+        return limits['windows']
+    out = []
+    for key, label in (('primary', 'primary'), ('secondary', 'secondary')):
+        if isinstance(limits.get(key), dict):
+            item = dict(limits[key]); item.setdefault('label', label); out.append(item)
+    return out
+
+def window_label(minutes):
+    if not minutes: return '?'
+    if minutes % 1440 == 0: return '%dd' % (minutes // 1440)
+    if minutes % 60 == 0: return '%dh' % (minutes // 60)
+    return '%dm' % minutes
+
+def reset_text(epoch):
+    if not epoch: return ''
+    left = int(epoch - now)
+    if left <= 0: return ' resets soon'
+    h, rem = divmod(left, 3600)
+    return ' resets in %dh%02dm' % (h, rem // 60)
+
+raw = ['=== engines (CLI) ===']
+for info in engines:
+    name = info['engine']
+    if info['state'] == 'not_installed':
+        raw.append('  %-9s -    (not in PATH)' % name)
+    else:
+        raw.append('  %-9s ok   %s' % (name, info.get('version') or '?'))
+        if info.get('login'): raw.append('  %-9s auth %s' % (name, info['login']))
+for info in engines:
+    if info['engine'] not in ('codex', 'claude'): continue
+    live = windows(info)
+    if live:
+        source = 'latest session' if info['engine'] == 'codex' else 'provider API'
+        raw.append('=== %s rate limits (%s) ===' % (info['engine'], source))
+        raw.append('  plan: %s' % ((info.get('limits') or {}).get('plan_type') or '?'))
+        for win in live:
+            used = float(win.get('used_percent') or win.get('utilization') or 0)
+            n = max(0, min(10, int(used // 10)))
+            raw.append('  %-9s [%s] %4.0f%% (window %s)%s' %
+                       (win.get('label') or 'window', '#'*n + '-'*(10-n), used,
+                        window_label(win.get('window_minutes')), reset_text(win.get('resets_at'))))
+    elif info['engine'] == 'codex':
+        raw.extend(['=== codex rate limits (from latest session) ===',
+                    '  no rate-limit data in recent sessions'])
+claude = next((x for x in engines if x['engine'] == 'claude'), None)
+if claude and not windows(claude):
+    raw.append('=== claude usage (local transcript estimate) ===')
+    raw.append('  ' + (claude.get('note') or 'no local usage data'))
+raw.append('=== deep checks (real one-shot runs) ===')
+if not deep_csv:
+    raw.append('  (no provider implements a deep check)')
+elif deep != '1':
+    raw.append("  skipped - run 'agent.sh doctor --deep' to execute a shell command through each supported engine")
+    raw.append("  (that is the only check that catches 'the model answers but every command hangs')")
+
+payload = {"generated_at": now, "engines": engines, "raw": '\n'.join(raw) + '\n',
+           "deep_engines": [x for x in deep_csv.split(',') if x]}
+if as_json == '1':
+    print(json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+else:
+    sys.stdout.write(payload['raw'])
 PY
-        # Claude exposes no remaining-limit API, so surface the provider's local usage estimate
-        # (tokens burned in the 5h / 7d windows) -- previously computed but never printed here.
-        if declare -F provider_claude_doctor >/dev/null 2>&1; then
-            echo "=== claude usage (local transcript estimate) ==="
-            claude_note="$(json_field note "$(provider_claude_doctor 2>/dev/null)")"
-            if [ -n "$claude_note" ]; then echo "  $claude_note"; else echo "  (no claude usage data)"; fi
-        fi
+        rm -f "$doctor_tmp"/*.json 2>/dev/null || true
+        rmdir "$doctor_tmp" 2>/dev/null || true
         # --- deep checks --------------------------------------------------------------------
         # Everything above is metadata: binary present, version, login, limits. None of it can
         # catch the failure that actually bit us -- the model answers fine but every shell command
         # it issues blocks forever, so the task sits in state=running for hours. Only a REAL run
         # that must execute a command catches that, so it lives behind --deep (one cheap model
         # call per engine that implements provider_<eng>_doctor_deep).
-        echo "=== deep checks (real one-shot runs) ==="
-        deep_any=0
-        for pdir in "$PROVIDERS_DIR"/*/; do
-            [ -d "$pdir" ] || continue
-            eng="$(basename "$pdir")"
-            declare -F "provider_${eng}_doctor_deep" >/dev/null 2>&1 || continue
-            deep_any=1
-            if [ "$deep" = 1 ]; then "provider_${eng}_doctor_deep"; fi
-        done
-        if [ "$deep_any" = 0 ]; then
-            echo "  (no provider implements a deep check)"
-        elif [ "$deep" != 1 ]; then
-            echo "  skipped — run 'agent.sh doctor --deep' to actually execute a shell command through each engine"
-            echo "  (that is the only check that catches 'the model answers but every command hangs')"
+        if [ "$deep" = 1 ]; then
+            for eng in "${doctor_deep_engines[@]}"; do "provider_${eng}_doctor_deep"; done
         fi
         ;;
     gui)

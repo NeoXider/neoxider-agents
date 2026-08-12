@@ -74,6 +74,7 @@ bash $SK clean                                      # delete md clutter (<name>.
                                                      # tasks; live running/idle tasks are never touched;
                                                      # --all incl. waiting, --purge also .log/.meta, -n dry-run
 bash $SK doctor                                     # pre-flight: engines + codex limits (before fanning out!)
+bash $SK doctor --json                              # machine-readable snapshot (used by the panel)
 bash $SK doctor --deep                              # + one REAL cheap run per engine that must EXECUTE a shell
                                                      # command — catches "answers fine, every command hangs"
 bash $SK gui [port]                                 # web control panel over all providers (stable default :8765,

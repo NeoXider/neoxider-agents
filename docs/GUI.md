@@ -129,6 +129,13 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   only when nothing is cached yet), then loads fresh data on top and replaces once it arrives. A small
   header spinner shows while that fresh load is in flight over the cache; the body "running doctor…"
   spinner appears only on the genuine empty-cache first open (before prewarm has populated it).
+- **Doctor snapshot update (current behaviour):** `agent.sh doctor --json` probes provider hooks
+  concurrently and returns ordered structured data. `GET /api/doctor?cached=1` never shells out;
+  it returns the last valid snapshot immediately, including `gui-doctor-cache.json` persisted beside
+  the logs. A normal doctor request starts a background stale-while-revalidate refresh. The modal
+  shows limit progress/reset cards first, then compact engine state/version/login rows; raw terminal
+  output stays available behind a toggle. The explicit `deep check` button is the only path that runs
+  `doctor --deep`, because it costs a real model call. Failed refreshes keep the last good snapshot.
 - **i18n**: English by default, Russian as a second locale (`locales/en.json`/`ru.json`), switchable
   via the header picker (persisted in localStorage). Adding a locale is a drop-in `locales/<code>.json`
   — any key it doesn't cover falls back to English automatically, so a partial translation still works.
