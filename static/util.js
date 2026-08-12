@@ -62,3 +62,23 @@ let collapsed = new Set(), seenProjects = new Set();
 let prevStates = {}, firstLoad = true;
 let lastLog = "";
 let BROWSE_MODE = "pick-field";
+/* Full-dialog view state (chat.js): which task is shown, whether "show the whole dialog" is
+   active, which tool calls are expanded (survives auto-refresh), thinking-blocks visibility,
+   and the server/client clock offset used for live elapsed times. */
+let dlgTask = "", dlgFull = false;
+let expandedTools = new Set();
+let showThinking = false;
+let clockSkew = 0;
+
+/* Short human duration, the exact mirror of gui.py's fmt_dur: 1.2s / 45s / 3m 20s / 1h 5m;
+   null/NaN/negative -> "" (show nothing rather than a made-up number). */
+function fmtDur(s) {
+  if (s == null || isNaN(s) || s < 0) return "";
+  if (s < 9.95) return s.toFixed(1) + "s";
+  const n = Math.round(s);
+  if (n < 60) return n + "s";
+  const m = Math.floor(n / 60), ss = n % 60;
+  if (m < 60) return ss ? m + "m " + ss + "s" : m + "m";
+  const h = Math.floor(m / 60), mm = m % 60;
+  return mm ? h + "h " + mm + "m" : h + "h";
+}

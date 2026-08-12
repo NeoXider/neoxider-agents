@@ -316,6 +316,348 @@ def read_log(name):
     except OSError:
         return ""
 
+# ---- Full-dialog parsing (/api/dialog) ---------------------------------------------------
+# The chat tab shows the WHOLE conversation of a task, Claude-Code-style: every run/reply
+# step in order, tool calls as collapsed one-liners, thinking blocks present in the data but
+# hidden by default, and real durations wherever the log actually carries timestamps.
+# Engines log very differently, so the parser is layered and ALWAYS degrades to raw text:
+#   1. current agent.sh format:  "========== [run] <ts> | engine=.. ==========" steps with
+#      "> PROMPT:" / "> ANSWER:" and "---------- output ----------" sections;
+#   2. legacy codex plaintext inside the output: block marker lines "user"/"codex"/
+#      "thinking"/"exec", tool results ending in "Wall time: N seconds" / "succeeded in Nms:";
+#   3. raw structured JSONL (codex `exec --json`, kimi/claude stream-json) — possible verbatim
+#      in a log when a provider's python cleanup layer is missing and it cats the raw stream;
+#   4. anything else -> one raw text block, never an empty pane, never an exception.
+
+def fmt_dur(sec):
+    """Short human duration: 1.2s / 45s / 3m 20s / 1h 5m. None or negative -> "" (the caller
+    shows NOTHING rather than a made-up number when the log has no timestamps)."""
+    if sec is None:
+        return ""
+    try:
+        sec = float(sec)
+    except (TypeError, ValueError):
+        return ""
+    if sec < 0:
+        return ""
+    if sec < 9.95:
+        return "%.1fs" % sec
+    n = int(round(sec))
+    if n < 60:
+        return "%ds" % n
+    m, s = divmod(n, 60)
+    if m < 60:
+        return "%dm %ds" % (m, s) if s else "%dm" % m
+    h, m = divmod(m, 60)
+    return "%dh %dm" % (h, m) if m else "%dh" % h
+
+_STEP_HDR = re.compile(r"^=+\s*\[(\w+)\]\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*(.*?)\s*=+\s*$")
+_OUT_MARK = "---------- output ----------"
+_CODEX_MARKS = ("user", "codex", "thinking", "exec")
+
+def _ts_epoch(ts):
+    try:
+        return time.mktime(time.strptime(ts, "%Y-%m-%d %H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+
+def _dur_ms_from_result(text):
+    """Per-tool-call duration from codex's own report lines, if present ('Wall time:
+    63.5 seconds' / 'succeeded in 1115ms:' / 'in 1.2s:'). None when absent."""
+    m = re.search(r"Wall time:\s*([\d.]+)\s*seconds", text)
+    if m:
+        return int(float(m.group(1)) * 1000)
+    # codex prints "succeeded in 1115ms:" / "failed in 1.2s:" around the command's output
+    m = re.search(r"(?:succeeded|failed)\s+in\s+([\d.]+)\s*ms\b", text)
+    if m:
+        return int(float(m.group(1)))
+    m = re.search(r"(?:succeeded|failed)\s+in\s+([\d.]+)\s*s\b", text)
+    if m:
+        return int(float(m.group(1)) * 1000)
+    return None
+
+def _text_block(blocks, text):
+    """Append/merge a text block (consecutive text fragments become one block)."""
+    text = (text or "").strip("\n")
+    if not text.strip():
+        return
+    if blocks and blocks[-1]["type"] == "text":
+        blocks[-1]["text"] += "\n" + text
+    else:
+        blocks.append({"type": "text", "text": text})
+
+def _parse_jsonl(lines):
+    """Structured JSONL streams. Returns None when nothing recognisable was found (caller then
+    tries the next format). Recognises codex `exec --json` events, kimi stream-json roles and
+    claude stream-json message envelopes; unknown event kinds are skipped, never fatal."""
+    blocks, recognized, last_tool = [], 0, None
+    for line in lines:
+        s = line.strip()
+        if not s or s[0] != "{":
+            continue
+        try:
+            o = json.loads(s)
+        except ValueError:
+            continue
+        if not isinstance(o, dict):
+            continue
+        t = o.get("type")
+        # --- codex exec --json: {"type":"item.completed","item":{...}}
+        if t in ("item.started", "item.completed") and isinstance(o.get("item"), dict):
+            recognized += 1
+            if t != "item.completed":
+                continue
+            it = o["item"]
+            it_t = it.get("type")
+            if it_t == "agent_message":
+                _text_block(blocks, it.get("text") or "")
+            elif it_t == "reasoning":
+                txt = it.get("text") or ""
+                if txt.strip():
+                    blocks.append({"type": "thinking", "text": txt.strip("\n")})
+            elif it_t == "command_execution":
+                last_tool = {"type": "tool", "name": "exec", "arg": it.get("command") or "",
+                             "result": (it.get("aggregated_output") or "").strip("\n"),
+                             "dur_ms": None}
+                blocks.append(last_tool)
+            elif it_t in ("mcp_tool_call", "custom_tool_call"):
+                last_tool = {"type": "tool",
+                             "name": it.get("tool") or it.get("name") or it_t,
+                             "arg": json.dumps(it.get("arguments") or it.get("input") or "", ensure_ascii=False),
+                             "result": json.dumps(it.get("result") or it.get("output") or "", ensure_ascii=False),
+                             "dur_ms": None}
+                blocks.append(last_tool)
+            elif it_t == "file_change":
+                ch = it.get("changes") or []
+                arg = ", ".join(str(c.get("path") or "") for c in ch if isinstance(c, dict))
+                blocks.append({"type": "tool", "name": "file_change", "arg": arg,
+                               "result": "", "dur_ms": None})
+        elif t in ("thread.started", "turn.started", "turn.completed", "turn.failed"):
+            recognized += 1  # codex session chrome -- known, but nothing to render
+        # --- kimi stream-json: {"role":"assistant","content":...,"tool_calls":[...]}
+        elif o.get("role") == "assistant":
+            recognized += 1
+            content = o.get("content")
+            if isinstance(content, list):  # claude-style content blocks inside a kimi/claude line
+                for c in content:
+                    if not isinstance(c, dict):
+                        continue
+                    if c.get("type") == "text":
+                        _text_block(blocks, c.get("text") or "")
+                    elif c.get("type") == "thinking":
+                        blocks.append({"type": "thinking", "text": (c.get("thinking") or "").strip("\n")})
+                    elif c.get("type") == "tool_use":
+                        last_tool = {"type": "tool", "name": c.get("name") or "tool",
+                                     "arg": json.dumps(c.get("input") or "", ensure_ascii=False),
+                                     "result": "", "dur_ms": None}
+                        blocks.append(last_tool)
+            elif isinstance(content, str):
+                _text_block(blocks, content)
+            for tc in (o.get("tool_calls") or []):
+                fn = (tc or {}).get("function") or {}
+                last_tool = {"type": "tool", "name": fn.get("name") or "tool",
+                             "arg": str(fn.get("arguments") or ""), "result": "", "dur_ms": None}
+                blocks.append(last_tool)
+        elif o.get("role") == "tool":
+            recognized += 1
+            res = o.get("content")
+            if not isinstance(res, str):
+                res = json.dumps(res, ensure_ascii=False)
+            if last_tool is not None and not last_tool["result"]:
+                last_tool["result"] = res.strip("\n")
+            else:
+                blocks.append({"type": "tool", "name": o.get("name") or "tool", "arg": "",
+                               "result": res.strip("\n"), "dur_ms": None})
+        elif o.get("role") in ("meta", "user", "system"):
+            recognized += 1  # session hints / echoed input -- not rendered
+        # --- claude stream-json envelope: {"type":"assistant","message":{"content":[...]}}
+        elif t in ("assistant", "user") and isinstance(o.get("message"), dict):
+            recognized += 1
+            content = (o["message"] or {}).get("content")
+            if isinstance(content, list):
+                for c in content:
+                    if not isinstance(c, dict):
+                        continue
+                    ct = c.get("type")
+                    if ct == "text":
+                        _text_block(blocks, c.get("text") or "")
+                    elif ct == "thinking":
+                        blocks.append({"type": "thinking", "text": (c.get("thinking") or "").strip("\n")})
+                    elif ct == "tool_use":
+                        last_tool = {"type": "tool", "name": c.get("name") or "tool",
+                                     "arg": json.dumps(c.get("input") or "", ensure_ascii=False),
+                                     "result": "", "dur_ms": None}
+                        blocks.append(last_tool)
+                    elif ct == "tool_result":
+                        res = c.get("content")
+                        if not isinstance(res, str):
+                            res = json.dumps(res, ensure_ascii=False)
+                        if last_tool is not None and not last_tool["result"]:
+                            last_tool["result"] = res.strip("\n")
+            elif isinstance(content, str):
+                _text_block(blocks, content)
+        elif t in ("system", "result", "stream_event", "rate_limit_event"):
+            recognized += 1
+    return blocks if recognized else None
+
+def _parse_codex_plaintext(lines):
+    """Legacy codex `exec` plaintext: bare marker lines user/codex/thinking/exec delimit blocks;
+    an exec block's first line is the command, the rest is its output (ending in a duration
+    line). Banner/chrome before the first marker and the trailing 'tokens used' block are
+    dropped. 'user' blocks are returned as user_text so the caller can use them as the step
+    prompt when the log has no > PROMPT: section (very old logs have no step headers at all)."""
+    blocks, mode, buf = [], None, []
+    def flush():
+        nonlocal buf
+        text = "\n".join(buf).strip("\n")
+        buf = []
+        if mode in (None, "user", "skip"):
+            if mode == "user" and text.strip():
+                blocks.append({"type": "user_text", "text": text})
+            return
+        if mode == "thinking":
+            if text.strip():
+                blocks.append({"type": "thinking", "text": text})
+            return
+        if mode == "exec":
+            parts = text.split("\n", 1)
+            cmd = parts[0].strip()
+            result = parts[1] if len(parts) > 1 else ""
+            blocks.append({"type": "tool", "name": "exec", "arg": cmd,
+                           "result": result.strip("\n"),
+                           "dur_ms": _dur_ms_from_result(result)})
+            return
+        _text_block(blocks, text)  # mode == "codex"
+    for line in lines:
+        if line in _CODEX_MARKS:
+            flush()
+            mode = line
+        elif line.startswith("tokens used"):
+            flush()
+            mode = "skip"
+        else:
+            buf.append(line)
+    flush()
+    return blocks
+
+def parse_output_blocks(text):
+    """One step's raw output -> ordered blocks (text / tool / thinking / user_text).
+    Never raises; unrecognised content comes back as a single raw text block."""
+    try:
+        lines = text.split("\n")
+        blocks = _parse_jsonl(lines)
+        if blocks is not None:
+            return blocks
+        if any(l in _CODEX_MARKS for l in lines):
+            return _parse_codex_plaintext(lines)
+        blocks = []
+        _text_block(blocks, text)
+        return blocks
+    except Exception:
+        return [{"type": "text", "text": text}] if text else []
+
+def parse_dialog(text, log_mtime=0, now=None):
+    """Whole .log -> ordered step list. A step is one run/reply: its prompt, its parsed output
+    blocks, its start timestamp and (when derivable) its duration. Duration sources, in order:
+    the NEXT step's header timestamp (real measured interval), else the log's mtime for the
+    final step of a finished task. A log with no step headers at all becomes one synthetic
+    'log' step over the raw content — the unrecognised-format fallback."""
+    now = time.time() if now is None else now
+    steps, cur, section = [], None, None
+    def new_step(kind, ts="", info=""):
+        return {"kind": kind, "ts": ts, "epoch": _ts_epoch(ts) if ts else None,
+                "info": info, "prompt_label": "", "prompt_lines": [], "out_lines": []}
+    for line in text.split("\n"):
+        m = _STEP_HDR.match(line)
+        if m:
+            cur = new_step(m.group(1), m.group(2), m.group(3))
+            steps.append(cur)
+            section = None
+            continue
+        if cur is None:
+            if not line.strip():
+                continue  # hdr() writes a leading blank line before the first step header
+            cur = new_step("log")  # no header (legacy/foreign log): everything is output
+            steps.append(cur)
+            section = "out"
+        if line in ("> PROMPT:", "> ANSWER:"):
+            section = "prompt"
+            cur["prompt_label"] = line[2:-1]
+        elif line == _OUT_MARK:
+            section = "out"  # repeated markers (provider cleanup chrome) just re-enter output
+        elif section == "prompt":
+            cur["prompt_lines"].append(line)
+        elif section == "out":
+            cur["out_lines"].append(line)
+    for i, st in enumerate(steps):
+        st["prompt"] = "\n".join(st.pop("prompt_lines")).strip()
+        blocks = parse_output_blocks("\n".join(st.pop("out_lines")))
+        if not st["prompt"] and blocks and blocks[0]["type"] == "user_text":
+            st["prompt"] = blocks.pop(0)["text"]  # legacy log: the 'user' block IS the prompt
+        st["blocks"] = [b for b in blocks if b["type"] != "user_text"] or blocks
+        end = steps[i + 1]["epoch"] if i + 1 < len(steps) else (log_mtime or None)
+        dur = (end - st["epoch"]) if (st["epoch"] and end) else None
+        st["duration_s"] = max(0.0, dur) if dur is not None else None
+        st["duration"] = fmt_dur(st["duration_s"])
+        for b in st["blocks"]:
+            if b.get("dur_ms") is not None:
+                b["duration"] = fmt_dur(b["dur_ms"] / 1000.0)
+    return steps
+
+_DIALOG_BLOCK_CAP = 20000  # chars per block in the default (non-full) payload
+_DIALOG_STEP_LIMIT = 30    # steps in the default payload; full=1 lifts both caps
+_DIALOG_CACHE = {}         # single-slot: the panel views one task at a time
+
+def dialog_payload(name, full=False, offset=None, limit=None):
+    """Structured conversation for the chat tab. Default payload = the LAST
+    _DIALOG_STEP_LIMIT steps with oversized blocks capped (has_more flags the rest);
+    full=1 returns every step and every byte — the 'show the whole dialog' control.
+    Parsed steps are cached keyed by (mtime, size) so the 3s auto-refresh re-parses only
+    when the log actually changed."""
+    try:
+        logp = os.path.join(LOGDIR, name + ".log")
+        st_ = os.stat(logp)
+        mtime, size = st_.st_mtime, st_.st_size
+    except OSError:
+        mtime, size = 0, 0
+    now = time.time()
+    meta = read_meta(name)
+    state = eff_state(meta, mtime, now)
+    key = (name, mtime, size)
+    hit = _DIALOG_CACHE.get("parsed")
+    if hit and hit[0] == key:
+        steps = hit[1]
+    else:
+        steps = parse_dialog(read_log(name), mtime, now)
+        _DIALOG_CACHE.clear()
+        _DIALOG_CACHE["parsed"] = (key, steps)
+    total = len(steps)
+    if full:
+        off, lim = 0, total
+    else:
+        lim = limit if limit is not None else _DIALOG_STEP_LIMIT
+        off = offset if offset is not None else max(0, total - lim)
+    out = []
+    for i in range(off, min(total, off + lim)):
+        st = dict(steps[i])
+        st["i"] = i
+        if not full:
+            blocks = []
+            for b in st["blocks"]:
+                b = dict(b)
+                for fld in ("text", "arg", "result"):
+                    v = b.get(fld)
+                    if isinstance(v, str) and len(v) > _DIALOG_BLOCK_CAP:
+                        b[fld] = v[:_DIALOG_BLOCK_CAP]
+                        b["truncated"] = True
+                blocks.append(b)
+            st["blocks"] = blocks
+        out.append(st)
+    return {"name": name, "state": state, "engine": meta.get("engine", "?"),
+            "model": meta.get("model", "?"), "total_steps": total, "offset": off,
+            "has_more": off > 0, "steps": out, "now": now,
+            "mtime": mtime, "log_size": size}
+
 def spawn(args, terminal=False):
     """Background launch of agent.sh. terminal=True -> a separate console window with a live chat view."""
     kw = dict(cwd=HERE)
@@ -610,6 +952,25 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/thread":
             name = (q.get("task") or [""])[0]
             self._send(200, json.dumps({"name": name, "log": read_log(name)}))
+        elif u.path == "/api/dialog":
+            name = (q.get("task") or [""])[0]
+            if not name:
+                return self._send(400, json.dumps({"error": "task required"}))
+            full = (q.get("full") or ["0"])[0] == "1"
+            try:
+                self._send(200, json.dumps(dialog_payload(name, full=full)))
+            except Exception as e:  # never blank the pane: fall back to the raw log as one step
+                self._send(200, json.dumps({"name": name, "state": "?", "engine": "?",
+                                            "model": "?", "total_steps": 1, "offset": 0,
+                                            "has_more": False, "now": time.time(),
+                                            "mtime": 0, "log_size": 0,
+                                            "steps": [{"kind": "log", "ts": "", "epoch": None,
+                                                       "info": "", "i": 0, "prompt": "",
+                                                       "prompt_label": "", "duration_s": None,
+                                                       "duration": "",
+                                                       "blocks": [{"type": "text",
+                                                                   "text": read_log(name)}]}],
+                                            "parse_error": str(e)}))
         elif u.path == "/api/doctor":
             if (q.get("cached") or ["0"])[0] == "1":
                 # non-blocking: hand back the cached text immediately (or empty=1 if none yet)
