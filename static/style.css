@@ -132,6 +132,27 @@ main{flex:1;display:flex;min-height:0}
 .bubble pre.code{background:#0b0f16;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;margin:6px 0}
 .bubble pre.code code{background:none;padding:0}
 .mh1,.mh2,.mh3{font-weight:700;margin:8px 0 2px} .mh1{font-size:15px}.mh2{font-size:14px}.mh3{font-size:13px}
+/* ---- full-dialog view (chat.js): step separators, collapsed tool calls, hidden thinking ---- */
+.step-sep{display:flex;align-items:center;gap:10px;color:var(--dim);font-size:11px;margin-top:6px}
+.step-sep::before,.step-sep::after{content:"";flex:1;border-top:1px solid var(--line)}
+.step-sep .dur{color:var(--accent);font-variant-numeric:tabular-nums}
+.msg.agent{max-width:94%}
+.msg.agent .bubble{margin:6px 0}
+.think{display:none;color:var(--dim);font-style:italic;font-size:12px;white-space:pre-wrap;border-left:2px solid var(--line);padding:4px 10px;margin:6px 0}
+#chat.show-think .think{display:block}
+.tool{margin:4px 0;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-size:12px}
+.tool-h{display:flex;gap:6px;align-items:baseline;padding:4px 10px;cursor:pointer;user-select:none;white-space:nowrap;overflow:hidden}
+.tool-h:hover{background:#ffffff08}
+.tool-h .tw{color:var(--dim);flex:none;transition:transform .12s}
+.tool.open .tool-h .tw{transform:rotate(90deg)}
+.tool-h b{color:var(--accent);font-weight:600;flex:none}
+.tool-h .targ{color:var(--dim);overflow:hidden;text-overflow:ellipsis}
+.tool-h .tdur{margin-left:auto;color:var(--dim);flex:none;font-variant-numeric:tabular-nums}
+.tool-b{display:none;margin:0;border-top:1px solid var(--line);padding:8px 10px;overflow:auto;max-height:420px;white-space:pre-wrap;word-break:break-word;font-size:12px;color:var(--fg)}
+.tool.open .tool-b{display:block}
+.trunc{color:var(--dim);font-size:11px;cursor:pointer;margin:2px 0}
+.trunc:hover{color:var(--accent)}
+#chead button.mini.on{border-color:var(--accent);color:var(--accent)}
 #replybar{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line);background:var(--panel);align-items:flex-end}
 #replybar textarea{flex:1;height:40px}
 #replybar .rcol{display:flex;flex-direction:column;gap:6px;align-items:stretch}

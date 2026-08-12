@@ -350,5 +350,301 @@ class IsOurPanelTests(unittest.TestCase):
             srv.close()
 
 
+class FmtDurTests(unittest.TestCase):
+    """fmt_dur is the single human-duration formatter for the dialog view (per step and per
+    tool call): 1.2s / 45s / 3m 20s / 1h 5m; no data -> empty string, never a made-up number."""
+
+    def test_sub_ten_seconds_one_decimal(self):
+        self.assertEqual(gui.fmt_dur(1.23), "1.2s")
+
+    def test_whole_seconds_no_decimal(self):
+        self.assertEqual(gui.fmt_dur(45), "45s")
+
+    def test_minutes_and_seconds(self):
+        self.assertEqual(gui.fmt_dur(200), "3m 20s")
+
+    def test_round_minute_drops_zero_seconds(self):
+        self.assertEqual(gui.fmt_dur(180), "3m")
+
+    def test_hours(self):
+        self.assertEqual(gui.fmt_dur(3900), "1h 5m")
+        self.assertEqual(gui.fmt_dur(3600), "1h")
+
+    def test_rounding_near_minute_boundary(self):
+        self.assertEqual(gui.fmt_dur(59.6), "1m")
+
+    def test_none_and_negative_are_empty(self):
+        self.assertEqual(gui.fmt_dur(None), "")
+        self.assertEqual(gui.fmt_dur(-3), "")
+        self.assertEqual(gui.fmt_dur("junk"), "")
+
+
+CURRENT_LOG = """
+========== [run] 2026-08-12 10:00:00 | engine=codex model=sol dir=/c/x ==========
+> PROMPT:
+fix the tests
+---------- output ----------
+session id: 019ff
+---------- output ----------
+Done, all green.
+"""
+
+LEGACY_CODEX_LOG = """OpenAI Codex v0.130.0
+--------
+workdir: C:\\X
+--------
+user
+fix the bug
+thinking
+I should look at the tests first
+codex
+Let me check.
+exec
+rg --files Assets
+ succeeded in 1115ms:
+Assets/a.cs
+codex
+Fixed it.
+tokens used
+12,345
+"""
+
+
+def _jsonl_log(objs):
+    out = "\n========== [run] 2026-08-12 10:00:00 | engine=x model=y dir=/c/x ==========\n"
+    out += "> PROMPT:\ndo it\n---------- output ----------\n"
+    for o in objs:
+        out += json.dumps(o) + "\n"
+    return out
+
+
+class ParseDialogTests(unittest.TestCase):
+    """parse_dialog turns a raw .log into ordered steps; parse_output_blocks inside it handles
+    every engine's flavour and ALWAYS degrades to raw text (never an exception, never empty)."""
+
+    def test_current_format_steps_prompt_and_text(self):
+        steps = gui.parse_dialog(CURRENT_LOG, log_mtime=0, now=0)
+        self.assertEqual(len(steps), 1)
+        st = steps[0]
+        self.assertEqual(st["kind"], "run")
+        self.assertEqual(st["ts"], "2026-08-12 10:00:00")
+        self.assertEqual(st["prompt"], "fix the tests")
+        self.assertEqual([b["type"] for b in st["blocks"]], ["text"])
+        self.assertIn("session id: 019ff", st["blocks"][0]["text"])  # chrome kept as text
+        self.assertIn("Done, all green.", st["blocks"][0]["text"])
+
+    def test_leading_blank_line_creates_no_phantom_step(self):
+        # hdr() writes a blank line before the first header; it must not become a 'log' step.
+        steps = gui.parse_dialog(CURRENT_LOG, log_mtime=0, now=0)
+        self.assertEqual([s["kind"] for s in steps], ["run"])
+
+    def test_step_duration_from_next_header_and_mtime(self):
+        log = CURRENT_LOG + """
+========== [reply] 2026-08-12 10:05:00 | engine=codex model=sol dir=/c/x ==========
+> ANSWER:
+continue
+---------- output ----------
+More work done.
+"""
+        steps = gui.parse_dialog(log, log_mtime=gui._ts_epoch("2026-08-12 10:09:00"), now=0)
+        self.assertEqual([s["kind"] for s in steps], ["run", "reply"])
+        self.assertEqual(steps[0]["duration"], "5m")          # until the reply's header
+        self.assertEqual(steps[1]["duration"], "4m")          # final step: until log mtime
+        self.assertEqual(steps[1]["prompt"], "continue")
+        self.assertEqual(steps[1]["prompt_label"], "ANSWER")
+
+    def test_no_timestamps_means_no_duration(self):
+        steps = gui.parse_dialog("just some raw text\n", log_mtime=0, now=0)
+        self.assertEqual(steps[0]["duration"], "")
+        self.assertIsNone(steps[0]["duration_s"])
+
+    def test_legacy_codex_plaintext_blocks(self):
+        steps = gui.parse_dialog(LEGACY_CODEX_LOG, log_mtime=0, now=0)
+        self.assertEqual(len(steps), 1)
+        st = steps[0]
+        self.assertEqual(st["kind"], "log")  # no step headers in a legacy log
+        self.assertEqual(st["prompt"], "fix the bug")  # the 'user' block becomes the prompt
+        types = [b["type"] for b in st["blocks"]]
+        self.assertEqual(types, ["thinking", "text", "tool", "text"])
+        tool = st["blocks"][2]
+        self.assertEqual(tool["name"], "exec")
+        self.assertEqual(tool["arg"], "rg --files Assets")
+        self.assertIn("Assets/a.cs", tool["result"])
+        self.assertEqual(tool["dur_ms"], 1115)
+        self.assertEqual(tool["duration"], "1.1s")
+        # banner chrome and the 'tokens used' block are dropped
+        blob = json.dumps(st, ensure_ascii=False)
+        self.assertNotIn("OpenAI Codex v0.130.0", blob)
+        self.assertNotIn("12,345", blob)
+
+    def test_legacy_codex_wall_time_duration(self):
+        self.assertEqual(gui._dur_ms_from_result("...output...\nWall time: 63.5 seconds"), 63500)
+
+    def test_codex_jsonl_stream(self):
+        log = _jsonl_log([
+            {"type": "thread.started", "thread_id": "abc"},
+            {"type": "item.completed", "item": {"type": "reasoning", "text": "thinking hard"}},
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "ls -la",
+                                                "aggregated_output": "file1\nfile2", "exit_code": 0}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Done."}},
+        ])
+        blocks = gui.parse_dialog(log, log_mtime=0, now=0)[0]["blocks"]
+        self.assertEqual([b["type"] for b in blocks], ["thinking", "tool", "text"])
+        self.assertEqual(blocks[1]["name"], "exec")
+        self.assertEqual(blocks[1]["arg"], "ls -la")
+        self.assertEqual(blocks[1]["result"], "file1\nfile2")
+        blob = json.dumps(blocks)
+        self.assertNotIn("abc", blob)  # thread.started is chrome, not rendered
+
+    def test_kimi_jsonl_stream_tool_result_attached(self):
+        log = _jsonl_log([
+            {"role": "meta", "type": "session.resume_hint", "session_id": "ses_1"},
+            {"role": "assistant", "content": "I will run it.",
+             "tool_calls": [{"function": {"name": "Bash", "arguments": '{"cmd":"ls"}'}}]},
+            {"role": "tool", "content": "file1"},
+            {"role": "assistant", "content": "All done"},
+        ])
+        blocks = gui.parse_dialog(log, log_mtime=0, now=0)[0]["blocks"]
+        self.assertEqual([b["type"] for b in blocks], ["text", "tool", "text"])
+        self.assertEqual(blocks[1]["name"], "Bash")
+        self.assertEqual(blocks[1]["result"], "file1")
+
+    def test_claude_stream_json_envelope(self):
+        log = _jsonl_log([
+            {"type": "system", "subtype": "init"},
+            {"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": "reading file"},
+                {"type": "tool_use", "name": "Read", "input": {"file_path": "/x.py"}}]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "file body"}]}},
+            {"type": "result", "subtype": "success"},
+        ])
+        blocks = gui.parse_dialog(log, log_mtime=0, now=0)[0]["blocks"]
+        self.assertEqual([b["type"] for b in blocks], ["thinking", "text", "tool"])
+        self.assertEqual(blocks[2]["name"], "Read")
+        self.assertEqual(blocks[2]["result"], "file body")
+
+    def test_unrecognised_format_falls_back_to_raw_text(self):
+        junk = "\x00\x01 random\nbinary junk {{{\nnot json at all"
+        steps = gui.parse_dialog(junk, log_mtime=0, now=0)  # must not raise
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["kind"], "log")
+        self.assertEqual([b["type"] for b in steps[0]["blocks"]], ["text"])
+        self.assertIn("binary junk", steps[0]["blocks"][0]["text"])
+
+    def test_json_looking_prose_is_not_misparsed_as_a_stream(self):
+        # an answer that merely CONTAINS a json line must stay plain text
+        log = "\n========== [run] 2026-08-12 10:00:00 | e ==========\n> PROMPT:\np\n---------- output ----------\n"
+        log += 'Here is the config: {"foo": 1, "bar": [2]}\nDone.\n'
+        blocks = gui.parse_dialog(log, log_mtime=0, now=0)[0]["blocks"]
+        self.assertEqual([b["type"] for b in blocks], ["text"])
+        self.assertIn('"foo": 1', blocks[0]["text"])
+
+    def test_empty_log_gives_no_steps(self):
+        self.assertEqual(gui.parse_dialog("", log_mtime=0, now=0), [])
+        self.assertEqual(gui.parse_dialog("\n\n", log_mtime=0, now=0), [])
+
+    def test_parse_output_blocks_never_raises_on_none_like_input(self):
+        self.assertEqual(gui.parse_output_blocks(""), [])
+
+
+class DialogPayloadTests(unittest.TestCase):
+    """dialog_payload backs GET /api/dialog: pagination over steps (default = the LAST
+    _DIALOG_STEP_LIMIT), per-block size caps in the default payload, full=1 lifts both."""
+
+    def setUp(self):
+        self.scratch = tempfile.mkdtemp()
+        self._orig = gui.LOGDIR
+        gui.LOGDIR = self.scratch
+        gui._DIALOG_CACHE.clear()
+
+    def tearDown(self):
+        gui.LOGDIR = self._orig
+        gui._DIALOG_CACHE.clear()
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def _write_task(self, name, log):
+        with open(os.path.join(self.scratch, name + ".log"), "w", encoding="utf-8") as f:
+            f.write(log)
+        with open(os.path.join(self.scratch, name + ".meta"), "w", encoding="utf-8") as f:
+            f.write("engine=codex\nmodel=sol\nstate=done\n")
+
+    def test_payload_fields_and_single_step(self):
+        self._write_task("t1", CURRENT_LOG)
+        p = gui.dialog_payload("t1")
+        self.assertEqual(p["name"], "t1")
+        self.assertEqual(p["engine"], "codex")
+        self.assertEqual(p["state"], "done")
+        self.assertEqual(p["total_steps"], 1)
+        self.assertFalse(p["has_more"])
+        self.assertEqual(p["steps"][0]["i"], 0)
+
+    def test_default_payload_is_last_n_steps_with_has_more(self):
+        log = ""
+        for i in range(gui._DIALOG_STEP_LIMIT + 5):
+            log += ("\n========== [run] 2026-08-12 10:%02d:00 | e ==========\n"
+                    "> PROMPT:\nstep %d\n---------- output ----------\nout %d\n" % (i % 60, i, i))
+        self._write_task("t2", log)
+        p = gui.dialog_payload("t2")
+        self.assertEqual(p["total_steps"], gui._DIALOG_STEP_LIMIT + 5)
+        self.assertEqual(len(p["steps"]), gui._DIALOG_STEP_LIMIT)
+        self.assertTrue(p["has_more"])
+        self.assertEqual(p["offset"], 5)
+        self.assertEqual(p["steps"][0]["prompt"], "step 5")  # the OLDEST shown is step 5
+        pf = gui.dialog_payload("t2", full=True)
+        self.assertEqual(len(pf["steps"]), gui._DIALOG_STEP_LIMIT + 5)
+        self.assertFalse(pf["has_more"])
+        self.assertEqual(pf["steps"][0]["prompt"], "step 0")
+
+    def test_default_payload_caps_huge_blocks_full_does_not(self):
+        big = "x" * (gui._DIALOG_BLOCK_CAP + 500)
+        log = ("\n========== [run] 2026-08-12 10:00:00 | e ==========\n"
+               "> PROMPT:\np\n---------- output ----------\n" + big + "\n")
+        self._write_task("t3", log)
+        p = gui.dialog_payload("t3")
+        b = p["steps"][0]["blocks"][0]
+        self.assertTrue(b["truncated"])
+        self.assertEqual(len(b["text"]), gui._DIALOG_BLOCK_CAP)
+        pf = gui.dialog_payload("t3", full=True)
+        self.assertEqual(len(pf["steps"][0]["blocks"][0]["text"]), len(big))
+        self.assertNotIn("truncated", pf["steps"][0]["blocks"][0])
+
+    def test_missing_log_is_empty_payload_not_exception(self):
+        p = gui.dialog_payload("no-such-task")
+        self.assertEqual(p["total_steps"], 0)
+        self.assertEqual(p["steps"], [])
+
+    def test_endpoint_serves_dialog_json(self):
+        """H.do_GET for /api/dialog, driven through a fake handler (no real socket)."""
+        self._write_task("t4", CURRENT_LOG)
+        sent = {}
+
+        class FakeHandler:
+            path = "/api/dialog?task=t4"
+
+            def _send(self, code, body, ctype="application/json"):
+                sent["code"] = code
+                sent["body"] = body
+
+        gui.H.do_GET(FakeHandler())
+        self.assertEqual(sent["code"], 200)
+        data = json.loads(sent["body"])
+        self.assertEqual(data["name"], "t4")
+        self.assertEqual(data["steps"][0]["prompt"], "fix the tests")
+
+    def test_endpoint_requires_task_param(self):
+        sent = {}
+
+        class FakeHandler:
+            path = "/api/dialog"
+
+            def _send(self, code, body, ctype="application/json"):
+                sent["code"] = code
+                sent["body"] = body
+
+        gui.H.do_GET(FakeHandler())
+        self.assertEqual(sent["code"], 400)
+
+
 if __name__ == "__main__":
     unittest.main()

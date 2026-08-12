@@ -36,7 +36,9 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   while `agent.sh status` called it *running*. The shared machine is: pid dead → `stalled`; pid alive
   + quiet longer than `AGENT_STALE_SEC` → `idle`, rendered as `running (no output for Nm)` (the exact
   CLI wording, via `stateLabel()` in `static/util.js`); otherwise `running`. `idle` counts as live
-  everywhere (`LIVE_STATES`) — `/api/wait` keeps waiting and the SSE log stream stays open.
+  everywhere (`LIVE_STATES`) — `/api/wait` keeps waiting, the SSE log stream stays open, and
+  `agent.sh clean` (including `--purge`) skips it exactly like `running` so a live process's
+  `.log`/`.meta` cannot be deleted while it is still writing.
   The pid check crosses the git-bash/python boundary through `winpid=` in `.meta` (a git-bash pid is
   meaningless to native python). **Never probe with `os.kill(pid, 0)` on Windows** — there it is not a
   probe, it calls `TerminateProcess` and would kill the very task being asked about; `pid_alive()`
@@ -44,6 +46,38 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
 - **Watchdog kills are surfaced, not hidden**: a task killed by `AGENT_TIMEOUT_SEC` carries
   `timeout=<secs>` in its `.meta`, which the chat header shows as a `⏱ killed after Ns` pill and the
   toast reports instead of a bare exit code.
+- **Full-dialog chat view** (`GET /api/dialog?task=<name>[&full=1]`, parsed by `parse_dialog()` /
+  `parse_output_blocks()` in `gui.py`, rendered by `static/chat.js`): the chat tab shows the WHOLE
+  conversation of a task, Claude-Code-style — every `run`/`reply` step in order with a separator
+  line (kind · timestamp · duration), the full prompt of each step, and the step's output as
+  ordered blocks. Tool calls render as one compact line (tool name + first line of the argument +
+  duration when known) and expand on click to the full arguments + result; **expand all / collapse
+  all** buttons act on the whole dialog, and the expansion state lives in a `Set` keyed
+  `task:step:block`, NOT in the DOM, so the 3s auto-refresh restores it exactly (losing expansions
+  on every poll was the old view's worst failure mode). Thinking/reasoning blocks are parsed into
+  the data but hidden by default (a 💭 toggle in the header shows them, off by default) — nothing
+  is stripped from the log itself. Durations use one short format (`fmt_dur()` in gui.py, mirrored
+  by `fmtDur()` in util.js: `1.2s` / `45s` / `3m 20s` / `1h 5m`); per step they come from the next
+  step's header timestamp (or the log's mtime for the final step), per tool call from codex's own
+  `Wall time: N seconds` / `succeeded in Nms:` lines; a still-running last step ticks live (1s,
+  using the server clock offset from the payload). Where the log has no timestamps, NOTHING is
+  shown rather than a made-up number. Engines log differently, so the output parser is layered and
+  always degrades to raw text — never an empty pane, never an exception: (1) the current
+  `========== [run] ts | … ==========` step format; (2) legacy codex plaintext (`user`/`codex`/
+  `thinking`/`exec` marker lines; a `user` block becomes the step prompt when there is no
+  `> PROMPT:` section, banner chrome and `tokens used` are dropped); (3) raw structured JSONL
+  (codex `exec --json` `item.completed` events, kimi stream-json roles with `tool_calls`, claude
+  stream-json `assistant`/`user` envelopes) — possible verbatim in a log when a provider's cleanup
+  layer cats the raw stream; (4) anything else → one raw text block. A JSON-looking line inside
+  ordinary prose does NOT trigger the JSONL path (it requires recognised event/role types).
+  Payload bounds: the default response is the LAST 30 steps (`_DIALOG_STEP_LIMIT`) with any single
+  block capped at 20 000 chars (`_DIALOG_BLOCK_CAP`, flagged `truncated`); the header then offers
+  **show the whole dialog (N steps)** which refetches with `full=1` (every step, every byte), so
+  the full text is always reachable without opening the `.log` by hand. Parsed steps are cached
+  server-side keyed by `(name, mtime, size)`, so the auto-refresh re-parses only when the log
+  actually changed; the client likewise rebuilds `#chat` only on a real change (mtime/size/state/
+  view-mode key), preserving scroll and expansions. `/api/thread` (raw log) and the SSE
+  `/api/stream` are untouched — `bridgetab.js` still consumes them.
 - **Tree**: nesting by `parent` (see `-P`). A parent task → its subagents indented.
   Projects = tasks ∪ explicitly registered ones via 📂＋ (even with 0 tasks, `projects.json` in `LOGDIR`).
   The active project is on top and expanded; each project has its own scroll (`max-height`), so a large

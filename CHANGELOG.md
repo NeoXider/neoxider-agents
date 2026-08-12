@@ -6,6 +6,24 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- gui: **the chat tab now shows the whole subagent conversation, Claude-Code-style.** New
+  `GET /api/dialog?task=<name>[&full=1]` parses a task's `.log` into ordered steps (every
+  `run`/`reply` with its full prompt and output) and ordered blocks (text / tool call /
+  thinking). Tool calls render collapsed to one compact line (name + short argument + duration)
+  and expand on click, with expand-all/collapse-all buttons; the expansion state is kept in a
+  `task:step:block` set so it survives the 3s auto-refresh instead of resetting on every poll.
+  Thinking/reasoning blocks stay in the data but are hidden by default (💭 toggle in the header,
+  off by default). Durations are visible per step (from step-header timestamps / log mtime, live
+  ticking while the last step runs) and per tool call where the log records them (codex `Wall
+  time` / `succeeded in Nms`), in one short format (`1.2s`, `45s`, `3m 20s`); no timestamps in
+  the log → nothing shown, never an invented number. The parser handles every engine's log
+  flavour — current step format, legacy codex plaintext (`user`/`codex`/`thinking`/`exec`
+  markers), raw codex/kimi/claude JSONL — and any unrecognised content falls back to raw text:
+  never an empty pane, never an exception. Long dialogs are bounded by default (last 30 steps,
+  20k chars per block) with a "show the whole dialog" control that fetches everything. Raw
+  `/api/thread` and the SSE `/api/stream` are unchanged. New labels added to both
+  `locales/en.json` and `locales/ru.json`; 26 new regression tests in `tests/test_gui.py`.
+
 - providers: **normal CLI tasks now use each engine's true unattended mode.** Every task runs with
   stdin closed, so a permission prompt can never be answered; without full auto the task only hangs
   until the watchdog kills it. Codex now defaults to `--sandbox danger-full-access` instead of

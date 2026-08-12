@@ -50,7 +50,10 @@ this project fills.
   in a throwaway directory — the only check that catches a CLI that answers normally
   while every command it runs hangs forever.
 - **Web GUI** (`neoxider` / `agent.sh gui`): a project tree of subagents (activity +
-  topic emoji, no redundant status dot), a chat-style thread view with basic markdown,
+  topic emoji, no redundant status dot), a full-dialog chat view (Claude-Code-style:
+  every run/reply step in order, tool calls collapsed to one line and expandable,
+  thinking blocks hidden by default, visible per-step/per-tool durations, basic
+  markdown — served parsed from `/api/dialog`),
   a provider/model/**effort** picker whose cached, manually-refreshable rate-limit
   panel adapts to whichever provider is selected, a folder browser to add new
   projects, resizable panels, toast notifications with history, an optional "open in a
