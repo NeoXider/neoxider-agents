@@ -458,9 +458,10 @@ section "AGENT_CHAT_ONLY sandboxing (codex + claude provider flags)"
 # can't silently drop it; the "does it actually restrict" claim is a live/manual check, not here.
 
 unset AGENT_CHAT_ONLY
+unset AGENT_CODEX_USER_CONFIG AGENT_CODEX_MCP
 mapfile -t codex_default < <(_provider_codex_chatonly_args)
-assert_eq "codex default (no AGENT_CHAT_ONLY): sandbox stays workspace-write" \
-    "--sandbox workspace-write" "${codex_default[*]}"
+assert_eq "codex default (no AGENT_CHAT_ONLY): workspace-write sandbox + user-config isolation" \
+    "--sandbox workspace-write --ignore-user-config" "${codex_default[*]}"
 
 AGENT_CHAT_ONLY=1
 mapfile -t codex_chatonly < <(_provider_codex_chatonly_args)
@@ -479,6 +480,151 @@ assert_eq "claude chat-only: adds disallowedTools flag" "--disallowedTools" "${c
 assert_match "claude chat-only: denylist blocks Bash/Edit/Write/Task/Web*" \
     'Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch' "${claude_chatonly[2]}"
 unset AGENT_CHAT_ONLY
+
+# ============================================================================================
+section "codex user-config isolation (AGENT_CODEX_USER_CONFIG / AGENT_CODEX_MCP)"
+# ============================================================================================
+# Every normal codex run is launched with --ignore-user-config, because ~/.codex/config.toml on a
+# machine with the ChatGPT desktop app declares a stdio "code-mode host" that is only reachable
+# from that app -- without it, codex answers but the FIRST shell command it issues blocks forever
+# (verified live; full repro in providers/codex/provider.sh). These tests lock the wiring in so it
+# cannot be silently dropped again, and cover the two escape hatches.
+
+unset AGENT_CHAT_ONLY AGENT_CODEX_USER_CONFIG AGENT_CODEX_MCP
+mapfile -t iso_default < <(_provider_codex_isolation_args)
+assert_eq "isolation on by default: --ignore-user-config" "--ignore-user-config" "${iso_default[*]}"
+
+AGENT_CODEX_USER_CONFIG=1
+mapfile -t iso_optout < <(_provider_codex_isolation_args)
+assert_eq "AGENT_CODEX_USER_CONFIG=1 opts back into ~/.codex/config.toml" "" "${iso_optout[*]}"
+unset AGENT_CODEX_USER_CONFIG
+
+AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp"
+mapfile -t iso_mcp < <(_provider_codex_isolation_args)
+assert_eq "AGENT_CODEX_MCP re-adds one server as a -c override" \
+    '--ignore-user-config -c mcp_servers.unityMCP.url="http://127.0.0.1:8040/mcp"' "${iso_mcp[*]}"
+
+AGENT_CODEX_MCP="a=http://x/1,,b=http://y/2"
+mapfile -t iso_mcp2 < <(_provider_codex_isolation_args 2>/dev/null)
+assert_eq "AGENT_CODEX_MCP: several servers, empty segments skipped" \
+    '--ignore-user-config -c mcp_servers.a.url="http://x/1" -c mcp_servers.b.url="http://y/2"' "${iso_mcp2[*]}"
+
+AGENT_CODEX_MCP="bad name=http://x/1,ok=http://y/2,noequals"
+mapfile -t iso_mcp3 < <(_provider_codex_isolation_args 2>/dev/null)
+assert_eq "AGENT_CODEX_MCP: illegal name and name-less entry are skipped, valid one kept" \
+    '--ignore-user-config -c mcp_servers.ok.url="http://y/2"' "${iso_mcp3[*]}"
+mcp_warn="$(AGENT_CODEX_MCP='bad name=http://x/1' _provider_codex_isolation_args 2>&1 >/dev/null)"
+assert_match "AGENT_CODEX_MCP: a bad entry is reported on stderr, not silently dropped" \
+    'skipping bad server name' "$mcp_warn"
+unset AGENT_CODEX_MCP
+
+# chat-only stays the strictest mode: isolated AND no MCP re-injection, even if asked for one.
+AGENT_CHAT_ONLY=1 AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp" AGENT_CODEX_USER_CONFIG=1
+mapfile -t iso_chat < <(_provider_codex_isolation_args)
+assert_eq "chat-only ignores both escape hatches (text-only lockdown wins)" \
+    "--ignore-user-config" "${iso_chat[*]}"
+unset AGENT_CHAT_ONLY AGENT_CODEX_MCP AGENT_CODEX_USER_CONFIG
+
+# ============================================================================================
+section "step watchdog (_guarded_run / AGENT_TIMEOUT_SEC)"
+# ============================================================================================
+# A provider step must never hang forever without saying so. _guarded_run enforces a wall-clock
+# deadline, kills the whole process tree, prints a "!! TIMEOUT" line into the task log and returns
+# 124 (which finish_step turns into state=error).
+
+guard_out="$(_guarded_run 5 echo hello)"; guard_rc=$?
+assert_eq "_guarded_run passes a fast command's output through" "hello" "$guard_out"
+assert_eq "_guarded_run returns the command's own exit code (0)" "0" "$guard_rc"
+
+_guarded_run 5 bash -c 'exit 7' >/dev/null 2>&1; guard_rc7=$?
+assert_eq "_guarded_run propagates a non-zero exit code" "7" "$guard_rc7"
+
+_guarded_run 0 bash -c 'exit 3' >/dev/null 2>&1; guard_rc_nolimit=$?
+assert_eq "AGENT_TIMEOUT_SEC=0 disables the deadline but still returns the exit code" "3" "$guard_rc_nolimit"
+
+# a grandchild that outlives its parent shell is what actually leaks (on Windows the native
+# codex.exe): the tree kill must reach it.
+guard_pidf="$SCRATCH_LOGDIR/guard-child.pid"
+guard_t0=$(date +%s)
+guard_slow="$(_guarded_run 2 bash -c "sleep 60 & echo \$! > '$guard_pidf'; wait" 2>&1)"; guard_rc124=$?
+guard_elapsed=$(( $(date +%s) - guard_t0 ))
+assert_eq "_guarded_run returns 124 when the deadline expires" "124" "$guard_rc124"
+assert_match "_guarded_run writes an explicit TIMEOUT line into the step output" \
+    '!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=2s' "$guard_slow"
+if [ "$guard_elapsed" -lt 30 ]; then
+    pass "_guarded_run actually stops at the deadline (${guard_elapsed}s, not 60s)"
+else
+    fail "_guarded_run did not stop at the deadline (took ${guard_elapsed}s)"
+fi
+sleep 1
+guard_child="$(cat "$guard_pidf" 2>/dev/null)"
+if [ -n "$guard_child" ] && kill -0 "$guard_child" 2>/dev/null; then
+    fail "_guarded_run left an orphaned grandchild process alive (pid $guard_child)"
+    kill -9 "$guard_child" 2>/dev/null
+else
+    pass "_guarded_run kills the whole process tree, no orphaned grandchild"
+fi
+
+# ============================================================================================
+section "eff_state / state_label (one liveness truth, shared with gui.py)"
+# ============================================================================================
+# The CLI used to call a task "running (alive)" while the GUI called the same task "stalled":
+# one looked only at the pid, the other only at the log's mtime. Now both implement THIS state
+# machine (gui.py mirrors it in python).
+
+for st in done waiting error stalled; do
+    meta_set "st_$st" state "$st"
+    assert_eq "eff_state passes a finished state through untouched ($st)" "$st" "$(eff_state "st_$st")"
+done
+
+# alive pid + fresh log -> running
+meta_set st_live state running; meta_set st_live pid "$$"
+: > "$SCRATCH_LOGDIR/st_live.log"
+assert_eq "running + live pid + fresh log -> running" "running" "$(eff_state st_live)"
+
+# alive pid + long-silent log -> idle (honest third state, NOT stalled)
+meta_set st_idle state running; meta_set st_idle pid "$$"
+: > "$SCRATCH_LOGDIR/st_idle.log"
+touch -d "@$(( $(date +%s) - AGENT_STALE_SEC - 120 ))" "$SCRATCH_LOGDIR/st_idle.log" 2>/dev/null \
+    || touch -t "$(date -d '-1 hour' '+%Y%m%d%H%M' 2>/dev/null)" "$SCRATCH_LOGDIR/st_idle.log" 2>/dev/null
+assert_eq "running + live pid + silent log -> idle (not stalled)" "idle" "$(eff_state st_idle)"
+
+# dead pid -> stalled, whatever the log says
+meta_set st_dead state running; meta_set st_dead pid 999999
+: > "$SCRATCH_LOGDIR/st_dead.log"
+assert_eq "running + dead pid -> stalled" "stalled" "$(eff_state st_dead)"
+
+# no pid recorded at all (pre-existing .meta) + silent log -> stalled, as the GUI always did
+meta_set st_nopid state running
+: > "$SCRATCH_LOGDIR/st_nopid.log"
+touch -d "@$(( $(date +%s) - AGENT_STALE_SEC - 120 ))" "$SCRATCH_LOGDIR/st_nopid.log" 2>/dev/null \
+    || touch -t "$(date -d '-1 hour' '+%Y%m%d%H%M' 2>/dev/null)" "$SCRATCH_LOGDIR/st_nopid.log" 2>/dev/null
+assert_eq "running + unknown pid + silent log -> stalled (legacy meta)" "stalled" "$(eff_state st_nopid)"
+
+assert_eq "state_label renders idle exactly like the GUI does" \
+    "running (no output for 7m)" "$(state_label idle 450)"
+assert_eq "state_label leaves other states alone" "running" "$(state_label running 450)"
+assert_eq "state_icon knows the idle state" "▷" "$(state_icon idle)"
+
+# `clean` must treat idle exactly like running. Before `idle` existed, a live-but-quiet task read
+# as `running` there and was skipped; the moment eff_state started reporting `idle`, `clean --purge`
+# began deleting the .log/.meta of a process that was still writing to them. Run as a REAL
+# subprocess, because the regression lives in the `case "$st" in running|idle) continue` arm of the
+# clean command, not in a sourceable function.
+meta_set st_clean_idle state running
+meta_set st_clean_idle pid "$$"
+meta_set st_clean_idle dir ""
+: > "$SCRATCH_LOGDIR/st_clean_idle.md"
+: > "$SCRATCH_LOGDIR/st_clean_idle.log"
+touch -d "@$(( $(date +%s) - AGENT_STALE_SEC - 120 ))" "$SCRATCH_LOGDIR/st_clean_idle.log" 2>/dev/null \
+    || touch -t "$(date -d '-1 hour' '+%Y%m%d%H%M' 2>/dev/null)" "$SCRATCH_LOGDIR/st_clean_idle.log" 2>/dev/null
+clean_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" clean -n --purge 2>&1)"
+if printf '%s' "$clean_out" | grep -q 'st_clean_idle'; then
+    fail "clean must not touch an idle (alive but quiet) task"
+else
+    pass "clean skips an idle task exactly like a running one"
+fi
+rm -f "$SCRATCH_LOGDIR/st_clean_idle.md"
 
 # ============================================================================================
 section "summary"

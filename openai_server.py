@@ -205,6 +205,16 @@ def _chatonly_env():
     providers/{codex,claude}/provider.sh's `_provider_*_chatonly_args`."""
     env = dict(os.environ)
     env["AGENT_CHAT_ONLY"] = "1"
+    # Hand agent.sh a deadline slightly SHORTER than our own subprocess timeout, so its step
+    # watchdog kills the CLI's whole process tree (and marks the task error/124) before we give
+    # up on the subprocess. Without that, killing only the wrapper left an orphaned CLI grandchild
+    # alive, still appending to the task log -- the exact case the "healthy" resume check below
+    # has to defend against. An explicit AGENT_TIMEOUT_SEC in the environment always wins.
+    if CFG is not None and getattr(CFG, "timeout", None):
+        try:
+            env.setdefault("AGENT_TIMEOUT_SEC", str(max(30, int(CFG.timeout) - 5)))
+        except (TypeError, ValueError):
+            pass
     return env
 
 

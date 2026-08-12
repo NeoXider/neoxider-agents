@@ -11,7 +11,8 @@ HERE/LOGDIR path strings) -- it does NOT bind a network port or write to LOGDIR 
 (that only happens inside main(), guarded by `if __name__ == "__main__":`). So a plain import is
 safe; we still monkeypatch LOGDIR/PROVIDERS_DIR/LOCALES_DIR to scratch temp dirs before any test
 that exercises functions which touch those paths, so tests never read/write the user's real
-~/.claude/agent-cli-logs.
+~/.claude/agent-cli-logs. The port-selection tests (choose_port/is_our_panel) do bind an
+ephemeral 127.0.0.1 port of their own — never a fixed one, and never the panel's default 8765.
 
 Run:
     python tests/test_gui.py
@@ -21,6 +22,7 @@ Run:
 import importlib.util
 import json
 import os
+import socket
 import sys
 import tempfile
 import shutil
@@ -67,11 +69,56 @@ class ToGitBashPathTests(unittest.TestCase):
 
 
 class EffStateTests(unittest.TestCase):
-    def test_running_with_stale_mtime_stays_running(self):
+    """eff_state is the ONE liveness truth, mirrored in agent.sh's eff_state(); these tests pin
+    the contract that used to differ between the two (CLI said running, GUI said stalled)."""
+
+    def setUp(self):
+        # default: no pid recorded -> liveness unknown, i.e. the historical mtime-only behaviour
+        self._orig_pid_alive = gui.pid_alive
+
+    def tearDown(self):
+        gui.pid_alive = self._orig_pid_alive
+
+    def test_running_with_stale_mtime_and_unknown_pid_becomes_stalled(self):
+        nowt = 1_000_000.0
+        log_mtime = nowt - (gui.STALE_SEC + 1)  # older than STALE_SEC, liveness unknown -> stalled
+        meta = {"state": "running"}
+        self.assertEqual(gui.eff_state(meta, log_mtime, nowt), "stalled")
+
+    def test_running_with_dead_pid_is_stalled_even_with_a_fresh_log(self):
+        gui.pid_alive = lambda meta: False
+        nowt = 1_000_000.0
+        self.assertEqual(gui.eff_state({"state": "running"}, nowt - 1, nowt), "stalled")
+
+    def test_running_with_live_pid_and_silent_log_is_idle_not_stalled(self):
+        gui.pid_alive = lambda meta: True
         nowt = 1_000_000.0
         log_mtime = nowt - (gui.STALE_SEC + 1)
-        meta = {"state": "running"}
-        self.assertEqual(gui.eff_state(meta, log_mtime, nowt), "running")
+        self.assertEqual(gui.eff_state({"state": "running"}, log_mtime, nowt), "idle")
+
+    def test_running_with_live_pid_and_fresh_log_is_running(self):
+        gui.pid_alive = lambda meta: True
+        nowt = 1_000_000.0
+        self.assertEqual(gui.eff_state({"state": "running"}, nowt - 3, nowt), "running")
+
+    def test_idle_counts_as_live(self):
+        self.assertIn("idle", gui.LIVE_STATES)
+        self.assertIn("running", gui.LIVE_STATES)
+
+    def test_pid_alive_returns_none_when_no_pid_recorded(self):
+        self.assertIsNone(gui.pid_alive({}))
+        self.assertIsNone(gui.pid_alive({"pid": "", "winpid": ""}))
+        self.assertIsNone(gui.pid_alive({"winpid": "not-a-number", "pid": "also-not"}))
+
+    def test_pid_alive_says_this_very_process_is_alive(self):
+        # os.getpid() is a Windows pid on Windows and a unix pid elsewhere -- which is exactly
+        # what agent.sh records in winpid=/pid= respectively.
+        meta = {"winpid": str(os.getpid())} if os.name == "nt" else {"pid": str(os.getpid())}
+        self.assertTrue(gui.pid_alive(meta))
+
+    def test_pid_alive_says_an_impossible_pid_is_dead(self):
+        meta = {"winpid": "4294967294"} if os.name == "nt" else {"pid": "4194303"}
+        self.assertIs(gui.pid_alive(meta), False)
 
     def test_running_with_fresh_mtime_stays_running(self):
         nowt = 1_000_000.0
@@ -262,6 +309,45 @@ class ServeStaticTraversalGuardTests(unittest.TestCase):
         gui.H._serve_static(fake_self, self.scratch, "does-not-exist.css")
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["code"], 404)
+
+
+class IsOurPanelTests(unittest.TestCase):
+    """`agent.sh gui` used to treat ANY busy port as "the panel is already running" and open a
+    browser tab at it -- even when the port belonged to an unrelated server (a WebSocket one, in
+    the wild), which showed up as a broken tab and no panel. is_our_panel() is the identity check
+    that now decides between "reuse it" and "move to the next free port"."""
+
+    def _free_port(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()          # closed again immediately: nothing is listening on p
+        return p
+
+    def test_nothing_listening_is_not_our_panel(self):
+        self.assertFalse(gui.is_our_panel(self._free_port()))
+
+    def test_port_available_agrees_that_a_free_port_is_free(self):
+        self.assertTrue(gui.port_available(self._free_port()))
+
+    def test_choose_port_uses_the_asked_port_when_free(self):
+        p = self._free_port()
+        self.assertEqual(gui.choose_port(p), (p, "asked"))
+
+    def test_choose_port_moves_off_a_port_held_by_a_foreign_server(self):
+        """A plain listening socket that never speaks HTTP stands in for the unrelated
+        WebSocket server that was found squatting on 8765."""
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        busy = srv.getsockname()[1]
+        try:
+            port, how = gui.choose_port(busy)
+            self.assertEqual(how, "moved")
+            self.assertNotEqual(port, busy)
+            self.assertGreater(port, busy)
+        finally:
+            srv.close()
 
 
 if __name__ == "__main__":

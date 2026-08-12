@@ -99,12 +99,75 @@ if not msg.endswith("\n"):
 '
 }
 
-# _provider_codex_chatonly_args — extra flags applied ONLY when AGENT_CHAT_ONLY=1 (set by
-# openai_server.py; unset for normal `agent.sh run`, which legitimately needs real file/shell/MCP
-# access). Locks the model down to text-only completion:
-#   --sandbox read-only     -- no file writes, no shell command execution (verified live: a
-#                               'write a file' request is rejected by policy, model answers in
-#                               text, no hang, no side effect).
+# _provider_codex_mcp_args — turns AGENT_CODEX_MCP="name=url,name2=url2" into repeated
+#   -c mcp_servers.<name>.url="<url>"
+# overrides. Isolation (below) drops ~/.codex/config.toml wholesale, which also drops the MCP
+# servers that ARE useful (e.g. unityMCP); this is the surgical way to bring back only the ones a
+# task actually needs, without re-enabling the desktop app's stdio hosts. Names are validated
+# ([A-Za-z0-9_-] only) because they land inside a config key; empty segments are skipped, and a
+# malformed segment is reported on stderr rather than silently dropped.
+_provider_codex_mcp_args() {
+    local spec="${AGENT_CODEX_MCP:-}" seg nm url
+    [ -n "$spec" ] || return 0
+    # read -ra, not an unquoted $spec: splitting an unquoted variable also PATHNAME-EXPANDS it, and
+    # a URL query string ("...?x=1") would then be silently replaced by a matching filename.
+    local -a segs; IFS=',' read -ra segs <<< "$spec"
+    for seg in "${segs[@]}"; do
+        seg="${seg#"${seg%%[![:space:]]*}"}"; seg="${seg%"${seg##*[![:space:]]}"}"   # trim
+        [ -n "$seg" ] || continue
+        nm="${seg%%=*}"; url="${seg#*=}"
+        if [ "$nm" = "$seg" ] || [ -z "$nm" ] || [ -z "$url" ]; then
+            echo "agent.sh: AGENT_CODEX_MCP: skipping malformed entry '$seg' (want name=url)" >&2
+            continue
+        fi
+        case "$nm" in
+            *[!A-Za-z0-9_-]*) echo "agent.sh: AGENT_CODEX_MCP: skipping bad server name '$nm' (allowed: A-Z a-z 0-9 _ -)" >&2; continue ;;
+        esac
+        printf '%s\n' -c "mcp_servers.$nm.url=\"$url\""
+    done
+}
+
+# _provider_codex_isolation_args — ALWAYS run codex with --ignore-user-config (opt out with
+# AGENT_CODEX_USER_CONFIG=1). This is the fix for "the agent answers but every shell command hangs
+# forever".
+#
+# VERIFIED LIVE (codex-cli 0.144.0, Windows, git-bash):
+#   codex exec -m gpt-5.6-terra --sandbox workspace-write --skip-git-repo-check "Run the shell
+#   command: ls ..."                                     -> HANGS forever. Trace shows
+#     ERROR codex_core::tools::router: error=code-mode host closed its stdout
+#   preceded by
+#     ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed ...
+#     http://127.0.0.1:8000/mcp
+#   The SAME command with --ignore-user-config finished in 360 ms with the correct answer.
+# WHY: ~/.codex/config.toml on a machine with the ChatGPT desktop app installed is owned by that
+# app. It declares a stdio MCP `node_repl` (the "code-mode host", a binary under
+# AppData\Local\OpenAI\Codex\runtimes\cua_node\...), a `notify` hook into the desktop helper, and
+# HTTP MCP servers that are only up while the app is (127.0.0.1:8000, unity-cli). Launched from a
+# plain shell instead of from the desktop app, that host is unreachable and codex's tool router
+# blocks on the FIRST exec call -- forever, with no output, so the task sits in state=running for
+# hours. (Seen in the wild as `windows sandbox: helper_unknown_error: setup refresh had errors`.)
+# Even when the desktop app IS running, loading its config costs real time: the same trivial
+# one-shot took 37s with the user config vs 15s with --ignore-user-config (measured back to back).
+# Auth is NOT affected: `codex exec --help` says the flag only skips $CODEX_HOME/config.toml,
+# "auth still uses CODEX_HOME" (confirmed -- isolated runs log in fine).
+# DO NOT remove this flag to "get MCP back": use AGENT_CODEX_MCP=name=url instead (above).
+_provider_codex_isolation_args() {
+    # chat-only is an even stricter mode (openai_server.py): always isolated, and never re-adds
+    # MCP servers -- that mode is text completion only.
+    if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
+        printf '%s\n' --ignore-user-config
+        return 0
+    fi
+    [ "${AGENT_CODEX_USER_CONFIG:-0}" = 1 ] && return 0   # escape hatch: old behaviour
+    printf '%s\n' --ignore-user-config
+    _provider_codex_mcp_args
+}
+
+# _provider_codex_chatonly_args — the sandbox flag plus the isolation flags above.
+# AGENT_CHAT_ONLY=1 (set by openai_server.py; unset for normal `agent.sh run`, which legitimately
+# needs real file/shell access) locks the model down to text-only completion:
+#   --sandbox read-only     -- no file writes (verified live: a 'write a file' request is rejected
+#                               by policy, model answers in text, no hang, no side effect).
 #   --ignore-user-config    -- skips ~/.codex/config.toml entirely, which is where this machine's
 #                               [mcp_servers.*] live (verified live: `-c mcp_servers={}` on the
 #                               command line did NOT stop codex from actually calling a configured
@@ -114,10 +177,11 @@ if not msg.endswith("\n"):
 #                               Auth still works (`--help`: "auth still uses CODEX_HOME").
 _provider_codex_chatonly_args() {
     if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
-        printf '%s\n' --sandbox read-only --ignore-user-config
+        printf '%s\n' --sandbox read-only
     else
         printf '%s\n' --sandbox workspace-write
     fi
+    _provider_codex_isolation_args
 }
 
 # provider_codex_run_cmd DIR MODEL EFFORT PROMPT — runs the CLI via `--json` and cleans the output.
@@ -143,11 +207,15 @@ provider_codex_run_cmd() {
 # above opts into that) -- same pattern provider_claude_resume_cmd uses. Same `--json` cleanup.
 provider_codex_resume_cmd() {
     local dir="$1" session="$2" answer="$3" cargs
+    local -a isoargs; mapfile -t isoargs < <(_provider_codex_isolation_args)
     if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
-        cargs=(-c 'sandbox_mode="read-only"' --ignore-user-config)
+        cargs=(-c 'sandbox_mode="read-only"')
     else
         cargs=(-c 'sandbox_mode="workspace-write"')
     fi
+    # Same config isolation as a fresh run -- a resumed session goes through the exact same tool
+    # router, so without it `reply` hangs on the first shell command just like `run` did.
+    [ ${#isoargs[@]} -gt 0 ] && cargs+=("${isoargs[@]}")
     [ -n "$P_MODEL" ] && cargs+=(-m "$P_MODEL")
     [ -n "$P_EFFORT" ] && cargs+=(-c "model_reasoning_effort=\"$P_EFFORT\"")
     ( cd "$dir" && codex exec resume --skip-git-repo-check \
@@ -155,6 +223,63 @@ provider_codex_resume_cmd() {
     local rc_codex=${PIPESTATUS[0]} rc_emit=${PIPESTATUS[1]}   # see provider_codex_run_cmd
     [ "$rc_emit" -ne 0 ] && return "$rc_emit"
     return "$rc_codex"
+}
+
+# provider_codex_doctor_deep — the "does a shell command actually RUN" check for `agent.sh doctor
+# --deep`. Everything else in doctor is metadata (binary present, version, login, limits); NONE of
+# it catches the failure this provider is built around: codex answers normally but every exec call
+# blocks forever on an unreachable code-mode host (see _provider_codex_isolation_args). So this
+# does the only thing that can catch it -- one real, cheap, read-only run with a hard deadline.
+#
+# It runs in a throwaway temp dir containing a single randomly-named marker file and asks the model
+# to LIST the directory with a shell command. The model cannot know that random name without
+# actually executing something, so the marker coming back in the answer is proof that the whole
+# tool-call round trip works -- while the command itself only reads.
+# Env: AGENT_CODEX_DOCTOR_TIMEOUT (default 60s), AGENT_CODEX_DOCTOR_MODEL (default spark = the
+# cheapest/fastest alias; the failure mode is model-independent).
+provider_codex_doctor_deep() {
+    if ! command -v codex >/dev/null 2>&1; then
+        printf '  codex shell: —    (codex not in PATH)\n'; return 0
+    fi
+    local secs="${AGENT_CODEX_DOCTOR_TIMEOUT:-60}" tmpd marker out rc t0 elapsed
+    provider_codex_resolve "${AGENT_CODEX_DOCTOR_MODEL:-spark}"
+    tmpd="$(mktemp -d 2>/dev/null)" || tmpd="${TMPDIR:-/tmp}/codex-doctor-$$"
+    mkdir -p "$tmpd" 2>/dev/null
+    marker="RSDOCTOR${RANDOM}${RANDOM}"
+    : > "$tmpd/$marker.txt"
+    local -a sbargs; mapfile -t sbargs < <(_provider_codex_chatonly_args)
+    t0=$(date +%s)
+    if declare -F _guarded_run >/dev/null 2>&1; then
+        out="$(_guarded_run "$secs" codex exec -m "$P_MODEL" -c model_reasoning_effort="$P_EFFORT" \
+            "${sbargs[@]}" --skip-git-repo-check -C "$tmpd" --json \
+            "Run one shell command that lists the files in the current directory, then reply with ONLY the file names." \
+            </dev/null 2>&1)"
+        rc=$?
+    else
+        out="$(codex exec -m "$P_MODEL" -c model_reasoning_effort="$P_EFFORT" \
+            "${sbargs[@]}" --skip-git-repo-check -C "$tmpd" --json \
+            "Run one shell command that lists the files in the current directory, then reply with ONLY the file names." \
+            </dev/null 2>&1)"
+        rc=$?
+    fi
+    elapsed=$(( $(date +%s) - t0 ))
+    rm -rf "$tmpd" 2>/dev/null
+    local hint="hint: ~/.codex/config.toml (owned by the ChatGPT desktop app) can hang codex's tool router; agent.sh passes --ignore-user-config by default -- do not set AGENT_CODEX_USER_CONFIG=1"
+    if [ "$rc" = 124 ]; then
+        printf '  codex shell: BROKEN — no answer within %ss, the tool router is hung (%s)\n' "$secs" "$hint"
+        case "$out" in *"code-mode host"*) printf '  codex shell: signature — "code-mode host closed its stdout" in the trace\n' ;; esac
+        return 0
+    fi
+    case "$out" in
+        *"$marker"*) printf '  codex shell: ok   (%s, %ss, real command executed)\n' "$P_MODEL" "$elapsed"; return 0 ;;
+    esac
+    if [ -z "$out" ]; then
+        printf '  codex shell: BROKEN — codex produced no output at all (exit %s) (%s)\n' "$rc" "$hint"
+    else
+        printf '  codex shell: BROKEN — the shell command never came back (exit %s, %ss); last line: %s\n' \
+            "$rc" "$elapsed" "$(printf '%s' "$out" | tr -d '\r' | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-160)"
+        printf '  codex shell: %s\n' "$hint"
+    fi
 }
 
 # provider_codex_doctor — prints a single-line JSON object to stdout:

@@ -15,11 +15,35 @@ Files: `gui.py` (backend) + `gui.html` (thin shell) + `static/*.js`/`static/styl
 frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) + `locales/*.json`.
 
 - **Stable port**: resolved as explicit CLI arg > `$AGENT_GUI_PORT` env var > `8765` default, so the
-  URL is bookmarkable across restarts instead of drifting between manual invocations.
-- **Idempotency**: one GUI for all providers, `LOGDIR` is shared. If a server is already up on the port —
-  a repeated `gui` doesn't crash or duplicate it, it just opens the browser. Parallel workers each write
-  to their own `<name>.meta/.log`, so a shared overview is safe (and concurrency-safe at the file
-  level too — `meta_set`'s read-modify-write is wrapped in a portable `mkdir`-based lock).
+  URL is bookmarkable across restarts instead of drifting between manual invocations. That priority
+  is fixed; only the busy-port behaviour is smart (next bullet).
+- **Idempotency vs. a squatted port** (`choose_port()`): one GUI for all providers, `LOGDIR` is shared,
+  so a repeated `gui` must not crash or duplicate anything. But "the bind failed" and "my panel is
+  already running" are NOT the same thing — the old code assumed they were, and when an unrelated
+  WebSocket server happened to hold `8765` it printed "already running", opened a browser tab and the
+  tab died with `invalid Connection header`. Now the occupant is *identified* first: `is_our_panel()`
+  GETs `/api/tasks` and checks the response's shape (shape, not a version header, so an older running
+  panel is still recognized). Outcomes:
+  `asked` (free → bind it) · `ours` (reuse, just open the browser) · `moved` (foreign occupant → next
+  free port + a `!!!!` banner with the real URL) · `none` (nothing free in +50 → an explicit error,
+  never a silent no-op). Parallel workers each write to their own `<name>.meta/.log`, so a shared
+  overview is safe (and concurrency-safe at the file level too — `meta_set`'s read-modify-write is
+  wrapped in a portable `mkdir`-based lock).
+- **Task liveness is NOT computed here anymore** — `gui.py`'s `eff_state()` is a literal mirror of
+  `agent.sh`'s. It used to have its own rule ("running + log quiet for 5 min = stalled"), which
+  contradicted the CLI's ("pid alive = running") on every long task: a codex step buffers its output
+  and flushes the log only when it ends, so an honest 10-minute task read as *stalled* in the panel
+  while `agent.sh status` called it *running*. The shared machine is: pid dead → `stalled`; pid alive
+  + quiet longer than `AGENT_STALE_SEC` → `idle`, rendered as `running (no output for Nm)` (the exact
+  CLI wording, via `stateLabel()` in `static/util.js`); otherwise `running`. `idle` counts as live
+  everywhere (`LIVE_STATES`) — `/api/wait` keeps waiting and the SSE log stream stays open.
+  The pid check crosses the git-bash/python boundary through `winpid=` in `.meta` (a git-bash pid is
+  meaningless to native python). **Never probe with `os.kill(pid, 0)` on Windows** — there it is not a
+  probe, it calls `TerminateProcess` and would kill the very task being asked about; `pid_alive()`
+  uses `OpenProcess` + `GetExitCodeProcess` instead.
+- **Watchdog kills are surfaced, not hidden**: a task killed by `AGENT_TIMEOUT_SEC` carries
+  `timeout=<secs>` in its `.meta`, which the chat header shows as a `⏱ killed after Ns` pill and the
+  toast reports instead of a bare exit code.
 - **Tree**: nesting by `parent` (see `-P`). A parent task → its subagents indented.
   Projects = tasks ∪ explicitly registered ones via 📂＋ (even with 0 tasks, `projects.json` in `LOGDIR`).
   The active project is on top and expanded; each project has its own scroll (`max-height`), so a large

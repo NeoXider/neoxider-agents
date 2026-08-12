@@ -73,9 +73,23 @@ bash $SK list                                       # table: state / engine / mo
 bash $SK clean                                      # delete md clutter (<name>.md + PROGRESS.<name>.md) of STOPPED
                                                      # tasks; --all incl. waiting, --purge also .log/.meta, -n dry-run
 bash $SK doctor                                     # pre-flight: engines + codex limits (before fanning out!)
+bash $SK doctor --deep                              # + one REAL cheap run per engine that must EXECUTE a shell
+                                                     # command — catches "answers fine, every command hangs"
 bash $SK gui [port]                                 # web control panel over all providers (stable default :8765,
-                                                     # or $AGENT_GUI_PORT, or a one-off port arg)
+                                                     # or $AGENT_GUI_PORT, or a one-off port arg; if that port is
+                                                     # held by someone else it moves to the next free one, loudly)
 ```
+
+**Environment knobs** (all optional, all with safe defaults):
+
+| Variable | Default | What it does |
+|---|---|---|
+| `AGENT_TIMEOUT_SEC` | `1800` | Wall-clock deadline for ONE step (`run`/`reply`). On expiry the whole process tree is killed, `!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=<N>s and was killed` is appended to the log, and the task ends as `state=error exit=124`. `0` disables it (only for genuinely long jobs). |
+| `AGENT_STALE_SEC` | `300` | Silence after which a still-alive task is reported as `running (no output for Nm)` instead of plain `running` — same wording in the CLI and in the GUI. |
+| `AGENT_CODEX_USER_CONFIG` | unset | `1` = let codex load `~/.codex/config.toml` again. Off by default **on purpose** — see ["Codex: every shell command hangs"](#codex-every-shell-command-hangs-environment-issue) below. |
+| `AGENT_CODEX_MCP` | unset | Re-add specific MCP servers to the isolated codex config: `AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp,other=http://…"` → repeated `-c mcp_servers.<name>.url="<url>"`. |
+| `AGENT_CODEX_DOCTOR_MODEL` / `AGENT_CODEX_DOCTOR_TIMEOUT` | `spark` / `60` | Model and hard deadline for `doctor --deep`'s codex shell check. |
+| `AGENT_GUI_PORT` | `8765` | GUI port (an explicit `gui <port>` argument still wins). |
 
 **Self-testing your own work.** If you just built or modified a local web service/API
 (e.g. a Unity `HttpListener` debug endpoint, a small backend), you can verify it works
@@ -194,19 +208,39 @@ get a running-bridges list with live `/health`, inline per-bridge request logs, 
 button and a stop button (no CLI needed). Task status is conveyed by the
 activity/topic emoji (✅⏳❌⚠️📖✏️🔧💭🐛🧪…) plus strikethrough for finished tasks. Stable
 port: CLI arg > `$AGENT_GUI_PORT` > `8765`; re-running `gui` while one is up just opens the
-browser. Providers are plugins (`providers/<name>/provider.json` + `provider.sh`) — adding a
+browser. If that port is held by **something else** (it happened: an unrelated WebSocket server on
+8765, which used to make `gui` print success while the browser tab failed with
+`invalid Connection header`), the panel now identifies the occupant, moves to the next free port and
+prints the chosen URL in a banner you cannot miss. Providers are plugins (`providers/<name>/provider.json` + `provider.sh`) — adding a
 CLI is one new directory, zero edits to `agent.sh`/`gui.py`. Implementation details
 (tree/i18n/toasts/splitters/caching/path normalization): [docs/GUI.md](docs/GUI.md).
 
 **Task state.** After every step the wrapper sets in `.meta`:
 `state` (`running`/`done`/`waiting`/`error`), the `exit` code, `files` (how many files the agent changed
-per `git status`), `pid`, and `started`. Icons in `list`/`status`: `▶` running, `✔` done, `⏳` waiting,
+per `git status`), `pid` + `winpid`, `started`, and `timeout` (set only when the step watchdog killed the
+task). Icons in `list`/`status`: `▶` running, `▷` running-but-silent, `✔` done, `⏳` waiting,
 `✖` error, `⚠` stalled.
 
-**Working or stuck (liveness).** `status`/`list` check whether the process is alive (`kill -0 pid`).
-If `state=running` but the process is dead (the machine was shut down / it was killed) → it shows
-`⚠ stalled` with the hint `agent.sh reply <name> "continue"`. A live process shows `▶ running (alive)`;
-to watch it: `agent.sh log -f <name>`.
+**Working or stuck (liveness) — one truth for CLI and GUI.** Both `agent.sh status`/`list` and the web
+panel run the SAME state machine (`eff_state` in `agent.sh` and in `gui.py`):
+
+| Situation | State | Shown as |
+|---|---|---|
+| process dead, meta still says running | `stalled` | `⚠ stalled` → `agent.sh reply <name> "continue"` |
+| process alive, log growing | `running` | `▶ running (alive, pid N)` |
+| process alive, no output for > `AGENT_STALE_SEC` | `idle` | `▷ running (no output for Nm)` |
+
+`idle` is an honest third state, not an error: a codex/claude step flushes its log only when the step
+ENDS, so silence alone never means dead. This is what used to make the CLI say *running* and the GUI say
+*stalled* about the very same task — the CLI looked only at the pid, the GUI only at the log's mtime.
+(On Windows the two now compare notes through `winpid`, because a git-bash pid means nothing to python.)
+
+**No silent forever-hangs.** Every step runs under `AGENT_TIMEOUT_SEC` (default 30 min). On expiry the
+whole process tree is killed — including the native Windows grandchild (`codex.exe` and whatever it
+spawned), which plain `timeout`/`kill` leaves orphaned — the log gets an explicit
+`!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=<N>s and was killed` line, and the task ends as
+`state=error exit=124`. `agent.sh status` then says `⏱ killed by the step watchdog after <N>s` instead of
+pretending the task is still working.
 
 opencode emits throttled activity heartbeats into that log while preserving a clean final-answer block.
 Its unattended run has a 30-minute hard deadline by default; override it with
@@ -233,6 +267,50 @@ presence and versions of the CLIs (codex/claude/kimi/opencode/gemini), login sta
 and codex's **remaining
 limits** — primary (5h window) and secondary (weekly) with % and time until reset (from session-jsonl).
 At >80% it prints a warning — in that case it's better to throttle the fan-out.
+
+`agent.sh doctor --deep` adds what none of the above can see: a **real** one-shot run per engine that
+must actually EXECUTE a shell command (codex today — `provider_<engine>_doctor_deep` is a plugin hook,
+so another provider can add its own). It runs in a throwaway temp dir holding a single randomly-named
+file and asks the model to list the directory; the random name can only come back if the whole
+tool-call round trip works, and the command itself only reads. Output is one line:
+
+```
+  codex shell: ok   (gpt-5.3-codex-spark, 10s, real command executed)
+  codex shell: BROKEN — no answer within 60s, the tool router is hung (hint: …)
+```
+
+It costs one cheap model call (~10–15s), so plain `doctor` stays instant and just prints a reminder
+that the deep check exists. Run `--deep` when an agent "answers but does nothing", after a codex-cli
+upgrade, or on a new machine.
+
+### Codex: every shell command hangs (environment issue)
+
+**Symptom:** `agent.sh run -e codex …` starts, the model replies, but every shell command it issues
+hangs forever; the task sits in `state=running` for hours with a log that never grows. Sometimes the
+agent reports `windows sandbox: helper_unknown_error: setup refresh had errors`.
+
+**Cause (diagnosed live, codex-cli 0.144.0, Windows):** `~/.codex/config.toml` is owned by the ChatGPT
+desktop app. It declares a stdio MCP `node_repl` — the "code-mode host" living under
+`AppData\Local\OpenAI\Codex\runtimes\cua_node\…` — plus a `notify` hook into the desktop helper and
+HTTP MCP servers that only answer while the app is up. Started from a plain shell, that host is
+unreachable and codex's tool router blocks on the FIRST exec call:
+`ERROR codex_core::tools::router: error=code-mode host closed its stdout`. The same command with
+`--ignore-user-config` finished in 360 ms.
+
+**What the wrapper does:** every codex run and resume now passes `--ignore-user-config`. Auth is
+unaffected (`codex exec --help`: the flag skips `config.toml` only, "auth still uses `CODEX_HOME`"),
+and as a bonus a trivial run got ~2.5× faster (37s → 15s) even with the desktop app running.
+Need one of those MCP servers back? Do it surgically:
+`AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp"`. Only if you truly want the old behaviour:
+`AGENT_CODEX_USER_CONFIG=1`.
+
+**Other junk in `~/.codex/` (not touched by the wrapper, your call as the user):** `codex doctor` on
+this machine dies with `memory allocation of 1060480 bytes failed`, and traces show
+`codex_models_manager: failed to renew cache TTL: missing field 'base_instructions'` — a stale models
+cache. The directory also holds multi-megabyte orphaned `..codex-global-state.json.tmp-*` /
+`.bak.tmp-*` files dating back months. Neither breaks agent.sh runs, and neither is deleted for you:
+if `codex doctor` matters to you, clean those leftovers by hand (that directory is your environment,
+not the wrapper's).
 
 **"One thread per task" model**: every `run` creates a `<name>.log` (full transcript) and a `<name>.meta`
 (engine/model/dir/session). All `reply` calls are APPENDED to that same `<name>.log` with headers

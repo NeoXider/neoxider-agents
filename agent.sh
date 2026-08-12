@@ -26,8 +26,12 @@
 #   agent.sh list                                                        — task table (state/engine/model/age/files)
 #   agent.sh clean  [--all] [--purge] [-n]                               — delete md clutter (<name>.md +
 #                      PROGRESS.<name>.md) of STOPPED tasks (done/error/stalled). --all also cleans
-#                      waiting tasks; --purge also drops .log/.meta; -n dry-run. Running tasks untouched.
-#   agent.sh doctor                                                      — pre-flight: engines + codex limits + claude usage (before fan-out)
+#                      waiting tasks; --purge also drops .log/.meta; -n dry-run. Live tasks
+#                      (running AND idle) are never touched.
+#   agent.sh doctor [--deep]                                             — pre-flight: engines + codex limits + claude usage (before fan-out).
+#                      --deep additionally does one REAL cheap run per engine that supports it and
+#                      makes it execute a shell command — the only check that catches "the model
+#                      answers but every shell command hangs" (see AGENT_CODEX_USER_CONFIG below).
 #   agent.sh provider-info <engine>                                      — single provider's doctor JSON (used by gui.py)
 #   agent.sh openai-server [-e engine] [-m model] [-f effort] [-p port]  — OpenAI-compatible
 #                      /v1/chat/completions bridge over a CLI subagent (see openai_server.py's
@@ -46,6 +50,19 @@
 #   kimi: k3|default -> kimi-code/k3 [DEFAULT]; k3-256k/coding/highspeed are explicit alternatives
 #   opencode/gemini: passed through as-is (-m provider/model)
 #
+# Environment:
+#   AGENT_TIMEOUT_SEC=1800      wall-clock deadline for ONE step (run/reply). On expiry the whole
+#                               process tree is killed, the log gets a "!! TIMEOUT" line and the
+#                               task ends as state=error exit=124 — never a silent forever-hang.
+#                               0 disables the watchdog (use for genuinely long jobs).
+#   AGENT_STALE_SEC=300         after this much silence a still-alive task is reported as
+#                               "running (no output for Nm)" instead of plain running (CLI + GUI).
+#   AGENT_CODEX_USER_CONFIG=1   let codex load ~/.codex/config.toml again (default: NOT loaded —
+#                               it hangs codex's tool router on machines with the ChatGPT desktop
+#                               app; see providers/codex/provider.sh for the live repro).
+#   AGENT_CODEX_MCP="a=url,b=url"  re-add specific MCP servers to the isolated codex config,
+#                               e.g. AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp".
+#
 # Providers are plugins: each providers/<name>/provider.sh defines provider_<name>_resolve,
 # provider_<name>_run_cmd, provider_<name>_resume_cmd (optional), provider_<name>_doctor.
 # Adding a new engine = adding one new providers/<name>/ directory, zero edits to this file.
@@ -54,8 +71,87 @@ set -uo pipefail
 LOGDIR="${AGENT_CLI_LOGS:-$HOME/.claude/agent-cli-logs}"
 mkdir -p "$LOGDIR"
 
+# Wall-clock deadline for ONE provider step, and the silence threshold after which a still-alive
+# task is reported as "no output for Nm". Both are shared with gui.py (same names, same defaults),
+# so the CLI and the web panel never disagree about what a task is doing.
+AGENT_TIMEOUT_SEC="${AGENT_TIMEOUT_SEC:-1800}"
+AGENT_STALE_SEC="${AGENT_STALE_SEC:-300}"
+case "$AGENT_TIMEOUT_SEC" in ''|*[!0-9]*) AGENT_TIMEOUT_SEC=1800 ;; esac
+case "$AGENT_STALE_SEC"   in ''|*[!0-9]*) AGENT_STALE_SEC=300   ;; esac
+
 die() { echo "agent.sh: $*" >&2; exit 1; }
 now() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# --- process control (git-bash safe) ---------------------------------------
+# _winpid MSYS_PID -> the Windows pid of that process (empty on Linux/macOS, where there is none).
+# MSYS2/git-bash exposes it as /proc/<pid>/winpid; it is what taskkill and python understand,
+# while the msys pid is not. Recorded in .meta as winpid= so gui.py can check liveness of the very
+# same process the CLI checks (see eff_state).
+_winpid() { local p="${1:-}"; [ -n "$p" ] && [ -r "/proc/$p/winpid" ] && cat "/proc/$p/winpid" 2>/dev/null; return 0; }
+
+# _child_pids PID -> msys pids whose PPID is PID (one per line).
+_child_pids() {
+    local p="${1:-}"
+    [ -n "$p" ] || return 0
+    # git-bash `ps` (no -o support) prints: PID PPID PGID WINPID TTY UID STIME COMMAND
+    # GNU/BSD ps do support -o, which is both cheaper and unambiguous -- try that first.
+    if ps -eo pid=,ppid= >/dev/null 2>&1; then
+        ps -eo pid=,ppid= 2>/dev/null | awk -v p="$p" '$2==p{print $1}'
+    else
+        ps 2>/dev/null | awk -v p="$p" 'NR>1 && $2==p{print $1}'
+    fi
+}
+
+# _kill_tree PID — kill PID and everything it spawned, on Windows too.
+# WHY not just `kill` / coreutils `timeout`: on git-bash the interesting process is a NATIVE
+# Windows grandchild (bash -> npm shim -> codex.exe/node.exe, which itself spawns powershell.exe).
+# Signals to the msys pid do not reap that native tree, so `timeout 60 codex ...` returns while a
+# codex.exe keeps running (and keeps holding the model session). taskkill /T on the WINDOWS pid is
+# what actually walks the OS process tree; the msys-side recursion below handles the shell wrappers
+# (and is the whole story on Linux/macOS, where there is no winpid).
+_kill_tree() {
+    local pid="${1:-}" k wp
+    [ -n "$pid" ] || return 0
+    for k in $(_child_pids "$pid"); do
+        [ "$k" = "$pid" ] || _kill_tree "$k"
+    done
+    wp="$(_winpid "$pid")"
+    if [ -n "$wp" ] && command -v taskkill >/dev/null 2>&1; then
+        # //F //T -> /F /T: the doubled slash stops MSYS from mangling the flag into a path.
+        taskkill //F //T //PID "$wp" >/dev/null 2>&1
+    fi
+    kill -TERM "$pid" 2>/dev/null
+    kill -KILL "$pid" 2>/dev/null
+    return 0
+}
+
+# _guarded_run SECS CMD... — run CMD (a shell function or a program) under a hard wall-clock
+# deadline. CMD's stdout/stderr go to OUR stdout unchanged, so callers can keep piping into
+# `tee -a "$log" | tail -40` exactly as before. Returns CMD's exit code, or 124 if the deadline
+# expired -- in which case the whole process tree is killed and a "!! TIMEOUT" line is printed on
+# the same stdout (so it lands in the task log AND in the tail the user sees).
+# SECS=0 disables the deadline. Callers treat 124 as "killed by the watchdog".
+_guarded_run() {
+    local secs="${1:-0}"; shift
+    case "$secs" in ''|*[!0-9]*) secs=0 ;; esac
+    local child waited=0 rc=0
+    ( "$@" ) 2>&1 &
+    child=$!
+    if [ "$secs" -gt 0 ]; then
+        while kill -0 "$child" 2>/dev/null; do
+            if [ "$waited" -ge "$secs" ]; then
+                _kill_tree "$child"
+                wait "$child" 2>/dev/null
+                printf '\n!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=%ss and was killed (process tree terminated)\n' "$secs"
+                return 124
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+    fi
+    wait "$child"; rc=$?
+    return "$rc"
+}
 
 # minimal JSON string escaper shared by provider doctor functions (backslash, quote, control chars).
 # NB: the backslash substitution MUST run first, before \t/\r/\n are introduced, otherwise those
@@ -192,10 +288,48 @@ name_by_session() { local s="$1" f
 latest_task() { ls -t "$LOGDIR"/*.meta 2>/dev/null | head -1 | xargs -r basename | sed 's/\.meta$//'; }
 
 is_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
-# actual state: running with a dead pid -> stalled (computer shut down / process killed)
-eff_state() { local n="$1" st; st="$(meta_get "$n" state)"
-    if [ "$st" = running ] && ! is_alive "$(meta_get "$n" pid)"; then echo stalled; else echo "$st"; fi; }
-state_icon() { case "$1" in running) echo "▶";; done) echo "✔";; waiting) echo "⏳";; error) echo "✖";; stalled) echo "⚠";; *) echo "•";; esac; }
+
+# log_idle_sec NAME -> seconds since the task's log last grew (empty if there is no log).
+log_idle_sec() {
+    local f="$LOGDIR/$1.log" m
+    [ -f "$f" ] || return 0
+    m="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)"
+    [ -n "$m" ] || return 0
+    echo $(( $(date +%s) - m ))
+}
+
+# eff_state NAME -> the ONE state machine, mirrored verbatim in gui.py's eff_state():
+#   not running        -> whatever meta says (done/waiting/error/…)
+#   running, pid dead  -> stalled   (machine rebooted, process killed)
+#   running, pid alive, silent for > AGENT_STALE_SEC -> idle
+#   running, pid alive -> running
+#   running, pid UNKNOWN (old .meta without pid=) + silent -> stalled (the pre-existing GUI rule)
+# WHY `idle` exists: the CLI used to look only at the pid ("alive -> running") and the GUI only at
+# the log's mtime ("quiet 5m -> stalled"), so the same task was reported as running by one and
+# stalled by the other. Both are half-truths: a codex step writes its log only when it FINISHES
+# (output is piped through a buffering parser), so every honest 10-minute task looked stalled in
+# the GUI. `idle` = "the process is alive, it just has not produced output for Nm" -- rendered the
+# same way on both sides (see state_label / util.js stateLabel).
+eff_state() {
+    local n="$1" st pid idle; st="$(meta_get "$n" state)"
+    [ "$st" = running ] || { echo "$st"; return; }
+    pid="$(meta_get "$n" pid)"
+    if [ -n "$pid" ] && ! is_alive "$pid"; then echo stalled; return; fi
+    idle="$(log_idle_sec "$n")"
+    if [ -n "$idle" ] && [ "$idle" -gt "$AGENT_STALE_SEC" ]; then
+        if [ -z "$pid" ]; then echo stalled; else echo idle; fi
+    else
+        echo running
+    fi
+}
+# state_label STATE [IDLE_SEC] -> the human-readable form (identical wording in gui.py/util.js).
+state_label() {
+    case "$1" in
+        idle) printf 'running (no output for %dm)' "$(( ${2:-0} / 60 ))" ;;
+        *)    printf '%s' "$1" ;;
+    esac
+}
+state_icon() { case "$1" in running) echo "▶";; idle) echo "▷";; done) echo "✔";; waiting) echo "⏳";; error) echo "✖";; stalled) echo "⚠";; *) echo "•";; esac; }
 
 hdr() { # kind "info" LABEL "text" logfile
     { echo; echo "========== [$1] $(now) | $2 =========="; echo "> $3:"; echo "$4";
@@ -244,7 +378,13 @@ finish_step() {
     fi
     meta_set "$n" files "$nfiles"
     tail3="$(last_output "$log" | grep -v '^[[:space:]]*$' | tail -3)"
-    if [ "$rc" -ne 0 ]; then
+    if [ "$rc" = 124 ]; then
+        # killed by the step watchdog (_guarded_run). Recorded in meta so `status`/`list`/the GUI
+        # can say WHY the task died instead of showing a bare exit code.
+        meta_set "$n" state error
+        meta_set "$n" timeout "$AGENT_TIMEOUT_SEC"
+        echo "[agent.sh] ⏱ TIMEOUT after ${AGENT_TIMEOUT_SEC}s — task=$n killed (raise AGENT_TIMEOUT_SEC or continue: agent.sh reply $n \"continue\")" >&2
+    elif [ "$rc" -ne 0 ]; then
         meta_set "$n" state error
         echo "[agent.sh] ✖ error exit=$rc  task=$n  (log: agent.sh log $n)" >&2
     elif printf '%s' "$tail3" | grep -qiE '\?[)"'\'' ]*$|should i |do you want|which (one|option|approach|of)|please (confirm|clarify|specify)|let me know|shall i |уточни|подтверд|как (мне |)поступ|какой из'; then
@@ -278,8 +418,8 @@ provider_dispatch_run() {
     if [ -n "$P_MODEL" ]; then
         meta_set "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}"  # resolved model, not the raw alias
     fi
-    "$fn" "$d" "$P_MODEL" "$P_EFFORT" "$prompt" 2>&1 | tee -a "$log" | tail -40
-    rc=${PIPESTATUS[0]}
+    _guarded_run "$AGENT_TIMEOUT_SEC" "$fn" "$d" "$P_MODEL" "$P_EFFORT" "$prompt" 2>&1 | tee -a "$log" | tail -40
+    rc=${PIPESTATUS[0]}   # 124 = killed by the step watchdog (see _guarded_run / finish_step)
 }
 
 provider_dispatch_resume() {
@@ -304,8 +444,8 @@ provider_dispatch_resume() {
             meta_set "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}"  # resolved model, not the raw alias
         fi
     fi
-    "$fn" "$d" "$session" "$answer" 2>&1 | tee -a "$log" | tail -40
-    rc=${PIPESTATUS[0]}
+    _guarded_run "$AGENT_TIMEOUT_SEC" "$fn" "$d" "$session" "$answer" 2>&1 | tee -a "$log" | tail -40
+    rc=${PIPESTATUS[0]}   # 124 = killed by the step watchdog (see _guarded_run / finish_step)
 }
 
 # shared body for `run` and `test-api` (identical except test-api also tags kind=api-test via
@@ -315,7 +455,13 @@ _do_run_dispatch() {
     log="$LOGDIR/$name.log"; : > "$log"
     meta_set "$name" engine "$engine"; meta_set "$name" model "${model:-default}"
     meta_set "$name" dir "$dir"; meta_set "$name" state running
-    meta_set "$name" pid "$BASHPID"; meta_set "$name" started "$(now)"
+    # NB: capture the pid into a variable FIRST. $BASHPID inside a command substitution reports
+    # the substitution's own throwaway subshell, so `winpid "$(_winpid "$BASHPID")"` would record
+    # the winpid of a process that is already dead -- and gui.py would call the task stalled while
+    # the CLI called it running (exactly the bug this pairing is meant to end).
+    step_pid="$BASHPID"
+    meta_set "$name" pid "$step_pid"; meta_set "$name" winpid "$(_winpid "$step_pid")"
+    meta_set "$name" started "$(now)"; meta_set "$name" timeout ""   # clear a previous run's marker
     [ -n "$parent" ] && meta_set "$name" parent "$parent"
     [ -n "$task_kind" ] && meta_set "$name" kind "$task_kind"
     echo "[agent.sh] ▶ run task=$name engine=$engine model=${model:-default} dir=$dir" >&2
@@ -433,6 +579,8 @@ except Exception:
         [ "$progress" = 1 ] && answer="$answer$(progress_proto_reply "$tname")"   # per-task reminder; needs resolved $tname
         [ -n "${session:-}" ] || [ "$engine" = claude ] || die "reply: could not find a session id (task '$tname'); specify uuid explicitly"
         touch "$log"; meta_set "$tname" state running; meta_set "$tname" pid "$$"
+        meta_set "$tname" winpid "$(_winpid "$$")"   # $$ is the SHELL's pid, safe inside $( ) — unlike $BASHPID
+        meta_set "$tname" timeout ""
         echo "[agent.sh] ▶ reply task=$tname session=$session dir=$dir" >&2
         hdr reply "task=$tname session=$session" ANSWER "$answer" "$log"
         rc=0
@@ -463,13 +611,19 @@ except Exception:
         [ -e "$(meta_file "$n")" ] || die "no such task: $n"
         st="$(eff_state "$n")"; e="$(meta_get "$n" engine)"; mo="$(meta_get "$n" model)"
         ex="$(meta_get "$n" exit)"; nf="$(meta_get "$n" files)"; s="$(meta_get "$n" session)"; d="$(meta_get "$n" dir)"
-        live=""; [ "$st" = running ] && live=" (alive, pid $(meta_get "$n" pid))"
-        echo "$(state_icon "$st") task=$n  state=${st}${live}  engine=$e/${mo}  exit=${ex:-–}  files=${nf:-0}"
+        idle_s="$(log_idle_sec "$n")"
+        live=""; [ "$st" = running ] || [ "$st" = idle ] && live=" (alive, pid $(meta_get "$n" pid))"
+        echo "$(state_icon "$st") task=$n  state=$(state_label "$st" "${idle_s:-0}")${live}  engine=$e/${mo}  exit=${ex:-–}  files=${nf:-0}"
         echo "   dir=$d"; echo "   session=${s:-–}"
         echo "   started=$(meta_get "$n" started)  md=$LOGDIR/$n.md"
         [ "$st" = waiting ]  && echo "   → needs a REPLY: agent.sh reply $n \"...\""
         [ "$st" = stalled ]  && echo "   ⚠ process not alive (computer shut down / killed) — continue: agent.sh reply $n \"continue\""
         [ "$st" = running ]  && echo "   ⟳ still working — follow: agent.sh log -f $n"
+        # honest third state: the process IS alive, it just has not written anything for a while
+        # (a codex/claude step only flushes its log when the step ends). Not an error by itself.
+        [ "$st" = idle ]     && echo "   ⟳ process alive but SILENT for $(( ${idle_s:-0} / 60 ))m — it is still working unless AGENT_TIMEOUT_SEC(${AGENT_TIMEOUT_SEC}s) kills it; follow: agent.sh log -f $n"
+        [ -n "$(meta_get "$n" timeout)" ] && [ "$st" = error ] && \
+            echo "   ⏱ killed by the step watchdog after $(meta_get "$n" timeout)s (AGENT_TIMEOUT_SEC) — raise it, or continue: agent.sh reply $n \"continue\""
         if [ -n "$d" ] && [ "${nf:-0}" != 0 ] && git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
             echo "   --- changed files ---"; git -C "$d" status --porcelain 2>/dev/null | sed 's/^/   /'
         fi
@@ -493,6 +647,13 @@ except Exception:
         "$fn"
         ;;
     doctor)
+        # --deep: additionally run each provider's real one-shot check (see the deep-checks block
+        # at the end). Off by default because it costs a real (cheap) model call per engine.
+        deep=0
+        for a in "$@"; do case "$a" in
+            --deep) deep=1 ;;
+            *) die "doctor: unknown option '$a' (use --deep)" ;;
+        esac; done
         # extract a top-level string/bool field from a provider doctor JSON blob (whitespace-tolerant,
         # unlike a hand-rolled grep regex — provider plugins may emit JSON with or without spaces).
         json_field() { PYTHONIOENCODING=utf-8 python -c '
@@ -555,6 +716,27 @@ PY
             claude_note="$(json_field note "$(provider_claude_doctor 2>/dev/null)")"
             if [ -n "$claude_note" ]; then echo "  $claude_note"; else echo "  (no claude usage data)"; fi
         fi
+        # --- deep checks --------------------------------------------------------------------
+        # Everything above is metadata: binary present, version, login, limits. None of it can
+        # catch the failure that actually bit us -- the model answers fine but every shell command
+        # it issues blocks forever, so the task sits in state=running for hours. Only a REAL run
+        # that must execute a command catches that, so it lives behind --deep (one cheap model
+        # call per engine that implements provider_<eng>_doctor_deep).
+        echo "=== deep checks (real one-shot runs) ==="
+        deep_any=0
+        for pdir in "$PROVIDERS_DIR"/*/; do
+            [ -d "$pdir" ] || continue
+            eng="$(basename "$pdir")"
+            declare -F "provider_${eng}_doctor_deep" >/dev/null 2>&1 || continue
+            deep_any=1
+            if [ "$deep" = 1 ]; then "provider_${eng}_doctor_deep"; fi
+        done
+        if [ "$deep_any" = 0 ]; then
+            echo "  (no provider implements a deep check)"
+        elif [ "$deep" != 1 ]; then
+            echo "  skipped — run 'agent.sh doctor --deep' to actually execute a shell command through each engine"
+            echo "  (that is the only check that catches 'the model answers but every command hangs')"
+        fi
         ;;
     gui)
         # lightweight local web dashboard over all providers: http://127.0.0.1:<port>
@@ -579,7 +761,7 @@ PY
     clean|prune)
         # Remove md clutter left by STOPPED tasks: the generated <name>.md thread in LOGDIR and the
         # agent's per-task PROGRESS.<name>.md in its working dir. Only stopped tasks (done/error/
-        # stalled) are touched; running and waiting (needs-reply) tasks are left intact. Only the
+        # stalled) are touched; live (running/idle) and waiting (needs-reply) tasks are left intact. Only the
         # unambiguously agent-generated PROGRESS.<name>.md is removed -- a generic PROGRESS.md is
         # never touched.
         #   --all     also clean waiting (needs-reply) tasks
@@ -597,7 +779,11 @@ PY
             [ -e "$f" ] || continue
             n="$(basename "$f" .meta)"; st="$(eff_state "$n")"
             case "$st" in
-                running) continue ;;
+                # `idle` is a LIVE task (alive pid, just quiet) -- it must be skipped exactly like
+                # `running`, otherwise --purge deletes the .log/.meta of a process that is still
+                # writing to them. Before the idle state existed, such a task simply read as
+                # `running` here, so leaving idle out silently turned clean into a data loss.
+                running|idle) continue ;;
                 waiting) [ "$incl_waiting" = 1 ] || continue ;;
             esac
             d="$(meta_get "$n" dir)"
@@ -620,8 +806,10 @@ PY
         ;;
     help|--help|-h)
         # print this file's own header comment as the command reference -- one source of
-        # truth instead of a duplicated usage string that can drift out of sync.
-        sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
+        # truth instead of a duplicated usage string that can drift out of sync. Printed by
+        # SHAPE (line 2 up to the first non-comment line) rather than by a hardcoded line range,
+        # which silently truncated the reference every time the header grew.
+        awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
         ;;
     *) die "unknown command: $cmd (see: agent.sh help)" ;;
 esac

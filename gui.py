@@ -47,7 +47,9 @@ if not BASH:
 LOGDIR = os.environ.get("AGENT_CLI_LOGS") or os.path.expanduser("~/.claude/agent-cli-logs")
 PROJECTS_FILE = os.path.join(LOGDIR, "projects.json")
 BRIDGES_DIR = os.path.join(LOGDIR, "bridges")  # openai_server.py drops bridge-<port>.json here
-STALE_SEC = 300  # retained for UI age hints; quiet output alone is not proof of a dead process
+# Silence threshold, shared with agent.sh (same env var, same default): a still-alive task that
+# has not written anything for this long is reported as "running (no output for Nm)".
+STALE_SEC = int(os.environ.get("AGENT_STALE_SEC") or 300)
 
 _DEFAULT_PROVIDERS = {
     "codex":   {"label": "Codex", "models": ["5.5", "5.5-high", "spark"], "limits": "codex"},
@@ -121,12 +123,73 @@ def read_meta(name):
         pass
     return d
 
+def _win_pid_alive(pid):
+    """Windows process liveness WITHOUT os.kill: on Windows python's os.kill(pid, 0) does NOT
+    probe, it calls TerminateProcess -- using it as a liveness check would kill the task it asks
+    about. OpenProcess+GetExitCodeProcess is the read-only equivalent."""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE, ERROR_ACCESS_DENIED = 0x1000, 259, 5
+    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, int(pid))
+    if not h:
+        return k32.GetLastError() == ERROR_ACCESS_DENIED  # exists, just not queryable by us
+    try:
+        code = ctypes.c_ulong()
+        if k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return code.value == STILL_ACTIVE
+        return True
+    finally:
+        k32.CloseHandle(h)
+
+def pid_alive(meta):
+    """True / False / None (= unknown, e.g. a .meta written by an older version with no winpid).
+    agent.sh records BOTH pid= (its own msys/unix pid) and winpid= (the Windows pid of the very
+    same process) precisely so this side can check the same process the CLI checks."""
+    if os.name == "nt":
+        wp = str(meta.get("winpid") or "").strip()
+        if not wp.isdigit():
+            return None
+        try:
+            return _win_pid_alive(int(wp))
+        except Exception:
+            return None
+    p = str(meta.get("pid") or "").strip()
+    if not p.isdigit():
+        return None
+    try:
+        os.kill(int(p), 0)          # POSIX only: signal 0 is a real, harmless probe there
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return None
+
 def eff_state(meta, log_mtime, nowt):
-    """Return persisted state; agent.sh owns process-liveness classification."""
+    """THE state machine — mirrored verbatim in agent.sh's eff_state(), so the CLI and this panel
+    can never contradict each other (they used to: the CLI looked only at the pid and said
+    "running", this looked only at the log's mtime and said "stalled", for the same task).
+      running + pid dead            -> stalled
+      running + pid alive + quiet   -> idle  ("running (no output for Nm)") — an honest third state
+      running + pid unknown + quiet -> stalled (the old mtime-only rule, for pre-winpid .meta files)
+    A codex/claude step flushes its log only when it ENDS, so silence alone never means dead."""
     st = meta.get("state", "?")
-    # A provider may legitimately be quiet for minutes while a tool call is running. Only agent.sh,
-    # which can check its MSYS wrapper PID, may classify a task as stalled; log age alone must not.
-    return st
+    if st != "running":
+        return st
+    alive = pid_alive(meta)
+    if alive is False:
+        return "stalled"
+    if log_mtime and (nowt - log_mtime) > STALE_SEC:
+        return "idle" if alive else "stalled"
+    return "running"
+
+# states that mean "this task has not finished yet" (used by /api/wait and the SSE log stream)
+LIVE_STATES = ("running", "idle")
 
 def first_prompt(name):
     """First line of the first PROMPT — used as the "chat" title in the tree."""
@@ -168,7 +231,7 @@ TOPIC_RULES = [
 def activity_emoji(name, state):
     if state in ACT_BY_STATE:
         return ACT_BY_STATE[state]
-    if state == "running":
+    if state in LIVE_STATES:   # idle is still a live task, just a quiet one
         lines = [l for l in read_log(name).splitlines() if l.strip()]
         last = (lines[-1] if lines else "").lower()
         for kws, em in ACT_RULES:
@@ -216,6 +279,7 @@ def list_tasks():
             "session": (meta.get("session", "") or "")[:8],
             "started": meta.get("started", ""),
             "kind": meta.get("kind", ""),  # "api-test" for agent.sh test-api tasks, else ""
+            "timeout": meta.get("timeout", ""),  # set when the step watchdog killed the task (exit 124)
             "idle_sec": int(nowt - lm) if lm else None,
             "updated": lm,
         })
@@ -576,7 +640,7 @@ class H(BaseHTTPRequestHandler):
             timeout = min(float((q.get("timeout") or ["60"])[0] or 60), 300)
             deadline = time.time() + timeout
             st, meta = task_state(name)
-            while st == "running" and time.time() < deadline:
+            while st in LIVE_STATES and time.time() < deadline:
                 time.sleep(0.5)
                 st, meta = task_state(name)
             self._send(200, json.dumps({"name": name, "state": st, "model": meta.get("model", "?"),
@@ -635,7 +699,7 @@ class H(BaseHTTPRequestHandler):
                 else:
                     idle += 1
                 st, _ = task_state(name)
-                if st != "running":
+                if st not in LIVE_STATES:   # idle = alive but quiet -> keep the stream open
                     self.wfile.write(b"event: done\ndata: {}\n\n")
                     self.wfile.flush()
                     break
@@ -726,22 +790,69 @@ def prewarm_cache():
             provider_info(eng)
     threading.Thread(target=run, daemon=True).start()
 
+def is_our_panel(port):
+    """True only if whatever holds <port> answers like THIS panel. The default port is a popular
+    one -- it was found occupied by an unrelated WebSocket server, and because the old code treated
+    ANY bind failure as "already running", `agent.sh gui` printed a success line and opened a tab
+    that could only fail with "invalid Connection header". Identity is checked by asking /api/tasks
+    for its shape (works against older panel versions too, unlike a version header)."""
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/api/tasks" % port, timeout=2) as r:
+            o = json.loads(r.read().decode("utf-8", "replace") or "{}")
+        return isinstance(o, dict) and "tasks" in o and "engines" in o
+    except Exception:
+        return False
+
+def choose_port(asked):
+    """Decide which port to actually serve on. Returns (port, status):
+         "asked" — the requested port is free, use it;
+         "ours"  — OUR panel already answers there (caller just opens the browser, no second
+                   server: the GUI is shared across providers, so a running one is reused);
+         "moved" — the port is held by SOMETHING ELSE; `port` is the next free one;
+         "none"  — busy and nothing free nearby.
+    The "moved" case is the one that used to be invisible: any bind failure was read as "already
+    running", so `agent.sh gui` claimed success while the browser tab hit a foreign server."""
+    if port_available(asked):
+        return asked, "asked"
+    if is_our_panel(asked):
+        return asked, "ours"
+    for cand in range(asked + 1, asked + 50):
+        if port_available(cand):
+            return cand, "moved"
+    return asked, "none"
+
 def main():
     # explicit CLI arg > $AGENT_GUI_PORT env var > 8765 default -- keeping the port stable
     # across restarts (rather than only ever accepting a positional arg) is what lets a
-    # browser tab stay pinned to the same URL run after run.
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("AGENT_GUI_PORT") or 8765)
-    url = "http://127.0.0.1:%d" % port
-    # Idempotency: the GUI/logic are shared across all providers. If a server is already up
-    # (another agent/the user themself), DO NOT fail or duplicate it — just open the browser on it.
-    try:
-        srv = Srv(("127.0.0.1", port), H)
-    except OSError:
-        print("[agent-gui] already running at %s — opening browser" % url)
+    # browser tab stay pinned to the same URL run after run. That priority is unchanged; only
+    # what happens when the chosen port is BUSY changed (see choose_port).
+    asked = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("AGENT_GUI_PORT") or 8765)
+    port, how = choose_port(asked)
+    if how == "ours":
+        url = "http://127.0.0.1:%d" % port
+        print("[agent-gui] already running at %s - opening browser" % url)
         try:
             import webbrowser; webbrowser.open(url)
         except Exception:
             pass
+        return
+    if how == "none":
+        print("[agent-gui] ERROR: port %d is busy (held by another program, not this panel) "
+              "and no free port in %d..%d - free it or set AGENT_GUI_PORT"
+              % (asked, asked + 1, asked + 49))
+        return
+    if how == "moved":
+        print("!" * 72)
+        print("[agent-gui] port %d is BUSY - held by another program, not this panel." % asked)
+        print("[agent-gui] STARTED ON PORT %d INSTEAD -> http://127.0.0.1:%d" % (port, port))
+        print("[agent-gui] (pin that URL, or free port %d / set AGENT_GUI_PORT to pick another)" % asked)
+        print("!" * 72)
+    url = "http://127.0.0.1:%d" % port
+    try:
+        srv = Srv(("127.0.0.1", port), H)
+    except OSError as e:
+        # lost a race for the port between the check and the bind (or it is reserved by Windows)
+        print("[agent-gui] could not bind %s: %s" % (url, e))
         return
     print("[agent-gui] %s  (logs: %s)  Ctrl-C to stop" % (url, LOGDIR))
     prewarm_cache()
