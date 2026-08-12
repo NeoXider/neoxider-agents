@@ -6,6 +6,27 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- providers: **normal CLI tasks now use each engine's true unattended mode.** Every task runs with
+  stdin closed, so a permission prompt can never be answered; without full auto the task only hangs
+  until the watchdog kills it. Codex now defaults to `--sandbox danger-full-access` instead of
+  `workspace-write`, with `AGENT_CODEX_SANDBOX` as an opt-down override (for example,
+  `workspace-write` or `read-only`). This is the repository owner's explicit standing decision: on
+  the owner Windows machine the sandbox helper independently rejected every write with
+  `patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings`
+  (earlier, `windows sandbox: helper_unknown_error: setup refresh had errors`), leaving codex able to
+  describe fixes but unable to apply them. Claude now defaults to `--dangerously-skip-permissions`
+  instead of `--permission-mode acceptEdits`, which covered edits but could still prompt for other
+  tools; `AGENT_CLAUDE_PERMISSION` overrides the normal-run permission arguments. This brings both
+  providers in line with Gemini `--yolo`, opencode `--auto`, and Kimi's auto policy.
+  `AGENT_CHAT_ONLY=1` is deliberately non-overridable: Codex remains `--sandbox read-only`, Claude
+  remains `--permission-mode acceptEdits` with its tools disabled, and both ignore the new variables.
+  That mode exposes an HTTP endpoint which turns arbitrary callers into CLI invocations, so it must
+  never inherit write, shell, or permission-bypass access from the environment.
+
+- agent.sh: **`clean` now treats `idle` exactly like `running`.** Even with `--purge`, it skips both
+  live states, preventing deletion of `.log`, `.meta`, and generated Markdown files while a quiet
+  process is still writing to them.
+
 - codex: **stop every shell command from hanging forever — isolate codex from `~/.codex/config.toml`.**
   Symptom: `agent.sh run -e codex …` started, the model answered, and then every command it issued
   blocked forever; the task stayed `state=running` for hours with a log that never grew (sometimes

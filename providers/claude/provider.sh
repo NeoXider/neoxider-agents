@@ -71,16 +71,39 @@ _provider_claude_chatonly_args() {
 # stream_text_filter.py, which reprints the SAME answer text incrementally -- so the task log
 # (agent.sh tees this stdout into it) GROWS while the model generates and a tailing reader can
 # forward real deltas. --verbose is required by the CLI for stream-json in -p mode.
+#
+# PERMISSIONS: full auto, like every other engine here (gemini --yolo, opencode --auto, codex
+# --sandbox danger-full-access, kimi's auto policy). stdin is closed for every task, so a run that
+# stops to ask for permission cannot be answered and hangs until the watchdog kills it --
+# "autonomous" is the whole point of this wrapper. acceptEdits was not enough: it pre-approves file
+# edits but still prompts on other tools.
+# Override with AGENT_CLAUDE_PERMISSION="--permission-mode acceptEdits" on machines where you want
+# the prompts back. Chat-only (openai_server.py) keeps acceptEdits and ignores the variable -- that
+# bridge already registers zero tools via --disallowedTools, and an HTTP endpoint reachable by
+# arbitrary callers must not be handed a permission bypass as well.
+_provider_claude_perm_args() {
+    if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
+        printf '%s\n' --permission-mode acceptEdits
+        return 0
+    fi
+    if [ -n "${AGENT_CLAUDE_PERMISSION:-}" ]; then
+        printf '%s\n' ${AGENT_CLAUDE_PERMISSION}
+        return 0
+    fi
+    printf '%s\n' --dangerously-skip-permissions
+}
+
 _provider_claude_invoke() {
     local dir="$1" prompt="$2"; shift 2
+    local -a perm; mapfile -t perm < <(_provider_claude_perm_args)
     if [ "${AGENT_STREAM_TEXT:-0}" = 1 ]; then
         local py
         py="$(command -v python || command -v python3 || command -v python3.12 || echo python)"
-        ( cd "$dir" && claude -p "$@" --permission-mode acceptEdits \
+        ( cd "$dir" && claude -p "$@" "${perm[@]}" \
             --output-format stream-json --include-partial-messages --verbose "$prompt" </dev/null 2>&1 \
           | PYTHONIOENCODING=utf-8 "$py" -u "$HERE/stream_text_filter.py" )
     else
-        ( cd "$dir" && claude -p "$@" --permission-mode acceptEdits "$prompt" </dev/null 2>&1 )
+        ( cd "$dir" && claude -p "$@" "${perm[@]}" "$prompt" </dev/null 2>&1 )
     fi
 }
 

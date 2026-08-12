@@ -175,11 +175,27 @@ _provider_codex_isolation_args() {
 #                               -- but --ignore-user-config does: list_mcp_resources came back
 #                               empty and the model correctly reported no MCP tools available).
 #                               Auth still works (`--help`: "auth still uses CODEX_HOME").
+#
+# SANDBOX MODE for normal runs: full auto, like every other engine here.
+# gemini runs with --yolo, opencode with --auto, claude with --permission-mode acceptEdits, kimi with
+# its auto policy -- an unattended run whose stdin is closed cannot answer a permission prompt, so
+# every provider must be in its own "full auto" equivalent or it hangs forever.
+# codex was the odd one out at --sandbox workspace-write, and on this Windows machine its sandbox
+# helper is broken independently of the config problem above: every write came back as
+#   patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings
+# (and earlier, as `windows sandbox: helper_unknown_error: setup refresh had errors`), so codex could
+# run commands but never edit a file -- it reported the fix instead of applying it.
+# Default is therefore danger-full-access, explicitly authorised by the repository owner.
+# Override per run with AGENT_CODEX_SANDBOX=workspace-write (or read-only) if you want the sandbox
+# back on a machine where it actually works.
+# NOT negotiable: AGENT_CHAT_ONLY=1 (the openai_server.py bridge) stays read-only and ignores the
+# variable. That mode exposes an HTTP endpoint that turns arbitrary callers into CLI invocations --
+# it must never gain write or shell access, no matter what the environment says.
 _provider_codex_chatonly_args() {
     if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
         printf '%s\n' --sandbox read-only
     else
-        printf '%s\n' --sandbox workspace-write
+        printf '%s\n' --sandbox "${AGENT_CODEX_SANDBOX:-danger-full-access}"
     fi
     _provider_codex_isolation_args
 }
@@ -208,10 +224,12 @@ provider_codex_run_cmd() {
 provider_codex_resume_cmd() {
     local dir="$1" session="$2" answer="$3" cargs
     local -a isoargs; mapfile -t isoargs < <(_provider_codex_isolation_args)
+    # Same sandbox policy as a fresh run (see _provider_codex_chatonly_args): full auto by default,
+    # read-only and unoverridable for the chat-only bridge.
     if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
         cargs=(-c 'sandbox_mode="read-only"')
     else
-        cargs=(-c 'sandbox_mode="workspace-write"')
+        cargs=(-c "sandbox_mode=\"${AGENT_CODEX_SANDBOX:-danger-full-access}\"")
     fi
     # Same config isolation as a fresh run -- a resumed session goes through the exact same tool
     # router, so without it `reply` hangs on the first shell command just like `run` did.

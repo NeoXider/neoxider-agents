@@ -71,7 +71,8 @@ bash $SK last fix-readme                            # only the agent's last answ
 bash $SK status fix-readme                          # state: state/stage/changed files/whether a reply is needed
 bash $SK list                                       # table: state / engine / model / age / files / session
 bash $SK clean                                      # delete md clutter (<name>.md + PROGRESS.<name>.md) of STOPPED
-                                                     # tasks; --all incl. waiting, --purge also .log/.meta, -n dry-run
+                                                     # tasks; live running/idle tasks are never touched;
+                                                     # --all incl. waiting, --purge also .log/.meta, -n dry-run
 bash $SK doctor                                     # pre-flight: engines + codex limits (before fanning out!)
 bash $SK doctor --deep                              # + one REAL cheap run per engine that must EXECUTE a shell
                                                      # command — catches "answers fine, every command hangs"
@@ -88,8 +89,19 @@ bash $SK gui [port]                                 # web control panel over all
 | `AGENT_STALE_SEC` | `300` | Silence after which a still-alive task is reported as `running (no output for Nm)` instead of plain `running` — same wording in the CLI and in the GUI. |
 | `AGENT_CODEX_USER_CONFIG` | unset | `1` = let codex load `~/.codex/config.toml` again. Off by default **on purpose** — see ["Codex: every shell command hangs"](#codex-every-shell-command-hangs-environment-issue) below. |
 | `AGENT_CODEX_MCP` | unset | Re-add specific MCP servers to the isolated codex config: `AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp,other=http://…"` → repeated `-c mcp_servers.<name>.url="<url>"`. |
+| `AGENT_CODEX_SANDBOX` | `danger-full-access` | Sandbox for normal Codex `run`/`reply` tasks. Set `workspace-write` or `read-only` to opt down. `AGENT_CHAT_ONLY=1` always forces `read-only` and ignores this variable. |
+| `AGENT_CLAUDE_PERMISSION` | `--dangerously-skip-permissions` | Permission arguments for normal Claude `run`/`reply` tasks; for example, set `--permission-mode acceptEdits` to opt down. `AGENT_CHAT_ONLY=1` always uses `--permission-mode acceptEdits` and ignores this variable. |
 | `AGENT_CODEX_DOCTOR_MODEL` / `AGENT_CODEX_DOCTOR_TIMEOUT` | `spark` / `60` | Model and hard deadline for `doctor --deep`'s codex shell check. |
 | `AGENT_GUI_PORT` | `8765` | GUI port (an explicit `gui <port>` argument still wins). |
+
+Normal provider runs are intentionally full-auto: Codex uses `--sandbox danger-full-access`, Claude
+uses `--dangerously-skip-permissions`, Gemini uses `--yolo`, opencode uses `--auto`, and Kimi uses its
+auto policy. Every task has stdin closed, so an approval question cannot be answered and would hang
+until the watchdog kills the process. Codex's full-access default is also an explicit repository-owner
+decision for Windows, where its sandbox helper rejected every attempted write (including
+`patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings`) and
+made agents report changes instead of applying them. Use the two opt-down variables above only where
+their restricted modes work and suit the task.
 
 **Self-testing your own work.** If you just built or modified a local web service/API
 (e.g. a Unity `HttpListener` debug endpoint, a small backend), you can verify it works
@@ -184,8 +196,11 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   `~/.codex/config.toml` so real configured MCP servers like a live `unityMCP` aren't
   reachable), claude runs with `--strict-mcp-config --disallowedTools
   Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, and Kimi uses an explicit
-  `tools: []` agent profile. Only applies to bridge
-  subprocesses — a normal `agent.sh run` keeps full access. Verified live: `-c
+  `tools: []` agent profile. Codex also ignores `AGENT_CODEX_SANDBOX`, and Claude keeps
+  `--permission-mode acceptEdits` while ignoring `AGENT_CLAUDE_PERMISSION`. This is a security
+  boundary: the HTTP endpoint turns arbitrary callers into CLI invocations, so environment overrides
+  must never grant it write, shell, or permission-bypass access. These restrictions apply only to
+  bridge subprocesses — a normal `agent.sh run` keeps full access. Verified live: `-c
   mcp_servers={}` alone did NOT stop a real MCP call from succeeding; the flags above
   do.
 - **`usage` token counts are estimates** (~4 chars/token, `"neoxider_estimated": true`)
@@ -234,6 +249,8 @@ panel run the SAME state machine (`eff_state` in `agent.sh` and in `gui.py`):
 ENDS, so silence alone never means dead. This is what used to make the CLI say *running* and the GUI say
 *stalled* about the very same task — the CLI looked only at the pid, the GUI only at the log's mtime.
 (On Windows the two now compare notes through `winpid`, because a git-bash pid means nothing to python.)
+`agent.sh clean`, including `clean --purge`, skips `idle` exactly like `running`; otherwise it could
+delete a live quiet process's `.log`/`.meta` while that process was still writing to them.
 
 **No silent forever-hangs.** Every step runs under `AGENT_TIMEOUT_SEC` (default 30 min). On expiry the
 whole process tree is killed — including the native Windows grandchild (`codex.exe` and whatever it

@@ -457,16 +457,58 @@ section "AGENT_CHAT_ONLY sandboxing (codex + claude provider flags)"
 # breaking the tool-calling prompt. These assertions just lock in the FLAG WIRING so a refactor
 # can't silently drop it; the "does it actually restrict" claim is a live/manual check, not here.
 
+# Normal runs are FULL AUTO on every engine (gemini --yolo, opencode --auto, kimi's auto policy,
+# claude --dangerously-skip-permissions, codex --sandbox danger-full-access). stdin is closed for
+# every task, so a run that stops to ask for permission can never be answered and hangs until the
+# watchdog kills it. codex was the odd one out at workspace-write, and on the owner's Windows box
+# its sandbox helper is broken outright: every write came back as "writing is blocked by read-only
+# sandbox", so the agent reported fixes instead of applying them. Full access is the owner's
+# explicit, standing decision -- these assertions exist so a later refactor cannot quietly put the
+# broken sandbox back and turn every write task into a no-op again.
 unset AGENT_CHAT_ONLY
-unset AGENT_CODEX_USER_CONFIG AGENT_CODEX_MCP
+unset AGENT_CODEX_USER_CONFIG AGENT_CODEX_MCP AGENT_CODEX_SANDBOX
 mapfile -t codex_default < <(_provider_codex_chatonly_args)
-assert_eq "codex default (no AGENT_CHAT_ONLY): workspace-write sandbox + user-config isolation" \
-    "--sandbox workspace-write --ignore-user-config" "${codex_default[*]}"
+assert_eq "codex default (no AGENT_CHAT_ONLY): full-access sandbox + user-config isolation" \
+    "--sandbox danger-full-access --ignore-user-config" "${codex_default[*]}"
+
+AGENT_CODEX_SANDBOX=workspace-write
+mapfile -t codex_sbox < <(_provider_codex_chatonly_args)
+assert_eq "codex: AGENT_CODEX_SANDBOX puts a sandbox back for machines where it works" \
+    "--sandbox workspace-write --ignore-user-config" "${codex_sbox[*]}"
+unset AGENT_CODEX_SANDBOX
 
 AGENT_CHAT_ONLY=1
 mapfile -t codex_chatonly < <(_provider_codex_chatonly_args)
 assert_eq "codex chat-only: switches to read-only sandbox + ignore-user-config" \
     "--sandbox read-only --ignore-user-config" "${codex_chatonly[*]}"
+
+# The bridge turns arbitrary HTTP callers into CLI invocations, so it must stay read-only no matter
+# what the environment says -- otherwise AGENT_CODEX_SANDBOX in a shell profile would silently hand
+# every caller of :8801/v1 full shell access.
+AGENT_CODEX_SANDBOX=danger-full-access
+mapfile -t codex_chat_sbox < <(_provider_codex_chatonly_args)
+assert_eq "codex chat-only ignores AGENT_CODEX_SANDBOX (bridge stays read-only)" \
+    "--sandbox read-only --ignore-user-config" "${codex_chat_sbox[*]}"
+unset AGENT_CODEX_SANDBOX
+unset AGENT_CHAT_ONLY
+
+unset AGENT_CLAUDE_PERMISSION
+mapfile -t claude_perm < <(_provider_claude_perm_args)
+assert_eq "claude default: full auto, no permission prompts" \
+    "--dangerously-skip-permissions" "${claude_perm[*]}"
+
+AGENT_CLAUDE_PERMISSION="--permission-mode acceptEdits"
+mapfile -t claude_perm_env < <(_provider_claude_perm_args)
+assert_eq "claude: AGENT_CLAUDE_PERMISSION brings the prompts back" \
+    "--permission-mode acceptEdits" "${claude_perm_env[*]}"
+unset AGENT_CLAUDE_PERMISSION
+
+AGENT_CHAT_ONLY=1
+AGENT_CLAUDE_PERMISSION="--dangerously-skip-permissions"
+mapfile -t claude_perm_chat < <(_provider_claude_perm_args)
+assert_eq "claude chat-only ignores AGENT_CLAUDE_PERMISSION (bridge keeps acceptEdits)" \
+    "--permission-mode acceptEdits" "${claude_perm_chat[*]}"
+unset AGENT_CLAUDE_PERMISSION
 unset AGENT_CHAT_ONLY
 
 unset AGENT_CHAT_ONLY
