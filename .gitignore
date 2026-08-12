@@ -15,3 +15,8 @@ Thumbs.db
 .vscode/
 .idea/
 *.local.json
+
+# per-task agent checkpoints: written by every `agent.sh run` into the working
+# directory, useful while a task is live and worthless in history. They leaked
+# into a commit once via `git add -A`; this is the guard against a repeat.
+PROGRESS.*.md
