@@ -85,13 +85,25 @@ cleaned up `agent.sh last`/the GUI for codex). One process = one fixed engine/mo
 text-only completion for bridge calls**: `AGENT_CHAT_ONLY=1` makes codex run
 `--sandbox read-only --ignore-user-config`, claude keeps `--permission-mode acceptEdits`
 and runs `--strict-mcp-config --disallowedTools
-Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, and Kimi uses a
-`tools: []` agent profile, so the bridge can't
+Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, Kimi uses a
+`tools: []` agent profile, and opencode uses an agent profile whose tool map is
+`{"*": false}` (`providers/opencode/chat-only.json` via `OPENCODE_CONFIG`), so the bridge can't
 reach a real MCP server (verified live against a configured `unityMCP`) or write files
 instead of answering in the expected format — a normal `agent.sh run` outside the
-bridge is unaffected. Chat-only ignores `AGENT_CODEX_SANDBOX` and
+bridge is unaffected. `gemini` is the exception: chat-only downgrades it to
+`--approval-mode plan` (no writes/exec) but its READ tools cannot be removed, so don't expose a
+gemini bridge on a network. opencode's native `serve` path is OFF by default for the same
+reason — it does not honour that profile over HTTP (`AGENT_OPENCODE_NATIVE_UNSAFE=1` opts in,
+loopback only). Chat-only ignores `AGENT_CODEX_SANDBOX` and
 `AGENT_CLAUDE_PERMISSION`: this HTTP-to-CLI boundary must never let arbitrary callers
 gain write, shell, or permission-bypass access through the environment.
+
+**Exposing either server off this machine.** The bridge takes `--api-key SECRET`
+(`$AGENT_OPENAI_KEY`) and then requires `Authorization: Bearer SECRET` on everything except
+`/health`. The GUI is loopback-only unless started as `gui <port> --lan --token SECRET`, and it
+REFUSES to bind the network without that token because it launches full-auto subagents. Remember
+which machine does the work: the agent always runs on the host, so the caller's own files are
+never touched.
 
 ## Rules for using this tool as a subagent orchestrator
 

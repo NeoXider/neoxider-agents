@@ -1,0 +1,10 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "neoxider-chat-only": {
+      "description": "Text-only completion profile for the local OpenAI-compatible bridge",
+      "mode": "primary",
+      "tools": { "*": false }
+    }
+  }
+}

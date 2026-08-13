@@ -6,6 +6,80 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-13
+
+### Security
+
+- **openai-server: `-e opencode` was an unauthenticated remote shell, and it was the default the
+  GUI offered.** The bridge's opencode path talked to `opencode serve` directly, which never goes
+  through `providers/opencode/provider.sh` and therefore never saw `AGENT_CHAT_ONLY=1` — while the
+  bridge binds `0.0.0.0` out of the box. Measured live (opencode 1.18.16, 2026-08-13): a plain
+  `POST /v1/chat/completions` session listed `apply_patch, bash, edit, glob, grep, question, read,
+  skill, todowrite, webfetch, websearch, write` **plus 40 live `unityMCP` tools**, and a simple
+  "create notes.txt" request really created the file on disk. Two things changed:
+  - a chat-only agent profile (`providers/opencode/chat-only.json`, tool map `{"*": false}`,
+    applied through `OPENCODE_CONFIG` + `--agent neoxider-chat-only`) now locks the CLI path down —
+    verified: the same question now answers `NONE`, and the same "create notes.txt" request writes
+    nothing;
+  - the native `opencode serve` path is **off by default**, because opencode does not honour an
+    agent's tool map over HTTP (the identical profile answers `NONE` via `opencode run --agent` and
+    still lists every tool via the server API, whether the agent is set on `POST /api/session` or
+    switched with `POST /api/session/{id}/agent`). `AGENT_OPENCODE_NATIVE_UNSAFE=1` opts back into
+    the faster path, with a banner, for a loopback-only bridge.
+- **openai-server: optional API-key authentication** — `--api-key SECRET` / `$AGENT_OPENAI_KEY`.
+  Callers present the standard `Authorization: Bearer SECRET` (what every OpenAI client already
+  sends as `api_key`) or `X-Api-Key`. `/health` and `/` stay open for liveness probes and the GUI's
+  bridge list; `/v1/models`, `/v1/chat/completions` and `/reset` return an OpenAI-shaped 401
+  without it. Comparison is constant-time. With no key the bridge stays open exactly as before —
+  fine on loopback — but the LAN banner now says so in as many words instead of implying safety.
+  The bridge registry records only *whether* a key is required, never the key.
+- **gui: `--lan` + mandatory `--token`.** The panel can now be driven from another computer or a
+  phone (`agent.sh gui 8765 --lan --token SECRET`, or `$AGENT_GUI_HOST`/`$AGENT_GUI_TOKEN`), which
+  is what you want when the files to edit live on the host. Because it launches full-auto
+  subagents in any directory a caller names, `--lan` **refuses to start** without a token — an open
+  LAN panel is remote code execution, not a convenience. The token is accepted as `?token=` (stored
+  in a `SameSite=Strict` cookie on first load, so no frontend change was needed), an
+  `X-Agent-Token` header, or that cookie; loopback clients never need it, which also keeps the
+  "is our panel already up?" probe working.
+- **gemini chat-only is now read-only** (`--approval-mode plan` instead of `--yolo`). Documented
+  honestly as the one incomplete lockdown: Gemini CLI has no flag that removes the READ tools, so a
+  gemini-backed bridge should not be exposed to a network.
+
+### Fixed
+
+- **openai-server: opencode ignored the working directory entirely.** `opencode serve` was spawned
+  with no cwd and sessions were created with no `location`, so the agent operated in the *bridge
+  process's* directory: `-C/--dir` did nothing and the scratch-dir isolation was void — the live
+  repro wrote `notes.txt` into this repository's own checkout. Sessions now carry
+  `location: {directory: …}`.
+- **openai-server: the scratch working directory was wiped on every turn of a no-resume
+  conversation.** `opencode`/`gemini` take the fresh-run path on *every* call, and that path
+  unconditionally deleted and recreated the session directory — pointless within one conversation,
+  and destabilising for a live `opencode serve` holding it as the project root (it reproducibly
+  emptied the answer of the tool-result turn in the live smoke). It is now wiped only when the
+  conversation actually changes.
+- **tests: the live smoke reported phantom failures for `claude` and `opencode`.** Its session
+  assertions counted `<task>.meta` files, which the native backends never write; a perfectly
+  healthy run showed 3–4 FAILs. Those checks now print as `skip` with the reason (never a silent
+  pass), `--no-native` forces both engines onto the agent.sh path to cover them for real, and a new
+  backend-independent divergence check (`session_turns` drops back to 1) runs everywhere.
+  `--api-key` additionally asserts the 401/open-`/health` split.
+
+### Added
+
+- `tests/`: 34 new offline regression tests (API-key auth incl. prefix rejection and the
+  `/health` exemption, the opencode session payload, the GUI LAN/token rules and the
+  query/header/cookie token sources) — 432 total, still zero dependencies.
+- README rewritten: quick start first, a "working from another computer" decision table, and the
+  long-form bridge internals folded into collapsible sections instead of one 500-line wall.
+
+### Changed
+
+- `agent.sh gui` forwards all arguments to `gui.py` verbatim (needed for `--lan`/`--token`), while
+  still falling back to `$AGENT_GUI_PORT`/`8765` when given none.
+
+## [0.2.0] - 2026-08-12
+
 - gui/doctor: **limits are now usable at a glance.** `doctor` probes provider hooks concurrently
   and `doctor --json` supplies an ordered structured snapshot to the panel, cutting the measured
   Windows run from 32.637s to 8.885s. The modal is persistent cache-first/stale-while-revalidate:

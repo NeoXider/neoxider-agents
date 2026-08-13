@@ -33,7 +33,12 @@
 #                      makes it execute a shell command — the only check that catches "the model
 #                      answers but every shell command hangs" (see AGENT_CODEX_USER_CONFIG below).
 #   agent.sh provider-info <engine>                                      — single provider's doctor JSON (used by gui.py)
-#   agent.sh openai-server [-e engine] [-m model] [-f effort] [-p port]  — OpenAI-compatible
+#   agent.sh gui [port] [--lan] [--token SECRET]                         — web control panel.
+#                      Loopback-only by default. --lan binds every interface so another computer or
+#                      a phone can drive it, and then --token (or $AGENT_GUI_TOKEN) is MANDATORY:
+#                      the panel launches full-auto subagents, so an open LAN panel is remote code
+#                      execution. Other devices open http://<this-host>:<port>/?token=<secret>.
+#   agent.sh openai-server [-e engine] [-m model] [-f effort] [-p port] [--api-key SECRET]  — OpenAI-compatible
 #                      /v1/chat/completions bridge over a CLI subagent (see openai_server.py's
 #                      own docstring for the full contract/caveats). Point any OpenAI-compatible
 #                      client -- including CoreAI's COREAI_TEST_BASE_URL -- at its base_url. Run
@@ -781,15 +786,12 @@ PY
     gui)
         # lightweight local web dashboard over all providers: http://127.0.0.1:<port>
         # native python (win) resolves `bash` to WSL -> pass it the EXACT git-bash path.
-        # Only forward an explicit port arg -- if none is given, let gui.py itself fall back
-        # to $AGENT_GUI_PORT or its own stable 8765 default (previously this always injected
-        # "${1:-8765}", which silently defeated AGENT_GUI_PORT since python always saw an argv).
+        # Every argument is forwarded verbatim (port, --lan, --token SECRET, --localhost) and
+        # gui.py owns the parsing -- with NO argument it still falls back to $AGENT_GUI_PORT or
+        # its own stable 8765 default (an unconditional "${1:-8765}" here used to defeat
+        # AGENT_GUI_PORT, because python always saw an argv).
         export AGENT_SH_BASH="$(cygpath -w "$BASH" 2>/dev/null || echo bash)"
-        if [ -n "${1:-}" ]; then
-            exec python "$(dirname "$0")/gui.py" "$1"
-        else
-            exec python "$(dirname "$0")/gui.py"
-        fi
+        exec python "$(dirname "$0")/gui.py" "$@"
         ;;
     openai-server)
         # OpenAI-compatible /v1/chat/completions bridge over a CLI subagent -- one process =

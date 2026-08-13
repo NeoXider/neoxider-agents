@@ -604,6 +604,17 @@ class SessionDirTests(unittest.TestCase):
         self.assertEqual(d, d2)
         self.assertFalse(os.path.exists(stray))
 
+    def test_wipe_false_keeps_the_same_conversation_files(self):
+        """A no-resume engine (opencode/gemini) takes the fresh-run path on EVERY turn of one
+        conversation; wiping the project root under a live `opencode serve` each time is both
+        pointless and destabilising, so a continuation keeps the directory intact."""
+        d = srv.fresh_session_dir()
+        keep = os.path.join(d, "turn1.txt")
+        with open(keep, "w", encoding="utf-8") as f:
+            f.write("written on the previous turn of the SAME conversation")
+        self.assertEqual(srv.fresh_session_dir(wipe=False), d)
+        self.assertTrue(os.path.exists(keep))
+
     def test_pinned_dir_is_returned_as_is_and_never_wiped(self):
         import tempfile
         pinned = tempfile.mkdtemp()
@@ -1850,6 +1861,97 @@ class TailTaskLogTests(unittest.TestCase):
         t.join()
         self.assertEqual("".join(got), "Hello ж")
         self.assertGreaterEqual(len(got), 2)  # arrived in pieces, not one blob
+
+
+class ApiKeyAuthTests(unittest.TestCase):
+    """`--api-key` / $AGENT_OPENAI_KEY -- the gate that makes a LAN/public bridge safe to expose.
+    An open bridge (no key) must keep behaving exactly as it always did on loopback."""
+
+    def setUp(self):
+        self._orig_cfg = srv.CFG
+
+        class FakeCfg:
+            api_key = ""
+
+        self.cfg = FakeCfg()
+        srv.CFG = self.cfg
+
+    def tearDown(self):
+        srv.CFG = self._orig_cfg
+
+    def test_no_key_configured_lets_everything_through(self):
+        self.assertTrue(srv.request_authorized({}, "/v1/chat/completions"))
+        self.assertTrue(srv.request_authorized({}, "/reset"))
+
+    def test_bearer_token_accepted(self):
+        self.cfg.api_key = "s3cret"
+        self.assertTrue(srv.request_authorized(
+            {"Authorization": "Bearer s3cret"}, "/v1/chat/completions"))
+
+    def test_bearer_scheme_is_case_insensitive(self):
+        self.cfg.api_key = "s3cret"
+        self.assertTrue(srv.request_authorized(
+            {"Authorization": "bearer s3cret"}, "/v1/chat/completions"))
+
+    def test_x_api_key_header_accepted(self):
+        self.cfg.api_key = "s3cret"
+        self.assertTrue(srv.request_authorized({"X-Api-Key": "s3cret"}, "/v1/chat/completions"))
+
+    def test_wrong_and_missing_keys_rejected(self):
+        self.cfg.api_key = "s3cret"
+        self.assertFalse(srv.request_authorized({}, "/v1/chat/completions"))
+        self.assertFalse(srv.request_authorized(
+            {"Authorization": "Bearer nope"}, "/v1/chat/completions"))
+        self.assertFalse(srv.request_authorized({"X-Api-Key": "nope"}, "/reset"))
+
+    def test_prefix_of_the_key_is_not_accepted(self):
+        self.cfg.api_key = "s3cret"
+        self.assertFalse(srv.request_authorized({"X-Api-Key": "s3c"}, "/v1/chat/completions"))
+
+    def test_health_and_root_stay_open_for_probes(self):
+        self.cfg.api_key = "s3cret"
+        self.assertTrue(srv.request_authorized({}, "/health"))
+        self.assertTrue(srv.request_authorized({}, "/"))
+
+    def test_models_endpoint_requires_the_key(self):
+        self.cfg.api_key = "s3cret"
+        self.assertFalse(srv.request_authorized({}, "/v1/models"))
+
+    def test_query_string_does_not_defeat_the_path_check(self):
+        self.cfg.api_key = "s3cret"
+        self.assertTrue(srv.request_authorized({}, "/health?x=1"))
+        self.assertFalse(srv.request_authorized({}, "/v1/chat/completions?health=1"))
+
+
+class OpencodeSessionBodyTests(unittest.TestCase):
+    """The native opencode session payload. Both extra fields are load-bearing: `agent` is the
+    tool lockdown (without it a LAN caller had bash/write/MCP), `location` is the working dir
+    (without it the agent wrote files into the bridge process's own cwd)."""
+
+    def test_chat_only_agent_is_always_requested(self):
+        body = srv.opencode_session_body("opencode/big-pickle", "/tmp/x")
+        self.assertEqual(body["agent"], srv.OPENCODE_CHATONLY_AGENT)
+
+    def test_provider_and_model_are_split_on_the_first_slash(self):
+        body = srv.opencode_session_body("zai/glm-4.6", "/tmp/x")
+        self.assertEqual(body["model"], {"providerID": "zai", "id": "glm-4.6"})
+
+    def test_bare_model_leaves_opencode_its_own_default(self):
+        self.assertNotIn("model", srv.opencode_session_body("", "/tmp/x"))
+        self.assertNotIn("model", srv.opencode_session_body("big-pickle", "/tmp/x"))
+
+    def test_workdir_becomes_the_session_location(self):
+        body = srv.opencode_session_body("opencode/big-pickle", "C:/Git/Proj")
+        self.assertEqual(body["location"], {"directory": "C:/Git/Proj"})
+
+    def test_no_workdir_omits_location_rather_than_sending_null(self):
+        self.assertNotIn("location", srv.opencode_session_body("opencode/big-pickle", None))
+
+    def test_chat_only_config_points_at_a_file_that_disables_every_tool(self):
+        with open(srv.OPENCODE_CHATONLY_CONFIG, encoding="utf-8") as f:
+            cfg = json.load(f)
+        agent = cfg["agent"][srv.OPENCODE_CHATONLY_AGENT]
+        self.assertEqual(agent["tools"], {"*": False})
 
 
 if __name__ == "__main__":

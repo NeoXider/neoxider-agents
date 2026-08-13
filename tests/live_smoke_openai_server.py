@@ -9,6 +9,14 @@ full CLI invocation per step, low minutes total) and real usage against your sub
 it deliberately, not automatically:
 
     python tests/live_smoke_openai_server.py [--engine claude] [--model sonnet] [--effort low]
+                                             [--no-native] [--api-key SECRET] [--port N]
+
+`claude` and `opencode` reach their CLI through a NATIVE backend by default (one persistent
+`claude -p` process / `opencode serve`'s HTTP API) rather than through `agent.sh run`, so they
+write no `<task>.meta` files and the task-count session assertions below cannot be evaluated --
+those print as `skip`, never as a silent pass. `--no-native` forces both engines onto the
+agent.sh path so the full matrix runs. `--api-key` additionally asserts that an unauthenticated
+call is rejected with 401 while `/health` stays open.
 
 Exercises a real openai_server.py instance on a scratch port with AGENT_CLI_LOGS pointed at a
 scratch temp dir (never touches your real ~/.claude/agent-cli-logs):
@@ -44,6 +52,7 @@ REPO_ROOT = os.path.dirname(HERE)
 
 PASS = 0
 FAIL = 0
+SKIP = 0
 
 
 def check(cond, desc):
@@ -56,6 +65,30 @@ def check(cond, desc):
         print("  FAIL - %s" % desc)
 
 
+def skip(desc, why):
+    """A check that CANNOT apply to this configuration -- printed, never silently dropped."""
+    global SKIP
+    SKIP += 1
+    print("  skip - %s (%s)" % (desc, why))
+
+
+# Engines whose bridge path does NOT go through `agent.sh run` at all: claude drives one persistent
+# `claude -p --input-format stream-json` process and opencode talks to `opencode serve`'s HTTP API.
+# Both are deliberate latency optimisations -- and both mean no <task>.meta file is ever written, so
+# the .meta-counting assertions below can only be evaluated on the agent.sh path. Before this was
+# accounted for, a perfectly healthy claude/opencode run reported 3-4 phantom FAILs.
+def uses_native_backend(engine, env):
+    if engine == "claude":
+        return env.get("CLAUDE_NO_NATIVE") != "1"
+    if engine == "opencode":
+        # opencode's native path is opt-IN since 0.2.0 -- it cannot be locked down to chat-only
+        # (see OPENCODE_NATIVE in openai_server.py), so by default opencode goes through agent.sh
+        # like every other engine and the task-count assertions DO apply.
+        return (env.get("AGENT_OPENCODE_NATIVE_UNSAFE") == "1"
+                and env.get("OPENCODE_NO_NATIVE") != "1")
+    return False
+
+
 def load_supports_resume(engine):
     try:
         with open(os.path.join(REPO_ROOT, "providers", engine, "provider.json"), encoding="utf-8") as f:
@@ -64,14 +97,26 @@ def load_supports_resume(engine):
         return False
 
 
+# Filled in by main() when --api-key is used; merged into every request below.
+AUTH = {}
+
+
+def _headers(extra=None):
+    h = dict(AUTH)
+    h.update(extra or {})
+    return h
+
+
 def http_get(base, path):
-    with urllib.request.urlopen(base + path, timeout=30) as r:
+    req = urllib.request.Request(base + path, headers=_headers())
+    with urllib.request.urlopen(req, timeout=30) as r:
         return r.status, json.loads(r.read().decode("utf-8"))
 
 
 def http_post_json(base, path, body, timeout=200):
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(base + path, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(base + path, data=data,
+                                 headers=_headers({"Content-Type": "application/json"}), method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read().decode("utf-8"))
@@ -81,7 +126,8 @@ def http_post_json(base, path, body, timeout=200):
 
 def http_post_stream(base, path, body, timeout=200):
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(base + path, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(base + path, data=data,
+                                 headers=_headers({"Content-Type": "application/json"}), method="POST")
     lines = []
     with urllib.request.urlopen(req, timeout=timeout) as r:
         for raw in r:
@@ -112,26 +158,59 @@ def main():
     ap.add_argument("--model", default="sonnet")
     ap.add_argument("--effort", default="low")
     ap.add_argument("--port", type=int, default=8977)
+    ap.add_argument("--no-native", action="store_true",
+                    help="force claude/opencode through the `agent.sh run` path instead of their "
+                         "native persistent-process/HTTP backends -- makes the .meta task-count "
+                         "session assertions observable for those engines too")
+    ap.add_argument("--keep-logs", action="store_true",
+                    help="do not delete the scratch AGENT_CLI_LOGS directory on exit -- the only "
+                         "way to inspect the actual CLI transcript behind a failing check")
+    ap.add_argument("--api-key", default="",
+                    help="start the bridge with --api-key and authenticate every request with it "
+                         "(also asserts that an unauthenticated call is rejected with 401)")
     args = ap.parse_args()
 
     supports_resume = load_supports_resume(args.engine)
     scratch_logdir = tempfile.mkdtemp(prefix="openai-server-smoke-logs-")
     env = dict(os.environ)
     env["AGENT_CLI_LOGS"] = scratch_logdir
+    if args.no_native:
+        env["CLAUDE_NO_NATIVE"] = "1"
+        env["OPENCODE_NO_NATIVE"] = "1"
+    native = uses_native_backend(args.engine, env)
     base = "http://127.0.0.1:%d" % args.port
 
+    cmd = [sys.executable, os.path.join(REPO_ROOT, "openai_server.py"),
+           "-e", args.engine, "-m", args.model, "-f", args.effort,
+           "-p", str(args.port), "--timeout", "180", "--session-ttl", "6"]
+    if args.api_key:
+        cmd += ["--api-key", args.api_key]
+        AUTH["Authorization"] = "Bearer " + args.api_key
     proc = subprocess.Popen(
-        [sys.executable, os.path.join(REPO_ROOT, "openai_server.py"),
-         "-e", args.engine, "-m", args.model, "-f", args.effort,
-         "-p", str(args.port), "--timeout", "180", "--session-ttl", "6"],
-        cwd=REPO_ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cmd, cwd=REPO_ROOT, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
-        print("[smoke] %s/%s/%s on port %d (supports_resume=%s), scratch logs at %s"
-              % (args.engine, args.model, args.effort, args.port, supports_resume, scratch_logdir))
+        print("[smoke] %s/%s/%s on port %d (supports_resume=%s, native_backend=%s, auth=%s), "
+              "scratch logs at %s"
+              % (args.engine, args.model, args.effort, args.port, supports_resume, native,
+                 bool(args.api_key), scratch_logdir))
         if not wait_for_server(base):
             check(False, "server came up within 15s")
             return 1
+
+        if args.api_key:
+            # /health stays open on purpose (liveness probes); everything that can spend tokens
+            # or touch the session must 401 without the key.
+            try:
+                urllib.request.urlopen(base + "/v1/models", timeout=10)
+                check(False, "unauthenticated /v1/models -> 401")
+            except urllib.error.HTTPError as e:
+                check(e.code == 401, "unauthenticated /v1/models -> 401 (got %d)" % e.code)
+            try:
+                urllib.request.urlopen(base + "/health", timeout=10)
+                check(True, "/health stays reachable without the key (liveness probe)")
+            except urllib.error.HTTPError as e:
+                check(False, "/health stays reachable without the key (got %d)" % e.code)
 
         status, body = http_get(base, "/health")
         check(status == 200 and body.get("ok") is True, "GET /health returns ok")
@@ -146,18 +225,21 @@ def main():
         check(status == 400, "missing messages -> 400")
 
         req = urllib.request.Request(base + "/v1/chat/completions", data=b"{not valid json",
-                                      headers={"Content-Type": "application/json"}, method="POST")
+                                      headers=_headers({"Content-Type": "application/json"}),
+                                      method="POST")
         try:
             urllib.request.urlopen(req, timeout=10)
             check(False, "invalid JSON body -> 400")
         except urllib.error.HTTPError as e:
-            check(e.code == 400, "invalid JSON body -> 400")
+            check(e.code == 400, "invalid JSON body -> 400 (got %d)" % e.code)
 
         try:
-            urllib.request.urlopen(base + "/definitely/not/a/real/path", timeout=10)
+            urllib.request.urlopen(
+                urllib.request.Request(base + "/definitely/not/a/real/path", headers=_headers()),
+                timeout=10)
             check(False, "unknown GET path -> 404")
         except urllib.error.HTTPError as e:
-            check(e.code == 404, "unknown GET path -> 404")
+            check(e.code == 404, "unknown GET path -> 404 (got %d)" % e.code)
 
         print("[smoke] fresh completion (real CLI call, please wait) ...")
         status, body = http_post_json(base, "/v1/chat/completions", {
@@ -166,7 +248,11 @@ def main():
         check(status == 200, "fresh completion returns 200")
         check(bool(body.get("choices", [{}])[0].get("message", {}).get("content")), "fresh completion has content")
         n1 = count_tasks(scratch_logdir, args.port)
-        check(n1 == 1, "exactly one task created after the first call (got %d)" % n1)
+        native_why = "%s uses its native backend, which writes no agent.sh task" % args.engine
+        if native:
+            skip("exactly one task created after the first call", native_why)
+        else:
+            check(n1 == 1, "exactly one task created after the first call (got %d)" % n1)
 
         print("[smoke] continuation (should recall context) ...")
         status, body = http_post_json(base, "/v1/chat/completions", {
@@ -179,7 +265,9 @@ def main():
         answer = body.get("choices", [{}])[0].get("message", {}).get("content") or ""
         check("42" in answer, "continuation correctly recalls context (got: %r)" % answer)
         n2 = count_tasks(scratch_logdir, args.port)
-        if supports_resume:
+        if native:
+            skip("continuation task-count behaviour", native_why)
+        elif supports_resume:
             check(n2 == n1, "task count did not grow on continuation (still %d)" % n2)
         else:
             check(n2 == n1 + 1, "engine has no resume support -> continuation started a new session")
@@ -221,13 +309,24 @@ def main():
         final_answer = body.get("choices", [{}])[0].get("message", {}).get("content") or ""
         check("11" in final_answer or "rain" in final_answer.lower(), "tool result correctly incorporated (got: %r)" % final_answer)
         n_after_tools = count_tasks(scratch_logdir, args.port)
-        if supports_resume:
+        if native:
+            skip("tool round-trip task-count behaviour", native_why)
+        elif supports_resume:
             check(n_after_tools == n1, "tool round-trip stayed in the same session")
 
         print("[smoke] unrelated conversation (should start a new session) ...")
         http_post_json(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "Reply with exactly: UNRELATED"}]})
         n3 = count_tasks(scratch_logdir, args.port)
-        check(n3 == n_after_tools + 1, "divergence correctly started a new session (task count %d -> %d)" % (n_after_tools, n3))
+        # session_turns is the one divergence signal that works on EVERY backend: an unrelated
+        # single-message conversation replaces the remembered 7-message array rather than extending
+        # it, so the counter drops back to 1 instead of climbing.
+        _, health = http_get(base, "/health")
+        check(health.get("session_turns") == 1,
+              "divergence replaced the remembered conversation (session_turns=%s)" % health.get("session_turns"))
+        if native:
+            skip("divergence task-count behaviour", native_why)
+        else:
+            check(n3 == n_after_tools + 1, "divergence correctly started a new session (task count %d -> %d)" % (n_after_tools, n3))
 
         status, body = http_post_json(base, "/reset", {})
         check(status == 200 and body.get("reset") is True, "POST /reset succeeds")
@@ -246,7 +345,10 @@ def main():
             ]
         })
         n5 = count_tasks(scratch_logdir, args.port)
-        check(n5 == n4 + 1, "expired session fell back to a fresh run (task count %d -> %d)" % (n4, n5))
+        if native:
+            skip("expired session fell back to a fresh run", native_why)
+        else:
+            check(n5 == n4 + 1, "expired session fell back to a fresh run (task count %d -> %d)" % (n4, n5))
 
         print("[smoke] streaming request ...")
         http_post_json(base, "/reset", {})
@@ -276,11 +378,16 @@ def main():
             proc.wait(timeout=10)
         except Exception:
             proc.kill()
-        shutil.rmtree(scratch_logdir, ignore_errors=True)
+        if args.keep_logs:
+            print("[smoke] scratch logs kept at %s" % scratch_logdir)
+        else:
+            shutil.rmtree(scratch_logdir, ignore_errors=True)
         shutil.rmtree(os.path.join(tempfile.gettempdir(), "neoxider-openai-bridge", "session-%d" % args.port), ignore_errors=True)
 
     print()
-    print("%d/%d passed" % (PASS, PASS + FAIL))
+    print("%d/%d passed%s" % (PASS, PASS + FAIL,
+                              (" (%d skipped -- run again with --no-native to cover them)" % SKIP)
+                              if SKIP else ""))
     return 0 if FAIL == 0 else 1
 
 

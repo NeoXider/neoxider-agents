@@ -44,6 +44,7 @@ async function submitBridgeStart() {
     dir: $("#brg-dir").value.trim(),
     localhost: $("#brg-localhost").checked,
     terminal: $("#brg-term").checked,
+    api_key: ($("#brg-key") ? $("#brg-key").value.trim() : ""),
   };
   const btn = $("#btn-brg-start");
   const old = btn.innerHTML;
@@ -57,6 +58,9 @@ async function submitBridgeStart() {
     }
     toast("success", t("bridge.started"),
       r.reassigned ? `${r.base_url} (${t("bridge.port_reassigned")} ${r.asked_port})` : r.base_url);
+    // A LAN bridge with no key lets anyone on the network spend this machine's tokens -- say so
+    // once, at the moment it happens, instead of leaving it to the console banner nobody reads.
+    if (r.unprotected_lan) toast("warning", t("bridge.lan_no_key_title"), t("bridge.lan_no_key"));
     // bump the port field so the next launch doesn't collide with this one
     $("#brg-port").value = (r.port || body.port) + 1;
     // the bridge writes its registry file only after it binds (opencode warms up `opencode serve`

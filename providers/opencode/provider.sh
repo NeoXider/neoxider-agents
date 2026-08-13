@@ -70,6 +70,29 @@ if not msg.endswith("\n"):
 '
 }
 
+# _provider_opencode_chatonly_args — extra CLI arguments for AGENT_CHAT_ONLY=1 (the
+# openai_server.py bridge). opencode has no "disable tools" flag, but its config format has a
+# per-agent tool map, and `"tools": {"*": false}` disables EVERY tool — built-ins (bash/write/
+# edit/read/webfetch/…) AND any MCP server the user has configured globally. Verified live on
+# opencode 1.18.16: without this the bridge's opencode sessions answered
+# "apply_patch, bash, edit, glob, grep, question, read, skill, todowrite, webfetch, websearch,
+# write" plus 40 unityMCP tools, and actually wrote a file on disk; with it they answer "NONE".
+# OPENCODE_CONFIG MERGES with the user's own config (providers/models/auth stay intact), it does
+# not replace it — also verified live. Never set for a normal `agent.sh run`, which legitimately
+# needs full tool access.
+_provider_opencode_chatonly() { [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; }
+# `cygpath -m` because opencode is a NATIVE Windows binary: it cannot open a git-bash
+# /c/Users/... path, only C:/Users/... . A no-op (plain path) on Linux/macOS.
+_provider_opencode_chatonly_config() {
+    local p="${AGENT_OPENCODE_CHATONLY_CONFIG:-$HERE/providers/opencode/chat-only.json}"
+    command -v cygpath >/dev/null 2>&1 && p="$(cygpath -m "$p" 2>/dev/null || printf '%s' "$p")"
+    printf '%s' "$p"
+}
+_provider_opencode_chatonly_args() {
+    _provider_opencode_chatonly && printf '%s\n' --agent neoxider-chat-only
+    return 0
+}
+
 # provider_opencode_run_cmd DIR MODEL EFFORT PROMPT — runs the CLI and emits clean final text.
 # MODEL is the raw -m value (may be empty). EFFORT maps to opencode's --variant flag (its
 # reasoning-effort equivalent: high/max/minimal/...), if given.
@@ -80,10 +103,14 @@ if not msg.endswith("\n"):
 # flag now fails `opencode run` with "Unexpected server error".
 provider_opencode_run_cmd() {
     local dir="$1" model="$2" effort="$3" prompt="$4"
-    local timeout_sec="${AGENT_OPENCODE_TIMEOUT_SEC:-1800}"
+    local timeout_sec="${AGENT_OPENCODE_TIMEOUT_SEC:-${AGENT_TIMEOUT_SEC:-1800}}"
     local args=(--auto --format json)
     [ -n "$model" ] && args+=(-m "$model")
     [ -n "$effort" ] && args+=(--variant "$effort")
+    mapfile -t -O ${#args[@]} args < <(_provider_opencode_chatonly_args)
+    if _provider_opencode_chatonly; then
+        export OPENCODE_CONFIG="$(_provider_opencode_chatonly_config)"
+    fi
     # stdout carries JSONL only. Keep stderr visible without corrupting that stream: diagnostics are
     # prefixed and sent through the provider stderr, which generic dispatch records in the task log.
     # A bounded default prevents an unattended provider/plugin deadlock from living forever. Set
