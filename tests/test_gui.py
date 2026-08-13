@@ -621,6 +621,9 @@ class DialogPayloadTests(unittest.TestCase):
 
         class FakeHandler:
             path = "/api/dialog?task=t4"
+            client_address = ("127.0.0.1", 4242)
+            headers = {}
+            _reject_unauthorized = gui.H._reject_unauthorized
 
             def _send(self, code, body, ctype="application/json"):
                 sent["code"] = code
@@ -637,6 +640,9 @@ class DialogPayloadTests(unittest.TestCase):
 
         class FakeHandler:
             path = "/api/dialog"
+            client_address = ("127.0.0.1", 4242)
+            headers = {}
+            _reject_unauthorized = gui.H._reject_unauthorized
 
             def _send(self, code, body, ctype="application/json"):
                 sent["code"] = code
@@ -705,6 +711,114 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("doctor-limit", js)
         self.assertIn("doctor-engine", js)
         self.assertIn("doctor-raw", js)
+
+
+class LanTokenTests(unittest.TestCase):
+    """`gui [port] [--lan] [--token SECRET]`. The panel starts full-auto subagents, so binding it
+    to the network without a token must be impossible, not merely discouraged."""
+
+    def test_defaults_are_loopback_port_8765_no_token(self):
+        self.assertEqual(gui.parse_argv([], {}), (8765, "127.0.0.1", ""))
+
+    def test_positional_port_wins_over_env(self):
+        self.assertEqual(gui.parse_argv(["9001"], {"AGENT_GUI_PORT": "8100"})[0], 9001)
+
+    def test_env_port_used_when_no_argument(self):
+        self.assertEqual(gui.parse_argv([], {"AGENT_GUI_PORT": "8100"})[0], 8100)
+
+    def test_lan_without_a_token_refuses_to_start(self):
+        with self.assertRaises(SystemExit) as ctx:
+            gui.parse_argv(["--lan"], {})
+        self.assertIn("token", str(ctx.exception).lower())
+
+    def test_lan_with_a_token_binds_all_interfaces(self):
+        self.assertEqual(gui.parse_argv(["8765", "--lan", "--token", "s3cret"], {}),
+                         (8765, "0.0.0.0", "s3cret"))
+
+    def test_token_can_come_from_the_environment(self):
+        self.assertEqual(gui.parse_argv(["--lan"], {"AGENT_GUI_TOKEN": "envkey"})[2], "envkey")
+
+    def test_env_host_also_needs_a_token(self):
+        with self.assertRaises(SystemExit):
+            gui.parse_argv([], {"AGENT_GUI_HOST": "0.0.0.0"})
+
+    def test_localhost_flag_overrides_env_host_and_needs_no_token(self):
+        self.assertEqual(gui.parse_argv(["--localhost"], {"AGENT_GUI_HOST": "0.0.0.0"}),
+                         (8765, "127.0.0.1", ""))
+
+    def test_unknown_argument_is_an_explicit_error(self):
+        with self.assertRaises(SystemExit):
+            gui.parse_argv(["--nope"], {})
+
+
+class StartBridgeTests(unittest.TestCase):
+    """The API tab must be able to protect a bridge it exposes, and must say so when it doesn't."""
+
+    def setUp(self):
+        self.spawned = []
+        self._orig_spawn, self._orig_free = gui.spawn, gui.port_available
+        gui.spawn = lambda args, terminal=False: self.spawned.append(list(args))
+        gui.port_available = lambda port, host="0.0.0.0": True
+
+    def tearDown(self):
+        gui.spawn, gui.port_available = self._orig_spawn, self._orig_free
+
+    def test_api_key_is_forwarded_to_the_bridge(self):
+        r = gui.start_bridge({"engine": "claude", "port": 8801, "api_key": " s3cret "})
+        self.assertIn("--api-key", self.spawned[0])
+        self.assertEqual(self.spawned[0][self.spawned[0].index("--api-key") + 1], "s3cret")
+        self.assertTrue(r["auth"])
+        self.assertFalse(r["unprotected_lan"])
+
+    def test_no_key_means_no_flag_and_stays_the_open_bridge(self):
+        r = gui.start_bridge({"engine": "claude", "port": 8801, "localhost": True})
+        self.assertNotIn("--api-key", self.spawned[0])
+        self.assertFalse(r["auth"])
+        self.assertFalse(r["unprotected_lan"])  # loopback without a key is the historic default
+
+    def test_lan_without_a_key_is_flagged_back_to_the_panel(self):
+        r = gui.start_bridge({"engine": "claude", "port": 8801, "localhost": False})
+        self.assertIn("--lan", self.spawned[0])
+        self.assertTrue(r["unprotected_lan"])
+
+
+class GuiAuthTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = gui.GUI_TOKEN
+
+    def tearDown(self):
+        gui.GUI_TOKEN = self._orig
+
+    def test_loopback_forms_recognised(self):
+        for a in ("127.0.0.1", "127.1.2.3", "::1", "::ffff:127.0.0.1"):
+            self.assertTrue(gui.is_loopback(a), a)
+        for a in ("192.168.1.5", "10.0.0.2", "", "::ffff:10.0.0.2"):
+            self.assertFalse(gui.is_loopback(a), a)
+
+    def test_no_token_configured_means_open_panel(self):
+        gui.GUI_TOKEN = ""
+        self.assertTrue(gui.gui_authorized("192.168.1.5", {}, "/api/tasks"))
+
+    def test_loopback_never_needs_the_token(self):
+        gui.GUI_TOKEN = "s3cret"
+        self.assertTrue(gui.gui_authorized("127.0.0.1", {}, "/api/tasks"))
+
+    def test_network_client_without_the_token_is_rejected(self):
+        gui.GUI_TOKEN = "s3cret"
+        self.assertFalse(gui.gui_authorized("192.168.1.5", {}, "/api/tasks"))
+        self.assertFalse(gui.gui_authorized("192.168.1.5", {}, "/api/tasks?token=nope"))
+
+    def test_token_accepted_from_query_header_or_cookie(self):
+        gui.GUI_TOKEN = "s3cret"
+        self.assertTrue(gui.gui_authorized("192.168.1.5", {}, "/?token=s3cret"))
+        self.assertTrue(gui.gui_authorized("192.168.1.5", {"X-Agent-Token": "s3cret"}, "/api/tasks"))
+        self.assertTrue(gui.gui_authorized(
+            "192.168.1.5", {"Cookie": "theme=dark; agent_gui_token=s3cret"}, "/api/tasks"))
+
+    def test_run_endpoint_is_gated_too(self):
+        """/api/run spawns a real subagent -- the whole reason the token exists."""
+        gui.GUI_TOKEN = "s3cret"
+        self.assertFalse(gui.gui_authorized("192.168.1.5", {}, "/api/run"))
 
 
 if __name__ == "__main__":

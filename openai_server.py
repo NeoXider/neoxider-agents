@@ -168,17 +168,24 @@ def session_scratch_dir():
     return os.path.join(tempfile.gettempdir(), "neoxider-openai-bridge", "session-%d" % CFG.port)
 
 
-def fresh_session_dir():
+def fresh_session_dir(wipe=True):
     """(Re)creates the working dir for a BRAND-NEW session. Wipes any leftover files from a
     previous, unrelated conversation first -- since this dir now persists for a whole session's
     lifetime (not a disposable per-call temp dir), a stray file the agent wrote in an earlier,
     different conversation must not leak into this new one. Never touches an operator-pinned
     --dir (that's a real project path -- respected as-is, exactly like every other command in
-    this project)."""
+    this project).
+
+    wipe=False when the conversation is CONTINUING but the engine has no CLI-level resume
+    (opencode/gemini), so every turn takes the fresh-run path. Deleting and recreating the
+    directory under a live `opencode serve` on every single turn of one conversation is both
+    pointless (same conversation -> the leak this guards against cannot happen) and destabilising
+    -- the server holds that path as the session's project root."""
     if CFG.dir:
         return CFG.dir
     d = session_scratch_dir()
-    shutil.rmtree(d, ignore_errors=True)
+    if wipe:
+        shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -400,17 +407,37 @@ def reply_agent_live(engine, model, effort, workdir, name, answer, timeout, on_d
 
 # ======================================================================================
 # opencode NATIVE backend -- talk to `opencode serve`'s HTTP API instead of spawning the
-# `opencode run` CLI per request. Default ON for engine=opencode (--no-opencode-native opts out).
-# Wins: no CLI process per completion (much lower latency) and REAL token streaming from the
-# server's global event bus (session.next.text.delta) instead of buffered chunking.
+# `opencode run` CLI per request. OFF BY DEFAULT since 0.2.0 (AGENT_OPENCODE_NATIVE_UNSAFE=1 opts
+# in): it is faster -- no CLI process per completion, and REAL token streaming from the server's
+# global event bus (session.next.text.delta) -- but it cannot be locked down to chat-only, so it
+# would hand every caller shell/file/MCP access. See OPENCODE_NATIVE below for the measurements.
 # Flow: POST /api/session {model} -> subscribe SSE GET /api/event -> POST /api/session/{id}/prompt
 #       -> collect this session's text.delta fragments until session.next.step.ended.
 # ======================================================================================
 import urllib.request as _urlreq
 import urllib.error as _urlerr
 
-# Default ON for opencode; set OPENCODE_NO_NATIVE=1 to force the legacy `opencode run` CLI path.
-OPENCODE_NATIVE = os.environ.get("OPENCODE_NO_NATIVE") != "1"
+# The chat-only profile the bridge's opencode sessions must run under. `"tools": {"*": false}` in
+# providers/opencode/chat-only.json disables EVERY tool -- built-ins and MCP servers alike -- and
+# OPENCODE_CONFIG merges with (does not replace) the user's own config, so providers/models/auth
+# still work. WHY this matters: AGENT_CHAT_ONLY=1 only reaches the agent.sh provider scripts.
+OPENCODE_CHATONLY_AGENT = "neoxider-chat-only"
+OPENCODE_CHATONLY_CONFIG = os.environ.get("AGENT_OPENCODE_CHATONLY_CONFIG") or os.path.join(
+    PROVIDERS_DIR, "opencode", "chat-only.json")
+
+# The native `opencode serve` path is FASTER (no CLI process per completion, real deltas from the
+# server's event bus) but CANNOT be locked down, so it is OFF by default -- measured 2026-08-13 on
+# opencode 1.18.16: `opencode run --agent neoxider-chat-only` answers "NONE" when asked what tools
+# it has, while the identical profile applied over HTTP (agent on POST /api/session, and again via
+# POST /api/session/{id}/agent) still answers "apply_patch, bash, edit, glob, grep, question, read,
+# skill, todowrite, webfetch, websearch, write" -- the server path does not honour the agent's tool
+# map. Before this default flipped, a bridge on 0.0.0.0 (which is the default bind!) handed every
+# device on the network shell and write access to this machine, plus every configured MCP server:
+# "create notes.txt" really created the file, in the bridge's own checkout.
+# AGENT_OPENCODE_NATIVE_UNSAFE=1 opts back in, with a loud banner, for a loopback-only bridge where
+# the latency matters more than the boundary.
+OPENCODE_NATIVE = (os.environ.get("AGENT_OPENCODE_NATIVE_UNSAFE") == "1"
+                   and os.environ.get("OPENCODE_NO_NATIVE") != "1")
 _OC = {"base": None, "proc": None, "lock": threading.Lock()}
 
 
@@ -429,9 +456,11 @@ def _ensure_opencode_server():
         if _OC["base"] and _OC["proc"] and _OC["proc"].poll() is None:
             return _OC["base"]
         port = _free_port()
+        env = dict(os.environ)
+        env["OPENCODE_CONFIG"] = OPENCODE_CHATONLY_CONFIG.replace("\\", "/")
         proc = subprocess.Popen(
             [BASH, "-lc", "opencode serve --port %d --hostname 127.0.0.1" % port],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
         base = "http://127.0.0.1:%d" % port
         # wait for /api/health
         for _ in range(120):
@@ -460,17 +489,29 @@ def _oc_json(base, path, method="GET", body=None, timeout=30):
     return json.loads(raw) if raw.strip() else {}
 
 
-def opencode_native_complete(model, prompt, timeout, on_delta=None):
+def opencode_session_body(model, workdir):
+    """The POST /api/session payload for one bridge completion. Three deliberate parts:
+      - "model": providerID/modelID, so the pinned -m actually applies;
+      - "agent": the chat-only profile (see OPENCODE_CHATONLY_AGENT) -- the tool lockdown;
+      - "location": the working directory. WITHOUT this, `opencode serve` inherits the BRIDGE
+        PROCESS's cwd, so -C/--dir was silently ignored and the scratch-dir isolation was void:
+        a plain "create notes.txt" request wrote the file into this repository's own checkout
+        (observed live, opencode 1.18.16)."""
+    provider_id, _, model_id = (model or "").partition("/")
+    body = {"agent": OPENCODE_CHATONLY_AGENT}
+    if provider_id and model_id:  # a bare model -> let opencode use its configured default
+        body["model"] = {"providerID": provider_id, "id": model_id}
+    if workdir:
+        body["location"] = {"directory": workdir}
+    return body
+
+
+def opencode_native_complete(model, prompt, timeout, on_delta=None, workdir=None):
     """One completion through opencode's native server. `model` is provider/model (first '/'
     splits providerID from modelID). Streams real text deltas to on_delta when given; returns the
     full assistant text. Raises on transport/boot failure so the caller's retry logic still runs."""
     base = _ensure_opencode_server()
-    provider_id, _, model_id = (model or "").partition("/")
-    if not model_id:  # bare model -> let opencode use its configured default
-        provider_id, model_id = None, None
-    sess_body = {}
-    if provider_id and model_id:
-        sess_body["model"] = {"providerID": provider_id, "id": model_id}
+    sess_body = opencode_session_body(model, workdir)
     sid = _oc_json(base, "/api/session", "POST", sess_body, timeout=15)["data"]["id"]
 
     pieces = []
@@ -1827,6 +1868,39 @@ SESSION_LOCK = threading.Lock()
 SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
 
 
+def _configured_api_key():
+    """The shared secret callers must present, or "" when the bridge is open. `--api-key` wins over
+    AGENT_OPENAI_KEY so one process can differ from the shell's default."""
+    return (getattr(CFG, "api_key", "") or "").strip()
+
+
+def request_authorized(headers, path):
+    """True when this request may proceed. Open bridge (no key configured) -> everything passes,
+    which keeps the loopback default working exactly as before. With a key configured, the OpenAI
+    convention is honored -- `Authorization: Bearer <key>` -- plus a plain `X-Api-Key: <key>` for
+    clients that cannot set an Authorization header.
+
+    `/health` and `/` stay open ON PURPOSE: they carry no conversation data (engine/model label and
+    session counters only) and the GUI's bridge list, the port-liveness probe and any uptime check
+    poll them. Everything that can spend tokens, read the session or mutate it -- /v1/models,
+    /v1/chat/completions, /reset -- requires the key. Comparison is constant-time so the endpoint
+    cannot be turned into a byte-by-byte oracle for the key."""
+    key = _configured_api_key()
+    if not key:
+        return True
+    p = urllib.parse.urlparse(path).path
+    if p in ("/health", "/"):
+        return True
+    presented = ""
+    auth = headers.get("Authorization") or ""
+    if auth[:7].lower() == "bearer ":
+        presented = auth[7:].strip()
+    if not presented:
+        presented = (headers.get("X-Api-Key") or "").strip()
+    import hmac
+    return hmac.compare_digest(presented, key)
+
+
 class ProviderLimitError(Exception):
     """Raised when the CLI's answer is actually the provider's own usage-limit banner (e.g.
     Claude Code's "You've hit your session limit · resets 7:40am"). Returning that text as a
@@ -1886,7 +1960,18 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _reject_unauthorized(self):
+        """OpenAI-shaped 401 for a missing/wrong key. Returns True when the caller must stop."""
+        if request_authorized(self.headers, self.path):
+            return False
+        self._send_json(401, {"error": {
+            "message": "missing or invalid API key -- send 'Authorization: Bearer <key>'",
+            "type": "invalid_request_error", "code": "invalid_api_key"}})
+        return True
+
     def do_GET(self):
+        if self._reject_unauthorized():
+            return
         p = urllib.parse.urlparse(self.path).path
         label = model_label(CFG.engine, CFG.model, CFG.effort)
         if p == "/health":
@@ -1978,14 +2063,19 @@ class H(BaseHTTPRequestHandler):
                 # never returns an empty 200, and a transient CLI hiccup (rate-limit blip, session
                 # startup race) should not zero a whole benchmark scenario.
                 prompt = build_prompt(messages, tools)
-                workdir = fresh_session_dir()
+                # Keep the directory only when this really is the same conversation carrying on
+                # (the normal case for a no-resume engine, where every turn lands here anyway).
+                continuing = (bool(SESSION["dir"]) and not session_expired()
+                              and is_extension(SESSION["messages"], messages))
+                workdir = fresh_session_dir(wipe=not continuing)
                 SESSION["dir"] = workdir
                 for attempt in range(CFG.retries + 1):
                     name = new_task_name()
                     if _use_opencode_native():
                         try:
                             raw_text = opencode_native_complete(
-                                CFG.model, prompt, CFG.timeout, on_delta if live else None)
+                                CFG.model, prompt, CFG.timeout, on_delta if live else None,
+                                workdir=workdir)
                             state = "done" if raw_text.strip() else "error"
                         except Exception as _oce:
                             print("[openai-bridge] opencode native error: %s" % _oce, file=sys.stderr)
@@ -2195,6 +2285,8 @@ class H(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        if self._reject_unauthorized():
+            return
         p = urllib.parse.urlparse(self.path).path
         if p.endswith("/reset"):
             return self._reset_session()
@@ -2319,6 +2411,10 @@ def register_bridge(cfg):
             "started": time.time(),
             "timeout": cfg.timeout,
             "session_ttl": cfg.session_ttl,
+            # the KEY itself is never written here -- only whether one is required, so the GUI can
+            # show an open LAN bridge as unprotected without leaking the secret into a world-
+            # readable file under ~/.claude/agent-cli-logs.
+            "auth": bool((getattr(cfg, "api_key", "") or "").strip()),
         }
         tmp = _bridge_file(cfg.port) + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -2366,6 +2462,11 @@ def main():
     ap.add_argument("--no-live-stream", action="store_true",
                      help="disable real token streaming for live-capable engines (claude); "
                           "stream:true then replays the finished answer as word-sized SSE deltas")
+    ap.add_argument("--api-key", default=os.environ.get("AGENT_OPENAI_KEY") or "",
+                     help="shared secret every caller must present as 'Authorization: Bearer <key>' "
+                          "(or 'X-Api-Key: <key>'). Empty = open bridge (the historic behaviour, fine "
+                          "on loopback). STRONGLY recommended whenever the bridge is reachable from "
+                          "anything but this machine. Default: $AGENT_OPENAI_KEY.")
     ap.add_argument("--session-ttl", type=int, default=1800,
                      help="seconds of inactivity before the ongoing session is treated as expired and the "
                           "next call starts fresh instead of resuming it (default: 1800 = 30 minutes)")
@@ -2407,6 +2508,17 @@ def main():
         print("[openai-bridge]          credentials/tools. Only expose it on a trusted network, and open the")
         print("[openai-bridge]          port in the firewall (Windows PowerShell, as admin):")
         print("[openai-bridge]          New-NetFirewallRule -DisplayName 'agent-openai %d' -Direction Inbound -Action Allow -Protocol TCP -LocalPort %d" % (CFG.port, CFG.port))
+        if _configured_api_key():
+            print("[openai-bridge] AUTH: a key IS required -- callers must send 'Authorization: Bearer <key>'.")
+        else:
+            print("[openai-bridge] AUTH: NO KEY SET -- anyone who can reach port %d can spend your tokens." % CFG.port)
+            print("[openai-bridge]       Start with --api-key <secret> (or AGENT_OPENAI_KEY=<secret>) to require one.")
+    elif _configured_api_key():
+        print("[openai-bridge] AUTH: a key is required ('Authorization: Bearer <key>').")
+    if _use_opencode_native():
+        print("[openai-bridge] !! AGENT_OPENCODE_NATIVE_UNSAFE=1 -- opencode's native server path is ON.")
+        print("[openai-bridge] !! Those sessions keep FULL tools (bash/write/edit + your MCP servers):")
+        print("[openai-bridge] !! opencode does not honour a chat-only agent over HTTP. Loopback only.")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

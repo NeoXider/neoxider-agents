@@ -87,6 +87,9 @@ provider_kimi_run_cmd() {
     local dir="$1" model="$2" prompt="$4" rc_kimi rc_emit
     # Print mode already uses Kimi's auto permission policy and explicitly rejects --auto together
     # with --prompt, so do not add the interactive-mode flag here.
+    # Проверено на kimi-code 0.34.0: `-y`/`--auto` — флаги ИНТЕРАКТИВНОГО режима, и CLI отвергает их
+    # вместе с `-p` («Cannot combine --prompt with --yolo»), то есть прогон падает на старте, ещё не
+    # начавшись. Авто-подтверждение в print-режиме и так включено, отдельный флаг для него не нужен.
     local -a args=(-m "$model" -p "$prompt" --output-format stream-json)
     mapfile -t -O ${#args[@]} args < <(_provider_kimi_run_args)
     ( cd "$dir" && kimi "${args[@]}" </dev/null 2>&1 ) | _provider_kimi_emit

@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 """Minimalist local web GUI over agent.sh — one dashboard for all CLI providers.
 
-Run:  agent.sh gui [port]   (or: python gui.py [port])
+Run:  agent.sh gui [port] [--lan] [--token SECRET]   (or: python gui.py [port] ...)
 Opens http://127.0.0.1:8765 by default -- a stable port so a browser tab can stay pinned
-across restarts. Override with $AGENT_GUI_PORT or an explicit [port] arg. Localhost only.
+across restarts. Override with $AGENT_GUI_PORT or an explicit [port] arg.
 Zero dependencies (stdlib).
+
+LOOPBACK BY DEFAULT, AND A TOKEN IS MANDATORY OFF IT. Unlike openai_server.py (a text-only
+completion bridge, safe enough to expose on a LAN), this panel LAUNCHES REAL SUBAGENTS: every
+`run`/`reply` it starts inherits the provider's full-auto mode (`--dangerously-skip-permissions`,
+`--sandbox danger-full-access`, `--yolo`, `--auto`) in any directory the caller names. Reachable
+from the network without authentication, that is unauthenticated remote code execution on this
+machine, so `--lan` REFUSES TO START without `--token SECRET` (or $AGENT_GUI_TOKEN). The token is
+accepted as `?token=` (once -- it is then stored in a cookie), an `X-Agent-Token` header, or the
+`agent_gui_token` cookie. Requests from loopback never need it: a local process could run agent.sh
+directly anyway, and requiring it there would break the "is our panel already up?" probe.
 
 The backend reads <name>.meta / <name>.log directly (fast, no parsing of `list`'s text),
 while actions (run/reply/doctor) shell out to agent.sh so all the logic lives in one place.
@@ -971,6 +981,31 @@ def port_available(port, host="0.0.0.0"):
     finally:
         s.close()
 
+def lan_ips():
+    """This host's non-loopback IPv4 addresses, for printing a URL the other device can actually
+    open (mirrors openai_server.py's _lan_ips). Connect-less UDP socket: no packets are sent."""
+    ips = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                ips.append(ip)
+        finally:
+            s.close()
+    except Exception:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and ip not in ips and not ip.startswith("127."):
+                ips.append(ip)
+    except Exception:
+        pass
+    return ips
+
+
 def kill_pid(pid):
     """Terminate a bridge process by pid. taskkill /T on Windows (the bash launcher exec's into
     python, so the recorded pid IS python, but /T also reaps any stragglers); SIGTERM elsewhere."""
@@ -1014,10 +1049,16 @@ def start_bridge(data):
     rdir = to_git_bash_path(data.get("dir") or "")
     if rdir:               args += ["-C", rdir]
     args += ["--localhost"] if localhost_only else ["--lan"]
+    # An empty key keeps the historic open bridge (fine on loopback); a LAN bridge without one is
+    # reported back so the panel can warn instead of quietly exposing the machine.
+    api_key = str(data.get("api_key") or "").strip()
+    if api_key:
+        args += ["--api-key", api_key]
     spawn(args, terminal=bool(data.get("terminal")))
     shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     return {"ok": True, "base_url": "http://%s:%d" % (shown, port),
-            "port": port, "asked_port": asked, "reassigned": port != asked}
+            "port": port, "asked_port": asked, "reassigned": port != asked,
+            "auth": bool(api_key), "unprotected_lan": (not localhost_only) and not api_key}
 
 def stop_bridge(port):
     """Kill the bridge on <port> (by its registered pid) and remove its registry file."""
@@ -1054,19 +1095,83 @@ def restart_bridge(data):
     data["port"] = port
     return start_bridge(data)
 
+# Set by main(): the shared secret required from non-loopback clients ("" = loopback-only panel,
+# no token needed). See the module docstring for why this panel is stricter than the API bridge.
+GUI_TOKEN = ""
+TOKEN_COOKIE = "agent_gui_token"
+
+
+def is_loopback(addr):
+    """True for 127.0.0.0/8 and ::1 (incl. the IPv4-mapped ::ffff:127.0.0.1 form)."""
+    a = (addr or "").strip()
+    if a.startswith("::ffff:"):
+        a = a[7:]
+    return a == "::1" or a.startswith("127.")
+
+
+def presented_token(headers, path):
+    """The token this request carries, from (in order) ?token=, X-Agent-Token, or the cookie."""
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(path or "").query)
+    tok = (q.get("token") or [""])[0].strip()
+    if tok:
+        return tok
+    tok = (headers.get("X-Agent-Token") or "").strip()
+    if tok:
+        return tok
+    cookie = headers.get("Cookie") or ""
+    for part in cookie.split(";"):
+        k, _, v = part.strip().partition("=")
+        if k == TOKEN_COOKIE:
+            return v.strip()
+    return ""
+
+
+def gui_authorized(client_addr, headers, path):
+    """Whether this request may touch the panel. No token configured -> open (the loopback-only
+    default, unchanged). Loopback clients -> always allowed (see the module docstring). Everyone
+    else must present the token; compared in constant time so the panel is not a guessing oracle."""
+    if not GUI_TOKEN:
+        return True
+    if is_loopback(client_addr):
+        return True
+    import hmac
+    return hmac.compare_digest(presented_token(headers, path), GUI_TOKEN)
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):  # silent
         pass
+
+    def _reject_unauthorized(self):
+        """401 for a network client with no/!wrong token. Returns True when the caller must stop."""
+        if gui_authorized(self.client_address[0] if self.client_address else "", self.headers,
+                          self.path):
+            return False
+        self._send(401, json.dumps({"error": "missing or invalid token -- open this panel as "
+                                             "http://<host>:<port>/?token=<secret>"}))
+        return True
+
+    def _maybe_set_token_cookie(self):
+        """After a successful ?token=... page load, remember it in a cookie so the page's own
+        fetch() calls (which carry no query string) keep working without touching any JS."""
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        tok = (q.get("token") or [""])[0].strip()
+        if GUI_TOKEN and tok and tok == GUI_TOKEN:
+            self.send_header("Set-Cookie",
+                             "%s=%s; Path=/; SameSite=Strict; Max-Age=604800" % (TOKEN_COOKIE, tok))
 
     def _send(self, code, body, ctype="application/json"):
         b = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
+        self._maybe_set_token_cookie()
         self.end_headers()
         self.wfile.write(b)
 
     def do_GET(self):
+        if self._reject_unauthorized():
+            return
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
         if u.path in ("/", "/index.html"):
@@ -1204,6 +1309,8 @@ class H(BaseHTTPRequestHandler):
             pass
 
     def do_POST(self):
+        if self._reject_unauthorized():
+            return
         u = urllib.parse.urlparse(self.path)
         n = int(self.headers.get("Content-Length") or 0)
         try:
@@ -1315,12 +1422,56 @@ def choose_port(asked):
             return cand, "moved"
     return asked, "none"
 
+def parse_argv(argv, env):
+    """(port, host, token) from the CLI arguments + environment. Kept as a pure function so the
+    LAN/token rules are unit-testable without binding a socket.
+      - a bare positional number is the port (explicit arg > $AGENT_GUI_PORT > 8765);
+      - --lan / $AGENT_GUI_HOST=0.0.0.0 binds all interfaces, --localhost forces loopback back;
+      - --token SECRET / $AGENT_GUI_TOKEN is the shared secret for non-loopback clients.
+    Raises SystemExit with an explanation when LAN is requested without a token -- an
+    unauthenticated LAN panel is remote code execution, so it must not start (see the docstring)."""
+    port = None
+    host = (env.get("AGENT_GUI_HOST") or "").strip() or "127.0.0.1"
+    token = (env.get("AGENT_GUI_TOKEN") or "").strip()
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--lan":
+            host = "0.0.0.0"
+        elif a == "--localhost":
+            host = "127.0.0.1"
+        elif a == "--token":
+            token = (argv[i + 1] if i + 1 < len(argv) else "").strip()
+            i += 1
+        elif a.startswith("--token="):
+            token = a.split("=", 1)[1].strip()
+        elif a.isdigit():
+            port = int(a)
+        else:
+            raise SystemExit("[agent-gui] unknown argument %r (usage: gui [port] [--lan] "
+                             "[--token SECRET] [--localhost])" % a)
+        i += 1
+    if port is None:
+        port = int(env.get("AGENT_GUI_PORT") or 8765)
+    if host not in ("127.0.0.1", "localhost", "::1") and not token:
+        raise SystemExit(
+            "[agent-gui] REFUSING to bind %s without a token.\n"
+            "            This panel starts real subagents in full-auto mode in any directory a\n"
+            "            caller names -- exposed to the network unauthenticated, that is remote\n"
+            "            code execution on this machine.\n"
+            "            Start it as:  agent.sh gui %d --lan --token <secret>\n"
+            "            (or set AGENT_GUI_TOKEN=<secret>), then open\n"
+            "            http://<this-host>:%d/?token=<secret> on the other device." % (host, port, port))
+    return port, host, token
+
+
 def main():
     # explicit CLI arg > $AGENT_GUI_PORT env var > 8765 default -- keeping the port stable
     # across restarts (rather than only ever accepting a positional arg) is what lets a
     # browser tab stay pinned to the same URL run after run. That priority is unchanged; only
     # what happens when the chosen port is BUSY changed (see choose_port).
-    asked = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("AGENT_GUI_PORT") or 8765)
+    global GUI_TOKEN
+    asked, host, GUI_TOKEN = parse_argv(sys.argv[1:], os.environ)
     port, how = choose_port(asked)
     if how == "ours":
         url = "http://127.0.0.1:%d" % port
@@ -1343,12 +1494,18 @@ def main():
         print("!" * 72)
     url = "http://127.0.0.1:%d" % port
     try:
-        srv = Srv(("127.0.0.1", port), H)
+        srv = Srv((host, port), H)
     except OSError as e:
         # lost a race for the port between the check and the bind (or it is reserved by Windows)
-        print("[agent-gui] could not bind %s: %s" % (url, e))
+        print("[agent-gui] could not bind %s:%d: %s" % (host, port, e))
         return
     print("[agent-gui] %s  (logs: %s)  Ctrl-C to stop" % (url, LOGDIR))
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        for ip in lan_ips():
+            print("[agent-gui] LAN: http://%s:%d/?token=<your token>  (other devices use THIS url)"
+                  % (ip, port))
+        print("[agent-gui] the token is required for every non-loopback request; open the ?token= "
+              "url once and the panel stores it in a cookie.")
     prewarm_cache()
     try:
         import webbrowser; webbrowser.open(url)

@@ -80,6 +80,9 @@ bash $SK doctor --deep                              # + one REAL cheap run per e
 bash $SK gui [port]                                 # web control panel over all providers (stable default :8765,
                                                      # or $AGENT_GUI_PORT, or a one-off port arg; if that port is
                                                      # held by someone else it moves to the next free one, loudly)
+bash $SK gui 8765 --lan --token SECRET              # ...reachable from another PC/phone. --token is MANDATORY with
+                                                     # --lan (the panel launches full-auto agents); the other device
+                                                     # opens http://<this-host>:8765/?token=SECRET once
 ```
 
 **Environment knobs** (all optional, all with safe defaults):
@@ -94,6 +97,10 @@ bash $SK gui [port]                                 # web control panel over all
 | `AGENT_CLAUDE_PERMISSION` | `--dangerously-skip-permissions` | Permission arguments for normal Claude `run`/`reply` tasks; for example, set `--permission-mode acceptEdits` to opt down. `AGENT_CHAT_ONLY=1` always uses `--permission-mode acceptEdits` and ignores this variable. |
 | `AGENT_CODEX_DOCTOR_MODEL` / `AGENT_CODEX_DOCTOR_TIMEOUT` | `spark` / `60` | Model and hard deadline for `doctor --deep`'s codex shell check. |
 | `AGENT_GUI_PORT` | `8765` | GUI port (an explicit `gui <port>` argument still wins). |
+| `AGENT_GUI_HOST` | `127.0.0.1` | GUI bind address. Anything but loopback also requires `AGENT_GUI_TOKEN`, or the panel refuses to start. `--lan` / `--localhost` override it. |
+| `AGENT_GUI_TOKEN` | unset | Shared secret the GUI demands from every NON-loopback request (`?token=`, `X-Agent-Token`, or the cookie it sets). Mandatory for `--lan`. |
+| `AGENT_OPENAI_KEY` | unset | Default `--api-key` for `openai-server`: callers must send `Authorization: Bearer <key>`. Unset = open bridge (fine on loopback only). |
+| `AGENT_OPENAI_HOST` | `0.0.0.0` | Bridge bind address (`--localhost` / `--lan` override it). |
 
 Normal provider runs are intentionally full-auto: Codex uses `--sandbox danger-full-access`, Claude
 uses `--dangerously-skip-permissions`, Gemini uses `--yolo`, opencode uses `--auto`, and Kimi uses its
@@ -133,16 +140,42 @@ now binds `0.0.0.0` (all interfaces), so other devices on the same network can c
 the box. On start it prints this host's LAN URL to point the other device at:
 
 ```bash
-bash $SK openai-server -e claude -m sonnet -p 8801
+bash $SK openai-server -e claude -m sonnet -p 8801 --api-key "$(openssl rand -hex 16)"
 # prints e.g. "LAN: reachable ... at http://192.168.1.115:8801/v1"
-# -> set that as the base_url in the APK / on the other PC
+# -> set that as the base_url in the APK / on the other PC, with the key as the OpenAI api_key
 ```
+
+**Off this machine, always set a key.** `--api-key SECRET` (or `AGENT_OPENAI_KEY=SECRET`) makes
+every caller present `Authorization: Bearer SECRET` — the standard OpenAI header, so any
+OpenAI-compatible client already sends it as `api_key`. `X-Api-Key: SECRET` works too. `/health`
+and `/` stay open so liveness probes and the GUI's bridge list keep working; `/v1/models`,
+`/v1/chat/completions` and `/reset` all 401 without the key. With no key the bridge is open —
+fine on loopback, reckless on a network, and the startup banner says so in as many words.
 
 It only exposes the bridge on the local network, not the internet. Because the bridge drives
 a CLI agent with your credentials/tools, only run it on a trusted network, and open the port
 in the firewall (the startup banner prints the exact `New-NetFirewallRule` command for
 Windows). To restrict back to this machine only, pass `--localhost` (or set
 `AGENT_OPENAI_HOST=127.0.0.1`); `--lan` forces all-interfaces explicitly.
+
+**Truly public (over the internet)?** Technically yes — the port-forward + the printed WAN
+address are all it takes — but do not do it bare. There is no TLS here, so a Bearer key crosses
+the network in clear text, and the thing behind the port spends your subscription. Put it behind
+a VPN/overlay network (Tailscale, WireGuard, ZeroTier) or a TLS reverse proxy (Caddy/nginx +
+Let's Encrypt) that terminates HTTPS and forwards to `127.0.0.1:<port>`, and keep `--api-key` on
+as a second lock.
+
+**What the remote caller actually gets — read this before planning a setup.** The agent always
+runs on the machine hosting the bridge, so any file it touches is a file on THAT machine. A
+second PC calling the API is a *client*: its own files are never read or written. On top of
+that, bridge sessions are deliberately chat-only (see the lockdown bullet below) — they answer
+in text, they do not edit code. So:
+
+| What you want | What to do |
+|---|---|
+| An LLM endpoint for an app/benchmark/phone, backed by your CLI subscription | `openai-server` + `--api-key`. This is exactly what it is for. |
+| Edit files that live on the SERVER, driven from another PC | Not the API — use `agent.sh gui <port> --lan --token <secret>` and launch tasks from the browser on the other PC. |
+| Edit files that live on the OTHER PC | Install the skill there and run agents locally on it. No API can do this; the agent has no access to the caller's disk. |
 
 This starts a standalone HTTP server that translates `/v1/chat/completions` calls into
 `agent.sh run`/`agent.sh reply` invocations of the chosen CLI subagent and translates
@@ -196,14 +229,23 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   `--sandbox read-only --ignore-user-config` (no shell/file writes, and skips
   `~/.codex/config.toml` so real configured MCP servers like a live `unityMCP` aren't
   reachable), claude runs with `--strict-mcp-config --disallowedTools
-  Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, and Kimi uses an explicit
-  `tools: []` agent profile. Codex also ignores `AGENT_CODEX_SANDBOX`, and Claude keeps
+  Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, Kimi uses an explicit
+  `tools: []` agent profile, and **opencode runs under an agent profile whose tool map is
+  `{"*": false}`** (`providers/opencode/chat-only.json`, applied through `OPENCODE_CONFIG` +
+  `--agent neoxider-chat-only`, and equally on opencode's native `serve` path). Codex also
+  ignores `AGENT_CODEX_SANDBOX`, and Claude keeps
   `--permission-mode acceptEdits` while ignoring `AGENT_CLAUDE_PERMISSION`. This is a security
   boundary: the HTTP endpoint turns arbitrary callers into CLI invocations, so environment overrides
   must never grant it write, shell, or permission-bypass access. These restrictions apply only to
   bridge subprocesses — a normal `agent.sh run` keeps full access. Verified live: `-c
   mcp_servers={}` alone did NOT stop a real MCP call from succeeding; the flags above
-  do.
+  do. opencode was verified the same way and used to FAIL it (2026-08-13, opencode 1.18.16): a
+  plain LAN request answered with `apply_patch, bash, edit, glob, grep, question, read, skill,
+  todowrite, webfetch, websearch, write` plus 40 live `unityMCP` tools and really created a file
+  on disk; with the profile the same question answers `NONE`. **`-e gemini` is the one engine
+  with no full lockdown** — Gemini CLI can drop writes/exec (`--approval-mode plan`, which
+  chat-only now uses instead of `--yolo`) but has no flag that removes the READ tools, so a
+  gemini-backed bridge can still be asked to read local files. Don't put that one on a network.
 - **`usage` token counts are estimates** (~4 chars/token, `"neoxider_estimated": true`)
   — useful for cost panels, not billing-grade.
 - **`content` is a clean answer for every bundled engine.** `codex` would otherwise mix
@@ -224,7 +266,19 @@ get a running-bridges list with live `/health`, inline per-bridge request logs, 
 button and a stop button (no CLI needed). Task status is conveyed by the
 activity/topic emoji (✅⏳❌⚠️📖✏️🔧💭🐛🧪…) plus strikethrough for finished tasks. Stable
 port: CLI arg > `$AGENT_GUI_PORT` > `8765`; re-running `gui` while one is up just opens the
-browser. If that port is held by **something else** (it happened: an unrelated WebSocket server on
+browser.
+
+**Driving the panel from another computer.** `agent.sh gui <port> --lan --token SECRET` binds all
+interfaces so a second PC (or a phone) can open the panel and launch/reply to tasks in the
+browser — the agents still run, and change files, on the HOST machine. The token is not optional:
+this panel starts subagents in full-auto mode (`--dangerously-skip-permissions`,
+`--sandbox danger-full-access`, `--yolo`, `--auto`) in any directory the caller names, so an
+unauthenticated LAN panel is remote code execution and `--lan` **refuses to start** without
+`--token` (or `$AGENT_GUI_TOKEN`). The other device opens
+`http://<this-host>:<port>/?token=SECRET` once; the panel stores it in a cookie, so its own
+`fetch()` calls keep working. Loopback requests never need the token — a local process could just
+run `agent.sh` directly. Over the internet, put it behind a VPN or an HTTPS reverse proxy; there
+is no TLS in the panel itself. If that port is held by **something else** (it happened: an unrelated WebSocket server on
 8765, which used to make `gui` print success while the browser tab failed with
 `invalid Connection header`), the panel now identifies the occupant, moves to the next free port and
 prints the chosen URL in a banner you cannot miss. Providers are plugins (`providers/<name>/provider.json` + `provider.sh`) — adding a

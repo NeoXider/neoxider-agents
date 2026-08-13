@@ -90,6 +90,8 @@
         <div style="flex:1"><label data-i18n="form.project">project (working dir)</label>
           <div class="dirfld"><input id="brg-dir"><button class="mini" onclick="openBrowse('pick-bridge')">📂</button></div></div>
       </div>
+      <div class="fld"><label data-i18n="bridge.api_key">API key (required for callers; leave empty = open bridge)</label>
+        <input id="brg-key" data-i18n-placeholder="bridge.api_key_ph" placeholder="empty = anyone who can reach the port can use it"></div>
       <div class="fld" style="display:flex;flex-direction:column;gap:6px">
         <label class="chk"><input type="checkbox" id="brg-localhost" checked> <span data-i18n="bridge.localhost">this machine only (uncheck to expose on the LAN)</span></label>
         <label class="chk"><input type="checkbox" id="brg-term"> <span data-i18n="form.terminal">open in a terminal (see the live chat)</span></label>

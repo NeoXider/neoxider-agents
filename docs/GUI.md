@@ -17,6 +17,17 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
 - **Stable port**: resolved as explicit CLI arg > `$AGENT_GUI_PORT` env var > `8765` default, so the
   URL is bookmarkable across restarts instead of drifting between manual invocations. That priority
   is fixed; only the busy-port behaviour is smart (next bullet).
+- **Loopback by default; `--lan` needs `--token`** (`parse_argv()`, a pure function so the rule is
+  unit-testable without binding a socket). This panel is strictly more dangerous than the API
+  bridge: `POST /api/run` launches a real subagent in full-auto mode in any directory the caller
+  names, so binding the network without authentication is remote code execution — `parse_argv`
+  raises `SystemExit` with an explanation rather than starting. Auth itself is `gui_authorized()`:
+  no token configured → open (the historic loopback behaviour); loopback client → always allowed
+  (a local process could run `agent.sh` directly anyway, and requiring it there would break
+  `is_our_panel()`'s "already running?" probe); otherwise a constant-time compare against
+  `?token=` / `X-Agent-Token` / the `agent_gui_token` cookie. `_send` sets that cookie on a
+  successful `?token=` load, which is why **no frontend change was needed** — the page's own
+  `fetch()` calls carry it automatically.
 - **Idempotency vs. a squatted port** (`choose_port()`): one GUI for all providers, `LOGDIR` is shared,
   so a repeated `gui` must not crash or duplicate anything. But "the bind failed" and "my panel is
   already running" are NOT the same thing — the old code assumed they were, and when an unrelated
@@ -90,7 +101,12 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
 - **"API" tab (OpenAI bridges)**: start/stop `agent.sh openai-server` bridges without the CLI. This
   is the only non-Tasks tab — the old standalone test-api tab was folded away (that feature lives in
   the CLI); `switchTab` now lives in `bridgetab.js`. Pick provider+model (default opencode/big-pickle,
-  +effort/port/dir, localhost-vs-LAN) → `POST /api/bridge/start` spawns the bridge in the background.
+  +effort/port/dir, localhost-vs-LAN, **API key**) → `POST /api/bridge/start` spawns the bridge in
+  the background. The key field maps to `openai_server.py --api-key`; leaving it empty keeps the
+  historic open bridge, and `start_bridge` returns `unprotected_lan: true` for the one genuinely
+  dangerous combination (LAN + no key) so `submitBridgeStart` can raise a warning toast rather than
+  leaving it to a console banner nobody reads. The key itself is never written into
+  `bridges/bridge-<port>.json` — only `auth: true/false`.
   Each bridge self-registers a `bridges/bridge-<port>.json` in `LOGDIR` (see `openai_server.py`'s
   `register_bridge`); `GET /api/bridges` lists them and probes each one's `/health` for live status
   (session active/idle + turns). **Pruning is port-based, not health-based**: a registry file is

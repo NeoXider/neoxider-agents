@@ -9,13 +9,23 @@
 # --yolo: auto-approve all tool actions -- without it gemini can block on a permission prompt,
 # which would hang forever since stdin is closed (</dev/null). The whole point of this tool is
 # fully unattended runs, so every provider must run in its own equivalent of "full auto" mode.
+#
+# AGENT_CHAT_ONLY=1 (the openai_server.py bridge) swaps --yolo for --approval-mode plan, Gemini
+# CLI's own read-only mode: no writes, no shell execution. Be honest about the limit -- unlike
+# codex (--sandbox read-only + --ignore-user-config), claude (--disallowedTools), kimi (tools: [])
+# and opencode (an agent profile with "tools": {"*": false}), Gemini has no flag that removes the
+# READ tools, so a gemini-backed bridge can still be asked to read local files. Do not put one on
+# a network; prefer claude/codex/opencode there.
 provider_gemini_run_cmd() {
     local dir="$1" model="$2" prompt="$4"
-    if [ -n "$model" ]; then
-        ( cd "$dir" && gemini -m "$model" --yolo -p "$prompt" </dev/null 2>&1 )
+    local -a args=()
+    [ -n "$model" ] && args+=(-m "$model")
+    if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
+        args+=(--approval-mode plan)
     else
-        ( cd "$dir" && gemini --yolo -p "$prompt" </dev/null 2>&1 )
+        args+=(--yolo)
     fi
+    ( cd "$dir" && gemini "${args[@]}" -p "$prompt" </dev/null 2>&1 )
 }
 
 # provider_gemini_doctor — prints a single-line JSON object to stdout.
