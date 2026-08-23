@@ -56,13 +56,13 @@ matters more than prompt wording.
 | Long-horizon coding / multimodal agent work | `-e kimi` (default Kimi K3) | Use Kimi Code after `kimi login`; `-m highspeed` selects the managed fast coding route. |
 | Deepest / architecture / security review | `-e claude -m opus`, or keep it yourself | Reserve top-tier for genuinely hard work. |
 | 5.6 variant A/B or if `terra` is rate-limited | `-m sol` (`gpt-5.6-sol`) / `-m luna` (`gpt-5.6-luna`) | Alternative 5.6 models. **Observed speed (n=1): luna 41s < sol 56s < terra 105s.** In that same run only `sol` produced code whose own tests passed (luna/terra picked non-palindrome examples) — `terra` is the default per user preference, so still verify its output. |
-| Local / offline / free | `-e opencode -m lmstudio/<model>` or `-m zai/<model>` | opencode's free `opencode/*` models work but are slow; prefer an authed model. |
+| Local / offline / free | `-e opencode -m free` (Muse Spark 1.2), or `-m lmstudio/<model>` | `free`/`spark`/`muse`, `ox`/`alpha`, `pickle`, `hy3`, `mimo`, `nemotron`/`ultra`, `lightning` alias the OpenCode Zen free tier. Unranked — `free` is a user preference, not a measurement. `opencode models` shows the live list. |
 
 **Engine quick facts (verified 2026-07-09):**
 - **codex** — opt in with `-e codex`; the 5.6 family needs **codex-cli >= 0.144**. Watch usage limits (`agent.sh doctor`). Runs are launched with `--ignore-user-config`: `~/.codex/config.toml` (owned by the ChatGPT desktop app) hangs codex's tool router on the very first shell command. Need one of its MCP servers back → `AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp"`.
 - **claude** — default engine, `opus5` by default; `sonnet`, legacy `opus`, and `haiku` are explicit alternatives.
 - **kimi** — `k3` by default (`kimi-code/k3`); `k3-256k`, `coding`, and `highspeed` are verified alternatives; supports named-task resume.
-- **opencode** — works via `--auto`; **pass an authed `-m`** (`zai/...`, `lmstudio/...`); free models are slow.
+- **opencode** — works via `--auto`. Free-tier aliases resolve to real ids (`-m free`, `-m ox`, …); raw `provider/model` still passes through. `ollama` and `zai` are disabled in `~/.config/opencode/opencode.json` as of 2026-08-24 — Ollama's cloud DeepSeek 403s without a paid subscription, and the local one is 8B.
 - **gemini** — needs `GEMINI_API_KEY` (Google sign-in is geo-blocked for some accounts); unavailable until a key is set.
 
 **Token economy (already on by default):** `--terse` (concise output) and per-task `PROGRESS.md` are
