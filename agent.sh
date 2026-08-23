@@ -136,22 +136,31 @@ _kill_tree() {
 # expired -- in which case the whole process tree is killed and a "!! TIMEOUT" line is printed on
 # the same stdout (so it lands in the task log AND in the tail the user sees).
 # SECS=0 disables the deadline. Callers treat 124 as "killed by the watchdog".
+#
+# The deadline is measured against the CLOCK, never by counting loop iterations. Counting was the
+# original implementation (`waited=$((waited+1))` per `sleep 1`) and it silently multiplied every
+# timeout: one iteration is sleep(1) PLUS a `kill -0` and the fork for `sleep` itself, which under
+# git-bash on Windows costs ~3.5s wall per pass. Measured live 2026-08-24: an opencode task with
+# AGENT_TIMEOUT_SEC=1800 was still alive at 108 minutes (6480s / 1800 iterations = 3.6s per pass).
+# The watchdog is the outer safety net for every engine, so a 3.6x-inflated net is worse than none:
+# it reads as "protected" while a wedged task runs for hours.
 _guarded_run() {
     local secs="${1:-0}"; shift
     case "$secs" in ''|*[!0-9]*) secs=0 ;; esac
-    local child waited=0 rc=0
+    local child rc=0 deadline now
     ( "$@" ) 2>&1 &
     child=$!
     if [ "$secs" -gt 0 ]; then
+        deadline=$(( $(date +%s) + secs ))
         while kill -0 "$child" 2>/dev/null; do
-            if [ "$waited" -ge "$secs" ]; then
+            now=$(date +%s)
+            if [ "$now" -ge "$deadline" ]; then
                 _kill_tree "$child"
                 wait "$child" 2>/dev/null
                 printf '\n!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=%ss and was killed (process tree terminated)\n' "$secs"
                 return 124
             fi
             sleep 1
-            waited=$((waited + 1))
         done
     fi
     wait "$child"; rc=$?
@@ -429,7 +438,13 @@ provider_dispatch_run() {
 
 provider_dispatch_resume() {
     local eng="$1" d="$2" session="$3" answer="$4" n="$5" fn="provider_${1}_resume_cmd"
-    declare -F "$fn" >/dev/null 2>&1 || die "unknown engine: $eng"
+    # Distinguish the two failures the old single message conflated: an engine nobody implements vs
+    # an engine that exists but has no resume path (supports_resume=false, e.g. opencode/gemini).
+    if ! declare -F "$fn" >/dev/null 2>&1; then
+        declare -F "provider_${eng}_run_cmd" >/dev/null 2>&1 \
+            && die "engine '$eng' does not support resuming a session (supports_resume=false) — use 'run' to start a new task"
+        die "unknown engine: $eng"
+    fi
     # Only re-resolve model/effort on resume for providers whose resume command actually takes a
     # model flag (claude and codex both do; PROVIDER_{CLAUDE,CODEX}_RESUME_NEEDS_MODEL=1). Every
     # other provider opts out by simply not setting this flag, so reply never overwrites their
@@ -581,6 +596,17 @@ except Exception:
             meng="$(meta_get "$tname" engine)"; [ -n "$meng" ] && [ "$engine_explicit" = 0 ] && engine="$meng"
             log="$LOGDIR/$tname.log"
         else session="$ref"; tname="session-$ref"; log="$LOGDIR/$tname.log"; meta_set "$tname" dir "$dir"; fi
+        # Validate the engine BEFORE touching .meta. provider_dispatch_resume dies further down, but
+        # by then state=running and pid= have already been written, so the dead task shows up as
+        # `⚠ stalled` and status helpfully advises re-running the very reply that cannot work. Seen
+        # on opencode: provider.json says supports_resume=false, so there is no
+        # provider_opencode_resume_cmd, and the generic dispatcher blamed it on an "unknown engine".
+        declare -F "provider_${engine}_run_cmd" >/dev/null 2>&1 \
+            || die "reply: unknown engine '$engine' (task '$tname') — no providers/$engine/provider.sh defines it"
+        if ! declare -F "provider_${engine}_resume_cmd" >/dev/null 2>&1; then
+            rmodel="$(meta_get "$tname" model)"
+            die "reply: engine '$engine' cannot resume a session (supports_resume=false), so task '$tname' cannot be continued — start a fresh one instead: agent.sh run -t <name> -e $engine${rmodel:+ -m ${rmodel}} -C $dir \"...\""
+        fi
         [ "$progress" = 1 ] && answer="$answer$(progress_proto_reply "$tname")"   # per-task reminder; needs resolved $tname
         [ -n "${session:-}" ] || [ "$engine" = claude ] || die "reply: could not find a session id (task '$tname'); specify uuid explicitly"
         touch "$log"; meta_set "$tname" state running; meta_set "$tname" pid "$$"
@@ -685,10 +711,47 @@ except Exception:
         doctor_engine_csv="$(IFS=,; echo "${doctor_engines[*]}")"
         doctor_deep_csv="$(IFS=,; echo "${doctor_deep_engines[*]}")"
         PYTHONIOENCODING=utf-8 python - "$doctor_tmp" "$doctor_json" "$doctor_engine_csv" "$doctor_deep_csv" "$deep" <<'PY'
-import json, os, sys, time
+import datetime, json, os, sys, time
 root, as_json, engine_csv, deep_csv, deep = sys.argv[1:6]
 now = time.time()
 engines = []
+
+def _epoch(value):
+    """A window's resets_at arrives however the provider's upstream API spelled it: a unix epoch
+    (claude's gui.py path), a numeric string, or an ISO-8601 timestamp -- Anthropic's
+    /api/oauth/usage sends the last one, which used to reach `epoch - now` as a str and abort the
+    ENTIRE doctor report with a TypeError. Never raise: an unreadable limits field must cost us
+    that one field, not the whole report."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        stamp = datetime.datetime.fromisoformat(text.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:          # upstream sends UTC; assuming local here would skew by the
+        stamp = stamp.replace(tzinfo=datetime.timezone.utc)   # machine's offset, silently.
+    return stamp.timestamp()
+
+def normalize_limits(info):
+    """Rewrite every window's resets_at to a float epoch (or None) IN PLACE, so the text renderer
+    and every --json consumer (static/app.js, static/modals.js, which both do `resets_at - now`
+    and would quietly produce NaN on a string) see one type."""
+    limits = info.get('limits')
+    if not isinstance(limits, dict):
+        return
+    buckets = [w for w in (limits.get('windows') or []) if isinstance(w, dict)]
+    buckets += [limits[k] for k in ('primary', 'secondary') if isinstance(limits.get(k), dict)]
+    for win in buckets:
+        win['resets_at'] = _epoch(win.get('resets_at'))
 for name in filter(None, engine_csv.split(',')):
     try:
         with open(os.path.join(root, name + '.json'), encoding='utf-8') as f:
@@ -697,6 +760,7 @@ for name in filter(None, engine_csv.split(',')):
         info = {"engine": name, "version": "ERROR", "available": False, "login": "",
                 "limits": None, "note": "probe returned invalid JSON"}
     info.setdefault('engine', name)
+    normalize_limits(info)
     login = (info.get('login') or '').lower()
     if not info.get('available'):
         info['state'] = 'not_installed'
@@ -722,8 +786,9 @@ def window_label(minutes):
     if minutes % 60 == 0: return '%dh' % (minutes // 60)
     return '%dm' % minutes
 
-def reset_text(epoch):
-    if not epoch: return ''
+def reset_text(value):
+    epoch = _epoch(value)   # defensive: normalize_limits already ran, but a provider added later
+    if not epoch: return ''  # must not be able to kill the report by inventing a new spelling.
     left = int(epoch - now)
     if left <= 0: return ' resets soon'
     h, rem = divmod(left, 3600)

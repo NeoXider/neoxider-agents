@@ -1,9 +1,37 @@
 # opencode provider plugin for agent.sh.
-# Contract: provider_opencode_run_cmd, provider_opencode_doctor.
-# No provider_opencode_resolve (opencode has no alias->model resolution layer): the raw
-# -m value (format provider/model, e.g. zai/glm-4.6, opencode/hy3-free, lmstudio/...) is passed
-# straight through; meta model= stays "default" otherwise. Discover models with `opencode models`.
+# Contract: provider_opencode_resolve, provider_opencode_run_cmd, provider_opencode_doctor.
 # No provider_opencode_resume_cmd: reply was never supported for opencode (matches today).
+
+# alias -> real model id. Sets P_MODEL; P_EFFORT stays empty (opencode takes effort only via the
+# separate --variant flag, i.e. agent.sh's -f, never as an alias suffix).
+#
+# WHY THIS EXISTS: opencode's own model ids are neither guessable nor stable-looking
+# ("muse-spark-1.2-contributor-free", "x-preview-f-free"), and the interactive picker is the only
+# place they are shown with human names. An orchestrator driving agent.sh headlessly could not name
+# a free model without first shelling out to `opencode models`. These aliases pin the OpenCode Zen
+# free tier by the label the picker displays.
+#
+# Zen free tier as listed by `opencode models` on 2026-08-24 (all 7 are free):
+#   big-pickle | hy3-free | mimo-v2.5-free | muse-spark-1.2-contributor-free
+#   nemotron-3-ultra-free | nemotron-3.5-lightning-free | x-preview-f-free
+# The list is a moving target — re-check with `opencode models`; an unknown alias still falls
+# through unchanged, so a raw `-m opencode/<whatever>` keeps working.
+#
+# NOT ranked by any benchmark: `free` points at muse-spark because that is the user's pick, not
+# because it was measured against the others.
+provider_opencode_resolve() {
+    local alias="${1:-}"; P_EFFORT=""
+    case "$alias" in
+        free|spark|muse|muse-spark) P_MODEL="opencode/muse-spark-1.2-contributor-free" ;;
+        ox|ox-alpha|alpha)          P_MODEL="opencode/x-preview-f-free" ;;
+        pickle|big-pickle)          P_MODEL="opencode/big-pickle" ;;
+        hy3)                        P_MODEL="opencode/hy3-free" ;;
+        mimo)                       P_MODEL="opencode/mimo-v2.5-free" ;;
+        nemotron|ultra)             P_MODEL="opencode/nemotron-3-ultra-free" ;;
+        lightning|nemotron-fast)    P_MODEL="opencode/nemotron-3.5-lightning-free" ;;
+        *)                          P_MODEL="$alias" ;;
+    esac
+}
 
 # _provider_opencode_python — first working python (mirrors codex's finder) for the JSON emitter.
 _provider_opencode_python() {
@@ -115,18 +143,29 @@ provider_opencode_run_cmd() {
     # prefixed and sent through the provider stderr, which generic dispatch records in the task log.
     # A bounded default prevents an unattended provider/plugin deadlock from living forever. Set
     # AGENT_OPENCODE_TIMEOUT_SEC=0 to disable it (also useful for shell-function test doubles).
+    #
+    # stderr goes to a TEMP FILE, never to a `2> >(...)` process substitution. The substitution
+    # deadlocked agent.sh: its reader is orphaned (reparented to PID 1) and the write end of its
+    # pipe gets inherited by the `| tee -a "$log" | tail -40` that generic dispatch wraps us in, so
+    # the reader never sees EOF, tee/tail never finish, and the task hangs after opencode itself is
+    # long gone. Observed live 2026-08-24: task `scan-muse` sat "running" for 143 minutes with a
+    # process tree of exactly {bash, tee, tail, orphaned reader} and NO opencode process — the
+    # `timeout` below had already done its job and killed the CLI. A temp file has no reader to
+    # deadlock on.
     local -a command=(opencode run "${args[@]}" "$prompt")
     local -a statuses
+    local errfile; errfile="$(mktemp -t opencode-stderr-XXXXXX 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/opencode-stderr-$$")"
     if [ "$timeout_sec" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
-        ( cd "$dir" && timeout --foreground --kill-after=10s "${timeout_sec}s" "${command[@]}" </dev/null \
-            2> >(while IFS= read -r line; do printf '[opencode] %s\n' "$line" >&2; done) \
-        ) | _provider_opencode_emit
+        ( cd "$dir" && timeout --foreground --kill-after=10s "${timeout_sec}s" "${command[@]}" </dev/null 2>"$errfile" ) \
+            | _provider_opencode_emit
     else
-        ( cd "$dir" && "${command[@]}" </dev/null \
-            2> >(while IFS= read -r line; do printf '[opencode] %s\n' "$line" >&2; done) \
-        ) | _provider_opencode_emit
+        ( cd "$dir" && "${command[@]}" </dev/null 2>"$errfile" ) | _provider_opencode_emit
     fi
     statuses=("${PIPESTATUS[@]}")
+    if [ -s "$errfile" ]; then
+        while IFS= read -r line; do printf '[opencode] %s\n' "$line" >&2; done <"$errfile"
+    fi
+    rm -f "$errfile"
     if [ "${statuses[0]}" -eq 124 ]; then
         printf '[opencode] timed out after %ss\n' "$timeout_sec" >&2
         return 124

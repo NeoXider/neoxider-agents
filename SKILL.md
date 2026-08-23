@@ -85,6 +85,40 @@ bash $SK gui 8765 --lan --token SECRET              # ...reachable from another 
                                                      # opens http://<this-host>:8765/?token=SECRET once
 ```
 
+## Windows / PowerShell invocation (verified 2026-08-17)
+
+- On Windows, `bash` on PATH may be WSL's (`C:\WINDOWS\system32\bash.exe`), which mangles
+  Windows paths (`C:UsersUser...`) and cannot find the script. Always call git-bash explicitly:
+  `& "C:\Program Files\Git\bin\bash.exe" "C:/Users/User/.claude/skills/neoxider-agents/agent.sh" doctor`
+  (forward slashes for the script argument; `-C` and paths inside prompts stay POSIX-style:
+  `/c/Git/Proj`).
+- From PowerShell, piping agent.sh output can surface a noisy `Unknown: ChildProcess.kill
+  (powershell.exe ...)` message even when the command succeeded — verify with
+  `agent.sh list` / `agent.sh status <name>` before assuming failure. `fan` returns immediately;
+  the launched task keeps running in the background.
+- **Model ids with a provider prefix must be passed verbatim**: `-e opencode -m
+  opencode/muse-spark-1.2-contributor-free` works; the bare id without the `opencode/` prefix
+  errors. Short aliases (`-m free`, `-m ox`, …) resolve to the full id for you.
+- **OpenCode Zen free tier (live list 2026-08-24):** `big-pickle`, `hy3-free`, `mimo-v2.5-free`,
+  `muse-spark-1.2-contributor-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`,
+  `x-preview-f-free`. Aliases: `free`/`spark`/`muse`, `ox`/`alpha`, `pickle`, `hy3`, `mimo`,
+  `nemotron`/`ultra`, `lightning`. Re-check with `opencode models` — the tier moves.
+  **Unranked**: `free` points at Muse Spark by user preference, not measurement. In the one
+  head-to-head actually run (2026-08-24, a 5-step PowerShell disk survey) *neither* Muse Spark nor
+  Ox Alpha produced an answer — Ox hit the 1800s timeout, Muse never emitted a line. Treat the free
+  tier as fine for one-shot Q&A and unproven for multi-step tool work.
+- **DeepSeek is gone from opencode:** the Zen `deepseek-v4-flash-free` entry no longer appears in
+  `opencode models`, and the Ollama route (`ollama/deepseek-v4-flash:cloud`) returns
+  `403 this model requires a subscription`. The `ollama` and `zai` providers are therefore listed
+  in `disabled_providers` in `~/.config/opencode/opencode.json`.
+- **Local LM Studio (`-e opencode` via the lmstudio-local provider):** LM Studio has ONE
+  loaded-model slot. If the model was unloaded (idle timeout), the subagent dies instantly with
+  `{"message":"Model is unloaded."}`. Reload it via the API with an explicit JSON body
+  (no body → HTTP 415):
+  `curl -s -X POST http://127.0.0.1:1234/api/v0/model/<model-id>/load -H "Content-Type: application/json" -d '{}'`
+  To avoid slot contention with the orchestrator's own opencode session, prefer a remote model
+  (`-m free`, i.e. an OpenCode Zen entry) for subagents when available.
+
 **Environment knobs** (all optional, all with safe defaults):
 
 | Variable | Default | What it does |
