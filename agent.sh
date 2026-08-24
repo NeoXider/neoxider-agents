@@ -439,6 +439,41 @@ looks_waiting() {
     return 1
 }
 
+# --- transient-failure retry ------------------------------------------------
+# Провайдеры регулярно рвут поток на середине шага, причём ошибка сама себя
+# помечает повторяемой: opencode отдаёт {"isRetryable":true,...,"message":
+# "Provider finish_reason: network_error"}, codex обрывает SSE. Повторов не
+# было вовсе, поэтому один сетевой сбой стоил агенту всей работы — за день так
+# умерли два аудита подряд и агент по вакансиям, каждый раз не успев записать
+# отчёт. Частичный вывод при этом остаётся в логе: tee пишет по ходу.
+#
+# Что НЕ повторяем: rc=124 (собственный watchdog — повтор упрётся в тот же
+# лимит), неверный ключ, отсутствующую модель и исчерпанную квоту. Это не
+# рассосётся само, а повтор сожжёт время и лимиты.
+AGENT_RETRIES="${AGENT_RETRIES:-2}"
+case "$AGENT_RETRIES" in ''|*[!0-9]*) AGENT_RETRIES=2 ;; esac
+AGENT_RETRY_DELAY="${AGENT_RETRY_DELAY:-8}"
+
+_is_transient_failure() {
+    local log="$1" tailtxt
+    tailtxt="$(tail -c 4000 "$log" 2>/dev/null)"
+    printf '%s' "$tailtxt" | grep -qiE 'unauthorized|invalid api key|authentication|forbidden|model .* (not found|unavailable|unknown)|insufficient (quota|credit)|quota exceeded|payment required' && return 1
+    printf '%s' "$tailtxt" | grep -qiE '"isretryable"[[:space:]]*:[[:space:]]*true|network_error|providerresponsestreamerror|stream (error|closed|interrupted)|econnreset|etimedout|enotfound|socket hang up|(429|500|502|503|504)|overloaded|temporarily unavailable|rate.?limit'
+}
+
+# Совет по восстановлению зависит от движка: у opencode и gemini возобновления
+# сессии нет (supports_resume=false), и предлагать им `reply` — значит посылать
+# человека в тупик. Обёртка так и делала после таймаута opencode-задачи.
+_recovery_hint() {
+    local n="$1" eng
+    eng="$(meta_get "$n" engine)"
+    if declare -F "provider_${eng}_resume_cmd" >/dev/null 2>&1; then
+        printf 'продолжить: agent.sh reply %s "continue"' "$n"
+    else
+        printf 'движок %s не умеет возобновлять сессию — запустить заново: agent.sh run -t %s ...' "$eng" "$n"
+    fi
+}
+
 # after a step finishes: exit code, changed files, state, question detection
 finish_step() {
     local n="$1" rc="$2" log tdir nfiles=0 last_line
@@ -454,10 +489,10 @@ finish_step() {
         # can say WHY the task died instead of showing a bare exit code.
         meta_set "$n" state error
         meta_set "$n" timeout "$AGENT_TIMEOUT_SEC"
-        echo "[agent.sh] ⏱ TIMEOUT after ${AGENT_TIMEOUT_SEC}s — task=$n killed (raise AGENT_TIMEOUT_SEC or continue: agent.sh reply $n \"continue\")" >&2
+        echo "[agent.sh] ⏱ TIMEOUT after ${AGENT_TIMEOUT_SEC}s — task=$n killed (raise AGENT_TIMEOUT_SEC or $(_recovery_hint "$n"))" >&2
     elif [ "$rc" -ne 0 ]; then
         meta_set "$n" state error
-        echo "[agent.sh] ✖ error exit=$rc  task=$n  (log: agent.sh log $n)" >&2
+        echo "[agent.sh] ✖ error exit=$rc  task=$n  (log: agent.sh log $n | $(_recovery_hint "$n"))" >&2
     elif looks_waiting "$last_line"; then
         meta_set "$n" state waiting
         echo "[agent.sh] ⏳ the agent appears to have ASKED a question — reply: agent.sh reply $n \"...\"  (question: agent.sh last $n)" >&2
@@ -489,8 +524,21 @@ provider_dispatch_run() {
     if [ -n "$P_MODEL" ]; then
         meta_set "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}"  # resolved model, not the raw alias
     fi
-    _guarded_run "$AGENT_TIMEOUT_SEC" "$fn" "$d" "$P_MODEL" "$P_EFFORT" "$prompt" 2>&1 | tee -a "$log" | tail -40
-    rc=${PIPESTATUS[0]}   # 124 = killed by the step watchdog (see _guarded_run / finish_step)
+    local _try=0
+    while : ; do
+        _guarded_run "$AGENT_TIMEOUT_SEC" "$fn" "$d" "$P_MODEL" "$P_EFFORT" "$prompt" 2>&1 | tee -a "$log" | tail -40
+        rc=${PIPESTATUS[0]}
+        { [ "$rc" = 0 ] || [ "$rc" = 124 ]; } && break
+        [ "$_try" -ge "$AGENT_RETRIES" ] && break
+        _is_transient_failure "$log" || break
+        _try=$((_try+1))
+        echo "[agent.sh] ↻ временный сбой провайдера (exit=$rc) — повтор $_try/$AGENT_RETRIES через ${AGENT_RETRY_DELAY}s  task=$n" >&2
+        printf '
+--- RETRY %s/%s after transient provider failure ---
+' "$_try" "$AGENT_RETRIES" >> "$log"
+        sleep "$AGENT_RETRY_DELAY"
+    done
+    [ "$_try" -gt 0 ] && meta_set "$n" retries "$_try"   # 124 = killed by the step watchdog (see _guarded_run / finish_step)
 }
 
 provider_dispatch_resume() {
@@ -711,7 +759,7 @@ except Exception:
         # (a codex/claude step only flushes its log when the step ends). Not an error by itself.
         [ "$st" = idle ]     && echo "   ⟳ process alive but SILENT for $(( ${idle_s:-0} / 60 ))m — it is still working unless AGENT_TIMEOUT_SEC(${AGENT_TIMEOUT_SEC}s) kills it; follow: agent.sh log -f $n"
         [ -n "$(meta_get "$n" timeout)" ] && [ "$st" = error ] && \
-            echo "   ⏱ killed by the step watchdog after $(meta_get "$n" timeout)s (AGENT_TIMEOUT_SEC) — raise it, or continue: agent.sh reply $n \"continue\""
+            echo "   ⏱ killed by the step watchdog after $(meta_get "$n" timeout)s (AGENT_TIMEOUT_SEC) — raise it, or $(_recovery_hint "$n")"
         if [ -n "$d" ] && [ "${nf:-0}" != 0 ] && git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
             echo "   --- changed files ---"; git -C "$d" status --porcelain 2>/dev/null | sed 's/^/   /'
         fi
