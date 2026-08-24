@@ -681,6 +681,135 @@ assert_match "doctor waits for every background provider probe" 'wait.*doctor_pi
 assert_match "doctor emits one structured payload with engines and raw fallback" '"engines": engines.*"raw"' "$doctor_source"
 
 # ============================================================================================
+section "_agent_python (shared Windows-aware python discovery)"
+# ============================================================================================
+# Contract: $AGENT_PYTHON wins, then python3/python/py; a candidate counts only if it actually
+# runs (`-c "import sys"`), so a Windows stub `python` that exits non-zero is skipped.
+
+FAKE_BIN="$SCRATCH_LOGDIR/fakebin"
+mkdir -p "$FAKE_BIN"
+make_py_stub() { # make_py_stub NAME EXIT_CODE — a fake interpreter: runs nothing, exits EXIT_CODE
+    printf '%s\n' '#!/usr/bin/env bash' "exit $2" > "$FAKE_BIN/$1"
+    chmod +x "$FAKE_BIN/$1"
+}
+
+PATH_SAVE="$PATH"
+while IFS='|' read -r desc py3_rc python_rc py_rc agent_python expected; do
+    [ "$desc" = "DESC" ] && continue
+    [ -n "$desc" ] || continue
+    make_py_stub python3 "$py3_rc"
+    make_py_stub python "$python_rc"
+    make_py_stub py "$py_rc"
+    if [ -n "$agent_python" ]; then make_py_stub "$agent_python" 0; fi
+    _AGENT_PY=""; _AGENT_PY_RESOLVED=""
+    got="<none>"
+    if PATH="$FAKE_BIN:$PATH_SAVE" AGENT_PYTHON="$agent_python" _agent_python; then got="$_AGENT_PY"; fi
+    assert_eq "$desc" "$expected" "$got"
+done <<'ROWS'
+DESC|py3_rc|python_rc|py_rc|agent_python|expected
+windows-stub python exits 1, python3 works -> picks python3|0|1|0||python3
+every PATH candidate works -> first (python3) wins|0|0|0||python3
+python3 and python are broken stubs -> falls through to py|1|1|0||py
+AGENT_PYTHON beats all PATH candidates|0|0|0|custom-py|custom-py
+no runnable candidate anywhere -> resolver fails|1|1|1||<none>
+ROWS
+
+PATH="$PATH_SAVE"; unset AGENT_PYTHON
+_AGENT_PY=""; _AGENT_PY_RESOLVED=""
+rm -rf "$FAKE_BIN"
+
+# ============================================================================================
+section "file_mtime (portable GNU/BSD stat fallback)"
+# ============================================================================================
+
+mtime_probe="$SCRATCH_LOGDIR/mtime-probe.txt"
+: > "$mtime_probe"
+mt="$(file_mtime "$mtime_probe")"
+case "$mt" in
+    ''|*[!0-9]*) fail "file_mtime returns a numeric epoch for an existing file (got [$mt])" ;;
+    *) pass "file_mtime returns a numeric epoch for an existing file ($mt)" ;;
+esac
+now_s="$(date +%s)"
+if [ "$mt" -le "$now_s" ] && [ "$(( now_s - mt ))" -lt 5 ]; then
+    pass "file_mtime is close to now"
+else
+    fail "file_mtime drifted from now (mtime=$mt now=$now_s)"
+fi
+assert_eq "file_mtime yields empty output for a missing path" "" "$(file_mtime "$SCRATCH_LOGDIR/nope-missing")"
+
+# GNU/BSD fallback: fake `stat` binaries that speak only one flavor each.
+STAT_FAKE="$SCRATCH_LOGDIR/statfake"
+mkdir -p "$STAT_FAKE"
+make_stat_stub() { # make_stat_stub gnu|bsd|broken — respond only to that stat's flag syntax
+    case "$1" in
+        gnu)    printf '#!/usr/bin/env bash\n[ "$1" = -c ] && { echo 1700000000; exit 0; }\nexit 1\n' ;;
+        bsd)    printf '#!/usr/bin/env bash\n[ "$1" = -f ] && { echo 1700000000; exit 0; }\nexit 1\n' ;;
+        broken) printf '#!/usr/bin/env bash\nexit 1\n' ;;
+    esac > "$STAT_FAKE/stat"
+    chmod +x "$STAT_FAKE/stat"
+}
+while IFS='|' read -r desc kind expected; do
+    [ "$desc" = "DESC" ] && continue
+    make_stat_stub "$kind"
+    got="$(PATH="$STAT_FAKE:$PATH" file_mtime "$mtime_probe")"
+    assert_eq "$desc" "$expected" "$got"
+done <<'ROWS'
+DESC|kind|expected
+GNU-only stat on PATH (-c %Y) -> used directly|gnu|1700000000
+BSD/macOS-only stat on PATH (-f %m) -> fallback hits it|bsd|1700000000
+stat fails in both flavors -> empty output|broken|
+ROWS
+rm -rf "$STAT_FAKE"
+
+# ============================================================================================
+section "looks_waiting classifier (final-line question detection)"
+# ============================================================================================
+
+LOOKS_WAITING_POSITIVE=(
+    "Should I proceed with the refactor?"
+    "do you want me to continue?"
+    "Which option do you prefer?"
+    "which of these files should I edit?"
+    "Please confirm before I delete anything."
+    "let me know if you need anything else."
+    "Shall I apply the fix?"
+    "уточни формат вывода"
+    "подтверди продолжение."
+    "как мне поступить дальше?"
+    "какой из вариантов тебе нужен?"
+    'Continue? (yes/no)'
+    'Ready?"'
+    "y?"
+)
+LOOKS_WAITING_NEGATIVE=(
+    "?"
+    "?!"
+    "? ? ?"
+    "..."
+    ""
+    "Task complete."
+    "All done!"
+    "Fixed the bug and ran the tests."
+    "should"
+    "Error: file not found."
+    "TODO"
+)
+for l in "${LOOKS_WAITING_POSITIVE[@]}"; do
+    if looks_waiting "$l"; then
+        pass "waiting: $l"
+    else
+        fail "waiting: '$l' classified as not-waiting"
+    fi
+done
+for l in "${LOOKS_WAITING_NEGATIVE[@]}"; do
+    if looks_waiting "$l"; then
+        fail "not-waiting: '$l' wrongly classified as waiting"
+    else
+        pass "not-waiting: $l"
+    fi
+done
+
+# ============================================================================================
 section "summary"
 # ============================================================================================
 TOTAL=$((PASS + FAIL))

@@ -33,17 +33,6 @@ provider_opencode_resolve() {
     esac
 }
 
-# _provider_opencode_python — first working python (mirrors codex's finder) for the JSON emitter.
-_provider_opencode_python() {
-    [ -n "${_PROVIDER_OPENCODE_PY:-}" ] && { [ "$_PROVIDER_OPENCODE_PY" = NONE ] && return 1 || return 0; }
-    local c
-    for c in "${AGENT_PYTHON:-}" python3 python py; do
-        [ -n "$c" ] || continue
-        command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys' >/dev/null 2>&1 && { _PROVIDER_OPENCODE_PY="$c"; return 0; }
-    done
-    _PROVIDER_OPENCODE_PY=NONE; return 1
-}
-
 # _provider_opencode_emit — reads opencode `--format json` JSONL on stdin and emits the agent.sh
 # output contract: a `session id: <id>` line (for reference), throttled activity heartbeats while
 # the tool loop is running, then a fresh `---------- output ----------` marker followed by ONLY the
@@ -51,8 +40,8 @@ _provider_opencode_python() {
 # marker, so agent.sh last/openai_server still see a clean answer while status/log -f no longer look
 # frozen for the whole run. No usable python -> raw passthrough.
 _provider_opencode_emit() {
-    if ! _provider_opencode_python; then cat; return 0; fi
-    PYTHONIOENCODING=utf-8 "$_PROVIDER_OPENCODE_PY" -c '
+    if ! _agent_python; then cat; return 0; fi
+    PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
 import sys, json, time
 try:
     sys.stdin.reconfigure(errors="ignore")

@@ -9,10 +9,14 @@ Run:
     python tests/test_openai_server.py
     python -m unittest tests.test_openai_server   (from the repo root)
 """
+import argparse
 import importlib.util
+import io
 import json
+import logging
 import os
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1952,6 +1956,233 @@ class OpencodeSessionBodyTests(unittest.TestCase):
             cfg = json.load(f)
         agent = cfg["agent"][srv.OPENCODE_CHATONLY_AGENT]
         self.assertEqual(agent["tools"], {"*": False})
+
+
+class _DoPostHarness(unittest.TestCase):
+    """Drives srv.H.do_POST against a bare fake receiver (no socket), stubbing the three
+    terminal branches so routing/body validation is observable in isolation."""
+
+    def setUp(self):
+        self._orig_cfg = srv.CFG
+        self.sent = []   # (code, payload) of every _send_json
+        self.hit = []    # which terminal branch ran ("reset" / "sync" / "stream")
+
+        class FakeCfg:
+            api_key = ""
+        srv.CFG = FakeCfg()
+
+    def tearDown(self):
+        srv.CFG = self._orig_cfg
+
+    def _call(self, path, body=b"", headers=None):
+        h = srv.H
+        sent, hit = self.sent, self.hit
+
+        class Fake:
+            _reject_unauthorized = h._reject_unauthorized
+            _read_content_length = h._read_content_length
+            _send_json = staticmethod(lambda code, obj: sent.append((code, obj)))
+            _reset_session = staticmethod(lambda: hit.append("reset"))
+            _sync_response = staticmethod(lambda messages, tools: hit.append(("sync", messages)))
+            _stream_response = staticmethod(lambda messages, tools: hit.append("stream"))
+
+            def __init__(self):
+                self.path = path
+                self.headers = dict(headers) if headers else {}
+                if body and "Content-Length" not in self.headers:
+                    self.headers["Content-Length"] = str(len(body))
+                self.rfile = io.BytesIO(body)
+
+        srv.H.do_POST(Fake())
+
+
+class PostRoutingTests(_DoPostHarness):
+    """POST accepts only the four documented exact paths; everything else is a 404."""
+
+    def test_documented_paths_are_accepted(self):
+        for p in ("/chat/completions", "/v1/chat/completions", "/reset", "/v1/reset"):
+            with self.subTest(path=p):
+                self.hit.clear()
+                self.sent.clear()
+                self._call(p, b'{"messages":[{"role":"user","content":"hi"}]}')
+                self.assertEqual(self.sent, [])
+                self.assertTrue(self.hit)
+
+    def test_lookalike_and_unknown_paths_are_404_without_touching_the_session(self):
+        for p in ("/x/chat/completions", "/chat/completions/extra", "/API/reset",
+                  "/v2/reset", "/reset/", "/completions", "/foo", "/health/reset"):
+            with self.subTest(path=p):
+                self.hit.clear()
+                self.sent.clear()
+                self._call(p)
+                self.assertEqual(len(self.sent), 1)
+                self.assertEqual(self.sent[0][0], 404)
+                self.assertFalse(self.hit)
+
+    def test_double_slash_prefix_collapses_to_the_documented_reset_route(self):
+        self._call("//v1/reset")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.hit, ["reset"])
+
+
+class PostBodyGuardTests(_DoPostHarness):
+    """Malformed/non-integer/oversized Content-Length and invalid or non-object JSON are
+    controlled 400/413 responses, not crashes or unbounded reads."""
+
+    def test_non_integer_content_length_is_400(self):
+        for v in ("abc", "12.5", "1e3", " ²"):
+            with self.subTest(value=v):
+                self.sent.clear()
+                self.hit.clear()
+                self._call("/v1/chat/completions", headers={"Content-Length": v})
+                self.assertEqual(self.sent[0][0], 400)
+                self.assertFalse(self.hit)
+
+    def test_negative_content_length_is_400_not_a_crash(self):
+        self._call("/v1/chat/completions", headers={"Content-Length": "-5"})
+        self.assertEqual(self.sent[0][0], 400)
+
+    def test_oversized_content_length_is_413_before_any_body_is_read(self):
+        self._call("/v1/chat/completions",
+                   headers={"Content-Length": str(srv.MAX_BODY_BYTES + 1)})
+        self.assertEqual(self.sent[0][0], 413)
+
+    def test_invalid_json_body_is_400(self):
+        raw = b"{not json"
+        self._call("/v1/chat/completions", body=raw,
+                   headers={"Content-Length": str(len(raw))})
+        self.assertEqual(self.sent[0][0], 400)
+
+    def test_json_array_body_is_400_because_it_must_be_an_object(self):
+        raw = b"[1,2]"
+        self._call("/v1/chat/completions", body=raw,
+                   headers={"Content-Length": str(len(raw))})
+        self.assertEqual(self.sent[0][0], 400)
+
+    def test_missing_header_and_empty_body_still_reach_the_handler(self):
+        self._call("/v1/chat/completions")
+        self.assertFalse(self.hit)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0][0], 400)
+        self.assertIn("messages", self.sent[0][1]["error"]["message"])
+
+
+class InstanceIdTests(unittest.TestCase):
+    """Each bridge process publishes a random instance_id in its registry record and in
+    /health -- the identity gui.stop_bridge checks before trusting a recorded pid."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._orig_dir, self._orig_cfg = srv.BRIDGES_DIR, srv.CFG
+        srv.BRIDGES_DIR = self.tmp
+
+        class FakeCfg:
+            port = 18901
+            host = "127.0.0.1"      # loopback -> register_bridge does no network probing
+            engine, model, effort, dir = "codex", "spark", "", ""
+            timeout, retries, session_ttl, api_key = 60, 1, 1800, ""
+        self.cfg = FakeCfg()
+        srv.CFG = self.cfg
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        srv.BRIDGES_DIR, srv.CFG = self._orig_dir, self._orig_cfg
+
+    def test_registry_record_carries_the_process_instance_id(self):
+        srv.register_bridge(self.cfg)
+        with open(os.path.join(self.tmp, "bridge-18901.json"), encoding="utf-8") as f:
+            rec = json.load(f)
+        self.assertEqual(rec["instance_id"], srv.INSTANCE_ID)
+        self.assertTrue(rec["instance_id"])
+
+    def test_health_reports_instance_id(self):
+        got = []
+
+        class Fake:
+            path = "/health"
+            headers = {}
+            _reject_unauthorized = srv.H._reject_unauthorized
+            _send_json = staticmethod(lambda code, obj: got.append((code, obj)))
+
+        srv.H.do_GET(Fake())
+        self.assertEqual(got[0][0], 200)
+        self.assertEqual(got[0][1].get("instance_id"), srv.INSTANCE_ID)
+
+
+class LoggingTests(unittest.TestCase):
+    """Diagnostics are opt-in (quiet WARNING default; AGENT_LOG_LEVEL raises the gate) and even
+    then never carry sensitive payloads: no request bodies, prompts, auth headers or API keys."""
+
+    def setUp(self):
+        self._level = srv.LOG.level
+        srv.LOG.setLevel(logging.WARNING)  # pin the documented default for every test here
+
+    def tearDown(self):
+        srv.LOG.setLevel(self._level)
+
+    class _FakeSelf:
+        @staticmethod
+        def address_string():
+            return "127.0.0.1"
+
+    def test_http_request_lines_route_to_debug_only(self):
+        with self.assertLogs(srv.LOG, level=logging.DEBUG) as cm:
+            srv.H.log_message(self._FakeSelf(), '"GET /health HTTP/1.1" %s %s', 200, "-")
+        self.assertTrue(cm.records)
+        self.assertTrue(all(r.levelno == logging.DEBUG for r in cm.records))
+        # at the default gate the same call is fully silent
+        with self.assertRaises(AssertionError):
+            with self.assertLogs(srv.LOG, level=logging.WARNING):
+                srv.H.log_message(self._FakeSelf(), '"GET /health HTTP/1.1" %s %s', 200, "-")
+
+    def test_expected_registry_removal_failure_is_swallowed_and_debug_only(self):
+        # no such registry file -- the routine double-exit case: must not raise and must stay
+        # below the default WARNING gate
+        with self.assertLogs(srv.LOG, level=logging.DEBUG):
+            srv.unregister_bridge(1)
+        with self.assertRaises(AssertionError):
+            with self.assertLogs(srv.LOG, level=logging.WARNING):
+                srv.unregister_bridge(1)
+
+    def test_registry_write_failure_warns_without_exposing_the_api_key(self):
+        d = tempfile.mkdtemp()
+        blocker = os.path.join(d, "not-a-dir")
+        open(blocker, "w").close()  # an existing FILE -> makedirs(exist_ok=True) fails
+        orig_dir = srv.BRIDGES_DIR
+        srv.BRIDGES_DIR = blocker
+
+        class FakeCfg:
+            port = 18999
+            host = "127.0.0.1"  # loopback -> no network probing in register_bridge
+            engine, model, effort, dir_ = "codex", "spark", "", ""
+            timeout, retries, session_ttl, api_key = 60, 1, 1800, ""
+
+        cfg = FakeCfg()
+        cfg.dir = ""
+        secret = "TOPSECRET-bridge-key"
+        cfg.api_key = secret
+        try:
+            with self.assertLogs(srv.LOG, level=logging.WARNING) as cm:
+                srv.register_bridge(cfg)
+        finally:
+            srv.BRIDGES_DIR = orig_dir
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+        joined = "\n".join(cm.output)
+        self.assertNotIn(secret, joined)
+        self.assertNotIn("Authorization", joined)
+
+
+class PortArgTests(unittest.TestCase):
+    def test_valid_ports_pass_through_as_ints(self):
+        self.assertEqual(srv._port_arg("8801"), 8801)
+        self.assertEqual(srv._port_arg(65535), 65535)
+
+    def test_garbage_out_of_range_and_negative_are_clean_errors(self):
+        for v in ("abc", "", None, "0", "-1", "65536", "70000"):
+            with self.subTest(port=v), self.assertRaises(argparse.ArgumentTypeError):
+                srv._port_arg(v)
 
 
 if __name__ == "__main__":

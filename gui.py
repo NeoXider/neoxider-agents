@@ -23,8 +23,23 @@ per-provider info (version/login/rate limits) is fetched by shelling out to
 `agent.sh provider-info <engine>` — the plugin's own provider.sh owns that logic, gui.py
 does not hardcode any per-engine behavior.
 """
-import json, os, re, sys, time, subprocess, socket, urllib.parse, urllib.request, glob, threading
+import json, math, logging, os, re, sys, time, subprocess, socket, urllib.parse, urllib.request, glob, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Opt-in diagnostics, same convention as openai_server.py: quiet (WARNING) unless AGENT_LOG_LEVEL
+# says otherwise -- request lines at DEBUG, a bridge kill that could not go through at WARNING,
+# expected failed health probes / stale-registry cleanups at DEBUG. Never logged anywhere:
+# request bodies, prompts, answers, auth headers, the GUI token or API keys.
+LOG = logging.getLogger("neoxider.gui")
+if not LOG.handlers:  # a re-import must not stack duplicate handlers
+    _lh = logging.StreamHandler()  # stderr
+    _lh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOG.addHandler(_lh)
+try:
+    LOG.setLevel(os.environ.get("AGENT_LOG_LEVEL", "WARNING").upper())
+except ValueError:  # garbage in AGENT_LOG_LEVEL -> stay quiet rather than refuse to start
+    LOG.setLevel(logging.WARNING)
+LOG.propagate = False
 
 def to_git_bash_path(p):
     """C:/Git/CoreAI or C:\\Git\\CoreAI -> /c/Git/CoreAI — the canonical form agent.sh
@@ -61,6 +76,9 @@ DOCTOR_CACHE_FILE = os.path.join(LOGDIR, "gui-doctor-cache.json")
 # Silence threshold, shared with agent.sh (same env var, same default): a still-alive task that
 # has not written anything for this long is reported as "running (no output for Nm)".
 STALE_SEC = int(os.environ.get("AGENT_STALE_SEC") or 300)
+MAX_BODY_BYTES = 10 * 1024 * 1024      # POST bodies above this get 413 before any byte is read
+DEFAULT_WAIT_TIMEOUT = 60.0            # /api/wait ?timeout= is clamped to finite [0, cap]
+WAIT_TIMEOUT_CAP = 300.0
 
 _DEFAULT_PROVIDERS = {
     "codex":   {"label": "Codex", "models": ["5.5", "5.5-high", "spark"], "limits": "codex"},
@@ -201,6 +219,18 @@ def eff_state(meta, log_mtime, nowt):
 
 # states that mean "this task has not finished yet" (used by /api/wait and the SSE log stream)
 LIVE_STATES = ("running", "idle")
+
+def clamp_wait_timeout(raw, default=DEFAULT_WAIT_TIMEOUT, cap=WAIT_TIMEOUT_CAP):
+    """Finite seconds in [0, cap] from an untrusted ?timeout= value; garbage/NaN -> default."""
+    try:
+        t = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(t):
+        return default
+    if not math.isfinite(t):
+        return cap if t > 0 else 0.0
+    return min(max(t, 0.0), cap)
 
 def first_prompt(name):
     """First line of the first PROMPT — used as the "chat" title in the tree."""
@@ -911,7 +941,8 @@ def _bridge_health(base_url, timeout=1.5):
     try:
         with urllib.request.urlopen(base_url.rstrip("/") + "/health", timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", "replace"))
-    except Exception:
+    except Exception as e:  # expected for a dead/busy bridge -- DEBUG-gated, type only
+        LOG.debug("health probe failed (%s)", type(e).__name__)
         return None
 
 def list_bridges():
@@ -955,6 +986,7 @@ def list_bridges():
                 os.remove(bf)
             except OSError:
                 pass
+            LOG.debug("pruned stale bridge registry (port %d no longer answers /health)", port)
             continue
         else:
             rec["live"] = False
@@ -1009,25 +1041,55 @@ def lan_ips():
 def kill_pid(pid):
     """Terminate a bridge process by pid. taskkill /T on Windows (the bash launcher exec's into
     python, so the recorded pid IS python, but /T also reaps any stragglers); SIGTERM elsewhere."""
+    if isinstance(pid, bool) or isinstance(pid, float):
+        # JSON true would coerce to pid 1 and 1.9/1.0 would silently truncate to 1 -- refuse
+        # the type confusion before any numeric conversion (also covers nan/inf OverflowError).
+        LOG.warning("kill_pid: refusing non-integer pid %r", pid)
+        return False
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return False
+    if pid <= 0:
+        # 0 and negative pids are signal targets for whole process groups (or every
+        # killable process) on POSIX -- never hand one to os.kill or taskkill.
+        LOG.warning("kill_pid: refusing non-positive pid %s", pid)
+        return False
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                           capture_output=True, timeout=10)
+            proc = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                  capture_output=True, timeout=10)
+            if proc.returncode != 0:
+                LOG.warning("kill_pid: could not terminate pid %s (taskkill status=%s)",
+                            pid, proc.returncode)
+                return False
         else:
             os.kill(pid, 15)
         return True
-    except Exception:
+    except Exception as e:  # exception type/status only -- never the surrounding command line
+        status = getattr(e, "returncode", getattr(e, "winerror", None))
+        LOG.warning("kill_pid: could not terminate pid %s (%s%s)", pid, type(e).__name__,
+                    "" if status is None else " status=%s" % status)
         return False
+
+def coerce_port(value, default=None):
+    """An integer TCP port in 1..65535, or `default`; every user-supplied bridge port goes
+    through this so garbage can't become bridge--1.json or a 70000 bind."""
+    try:
+        p = int(value)
+    except (TypeError, ValueError):
+        return default
+    return p if 1 <= p <= 65535 else default
+
 
 def start_bridge(data):
     """Spawn `agent.sh openai-server` in the background from the GUI's form. Returns a dict
     with ok/error and the resolved base_url."""
     engine = data.get("engine") or "codex"
-    port = int(data.get("port") or 8801)
+    asked_raw = data.get("port")
+    port = 8801 if asked_raw in (None, "") else coerce_port(asked_raw)
+    if port is None:
+        return {"error": "port must be an integer in 1..65535"}
     localhost_only = data.get("localhost", True)
     host = "127.0.0.1" if localhost_only else "0.0.0.0"
     # A busy/reserved port used to fail silently ("clicked start, nothing appeared"). Instead,
@@ -1060,37 +1122,102 @@ def start_bridge(data):
             "port": port, "asked_port": asked, "reassigned": port != asked,
             "auth": bool(api_key), "unprotected_lan": (not localhost_only) and not api_key}
 
-def stop_bridge(port):
-    """Kill the bridge on <port> (by its registered pid) and remove its registry file."""
-    bf = os.path.join(BRIDGES_DIR, "bridge-%d.json" % int(port))
+def stop_bridge(port, expected_instance_id=None):
+    """Stop the bridge on <port> and drop its registry file -- FAIL-CLOSED: kill_pid runs only
+    when the registry record and the live GET /health carry the same non-empty instance_id.
+    A supplied expected_instance_id must exactly equal the registry id (a missing registry id
+    counts as a mismatch). Unreachable /health never kills: on a still-held port the bridge is
+    alive but unverifiable (busy/wedged) -> keep the registry and report ok:false so the user can
+    retry; only a genuinely free port proves the process is gone and lets the stale file go.
+    Even with matching identity, a missing/unusable pid or a failed kill keeps the registry and
+    reports ok:false -- never claim a bridge was stopped when its termination is unconfirmed."""
+    coerced = coerce_port(port)
+    if coerced is None:
+        return {"ok": False, "killed": False, "error": "port must be an integer in 1..65535",
+                "port": port}
+    port = coerced
+    bf = os.path.join(BRIDGES_DIR, "bridge-%d.json" % port)
     rec = {}
     try:
         with open(bf, encoding="utf-8") as f:
             rec = json.load(f)
     except Exception:
         pass
-    killed = kill_pid(rec.get("pid")) if rec.get("pid") else False
+    rec_id = rec.get("instance_id")
+    if expected_instance_id is not None and expected_instance_id != rec_id:
+        return {"ok": False, "killed": False, "port": port,
+                "error": "instance mismatch -- the bridge list is stale, refresh it"}
+    health = _bridge_health(rec.get("base_url") or "")
+    if health is None:
+        if not port_available(port):
+            # alive but /health unverifiable (a completion holds its lock, or it is wedged):
+            # identity cannot be proven, so never kill AND never drop the registry -- the
+            # record is the only thing left to identify this bridge after a retry.
+            return {"ok": False, "killed": False, "stale_registry": False, "port": port,
+                    "error": "bridge on port %d did not answer /health while the port is "
+                             "still in use -- identity unavailable, retry once it is idle" % port}
+        # nothing listens -> the recorded process is gone; remove the stale registry safely.
+        try:
+            os.remove(bf)
+        except OSError:
+            pass
+        LOG.debug("pruned stale bridge registry for port %d (unreachable, port free)", port)
+        return {"ok": True, "killed": False, "stale_registry": True, "port": port}
+    live_id = health.get("instance_id")
+    if rec_id and live_id and live_id != rec_id:
+        # someone else owns this port/pid now -- only the stale file may go
+        try:
+            os.remove(bf)
+        except OSError:
+            pass
+        LOG.debug("dropped stale registry for port %d (another instance owns the port now)", port)
+        return {"ok": True, "killed": False, "stale_registry": True, "port": port}
+    if not rec_id or not live_id:
+        # reachable but identity missing/unprovable on either side -> keep the registry,
+        # refuse to kill (fail closed), let the panel surface the error.
+        return {"ok": False, "killed": False, "stale_registry": False, "port": port,
+                "error": "could not verify the bridge identity on port %d -- "
+                         "refresh the list and retry" % port}
+    pid = rec.get("pid")
+    if not pid or not kill_pid(pid):
+        # identity matched, but the kill could not be confirmed (missing/unusable pid, or
+        # kill_pid failed) -- the bridge may still be running: keep the registry (it is the
+        # only handle left for a retry) and fail closed so a restart never spawns on top.
+        reason = ("no usable process id in its registry entry" if not pid
+                  else "its recorded process did not terminate")
+        LOG.warning("stop_bridge: refusing to drop registry for port %d -- %s", port, reason)
+        return {"ok": False, "killed": False, "stale_registry": False, "port": port,
+                "error": "could not stop the bridge on port %d -- %s, "
+                         "refresh the list and retry" % (port, reason)}
     try:
         os.remove(bf)
     except OSError:
         pass
-    return {"ok": True, "killed": killed, "port": int(port)}
+    return {"ok": True, "killed": True, "port": port}
 
 def restart_bridge(data):
     """Stop the bridge on <port> and relaunch it on the SAME port with new engine/model/effort/
     localhost/dir -- lets the GUI switch a running bridge's model (and local/LAN binding) in place
-    without retyping the whole form. Waits for the OS to release the port before rebinding."""
-    try:
-        port = int(data.get("port") or 0)
-    except (TypeError, ValueError):
-        port = 0
-    if not port:
-        return {"error": "port required"}
-    stop_bridge(port)
+    without retyping the whole form. Aborts with the stop error when stopping failed (held or
+    unverifiable bridge) and never silently launches on another port."""
+    port = coerce_port(data.get("port"))
+    if port is None:
+        return {"error": "port must be an integer in 1..65535"}
+    stopped = stop_bridge(port, data.get("instance_id"))
+    if not stopped.get("ok"):
+        return {"ok": False, "error": stopped.get("error")
+                or "could not stop the bridge on port %d" % port,
+                "port": port, "stopped": stopped}
     for _ in range(20):  # give the kernel up to ~3s to free the port after the kill
         if port_available(port):
             break
         time.sleep(0.15)
+    else:
+        # stopping claimed success but the port never freed (e.g. a foreign live bridge owns
+        # it): launching now would silently reassign ports -- refuse instead.
+        return {"ok": False, "error": "port %d is still in use -- the old bridge did not "
+                                      "release it, no new bridge was started" % port,
+                "port": port}
     data = dict(data)
     data["port"] = port
     return start_bridge(data)
@@ -1139,8 +1266,10 @@ def gui_authorized(client_addr, headers, path):
 
 
 class H(BaseHTTPRequestHandler):
-    def log_message(self, *a):  # silent
-        pass
+    def log_message(self, fmt, *a):  # request lines at DEBUG only (AGENT_LOG_LEVEL); token/key
+        # query params are redacted so a `?token=...` URL never lands in the log
+        LOG.debug("%s %s", self.address_string(),
+                  re.sub(r"((?:api[_-]?key|token)=)[^&\s\"']*", r"\1<redacted>", fmt % a))
 
     def _reject_unauthorized(self):
         """401 for a network client with no/!wrong token. Returns True when the caller must stop."""
@@ -1238,7 +1367,7 @@ class H(BaseHTTPRequestHandler):
             name = (q.get("task") or [""])[0]
             if not name:
                 return self._send(400, json.dumps({"error": "task required"}))
-            timeout = min(float((q.get("timeout") or ["60"])[0] or 60), 300)
+            timeout = clamp_wait_timeout((q.get("timeout") or [""])[0])
             deadline = time.time() + timeout
             st, meta = task_state(name)
             while st in LIVE_STATES and time.time() < deadline:
@@ -1308,15 +1437,33 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, OSError):
             pass
 
+    def _read_json_object_body(self):
+        """Request body as a JSON object; answers 400/413 itself, None = caller must stop."""
+        raw_len = (self.headers.get("Content-Length") or "").strip()
+        if raw_len and not (raw_len.isascii() and raw_len.isdigit()):
+            self._send(400, json.dumps({"error": "malformed Content-Length header"}))
+            return None
+        n = int(raw_len) if raw_len else 0
+        if n > MAX_BODY_BYTES:
+            self._send(413, json.dumps({"error": "request body too large"}))
+            return None
+        try:
+            data = json.loads(self.rfile.read(n) if n else b"{}")
+        except ValueError:
+            self._send(400, json.dumps({"error": "invalid JSON body"}))
+            return None
+        if not isinstance(data, dict):
+            self._send(400, json.dumps({"error": "request body must be a JSON object"}))
+            return None
+        return data
+
     def do_POST(self):
         if self._reject_unauthorized():
             return
         u = urllib.parse.urlparse(self.path)
-        n = int(self.headers.get("Content-Length") or 0)
-        try:
-            data = json.loads(self.rfile.read(n) or b"{}")
-        except ValueError:
-            data = {}
+        data = self._read_json_object_body()
+        if data is None:
+            return
         if u.path == "/api/run":
             prompt = (data.get("prompt") or "").strip()
             if not prompt:
@@ -1372,7 +1519,7 @@ class H(BaseHTTPRequestHandler):
             port = data.get("port")
             if port in (None, ""):
                 return self._send(400, json.dumps({"error": "port required"}))
-            self._send(200, json.dumps(stop_bridge(port)))
+            self._send(200, json.dumps(stop_bridge(port, data.get("instance_id"))))
         elif u.path == "/api/bridge/restart":
             self._send(200, json.dumps(restart_bridge(data)))
         else:
@@ -1385,7 +1532,6 @@ def prewarm_cache():
     """Start only one doctor refresh on startup. Doctor already probes every provider, while
     eagerly launching five separate provider-info calls duplicates Windows process creation and
     can exhaust a busy machine; the right-panel provider cache remains lazy."""
-    import threading
     def run():
         # Disk cache is loaded synchronously and the expensive probe starts in its own thread.
         doctor_cached_only(refresh=True)

@@ -25,22 +25,6 @@ provider_codex_resolve() {
     esac
 }
 
-# _provider_codex_python — first of python3/python/py that actually runs (a bare `python` on
-# Windows can be a WindowsApps alias stub that exits non-zero), or empty if none work. Cached.
-_PROVIDER_CODEX_PY=""
-_PROVIDER_CODEX_PY_RESOLVED=""
-_provider_codex_python() {
-    if [ -z "$_PROVIDER_CODEX_PY_RESOLVED" ]; then
-        _PROVIDER_CODEX_PY_RESOLVED=1
-        local c
-        for c in "${AGENT_PYTHON:-}" python3 python py; do
-            [ -n "$c" ] || continue
-            if "$c" -c "import sys" >/dev/null 2>&1; then _PROVIDER_CODEX_PY="$c"; break; fi
-        done
-    fi
-    [ -n "$_PROVIDER_CODEX_PY" ]
-}
-
 # _provider_codex_emit — reads codex `--json` JSONL on stdin and emits agent.sh-friendly output:
 #   1. a `session id: <uuid>` line (parsed from the `thread.started` event) so agent.sh's own
 #      session-id grep keeps working for resume, exactly as it did with codex's plaintext banner;
@@ -56,11 +40,11 @@ _provider_codex_python() {
 # NB: the parser is passed via `python -c`, NOT a `python - <<HEREDOC`: a heredoc would itself
 # occupy stdin, so the piped codex JSONL would never reach sys.stdin.
 _provider_codex_emit() {
-    if ! _provider_codex_python; then
+    if ! _agent_python; then
         cat   # no usable python -> raw passthrough (degraded but not broken)
         return 0
     fi
-    PYTHONIOENCODING=utf-8 "$_PROVIDER_CODEX_PY" -c '
+    PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
 import sys, json
 try:
     sys.stdin.reconfigure(errors="ignore")   # codex prints a cp866 OS-notification line that is not UTF-8

@@ -76,7 +76,7 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
 (does not import gui.py) so the two servers can run/fail independently.
 """
-import argparse, atexit, glob, json, os, queue, re, shlex, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
+import argparse, atexit, glob, json, logging, os, queue, re, shlex, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -87,6 +87,25 @@ LOGDIR = os.environ.get("AGENT_CLI_LOGS") or os.path.expanduser("~/.claude/agent
 # and stop bridges it didn't launch itself -- the process self-registers on bind and removes its
 # own file on a clean exit; the GUI prunes files whose port no longer answers /health.
 BRIDGES_DIR = os.path.join(LOGDIR, "bridges")
+# Random per-process identity, published in the registry file AND in GET /health so
+# gui.stop_bridge only ever kills the process it recorded.
+INSTANCE_ID = uuid.uuid4().hex[:12]
+# Cap on one request body; larger or malformed Content-Length gets 400/413.
+MAX_BODY_BYTES = 64 * 1024 * 1024
+
+# Opt-in diagnostics: quiet (WARNING) unless AGENT_LOG_LEVEL says otherwise -- request lines at
+# DEBUG, infrastructure failures (provider config, registry writes) at WARNING. Payloads are
+# never logged anywhere: no request bodies, prompts, auth headers, keys or model output.
+LOG = logging.getLogger("neoxider.openai_server")
+if not LOG.handlers:  # a re-import must not stack duplicate handlers
+    _lh = logging.StreamHandler()  # stderr
+    _lh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    LOG.addHandler(_lh)
+try:
+    LOG.setLevel(os.environ.get("AGENT_LOG_LEVEL", "WARNING").upper())
+except ValueError:  # garbage in AGENT_LOG_LEVEL -> stay quiet rather than refuse to start
+    LOG.setLevel(logging.WARNING)
+LOG.propagate = False
 
 BASH = os.environ.get("AGENT_SH_BASH")
 if not BASH:
@@ -106,7 +125,8 @@ def load_providers():
         try:
             with open(pf, encoding="utf-8") as f:
                 out[name] = json.load(f)
-        except Exception:
+        except Exception as e:
+            LOG.warning("skipping unreadable provider config %s (%s)", name, type(e).__name__)
             continue
     return out
 
@@ -600,7 +620,7 @@ def _use_opencode_native():
 # ======================================================================================
 CLAUDE_NATIVE = os.environ.get("CLAUDE_NO_NATIVE") != "1"
 CLAUDE_NATIVE_TASK = "__claude_native__"
-_CL = {"proc": None, "queue": None, "lock": threading.Lock()}
+_CL = {"proc": None, "queue": None}
 
 
 def _use_claude_native():
@@ -883,13 +903,11 @@ def build_prompt(messages, tools):
     return text
 
 
-# The fence body deliberately excludes backticks ([^`]): with DOTALL-".*?" a malformed
-# tool_calls fence ("{...} trailing junk") made the match run PAST its own closing fence into
-# the next one, so one bad fence swallowed a following perfectly valid one (calls lost).
-# (?i) so a ```JSON tag (observed from models) is recognized too.
-FENCE_RE = re.compile(r"(?i)```(?:json)?\s*(\{[^`]*\})\s*```")
-# Same, but the body may be a JSON OBJECT ({...}) or a JSON ARRAY ([...]) -- Opus 4.8 emits a
-# fenced array of call objects. Backtick-free body so a malformed fence can't swallow the next.
+# Fence bodies deliberately exclude backticks ([^`]): with DOTALL-".*?" a malformed tool_calls
+# fence ("{...} trailing junk") made the match run PAST its own closing fence into the next one,
+# so one bad fence swallowed a following perfectly valid one (calls lost). (?i) so a ```JSON tag
+# (observed from models) is recognized too. This variant accepts a body that is either a JSON
+# OBJECT ({...}) or a JSON ARRAY ([...]) -- Opus 4.8 emits a fenced array of call objects.
 FENCE_ANY_RE = re.compile(r"(?i)```(?:json)?\s*([\[{][^`]*[\]}])\s*```")
 # Fallback for a fence whose JSON legitimately CONTAINS a backtick inside a string value (e.g.
 # lua code with `...`), which the strict backtick-free pass above cannot match. Only consulted
@@ -1949,8 +1967,8 @@ def session_expired():
 
 
 class H(BaseHTTPRequestHandler):
-    def log_message(self, *a):  # silent
-        pass
+    def log_message(self, fmt, *a):  # request lines only, DEBUG-gated (opt-in via AGENT_LOG_LEVEL)
+        LOG.debug("%s %s", self.address_string(), fmt % a)
 
     def _send_json(self, code, obj):
         b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1984,7 +2002,8 @@ class H(BaseHTTPRequestHandler):
                 idle = session_idle_seconds()
             except Exception:
                 idle = None
-            self._send_json(200, {"ok": True, "engine": CFG.engine, "model": label,
+            self._send_json(200, {"ok": True, "instance_id": INSTANCE_ID, "engine": CFG.engine,
+                                   "model": label,
                                    "session_active": active, "session_turns": turns,
                                    "session_idle_seconds": None if idle is None else int(idle),
                                    "session_ttl_seconds": CFG.session_ttl,
@@ -2284,20 +2303,37 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, OSError):
             pass
 
+    def _read_content_length(self):
+        """(n, None) on success or (None, (http_code, message)); missing header -> 0,
+        non-integer -> 400, over MAX_BODY_BYTES -> 413 before any byte is read."""
+        raw = (self.headers.get("Content-Length") or "").strip()
+        if not raw:
+            return 0, None
+        if not (raw.isascii() and raw.isdigit()):
+            return None, (400, "malformed Content-Length header")
+        n = int(raw)
+        if n > MAX_BODY_BYTES:
+            return None, (413, "request body too large (%d bytes; limit %d)" % (n, MAX_BODY_BYTES))
+        return n, None
+
     def do_POST(self):
         if self._reject_unauthorized():
             return
         p = urllib.parse.urlparse(self.path).path
-        if p.endswith("/reset"):
-            return self._reset_session()
-        if not p.endswith("/chat/completions"):
+        if p not in ("/chat/completions", "/v1/chat/completions", "/reset", "/v1/reset"):
             return self._send_json(404, {"error": {"message": "not found: " + p}})
-        length = int(self.headers.get("Content-Length") or 0)
+        length, err = self._read_content_length()
+        if err:
+            return self._send_json(err[0], {"error": {"message": err[1]}})
         raw = self.rfile.read(length) if length else b""
         try:
             body = json.loads(raw or b"{}")
         except ValueError:
             return self._send_json(400, {"error": {"message": "invalid JSON body"}})
+        if not isinstance(body, dict):
+            return self._send_json(400, {"error": {"message": "request body must be a JSON object"}})
+        if p in ("/reset", "/v1/reset"):
+            return self._reset_session()
         messages = body.get("messages") or []
         if not messages:
             return self._send_json(400, {"error": {"message": "'messages' is required and must be a non-empty array"}})
@@ -2408,6 +2444,7 @@ def register_bridge(cfg):
             "dir": cfg.dir,
             "lan": all_ifaces,
             "pid": os.getpid(),
+            "instance_id": INSTANCE_ID,
             "started": time.time(),
             "timeout": cfg.timeout,
             "session_ttl": cfg.session_ttl,
@@ -2420,15 +2457,27 @@ def register_bridge(cfg):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(rec, f, ensure_ascii=False)
         os.replace(tmp, _bridge_file(cfg.port))
-    except Exception:
-        pass
+    except Exception as e:
+        LOG.warning("bridge registry write failed (%s)", type(e).__name__)
 
 
 def unregister_bridge(port):
     try:
         os.remove(_bridge_file(port))
-    except OSError:
-        pass
+    except OSError as e:
+        # expected on the double-exit path (file already gone) or a never-registered port
+        LOG.debug("registry removal skipped (%s)", e.strerror or type(e).__name__)
+
+
+def _port_arg(v):
+    """argparse type for -p/--port: an integer in 1..65535 or a clean CLI error."""
+    try:
+        p = int(v)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("port must be an integer, got %r" % v)
+    if not 1 <= p <= 65535:
+        raise argparse.ArgumentTypeError("port must be an integer in 1..65535, got %r" % v)
+    return p
 
 
 def main():
@@ -2444,7 +2493,7 @@ def main():
                      help="working dir for the agent's session (default: a scratch temp dir, "
                           "wiped and recreated each time a brand-new session starts). Pin this "
                           "to a real project path if the agent should operate there instead.")
-    ap.add_argument("-p", "--port", type=int, default=int(os.environ.get("AGENT_OPENAI_PORT") or 8801))
+    ap.add_argument("-p", "--port", type=_port_arg, default=os.environ.get("AGENT_OPENAI_PORT") or 8801)
     ap.add_argument("--host", default=os.environ.get("AGENT_OPENAI_HOST") or "0.0.0.0",
                      help="interface to bind (default: 0.0.0.0 = all interfaces, reachable over the LAN "
                           "from a phone/APK or another computer). Set AGENT_OPENAI_HOST to change the "
@@ -2523,8 +2572,6 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n[openai-bridge] stopped")
-    finally:
-        unregister_bridge(CFG.port)
 
 
 if __name__ == "__main__":

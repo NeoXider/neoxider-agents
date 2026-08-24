@@ -18,29 +18,15 @@ provider_kimi_resolve() {
     esac
 }
 
-_PROVIDER_KIMI_PY=""
-_PROVIDER_KIMI_PY_RESOLVED=""
-_provider_kimi_python() {
-    if [ -z "$_PROVIDER_KIMI_PY_RESOLVED" ]; then
-        _PROVIDER_KIMI_PY_RESOLVED=1
-        local c
-        for c in "${AGENT_PYTHON:-}" python3 python py; do
-            [ -n "$c" ] || continue
-            if "$c" -c "import sys" >/dev/null 2>&1; then _PROVIDER_KIMI_PY="$c"; break; fi
-        done
-    fi
-    [ -n "$_PROVIDER_KIMI_PY" ]
-}
-
 # Convert Kimi's documented stream-json messages into the wrapper's clean-output contract.
 # Tool-call preambles are excluded; only assistant messages without tool_calls are joined into the
 # final answer. The session.resume_hint meta record supplies the resumable ses_* id.
 _provider_kimi_emit() {
-    if ! _provider_kimi_python; then
+    if ! _agent_python; then
         cat
         return 0
     fi
-    PYTHONIOENCODING=utf-8 "$_PROVIDER_KIMI_PY" -c '
+    PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
 import json, sys
 try:
     sys.stdin.reconfigure(errors="ignore")
@@ -115,7 +101,7 @@ provider_kimi_doctor() {
     local ver login="" py
     if command -v kimi >/dev/null 2>&1; then
         ver="$(kimi --version 2>&1 | head -1)"
-        py="$(command -v python3 || command -v python || command -v py || echo python)"
+        py=python; _agent_python && py="$_AGENT_PY"
         if kimi provider list --json 2>/dev/null | "$py" -c '
 import json, sys
 try:

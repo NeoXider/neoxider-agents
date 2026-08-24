@@ -20,7 +20,9 @@ Run:
     python -m unittest discover tests
 """
 import importlib.util
+import io
 import json
+import logging
 import os
 import socket
 import sys
@@ -819,6 +821,673 @@ class GuiAuthTests(unittest.TestCase):
         """/api/run spawns a real subagent -- the whole reason the token exists."""
         gui.GUI_TOKEN = "s3cret"
         self.assertFalse(gui.gui_authorized("192.168.1.5", {}, "/api/run"))
+
+
+class WaitTimeoutAndPortTests(unittest.TestCase):
+    """Untrusted /api/wait timeouts stay finite in [0, cap]; bridge ports stay real ports."""
+
+    def test_wait_timeout_garbage_falls_back_to_default(self):
+        for v in (None, "", "abc", [], object()):
+            self.assertEqual(gui.clamp_wait_timeout(v), gui.DEFAULT_WAIT_TIMEOUT, repr(v))
+
+    def test_wait_timeout_is_clamped_to_finite_0_300(self):
+        self.assertEqual(gui.WAIT_TIMEOUT_CAP, 300.0)
+        self.assertEqual(gui.clamp_wait_timeout("-1"), 0.0)
+        self.assertEqual(gui.clamp_wait_timeout("12.5"), 12.5)
+        self.assertEqual(gui.clamp_wait_timeout("10e9"), 300.0)
+        self.assertEqual(gui.clamp_wait_timeout("inf"), 300.0)
+        self.assertEqual(gui.clamp_wait_timeout("-inf"), 0.0)
+        self.assertEqual(gui.clamp_wait_timeout("nan"), gui.DEFAULT_WAIT_TIMEOUT)
+
+    def test_coerce_port_accepts_only_1_65535(self):
+        self.assertEqual(gui.coerce_port("8801"), 8801)
+        for bad in (None, "", 0, -1, 65536, "abc"):
+            self.assertIsNone(gui.coerce_port(bad), repr(bad))
+        self.assertEqual(gui.coerce_port("junk", 99), 99)
+
+    def test_start_bridge_rejects_a_bad_port_without_spawning(self):
+        spawned = []
+        orig = gui.spawn
+        gui.spawn = lambda args, terminal=False: spawned.append(args)
+        try:
+            r = gui.start_bridge({"engine": "codex", "port": "70000"})
+        finally:
+            gui.spawn = orig
+        self.assertIn("error", r)
+        self.assertFalse(spawned)
+
+
+class StopBridgeTests(unittest.TestCase):
+    """Fail-closed stopping: kill_pid runs only when the registry record and the live /health
+    carry the same non-empty instance_id. Unreachable /health never kills: a held port means
+    alive-but-unverifiable -> error + registry kept; a free port proves dead -> stale prune."""
+
+    PID = 4321
+
+    def setUp(self):
+        self.scratch = tempfile.mkdtemp()
+        self.orig = (gui.BRIDGES_DIR, gui._bridge_health, gui.kill_pid)
+        gui.BRIDGES_DIR = self.scratch
+        self.killed = []
+        gui.kill_pid = lambda pid: self.killed.append(pid) or True
+
+    def tearDown(self):
+        (gui.BRIDGES_DIR, gui._bridge_health, gui.kill_pid) = self.orig
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def _write_rec(self, port, **kw):
+        rec = {"pid": self.PID, "base_url": "http://127.0.0.1:%d" % port,
+               "instance_id": "IID-%d" % port}
+        rec.update(kw)
+        with open(os.path.join(self.scratch, "bridge-%d.json" % port), "w",
+                  encoding="utf-8") as f:
+            json.dump(rec, f)
+
+    def _rec_path(self, port):
+        return os.path.join(self.scratch, "bridge-%d.json" % port)
+
+    def _set(self, health):
+        gui._bridge_health = lambda url: health
+
+    def _free_port(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+
+    def _hold(self, port):
+        """Hold <port> the way a live bridge would (any interface)."""
+        s = socket.socket()
+        s.bind(("0.0.0.0", int(port)))
+        s.listen(1)
+        self.addCleanup(s.close)
+        return s
+
+    def test_free_port_with_unreachable_health_prunes_the_stale_registry(self):
+        port = self._free_port()
+        self._write_rec(port)
+        self._set(None)   # nothing listening -> the recorded process is provably gone
+        r = gui.stop_bridge(port)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["killed"])
+        self.assertTrue(r["stale_registry"])
+        self.assertEqual(self.killed, [])
+        self.assertFalse(os.path.exists(self._rec_path(port)))
+
+    def test_busy_bridge_with_unreachable_health_preserves_file_and_errors(self):
+        port = self._free_port()
+        self._write_rec(port)
+        self._hold(port)
+        self._set(None)   # wedged bridge: port held but /health does not answer
+        r = gui.stop_bridge(port)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["killed"])
+        self.assertFalse(r.get("stale_registry"))
+        self.assertIn("retry", r["error"])
+        self.assertEqual(self.killed, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_live_bridge_without_publishable_identity_fails_closed_and_keeps_file(self):
+        port = self._free_port()
+        self._write_rec(port, instance_id="")
+        self._set({"instance_id": ""})
+        r = gui.stop_bridge(port)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["killed"])
+        self.assertEqual(self.killed, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_live_bridge_with_different_identity_never_kills(self):
+        port = self._free_port()
+        self._write_rec(port)
+        self._set({"instance_id": "someone-else"})
+        r = gui.stop_bridge(port)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["killed"])
+        self.assertTrue(r.get("stale_registry"))
+        self.assertEqual(self.killed, [])
+        self.assertFalse(os.path.exists(self._rec_path(port)))
+
+    def test_live_bridge_without_health_identity_fails_closed_and_keeps_file(self):
+        port = self._free_port()
+        self._write_rec(port)
+        self._set({})   # live /health carries no instance_id
+        r = gui.stop_bridge(port)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["killed"])
+        self.assertEqual(self.killed, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_matching_identity_kills_and_removes_the_registry_file(self):
+        port = self._free_port()
+        self._write_rec(port)
+        self._set({"instance_id": "IID-%d" % port})
+        r = gui.stop_bridge(port)
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["killed"])
+        self.assertEqual(self.killed, [self.PID])
+        self.assertFalse(os.path.exists(self._rec_path(port)))
+
+    def test_kill_pid_failure_keeps_registry_and_fails_closed(self):
+        port = self._free_port()
+        self._write_rec(port)
+        self._set({"instance_id": "IID-%d" % port})
+        gui.kill_pid = lambda pid: self.killed.append(pid) or False
+        r = gui.stop_bridge(port)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["killed"])
+        self.assertFalse(r.get("stale_registry"))
+        self.assertIn("did not terminate", r["error"])
+        self.assertEqual(self.killed, [self.PID])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_missing_pid_keeps_registry_and_fails_closed(self):
+        port = self._free_port()
+        self._write_rec(port, pid=None)
+        self._set({"instance_id": "IID-%d" % port})
+        r = gui.stop_bridge(port)
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["killed"])
+        self.assertFalse(r.get("stale_registry"))
+        self.assertIn("no usable process id", r["error"])
+        self.assertEqual(self.killed, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_stale_expected_instance_id_refuses_without_touching_anything(self):
+        port = self._free_port()
+        self._write_rec(port)
+        self._set({"instance_id": "IID-%d" % port})
+        r = gui.stop_bridge(port, expected_instance_id="outdated")
+        self.assertFalse(r["ok"])
+        self.assertIn("mismatch", r["error"])
+        self.assertEqual(self.killed, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_expected_instance_id_against_a_record_missing_one_is_a_mismatch(self):
+        port = self._free_port()
+        self._write_rec(port, instance_id=None)
+        self._set({"instance_id": "whatever"})
+        r = gui.stop_bridge(port, expected_instance_id="seen-in-the-panel")
+        self.assertFalse(r["ok"])
+        self.assertIn("mismatch", r["error"])
+        self.assertEqual(self.killed, [])
+
+    def test_expected_instance_id_equal_to_the_registry_kills_normally(self):
+        port = self._free_port()
+        self._write_rec(port)
+        self._set({"instance_id": "IID-%d" % port})
+        r = gui.stop_bridge(port, expected_instance_id="IID-%d" % port)
+        self.assertTrue(r["killed"])
+        self.assertEqual(self.killed, [self.PID])
+
+    def test_bad_port_is_refused(self):
+        self._set(None)
+        self.assertFalse(gui.stop_bridge("not-a-port")["ok"])
+
+    def test_nonpositive_pid_fails_closed_and_keeps_registry(self):
+        """Identity matches, but the recorded pid is unusable (0): the real kill_pid must
+        refuse it, stop_bridge must fail closed, and the registry must survive for a retry."""
+        port = self._free_port()
+        self._write_rec(port, pid=0)
+        self._set({"instance_id": "IID-%d" % port})
+        real_kill_pid = self.orig[2]
+        gui.kill_pid = real_kill_pid
+        calls = []
+
+        def no_run(*a, **k):
+            calls.append("subprocess.run")
+            raise AssertionError("backend primitive must not be called")
+
+        orig_run = gui.subprocess.run
+        gui.subprocess.run = no_run
+        try:
+            r = gui.stop_bridge(port, expected_instance_id="IID-%d" % port)
+        finally:
+            gui.subprocess.run = orig_run
+        self.assertFalse(r["ok"])
+        self.assertFalse(r["killed"])
+        self.assertEqual(calls, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_bool_or_float_recorded_pid_fails_closed_and_keeps_registry(self):
+        """Matching identity, but the recorded pid is a bool/float: kill_pid must refuse the
+        type confusion before any backend call, stop_bridge must fail closed, and the registry
+        must survive for a retry."""
+        for bad_pid in (True, 1.5):
+            port = self._free_port()
+            self._write_rec(port, pid=bad_pid)
+            self._set({"instance_id": "IID-%d" % port})
+            gui.kill_pid = self.orig[2]  # the REAL kill_pid
+            calls = []
+
+            def no_run(*a, **k):
+                calls.append("subprocess.run")
+                raise AssertionError("backend primitive must not be called")
+
+            orig_run = gui.subprocess.run
+            gui.subprocess.run = no_run
+            try:
+                r = gui.stop_bridge(port, expected_instance_id="IID-%d" % port)
+            finally:
+                gui.subprocess.run = orig_run
+            self.assertFalse(r["ok"])
+            self.assertFalse(r["killed"])
+            self.assertEqual(calls, [])
+            self.assertTrue(os.path.exists(self._rec_path(port)))
+
+
+class KillPidNonPositiveTests(unittest.TestCase):
+    """pid <= 0 -- numeric or string -- is a process-group / broadcast signal target on POSIX,
+    so kill_pid must reject it before subprocess.run or os.kill is ever reached."""
+
+    def _assert_rejected_before_backend(self, bad_pid):
+        calls = []
+
+        def no_run(*a, **k):
+            calls.append("subprocess.run")
+            return types.SimpleNamespace(returncode=1)
+
+        orig_run, orig_kill = gui.subprocess.run, os.kill
+
+        def no_kill(pid, sig=None):
+            calls.append("os.kill")
+            return None
+
+        gui.subprocess.run = no_run
+        try:
+            os.kill = no_kill  # patch the primitive itself, not os.name routing
+            self.assertFalse(gui.kill_pid(bad_pid))
+        finally:
+            gui.subprocess.run = orig_run
+            os.kill = orig_kill
+        self.assertEqual(calls, [])
+
+    def test_numeric_zero_and_minus_one_are_refused(self):
+        for bad in (0, -1):
+            self._assert_rejected_before_backend(bad)
+
+    def test_string_zero_and_minus_one_are_refused(self):
+        for bad in ("0", "-1"):
+            self._assert_rejected_before_backend(bad)
+
+    def test_malformed_values_are_refused_without_touching_a_backend(self):
+        for bad in (None, "", "   ", "abc", "12x", [], {}):
+            self._assert_rejected_before_backend(bad)
+
+    def test_refusal_of_nonpositive_pid_logs_a_sanitized_warning(self):
+        with self.assertLogs(gui.LOG, level=logging.WARNING) as cm:
+            self.assertFalse(gui.kill_pid("-1"))
+        msg = cm.records[0].getMessage()
+        self.assertIn("non-positive", msg)
+        self.assertIn("-1", msg)
+
+
+class KillPidTypeStrictnessTests(unittest.TestCase):
+    """A pid must be a positive int or an integer-form string. bool and float are rejected
+    BEFORE int coercion: JSON true would coerce to pid 1 and 1.9/1.0 would truncate to 1,
+    so kill_pid must refuse them before subprocess.run or os.kill is ever reached."""
+
+    def _assert_rejected_before_backend(self, bad_pid):
+        calls = []
+
+        def no_run(*a, **k):
+            calls.append("subprocess.run")
+            return types.SimpleNamespace(returncode=1)
+
+        orig_run, orig_kill = gui.subprocess.run, os.kill
+
+        def no_kill(pid, sig=None):
+            calls.append("os.kill")
+            return None
+
+        gui.subprocess.run = no_run
+        try:
+            os.kill = no_kill  # patch the primitive itself, not os.name routing
+            self.assertFalse(gui.kill_pid(bad_pid))
+        finally:
+            gui.subprocess.run = orig_run
+            os.kill = orig_kill
+        self.assertEqual(calls, [])
+
+    def test_bool_pids_are_refused_without_touching_a_backend(self):
+        for bad in (True, False):
+            self._assert_rejected_before_backend(bad)
+
+    def test_float_pids_are_refused_without_touching_a_backend(self):
+        for bad in (1.0, 1.9, -2.0, -2.5, 0.5, 4242.0, 4242.999, float("inf"), float("nan")):
+            self._assert_rejected_before_backend(bad)
+
+    def test_refusal_of_bool_or_float_pid_logs_a_sanitized_warning(self):
+        for bad in (True, 1.5):
+            with self.assertLogs(gui.LOG, level=logging.WARNING) as cm:
+                self.assertFalse(gui.kill_pid(bad))
+            msg = cm.records[0].getMessage()
+            self.assertIn("non-integer", msg)
+
+    def test_positive_int_pid_still_reaches_the_backend_once(self):
+        calls = []
+        orig_run = gui.subprocess.run
+        orig_os_name = os.name
+        if orig_os_name != "nt":
+            os.name = "nt"
+
+        def fake_run(args, **kw):
+            calls.append(list(args))
+            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"", args=args)
+
+        gui.subprocess.run = fake_run
+        try:
+            self.assertTrue(gui.kill_pid(4242))
+        finally:
+            gui.subprocess.run = orig_run
+            if orig_os_name != "nt":
+                os.name = orig_os_name
+        self.assertEqual(calls, [["taskkill", "/F", "/T", "/PID", "4242"]])
+
+    def test_positive_string_pid_is_still_accepted(self):
+        # integer-form strings remain compatible (registry JSON round-trips pids as text)
+        calls = []
+        orig_run = gui.subprocess.run
+        orig_os_name = os.name
+        if orig_os_name != "nt":
+            os.name = "nt"
+
+        def fake_run(args, **kw):
+            calls.append(list(args))
+            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"", args=args)
+
+        gui.subprocess.run = fake_run
+        try:
+            self.assertTrue(gui.kill_pid("4242"))
+            self.assertTrue(gui.kill_pid(" 4243 "))
+        finally:
+            gui.subprocess.run = orig_run
+            if orig_os_name != "nt":
+                os.name = orig_os_name
+        self.assertEqual(calls, [["taskkill", "/F", "/T", "/PID", "4242"],
+                                 ["taskkill", "/F", "/T", "/PID", "4243"]])
+
+
+class RestartBridgeTests(unittest.TestCase):
+    """restart must abort with the stop error when stopping failed -- never silently launch on
+    another port -- and may relaunch only when the stale registry was pruned and the port is
+    free (or the old process was killed and released it)."""
+
+    PID = 4321
+
+    def setUp(self):
+        self.scratch = tempfile.mkdtemp()
+        self.orig = (gui.BRIDGES_DIR, gui._bridge_health, gui.kill_pid, gui.spawn)
+        gui.BRIDGES_DIR = self.scratch
+        self.spawned = []
+        gui.spawn = lambda args, terminal=False: self.spawned.append(args)
+        gui.kill_pid = lambda pid: True
+
+    def tearDown(self):
+        (gui.BRIDGES_DIR, gui._bridge_health, gui.kill_pid, gui.spawn) = self.orig
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def _free_port(self):
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        p = s.getsockname()[1]
+        s.close()
+        return p
+
+    def _hold(self, port):
+        s = socket.socket()
+        s.bind(("0.0.0.0", int(port)))
+        s.listen(1)
+        self.addCleanup(s.close)
+        return s
+
+    def _write_rec(self, port, **kw):
+        rec = {"pid": self.PID, "base_url": "http://127.0.0.1:%d" % port,
+               "instance_id": "IID-%d" % port}
+        rec.update(kw)
+        with open(os.path.join(self.scratch, "bridge-%d.json" % port), "w",
+                  encoding="utf-8") as f:
+            json.dump(rec, f)
+
+    def _rec_path(self, port):
+        return os.path.join(self.scratch, "bridge-%d.json" % port)
+
+    def test_restart_aborts_on_held_unverifiable_bridge_without_spawning(self):
+        port = self._free_port()
+        self._write_rec(port)
+        self._hold(port)
+        gui._bridge_health = lambda url: None
+        r = gui.restart_bridge({"port": port, "engine": "codex"})
+        self.assertIn("error", r)
+        self.assertNotIn("base_url", r)
+        self.assertEqual(self.spawned, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_restart_aborts_on_expected_id_mismatch_without_spawning(self):
+        port = self._free_port()
+        self._write_rec(port)
+        gui._bridge_health = lambda url: {"instance_id": "IID-%d" % port}
+        r = gui.restart_bridge({"port": port, "engine": "codex", "instance_id": "outdated"})
+        self.assertIn("error", r)
+        self.assertIn("mismatch", r["error"])
+        self.assertEqual(self.spawned, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_restart_aborts_on_kill_failure_without_spawning(self):
+        port = self._free_port()
+        self._write_rec(port)
+        gui._bridge_health = lambda url: {"instance_id": "IID-%d" % port}
+        gui.kill_pid = lambda pid: False
+        r = gui.restart_bridge({"port": port, "engine": "codex"})
+        self.assertIn("error", r)
+        self.assertNotIn("base_url", r)
+        self.assertEqual(self.spawned, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_restart_proceeds_after_stale_registry_prune_on_same_port(self):
+        port = self._free_port()   # nothing holds it: an already-dead stale registry
+        self._write_rec(port)
+        gui._bridge_health = lambda url: None
+        r = gui.restart_bridge({"port": port, "engine": "codex"})
+        self.assertTrue(r.get("ok"))
+        self.assertEqual(r["port"], port)
+        self.assertFalse(r.get("reassigned"))
+        self.assertEqual(self.spawned, [[u"openai-server", u"-e", u"codex",
+                                         u"-p", str(port), u"--localhost"]])
+        self.assertFalse(os.path.exists(self._rec_path(port)))
+
+
+class BridgeStopRouteTests(unittest.TestCase):
+    """The existing /api/bridge/stop route must carry the row's registered instance_id through
+    to gui.stop_bridge so a stale panel can't stop a newer bridge."""
+
+    def test_route_forwards_instance_id_to_stop_bridge(self):
+        seen = []
+
+        def fake_stop(port, expected_instance_id=None):
+            seen.append((port, expected_instance_id))
+            return {"ok": True, "killed": True}
+
+        orig = gui.stop_bridge
+        gui.stop_bridge = fake_stop
+        try:
+            sent = []
+
+            class Fake:
+                client_address = ("127.0.0.1", 4242)
+                _reject_unauthorized = gui.H._reject_unauthorized
+                _read_json_object_body = gui.H._read_json_object_body
+
+                def __init__(self):
+                    body = json.dumps({"port": 8899, "instance_id": "IID-8899"}).encode()
+                    self.path = "/api/bridge/stop"
+                    self.headers = {"Content-Length": str(len(body))}
+                    self.rfile = io.BytesIO(body)
+
+                def _send(self, code, body_, ctype="application/json"):
+                    sent.append((code, body_))
+
+            gui.H.do_POST(Fake())
+        finally:
+            gui.stop_bridge = orig
+        self.assertEqual(seen, [(8899, "IID-8899")])
+        self.assertEqual(json.loads(sent[0][1])["killed"], True)
+
+
+class GuiPostBodyGuardTests(unittest.TestCase):
+    """gui.do_POST answers garbled/oversized bodies with controlled 400/413 instead of
+    crashing on int()/rfile.read or reading an unbounded body into memory."""
+
+    def _call(self, body=b"", headers=None):
+        sent = []
+
+        class Fake:
+            client_address = ("127.0.0.1", 4242)
+            _reject_unauthorized = gui.H._reject_unauthorized
+            _read_json_object_body = gui.H._read_json_object_body
+
+            def __init__(self):
+                self.path = "/api/no-such-route"
+                self.headers = headers if headers is not None else {}
+                if body and "Content-Length" not in self.headers:
+                    self.headers["Content-Length"] = str(len(body))
+                self.rfile = io.BytesIO(body)
+
+            def _send(self, code, body_, ctype="application/json"):
+                sent.append((code, body_))
+
+        gui.H.do_POST(Fake())
+        return sent
+
+    def test_malformed_and_negative_content_length_are_400(self):
+        for v in ("abc", "-5", "1e3"):
+            with self.subTest(value=v):
+                sent = self._call(headers={"Content-Length": v})
+                self.assertEqual(sent[0][0], 400)
+
+    def test_oversized_content_length_is_413_before_any_read(self):
+        sent = self._call(headers={"Content-Length": str(gui.MAX_BODY_BYTES + 1)})
+        self.assertEqual(sent[0][0], 413)
+
+    def test_invalid_or_non_object_json_is_400(self):
+        for raw in (b"{nope", b"[1]"):
+            with self.subTest(body=raw):
+                sent = self._call(body=raw, headers={"Content-Length": str(len(raw))})
+                self.assertEqual(sent[0][0], 400)
+
+    def test_valid_empty_body_reaches_routing(self):
+        sent = self._call()   # no header -> {} -> unknown route -> plain 404
+        self.assertEqual(sent[0][0], 404)
+
+
+class GuiLoggingTests(unittest.TestCase):
+    """Diagnostics mirror openai_server.py: opt-in (quiet WARNING default, AGENT_LOG_LEVEL raises
+    the gate) and never carrying secrets -- no request bodies/prompts/answers/auth headers, and a
+    `?token=` URL is redacted before it can reach the log."""
+
+    def setUp(self):
+        self._level = gui.LOG.level
+        gui.LOG.setLevel(logging.WARNING)  # pin the documented default for every test here
+
+    def tearDown(self):
+        gui.LOG.setLevel(self._level)
+
+    class _FakeSelf:
+        @staticmethod
+        def address_string():
+            return "127.0.0.1"
+
+    def test_request_lines_route_to_debug_only(self):
+        with self.assertLogs(gui.LOG, level=logging.DEBUG) as cm:
+            gui.H.log_message(self._FakeSelf(), '"GET / HTTP/1.1" %s %s', 200, "-")
+        self.assertTrue(all(r.levelno == logging.DEBUG for r in cm.records))
+        with self.assertRaises(AssertionError):  # fully silent at the default gate
+            with self.assertLogs(gui.LOG, level=logging.WARNING):
+                gui.H.log_message(self._FakeSelf(), '"GET / HTTP/1.1" 200 -')
+
+    def test_token_in_request_line_is_redacted(self):
+        secret = "sekrit-token-9f2"
+        with self.assertLogs(gui.LOG, level=logging.DEBUG) as cm:
+            gui.H.log_message(self._FakeSelf(), '"GET /?token=%s HTTP/1.1" 200 -' % secret)
+        line = cm.records[0].getMessage()
+        self.assertNotIn(secret, line)
+        self.assertIn("token=<redacted>", line)
+        self.assertIn("api_key=<redacted>", self._fmt("api_key=k3"))
+        self.assertNotIn("k3", self._fmt("api_key=k3"))
+
+    def _fmt(self, requestline):
+        with self.assertLogs(gui.LOG, level=logging.DEBUG) as cm:
+            gui.H.log_message(self._FakeSelf(), '"%s" 200 -' % requestline)
+        return cm.records[0].getMessage()
+
+    def test_failed_health_probe_is_debug_gated_and_leaks_no_url(self):
+        orig = gui.urllib.request.urlopen
+        secret = "sekrit-health-9f2"
+        secret_url = "http://127.0.0.1:9999/health?token=%s" % secret
+
+        class SyntheticProbeError(RuntimeError):
+            pass
+
+        def fake_urlopen(*a, **kw):
+            raise SyntheticProbeError("should-not-be-logged")
+
+        gui.urllib.request.urlopen = fake_urlopen
+        try:
+            with self.assertLogs(gui.LOG, level=logging.DEBUG) as cm:
+                self.assertIsNone(gui._bridge_health(secret_url))
+            msg = cm.records[0].getMessage()
+            self.assertIn("SyntheticProbeError", msg)
+            self.assertNotIn(secret, msg)
+            self.assertNotIn(secret_url, msg)
+            self.assertNotIn("should-not-be-logged", msg)
+            with self.assertRaises(AssertionError):
+                with self.assertLogs(gui.LOG, level=logging.WARNING):
+                    gui._bridge_health(secret_url)
+        finally:
+            gui.urllib.request.urlopen = orig
+
+    def test_kill_pid_failure_warns_with_exception_type_only(self):
+        orig_run = gui.subprocess.run
+
+        class Boom(RuntimeError):
+            pass
+
+        def raising_run(*a, **k):
+            raise Boom("taskkill internal detail should-not-be-logged")
+        gui.subprocess.run = raising_run
+        try:
+            with self.assertLogs(gui.LOG, level=logging.WARNING) as cm:
+                self.assertFalse(gui.kill_pid(424242))
+        finally:
+            gui.subprocess.run = orig_run
+        msg = cm.records[0].getMessage()
+        self.assertIn("Boom", msg)          # exception type is fine
+        self.assertIn("424242", msg)        # pid is fine
+        self.assertNotIn("should-not-be-logged", msg)
+
+    def test_kill_pid_nonzero_returncode_warns_with_status_only(self):
+        orig_run = gui.subprocess.run
+        orig_os_name = os.name
+        if orig_os_name != "nt":
+            os.name = "nt"
+        secret = "sekrit-cmd-should-not-appear"
+
+        def fake_run(args, **kw):
+            return types.SimpleNamespace(returncode=2, stdout=secret, stderr=secret, args=args)
+
+        gui.subprocess.run = fake_run
+        try:
+            with self.assertLogs(gui.LOG, level=logging.WARNING) as cm:
+                self.assertFalse(gui.kill_pid(424242))
+            msg = cm.records[0].getMessage()
+            self.assertIn("2", msg)
+            self.assertIn("424242", msg)
+            self.assertNotIn(secret, msg)
+        finally:
+            gui.subprocess.run = orig_run
+            if orig_os_name != "nt":
+                os.name = orig_os_name
 
 
 if __name__ == "__main__":

@@ -71,13 +71,15 @@ and `GET /health` reports `session_active`/`session_turns`. An idle session also
 auto-expires after `--session-ttl` seconds (default 1800 = 30 min) — the next call
 after that just starts fresh instead of resuming. Beyond that: latency is a
 **full CLI subprocess invocation** (seconds to low minutes, not a token stream);
-`stream: true` **replays an already-finished answer** as word-sized SSE chunks, it is
-not real per-token streaming; `tools`/function-calling is **emulated via prompting**
+`stream: true` **is REAL per-token streaming on the `claude` engine** (deltas stream as SSE
+chunks while the model generates); non-live engines (codex/kimi/opencode/gemini) and
+`--no-live-stream` instead **replay an already-finished answer** as word-sized SSE chunks;
+`tools`/function-calling is **emulated via prompting**
 (best-effort; the bridge accepts the call as EITHER a JSON `{"tool_calls":[...]}` block
 OR literal `name(arg=value, ...)` lines — codex tends to write the latter — and the
 prompt warns that prose describing an action is ignored; re-sent on every `tools` call);
-`usage` token counts are **always
-`0/0/0`**; and **`content` is a clean answer for every bundled engine** (`codex` would
+`usage` token counts are an **explicit approximate estimate** (~4 chars/token, flagged
+"neoxider_estimated": true) — not billing-grade; and **`content` is a clean answer for every bundled engine** (`codex` would
 otherwise mix its banner/session-id/error-log/"tokens used" chrome into the answer, so its
 provider runs `codex exec --json` and extracts only the final agent message — this also
 cleaned up `agent.sh last`/the GUI for codex). One process = one fixed engine/model/effort
