@@ -6,6 +6,25 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **gui bridge log: undefined `parseThread` + unsafe curl quoting.** Removed the stale parser call,
+  load request details through `/api/dialog`, and quote copied curl commands safely for POSIX shells.
+- **gui HTTP: body/route/port/wait hardening.** Validate request bodies, use exact routes, and
+  reject malformed port and wait/timeout values with controlled errors.
+- **bridge: fail-closed identity and PID termination.** Require matching live and registered
+  instance identities, reject unsafe PID values, and preserve the registry while aborting restart
+  whenever health, identity, or termination cannot be verified.
+- **shell: shared Python/mtime/wait classifier.** Centralize Python discovery, portable file mtime,
+  and final-line input-request classification instead of keeping provider-specific copies.
+
+### Changed
+
+- **cleanup: dead CSS/locale/parser state.** Remove unused CSS, stale locale keys, parser symbols,
+  and duplicated provider helpers left from earlier iterations.
+- **logging: safe diagnostics.** HTTP request diagnostics are DEBUG opt-in; default warnings expose
+  failure type/status only and never log request bodies, prompts, auth headers, or API keys.
+
 ## [0.3.0] - 2026-08-13
 
 ### Security

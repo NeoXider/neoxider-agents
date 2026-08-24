@@ -179,6 +179,28 @@ _json_str() {
     printf '"%s"' "$s"
 }
 
+# --- shared provider helpers -------------------------------------------------
+# _agent_python — shared python discovery for all providers: $AGENT_PYTHON wins, then
+# python3/python/py; a candidate counts only if it actually runs (`-c "import sys"` — Windows'
+# bare `python` can be an exit-nonzero stub). Sets $_AGENT_PY on success; non-zero return means
+# none found (providers degrade to raw passthrough). Cached for the process lifetime.
+_AGENT_PY=""
+_AGENT_PY_RESOLVED=""
+_agent_python() {
+    if [ -z "$_AGENT_PY_RESOLVED" ]; then
+        _AGENT_PY_RESOLVED=1
+        local c
+        for c in "${AGENT_PYTHON:-}" python3 python py; do
+            [ -n "$c" ] || continue
+            if command -v "$c" >/dev/null 2>&1 && "$c" -c "import sys" >/dev/null 2>&1; then
+                _AGENT_PY="$c"
+                break
+            fi
+        done
+    fi
+    [ -n "$_AGENT_PY" ]
+}
+
 # --- provider plugin loader ------------------------------------------------
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROVIDERS_DIR="$HERE/providers"
@@ -303,11 +325,19 @@ latest_task() { ls -t "$LOGDIR"/*.meta 2>/dev/null | head -1 | xargs -r basename
 
 is_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
+# file_mtime PATH -> mtime as epoch seconds (empty if missing/unreadable).
+# GNU stat (-c %Y) first, BSD/macOS stat (-f %m) as fallback.
+file_mtime() {
+    local m
+    m="$(stat -c %Y "$1" 2>/dev/null)" && { printf '%s\n' "$m"; return 0; }
+    stat -f %m "$1" 2>/dev/null
+}
+
 # log_idle_sec NAME -> seconds since the task's log last grew (empty if there is no log).
 log_idle_sec() {
     local f="$LOGDIR/$1.log" m
     [ -f "$f" ] || return 0
-    m="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)"
+    m="$(file_mtime "$f")"
     [ -n "$m" ] || return 0
     echo $(( $(date +%s) - m ))
 }
@@ -382,16 +412,43 @@ render_md() {
     } > "$md"
 }
 
+# looks_waiting LINE — true if this final output line asks for input (-> state=waiting):
+# real (alphanumeric) text before a trailing '?' — bare '?'/'?!'/punctuation-only do NOT count —
+# or an explicit ask-phrase (English + Russian phrasings seen live). Trailing quotes/brackets and
+# a `(yes/no)` aside are stripped first.
+looks_waiting() {
+    local body="${1:-}" last
+    body="${body%$'\r'}"
+    body="${body% \(*\)}"
+    while [ -n "$body" ]; do
+        last="${body#"${body%?}"}"   # POSIX-safe last char (no ${var: -1}, for bash 3/macOS)
+        case "$last" in
+            " "|$'\t'|'"'|"'"|")"|"]"|"}") body="${body%?}" ;;
+            *) break ;;
+        esac
+    done
+    case "$body" in
+        *\?)
+            local q="${body%\?}"
+            [ -n "$(printf '%s' "$q" | tr -cd '[:alnum:]')" ] && return 0
+            ;;
+    esac
+    printf '%s' "$body" | grep -qiE \
+        'should i |do you want|which (one|option|approach|of)|please (confirm|clarify|specify)|let me know|shall i |уточни|подтверд|как (мне |)поступ|какой из' \
+        && return 0
+    return 1
+}
+
 # after a step finishes: exit code, changed files, state, question detection
 finish_step() {
-    local n="$1" rc="$2" log tdir nfiles=0 tail3
+    local n="$1" rc="$2" log tdir nfiles=0 last_line
     log="$LOGDIR/$n.log"; tdir="$(meta_get "$n" dir)"; [ -n "$tdir" ] || tdir="$dir"
     meta_set "$n" exit "$rc"
     if git -C "$tdir" rev-parse --git-dir >/dev/null 2>&1; then
         nfiles=$(git -C "$tdir" status --porcelain 2>/dev/null | grep -c .)
     fi
     meta_set "$n" files "$nfiles"
-    tail3="$(last_output "$log" | grep -v '^[[:space:]]*$' | tail -3)"
+    last_line="$(last_output "$log" | grep -v '^[[:space:]]*$' | tail -1)"
     if [ "$rc" = 124 ]; then
         # killed by the step watchdog (_guarded_run). Recorded in meta so `status`/`list`/the GUI
         # can say WHY the task died instead of showing a bare exit code.
@@ -401,7 +458,7 @@ finish_step() {
     elif [ "$rc" -ne 0 ]; then
         meta_set "$n" state error
         echo "[agent.sh] ✖ error exit=$rc  task=$n  (log: agent.sh log $n)" >&2
-    elif printf '%s' "$tail3" | grep -qiE '\?[)"'\'' ]*$|should i |do you want|which (one|option|approach|of)|please (confirm|clarify|specify)|let me know|shall i |уточни|подтверд|как (мне |)поступ|какой из'; then
+    elif looks_waiting "$last_line"; then
         meta_set "$n" state waiting
         echo "[agent.sh] ⏳ the agent appears to have ASKED a question — reply: agent.sh reply $n \"...\"  (question: agent.sh last $n)" >&2
     else
@@ -667,7 +724,8 @@ except Exception:
             n="$(basename "$m" .meta)"
             e="$(meta_get "$n" engine)"; mo="$(meta_get "$n" model)"; s="$(meta_get "$n" session)"
             st="$(eff_state "$n")"; nf="$(meta_get "$n" files)"
-            age="$(( ($(date +%s) - $(stat -c %Y "$m" 2>/dev/null || echo 0)) / 60 ))m"
+            fm="$(file_mtime "$m")"
+            age="$(( ($(date +%s) - ${fm:-0}) / 60 ))m"
             printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %s\n' "$(state_icon "$st")" "$n" "${st:-?}" "${e:-?}" "${mo:-?}" "$age" "${nf:-0}" "${s:0:8}"
         done
         ;;

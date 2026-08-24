@@ -1,6 +1,24 @@
 # Tests
 
-Two independent, self-contained suites — one per language in this repo.
+Three suites: two offline zero-dependency suites that need no provider credentials, plus one manual
+live smoke.
+
+## Python suite (gui.py + openai_server.py)
+
+```bash
+python -m unittest discover tests
+# or individually:
+python -m unittest tests.test_gui
+python -m unittest tests.test_openai_server
+# or directly:
+python tests/test_gui.py
+python tests/test_openai_server.py
+```
+
+`test_gui.py` imports `gui.py` by file path and covers GUI state, parsing, HTTP guards, bridge
+lifecycle, and diagnostics. `test_openai_server.py` covers bridge parsing, sessions, routing,
+streaming, tool-call extraction, and diagnostics. They start no persistent servers, use scratch
+directories where needed, and rely only on stdlib `unittest`.
 
 ## Bash suite (agent.sh)
 
@@ -9,28 +27,20 @@ bash tests/test_agent_sh.sh
 ```
 
 Sources `agent.sh` (via the harmless `list` subcommand) inside a scratch `AGENT_CLI_LOGS`
-directory to exercise `meta_set`/`meta_get`/`_meta_lock`/`_meta_unlock`, the codex/claude
-provider `_resolve` functions, and the default task-name shape — without invoking any real CLI
-(codex/claude/etc.) and without touching the real `~/.claude/agent-cli-logs`. Prints per-test
-pass/fail lines and a final `N/N passed` summary; exits non-zero if anything failed.
+directory to exercise metadata locking, provider contracts, watchdog/liveness behavior, shared
+helpers, and waiting detection—without invoking a real agent CLI or touching the real logs. It
+prints per-test results and exits non-zero on failure.
 
-## Python suite (gui.py)
+## Live smoke (manual — spends provider usage)
 
 ```bash
-python tests/test_gui.py
-# or:
-python -m unittest tests.test_gui
-# or, to run every test module under tests/:
-python -m unittest discover tests
+python tests/live_smoke_openai_server.py
 ```
 
-Imports `gui.py` by file path via `importlib` (it's a standalone script, not an importable
-package) and covers `to_git_bash_path`, `eff_state`, `activity_emoji`/`topic_emoji`,
-`list_locales`, and the `_serve_static` directory-traversal guard — monkeypatching
-`LOGDIR`/`LOCALES_DIR` to scratch temp directories where needed so nothing reads or writes the
-real `~/.claude/agent-cli-logs`, and no network port is ever bound.
+Standalone end-to-end smoke against a real CLI subagent. It covers health/errors, completion,
+continuation, tool calls, reset, expiry, streaming, and concurrency. It is not part of discovery;
+run it deliberately because it requires credentials and spends provider usage.
 
 ## Zero dependencies
 
-This project's "zero dependencies" philosophy extends to its tests: plain bash + Python's
-built-in `unittest` only — no bats-core, no pytest, no pip/npm installs required.
+Plain bash + Python stdlib `unittest` only — no bats-core, no pytest, no pip/npm installs required.
