@@ -6,8 +6,37 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-26
+
+### Security
+
+- **GUI request boundary hardened.** A configured token is now required even through loopback
+  reverse proxies; tokenless local mutations require JSON and same-origin browser headers. Query
+  token bootstrap redirects to a clean URL and uses an HttpOnly cookie. Task identifiers are
+  bounded basenames, eliminating log/meta traversal and option injection.
+- **API bridge is loopback-first and fail-closed.** The default bind is `127.0.0.1`; every LAN
+  bridge requires an API key, while Codex/Gemini and unsafe native OpenCode remain loopback-only
+  because their read/tool boundary is incomplete. Claude uses an empty native tool set.
+- **Secrets and local state are private.** GUI-started bridge keys travel in the child environment,
+  never argv; shell task state is created/repaired with owner-only permissions and HTTP diagnostics
+  omit query strings and provider exception details.
+
 ### Fixed
 
+- **shell lifecycle and retry correctness.** Validate task names before every file access, replace
+  lock stealing with owner-aware recovery and per-writer temporary files, isolate retry attempts,
+  stop retries after detectable session/side-effect activity, persist the successful session, and
+  inherit the original model/effort on reply.
+- **bridge session/protocol correctness.** Persist the exact client-visible assistant turn before
+  resume, reject tampered history, invalidate sessions after hidden tool nudges, terminate process
+  trees on timeout, validate request schemas as 400s, filter undeclared tools, report failed SSE
+  streams without a false success terminator, and make `/health.busy` mean in-flight work.
+- **GUI frontend correctness.** Remove inline-handler interpolation, fix whole-dialog selection and
+  stale request races, bound bridge transcript caches/polling, handle deleted tasks and corrupt
+  local storage, preserve i18n controls, and surface non-2xx/non-JSON responses.
+- **cross-platform launchers.** Windows wrappers use Git's complete `bin/bash.exe` runtime and
+  propagate native exit codes in cmd, Windows PowerShell 5.1, and PowerShell 7. The POSIX installer
+  selects its rc file from `$SHELL`; the runtime now states and enforces Bash 4+.
 - **gui bridge log: undefined `parseThread` + unsafe curl quoting.** Removed the stale parser call,
   load request details through `/api/dialog`, and quote copied curl commands safely for POSIX shells.
 - **gui HTTP: body/route/port/wait hardening.** Validate request bodies, use exact routes, and
@@ -30,6 +59,11 @@ All notable changes to this project are documented here. Format follows
 
 ### Changed
 
+- **distribution contracts refreshed.** Plugin metadata is versioned `0.4.0`, includes Kimi, passes
+  strict Claude validation, resolves bundled files through `CLAUDE_PLUGIN_ROOT`, and no longer
+  publishes stale hard-coded test totals. `TODO.md` now contains only open work.
+- **retry ownership is explicit.** The OpenAI bridge disables the wrapper's inner retry layer, so
+  its `--retries` value maps directly to provider call count instead of multiplying two loops.
 - **cleanup: dead CSS/locale/parser state.** Remove unused CSS, stale locale keys, parser symbols,
   and duplicated provider helpers left from earlier iterations.
 - **logging: safe diagnostics.** HTTP request diagnostics are DEBUG opt-in; default warnings expose

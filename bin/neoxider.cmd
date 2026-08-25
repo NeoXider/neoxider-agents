@@ -7,8 +7,9 @@ rem C:\Windows\System32\bash.exe, which cannot run this MSYS script (it opens th
 rem wrong filesystem / Store prompt and the launcher silently fails). Locate Git
 rem Bash explicitly from its common install paths, falling back to bare bash.
 setlocal
-set "GITBASH=%ProgramFiles%\Git\usr\bin\bash.exe"
-if not exist "%GITBASH%" set "GITBASH=%ProgramFiles(x86)%\Git\usr\bin\bash.exe"
-if not exist "%GITBASH%" set "GITBASH=%LocalAppData%\Programs\Git\usr\bin\bash.exe"
+set "GITBASH=%ProgramFiles%\Git\bin\bash.exe"
+if not exist "%GITBASH%" set "GITBASH=%ProgramFiles(x86)%\Git\bin\bash.exe"
+if not exist "%GITBASH%" set "GITBASH=%LocalAppData%\Programs\Git\bin\bash.exe"
 if not exist "%GITBASH%" set "GITBASH=bash"
 "%GITBASH%" "%~dp0neoxider" %*
+exit /b %ERRORLEVEL%

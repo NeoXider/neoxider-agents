@@ -5,9 +5,18 @@ description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tas
 
 # CLI Subagents (Codex Orchestration)
 
-For subagent tasks use **Claude Code CLI (Opus 5)** through the wrapper
-`~/.claude/skills/neoxider-agents/agent.sh` (git-bash; when working inside this repo use
-`./agent.sh`).
+For foreign-engine subagent tasks, resolve the bundled wrapper from the plugin root; a manual
+clone/skill install falls back to the conventional skill directory:
+
+```bash
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "$CLAUDE_PLUGIN_ROOT/agent.sh" ]; then
+  SK="$CLAUDE_PLUGIN_ROOT/agent.sh"
+else
+  SK="${NEOXIDER_AGENTS_HOME:-$HOME/.claude/skills/neoxider-agents}/agent.sh"
+fi
+```
+
+When working inside this repository, `SK=./agent.sh` is sufficient.
 
 **NATIVE-FIRST RULE (user, 2026-07-22, permanent):** every orchestrator spawns its OWN
 engine's subagents natively; the agent.sh wrapper is ONLY for foreign engines.
@@ -46,41 +55,40 @@ The loop:
 ## Commands
 
 ```bash
-SK=~/.claude/skills/neoxider-agents/agent.sh
-bash $SK run  -t fix-readme -C /c/Git/Proj "prompt" # claude, claude-opus-5 (default); -t = task name
-bash $SK fan  -t audit -C dir "prompt A" "prompt B" # N parallel background tasks from one call
+bash "$SK" run  -t fix-readme -C /c/Git/Proj "prompt" # claude, claude-opus-5 (default); -t = task name
+bash "$SK" fan  -t audit -C dir "prompt A" "prompt B" # N parallel background tasks from one call
                                                      # (audit-01, audit-02, ...); shared -e/-m/-f/-C;
                                                      # returns at once — poll with list/status.
                                                      # Use instead of a hand-written `run ... &` loop
-bash $SK run  -t big-job -C dir "prompt"            # agent keeps PROGRESS.<task>.md by default (per-task, resumable + orchestrator-readable); --no-progress opts out
-bash $SK run  --no-terse -C dir "prompt"            # terse (concision) directive is ON by default to save output/turn tokens; --no-terse for exploratory/ambiguous work
-bash $SK run  -m spark -C /c/Git/Proj "prompt"      # trivial task -> spark
-bash $SK run  -e claude -m haiku -C dir "prompt"    # a different CLI: claude/opencode/gemini
-bash $SK run  -m sonnet -f low -e claude -C dir "prompt"  # -f <effort>, separate from -m <model>
-bash $SK run  -e kimi -C dir "prompt"              # Kimi Code, Kimi K3 by default
-bash $SK run  -e kimi -m highspeed -C dir "prompt" # explicit managed high-speed coding model
-bash $SK test-api --base-url http://127.0.0.1:8080 --goal "check /health, then POST+GET /item" --out r.json
+bash "$SK" run  -t big-job -C dir "prompt"            # agent keeps PROGRESS.<task>.md by default (per-task, resumable + orchestrator-readable); --no-progress opts out
+bash "$SK" run  --no-terse -C dir "prompt"            # terse (concision) directive is ON by default to save output/turn tokens; --no-terse for exploratory/ambiguous work
+bash "$SK" run  -m spark -C /c/Git/Proj "prompt"      # trivial task -> spark
+bash "$SK" run  -e claude -m haiku -C dir "prompt"    # a different CLI: claude/opencode/gemini
+bash "$SK" run  -m sonnet -f low -e claude -C dir "prompt"  # -f <effort>, separate from -m <model>
+bash "$SK" run  -e kimi -C dir "prompt"              # Kimi Code, Kimi K3 by default
+bash "$SK" run  -e kimi -m highspeed -C dir "prompt" # explicit managed high-speed coding model
+bash "$SK" test-api --base-url http://127.0.0.1:8080 --goal "check /health, then POST+GET /item" --out r.json
                                                      # thin wrapper on `run`: agent exercises a local
                                                      # HTTP API via its own curl/shell, returns strict JSON
-bash $SK reply fix-readme "answer"                  # continue the task by name (session/dir taken from meta)
-bash $SK reply <session-uuid> "answer"              # or by uuid; with no argument — the last task
-bash $SK log  fix-readme                            # the entire task thread (run + all replies in one file)
-bash $SK log  -f fix-readme                         # follow a live background agent (tail -f)
-bash $SK log  -l fix-readme                         # only the last step
-bash $SK last fix-readme                            # only the agent's last answer
-bash $SK status fix-readme                          # state: state/stage/changed files/whether a reply is needed
-bash $SK list                                       # table: state / engine / model / age / files / session
-bash $SK clean                                      # delete md clutter (<name>.md + PROGRESS.<name>.md) of STOPPED
+bash "$SK" reply fix-readme "answer"                  # continue the task by name (session/dir taken from meta)
+bash "$SK" reply SESSION_UUID "answer"                 # or by uuid; with no argument — the last task
+bash "$SK" log  fix-readme                            # the entire task thread (run + all replies in one file)
+bash "$SK" log  -f fix-readme                         # follow a live background agent (tail -f)
+bash "$SK" log  -l fix-readme                         # only the last step
+bash "$SK" last fix-readme                            # only the agent's last answer
+bash "$SK" status fix-readme                          # state: state/stage/changed files/whether a reply is needed
+bash "$SK" list                                       # table: state / engine / model / age / files / session
+bash "$SK" clean                                      # delete md clutter (<name>.md + PROGRESS.<name>.md) of STOPPED
                                                      # tasks; live running/idle tasks are never touched;
                                                      # --all incl. waiting, --purge also .log/.meta, -n dry-run
-bash $SK doctor                                     # pre-flight: engines + codex limits (before fanning out!)
-bash $SK doctor --json                              # machine-readable snapshot (used by the panel)
-bash $SK doctor --deep                              # + one REAL cheap run per engine that must EXECUTE a shell
+bash "$SK" doctor                                     # pre-flight: engines + codex limits (before fanning out!)
+bash "$SK" doctor --json                              # machine-readable snapshot (used by the panel)
+bash "$SK" doctor --deep                              # + one REAL cheap run per engine that must EXECUTE a shell
                                                      # command — catches "answers fine, every command hangs"
-bash $SK gui [port]                                 # web control panel over all providers (stable default :8765,
+bash "$SK" gui [port]                                 # web control panel over all providers (stable default :8765,
                                                      # or $AGENT_GUI_PORT, or a one-off port arg; if that port is
                                                      # held by someone else it moves to the next free one, loudly)
-bash $SK gui 8765 --lan --token SECRET              # ...reachable from another PC/phone. --token is MANDATORY with
+bash "$SK" gui 8765 --lan --token SECRET              # ...reachable from another PC/phone. --token is MANDATORY with
                                                      # --lan (the panel launches full-auto agents); the other device
                                                      # opens http://<this-host>:8765/?token=SECRET once
 ```
@@ -124,6 +132,8 @@ bash $SK gui 8765 --lan --token SECRET              # ...reachable from another 
 | Variable | Default | What it does |
 |---|---|---|
 | `AGENT_TIMEOUT_SEC` | `1800` | Wall-clock deadline for ONE step (`run`/`reply`). On expiry the whole process tree is killed, `!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=<N>s and was killed` is appended to the log, and the task ends as `state=error exit=124`. `0` disables it (only for genuinely long jobs). |
+| `AGENT_RETRIES` | `2` | Additional provider attempts after a transient failure. Set `0` when an outer caller (such as the API bridge) owns retries. Attempts stop when retrying could repeat autonomous side effects. |
+| `AGENT_RETRY_DELAY` | `8` | Seconds between safe transient retries. |
 | `AGENT_STALE_SEC` | `300` | Silence after which a still-alive task is reported as `running (no output for Nm)` instead of plain `running` — same wording in the CLI and in the GUI. |
 | `AGENT_CODEX_USER_CONFIG` | unset | `1` = let codex load `~/.codex/config.toml` again. Off by default **on purpose** — see ["Codex: every shell command hangs"](#codex-every-shell-command-hangs-environment-issue) below. |
 | `AGENT_CODEX_MCP` | unset | Re-add specific MCP servers to the isolated codex config: `AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp,other=http://…"` → repeated `-c mcp_servers.<name>.url="<url>"`. |
@@ -132,9 +142,9 @@ bash $SK gui 8765 --lan --token SECRET              # ...reachable from another 
 | `AGENT_CODEX_DOCTOR_MODEL` / `AGENT_CODEX_DOCTOR_TIMEOUT` | `spark` / `60` | Model and hard deadline for `doctor --deep`'s codex shell check. |
 | `AGENT_GUI_PORT` | `8765` | GUI port (an explicit `gui <port>` argument still wins). |
 | `AGENT_GUI_HOST` | `127.0.0.1` | GUI bind address. Anything but loopback also requires `AGENT_GUI_TOKEN`, or the panel refuses to start. `--lan` / `--localhost` override it. |
-| `AGENT_GUI_TOKEN` | unset | Shared secret the GUI demands from every NON-loopback request (`?token=`, `X-Agent-Token`, or the cookie it sets). Mandatory for `--lan`. |
+| `AGENT_GUI_TOKEN` | unset | Shared secret the GUI demands from every request when configured (`?token=` bootstrap, `X-Agent-Token`, or its HttpOnly cookie). Mandatory for `--lan`. |
 | `AGENT_OPENAI_KEY` | unset | Default `--api-key` for `openai-server`: callers must send `Authorization: Bearer <key>`. Unset = open bridge (fine on loopback only). |
-| `AGENT_OPENAI_HOST` | `0.0.0.0` | Bridge bind address (`--localhost` / `--lan` override it). |
+| `AGENT_OPENAI_HOST` | `127.0.0.1` | Bridge bind address (`--localhost` / `--lan` override it); every non-loopback bind requires an API key. |
 
 Normal provider runs are intentionally full-auto: Codex uses `--sandbox danger-full-access`, Claude
 uses `--dangerously-skip-permissions`, Gemini uses `--yolo`, opencode uses `--auto`, and Kimi uses its
@@ -150,7 +160,7 @@ their restricted modes work and suit the task.
 yourself before declaring the task done:
 
 ```bash
-bash $SK test-api --base-url http://127.0.0.1:<port> \
+bash "$SK" test-api --base-url http://127.0.0.1:PORT \
   --goal "check /health returns ok, then POST /item and GET it back" --out result.json
 ```
 
@@ -165,16 +175,15 @@ vars, or any OpenAI-client library), use `agent.sh openai-server` instead of set
 a real provider API key:
 
 ```bash
-bash $SK openai-server -e claude -m sonnet -f low -p 8801
+bash "$SK" openai-server -e claude -m sonnet -f low -p 8801
 # then point any OpenAI-compatible client's base_url at http://127.0.0.1:8801/v1
 ```
 
-**Reaching the bridge from a phone/APK or another computer (LAN).** By default the bridge
-now binds `0.0.0.0` (all interfaces), so other devices on the same network can connect out of
-the box. On start it prints this host's LAN URL to point the other device at:
+**Reaching the bridge from a phone/APK or another computer (LAN).** The bridge is loopback-only
+by default. Pass `--lan` together with an API key; non-loopback startup without a key is refused:
 
 ```bash
-bash $SK openai-server -e claude -m sonnet -p 8801 --api-key "$(openssl rand -hex 16)"
+bash "$SK" openai-server -e claude -m sonnet -p 8801 --lan --api-key "$(openssl rand -hex 16)"
 # prints e.g. "LAN: reachable ... at http://192.168.1.115:8801/v1"
 # -> set that as the base_url in the APK / on the other PC, with the key as the OpenAI api_key
 ```
@@ -183,8 +192,9 @@ bash $SK openai-server -e claude -m sonnet -p 8801 --api-key "$(openssl rand -he
 every caller present `Authorization: Bearer SECRET` — the standard OpenAI header, so any
 OpenAI-compatible client already sends it as `api_key`. `X-Api-Key: SECRET` works too. `/health`
 and `/` stay open so liveness probes and the GUI's bridge list keep working; `/v1/models`,
-`/v1/chat/completions` and `/reset` all 401 without the key. With no key the bridge is open —
-fine on loopback, reckless on a network, and the startup banner says so in as many words.
+`/v1/chat/completions` and `/reset` all 401 without the key. With no key the bridge is available
+only on loopback. Codex and Gemini remain loopback-only even with a key because read capability
+cannot currently be removed from those CLI sessions.
 
 It only exposes the bridge on the local network, not the internet. Because the bridge drives
 a CLI agent with your credentials/tools, only run it on a trusted network, and open the port
@@ -260,13 +270,13 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   completion.
 - **The wrapped CLI is locked to text-only completion — real CLI flags, not just a
   prompt ask.** Every subprocess gets `AGENT_CHAT_ONLY=1`, which makes codex run with
-  `--sandbox read-only --ignore-user-config` (no shell/file writes, and skips
+  `--sandbox read-only --ignore-user-config` (no writes, and skips
   `~/.codex/config.toml` so real configured MCP servers like a live `unityMCP` aren't
-  reachable), claude runs with `--strict-mcp-config --disallowedTools
-  Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, Kimi uses an explicit
+  reachable; host reads remain, so Codex bridges are loopback-only), Claude runs with
+  `--strict-mcp-config --tools ""`, Kimi uses an explicit
   `tools: []` agent profile, and **opencode runs under an agent profile whose tool map is
   `{"*": false}`** (`providers/opencode/chat-only.json`, applied through `OPENCODE_CONFIG` +
-  `--agent neoxider-chat-only`, and equally on opencode's native `serve` path). Codex also
+  `--agent neoxider-chat-only`; the unsafe native `serve` path is loopback-only). Codex also
   ignores `AGENT_CODEX_SANDBOX`, and Claude keeps
   `--permission-mode acceptEdits` while ignoring `AGENT_CLAUDE_PERMISSION`. This is a security
   boundary: the HTTP endpoint turns arbitrary callers into CLI invocations, so environment overrides
@@ -309,9 +319,9 @@ this panel starts subagents in full-auto mode (`--dangerously-skip-permissions`,
 `--sandbox danger-full-access`, `--yolo`, `--auto`) in any directory the caller names, so an
 unauthenticated LAN panel is remote code execution and `--lan` **refuses to start** without
 `--token` (or `$AGENT_GUI_TOKEN`). The other device opens
-`http://<this-host>:<port>/?token=SECRET` once; the panel stores it in a cookie, so its own
-`fetch()` calls keep working. Loopback requests never need the token — a local process could just
-run `agent.sh` directly. Over the internet, put it behind a VPN or an HTTPS reverse proxy; there
+`http://<this-host>:<port>/?token=SECRET` once; the panel redirects to a query-free URL and stores
+the token in an HttpOnly cookie. When configured, the token is required even on loopback, so an
+HTTPS reverse proxy cannot bypass it. Over the internet, put it behind a VPN or an HTTPS reverse proxy; there
 is no TLS in the panel itself. If that port is held by **something else** (it happened: an unrelated WebSocket server on
 8765, which used to make `gui` print success while the browser tab failed with
 `invalid Connection header`), the panel now identifies the occupant, moves to the next free port and
@@ -443,10 +453,10 @@ Gotchas (verified):
 
 | Alias | Model | When |
 |---|---|---|
-| `5.6-sol` / `sol` (default) | `gpt-5.6-sol`, effort medium | regular tasks |
+| `5.6-terra` / `terra` (default) | `gpt-5.6-terra`, effort medium | regular tasks |
+| `5.6-sol` / `sol` | `gpt-5.6-sol`, effort medium | 5.6 variant / explicit Sol request |
 | `high` | `gpt-5.6-sol`, effort high | harder than usual (rare; big stuff is better done yourself) |
 | `luna` | `gpt-5.6-luna` | 5.6 variant |
-| `terra` | `gpt-5.6-terra` | 5.6 variant |
 | `spark` / `5.3` | `gpt-5.3-codex-spark` | very simple: renames, minor text/docs edits, one-line fixes |
 
 If the user explicitly names a model ("codex luna", "spark 5.3") — use that one. A raw model id still

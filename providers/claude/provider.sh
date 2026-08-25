@@ -51,17 +51,9 @@ provider_claude_resolve() {
 # tool-calling completion (still returned a clean fenced JSON tool_calls block).
 _provider_claude_chatonly_args() {
     if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then
-        # The denylist covers EVERY tool the CLI registers in -p sessions. Read/Grep/Glob were
-        # originally left allowed (read-only, harmless), but that backfired on a live Sonnet 5
-        # G6 run: seeing ANY native tools, the model concluded the text tool-call protocol in
-        # the prompt was fake ("my actual available tools are Glob, Grep, Read, Skill,
-        # ToolSearch, and Workflow") and refused to emit tool calls at all. With zero tools
-        # registered the model has nothing to contrast against and follows the text protocol.
-        # Skill is blocked for the same reason (it also exposed the user's global skills, e.g.
-        # unity-mcp). (SlashCommand is NOT a valid tool name here -- listing it made the CLI
-        # prepend a 'matches no known tool' warning to every answer.)
-        printf '%s\n' --strict-mcp-config --disallowedTools \
-            Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch,Skill,Read,Grep,Glob,ToolSearch,Workflow
+        # `--tools ""` is the CLI's fail-closed zero-tool contract. A denylist drifts whenever
+        # Claude adds a new tool name and previously exposed Skill/ToolSearch before being updated.
+        printf '%s\n' --strict-mcp-config --tools ""
     fi
 }
 
@@ -97,11 +89,10 @@ _provider_claude_invoke() {
     local dir="$1" prompt="$2"; shift 2
     local -a perm; mapfile -t perm < <(_provider_claude_perm_args)
     if [ "${AGENT_STREAM_TEXT:-0}" = 1 ]; then
-        local py
-        py="$(command -v python || command -v python3 || command -v python3.12 || echo python)"
+        _agent_python || { printf 'agent.sh: claude streaming needs a runnable python interpreter\n' >&2; return 1; }
         ( cd "$dir" && claude -p "$@" "${perm[@]}" \
             --output-format stream-json --include-partial-messages --verbose "$prompt" </dev/null 2>&1 \
-          | PYTHONIOENCODING=utf-8 "$py" -u "$HERE/stream_text_filter.py" )
+          | PYTHONIOENCODING=utf-8 "$_AGENT_PY" -u "$HERE/stream_text_filter.py" )
     else
         ( cd "$dir" && claude -p "$@" "${perm[@]}" "$prompt" </dev/null 2>&1 )
     fi
@@ -133,14 +124,15 @@ provider_claude_resume_cmd() {
 # token is still current; never refresh/rotate credentials from a read-only doctor command. The
 # fallback is an explicitly labelled LOCAL USAGE-SO-FAR estimate from transcript usage blocks.
 provider_claude_doctor() {
-    local ver auth py
+    local ver auth
     if command -v claude >/dev/null 2>&1; then
         ver="$(claude --version 2>&1 | head -1)"
         auth="$(claude auth status --json 2>/dev/null || true)"
-        # `python` can resolve to the non-executable WindowsApps shim in some shells; fall back
-        # through real interpreters so the usage estimate works everywhere.
-        py="$(command -v python || command -v python3 || command -v python3.12 || echo python)"
-        PYTHONIOENCODING=utf-8 "$py" - "$ver" "$auth" <<'PY'
+        if ! _agent_python; then
+            printf '{"engine":"claude","version":%s,"available":true,"login":"","limits":null,"note":"Python unavailable; usage probe skipped."}\n' "$(_json_str "$ver")"
+            return 0
+        fi
+        PYTHONIOENCODING=utf-8 "$_AGENT_PY" - "$ver" "$auth" <<'PY'
 import glob, io, json, os, sys, time, urllib.error, urllib.request
 ver, auth_raw = sys.argv[1:3]
 now = time.time()

@@ -13,6 +13,8 @@ function switchTab(tab) {
 }
 
 async function syncBridgeModels() {
+  const requestId = (syncBridgeModels.requestId || 0) + 1;
+  syncBridgeModels.requestId = requestId;
   const e = $("#brg-engine").value;
   const p = PROVIDERS[e] || {};
   $("#brg-model").placeholder = p.resolved_label
@@ -24,10 +26,20 @@ async function syncBridgeModels() {
   eff.disabled = !efforts.length;
   try {
     const d = await jget("/api/models?engine=" + encodeURIComponent(e));
-    $("#brg-models").innerHTML = (d.models || []).map(m => `<option value="${esc(m)}">`).join("");
+    if (requestId !== syncBridgeModels.requestId || $("#brg-engine").value !== e) return;
+    setBridgeModelOptions(d.models || []);
   } catch (err) {
-    $("#brg-models").innerHTML = (p.models || []).map(m => `<option value="${esc(m)}">`).join("");
+    if (requestId === syncBridgeModels.requestId && $("#brg-engine").value === e)
+      setBridgeModelOptions(p.models || []);
   }
+}
+
+function setBridgeModelOptions(models) {
+  $("#brg-models").replaceChildren(...models.map(model => {
+    const option = document.createElement("option");
+    option.value = String(model);
+    return option;
+  }));
 }
 
 async function submitBridgeStart() {
@@ -53,9 +65,7 @@ async function submitBridgeStart() {
     }
     toast("success", t("bridge.started"),
       r.reassigned ? `${r.base_url} (${t("bridge.port_reassigned")} ${r.asked_port})` : r.base_url);
-    // A LAN bridge with no key lets anyone on the network spend this machine's tokens -- say so
-    // once, at the moment it happens, instead of leaving it to the console banner nobody reads.
-    if (r.unprotected_lan) toast("warning", t("bridge.lan_no_key_title"), t("bridge.lan_no_key"));
+    $("#brg-key").value = "";
     // bump the port field so the next launch doesn't collide with this one
     $("#brg-port").value = (r.port || body.port) + 1;
     // the bridge writes its registry file only after it binds (opencode warms up `opencode serve`
@@ -83,8 +93,14 @@ async function stopBridge(port, e) {
 
 const BRG_OPEN_LOGS = new Set();   // ports whose log panel is open
 const BRG_OPEN_REQS = new Set();   // request task names whose transcript is expanded
-const _reqListCache = {};          // port -> requests-list innerHTML
-const _reqBodyCache = {};          // name -> transcript innerHTML
+const _reqListCache = new Map();   // port -> {key, html}; capped below
+const _reqBodyCache = new Map();   // name -> {key, html}; capped below
+const _reqControllers = new Map();
+function boundedCacheSet(cache, key, value, cap = 50) {
+  cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > cap) cache.delete(cache.keys().next().value);
+}
 
 async function toggleBridgeLogs(port) {
   if (BRG_OPEN_LOGS.has(port)) BRG_OPEN_LOGS.delete(port);
@@ -92,7 +108,7 @@ async function toggleBridgeLogs(port) {
   await renderBridgeLogs(port);
 }
 
-async function renderBridgeLogs(port) {
+async function renderBridgeLogs(port, suppliedTasks) {
   const row = document.querySelector(`#brg-list .api-run[data-port="${port}"]`);
   if (!row) return;
   let panel = row.querySelector(".brg-logs");
@@ -102,11 +118,11 @@ async function renderBridgeLogs(port) {
     panel.className = "brg-logs";
     row.querySelector(".api-run-body").appendChild(panel);
   }
-  if (!panel.innerHTML) panel.innerHTML = _reqListCache[port] || spin(t("limits.loading"));
+  if (!panel.innerHTML) panel.innerHTML = spin(t("limits.loading"));
   let reqs = [];
   try {
-    const d = await jget("/api/tasks");
-    reqs = (d.tasks || [])
+    const tasks = suppliedTasks || (await jget("/api/tasks")).tasks || [];
+    reqs = tasks
       .filter(x => x.name && x.name.indexOf("openai-" + port + "-") === 0)
       .sort((a, b) => (b.updated || 0) - (a.updated || 0));
   } catch (e) {}
@@ -115,20 +131,32 @@ async function renderBridgeLogs(port) {
     return;
   }
   const pfx = "openai-" + port + "-";
+  const cacheKey = document.documentElement.lang + ":" + reqs.map(r =>
+    [r.name, r.updated || 0, r.state || ""].join("@")).join("|");
+  const cached = _reqListCache.get(port);
   const html = reqs
     .map(r => `<div class="brg-req" data-name="${esc(r.name)}">
-        <div class="brg-req-hd" onclick="toggleBridgeReq('${esc(r.name)}', this)">
+        <div class="brg-req-hd">
           <span class="em">${r.act || "•"}</span>
           <span class="mono">${esc(r.name.slice(pfx.length))}</span>
           <span class="sp"></span>
           <span class="note">${esc(r.state)}</span>
         </div></div>`)
     .join("");
-  _reqListCache[port] = html;
+  boundedCacheSet(_reqListCache, port, { key: cacheKey, html });
   if (!BRG_OPEN_LOGS.has(port) || !document.body.contains(panel)) return;  // closed while fetching
-  panel.innerHTML = html;
+  if (!cached || cached.key !== cacheKey || panel.dataset.cacheKey !== cacheKey) {
+    panel.innerHTML = html;
+    panel.dataset.cacheKey = cacheKey;
+  }
   panel.querySelectorAll(".brg-req").forEach(req => {
-    if (BRG_OPEN_REQS.has(req.dataset.name)) renderBridgeReq(req.dataset.name, req);
+    const header = req.querySelector(".brg-req-hd");
+    if (header && !header.dataset.bound) {
+      header.dataset.bound = "1";
+      header.addEventListener("click", () => toggleBridgeReq(req.dataset.name, header));
+    }
+    const task = reqs.find(item => item.name === req.dataset.name);
+    if (BRG_OPEN_REQS.has(req.dataset.name)) renderBridgeReq(req.dataset.name, req, task);
   });
 }
 
@@ -138,7 +166,7 @@ async function toggleBridgeReq(name, hd) {
   await renderBridgeReq(name, hd.closest(".brg-req"));
 }
 
-async function renderBridgeReq(name, req) {
+async function renderBridgeReq(name, req, task) {
   if (!req) return;
   let body = req.querySelector(".brg-req-body");
   if (!BRG_OPEN_REQS.has(name)) { if (body) body.remove(); return; }
@@ -147,11 +175,22 @@ async function renderBridgeReq(name, req) {
     body.className = "brg-req-body";
     req.appendChild(body);
   }
-  if (!body.innerHTML) body.innerHTML = _reqBodyCache[name] || spin();
+  const cacheKey = document.documentElement.lang + ":" + (task ? `${task.updated || 0}:${task.state || ""}` : "manual");
+  const cached = _reqBodyCache.get(name);
+  if (cached && cached.key === cacheKey) {
+    body.innerHTML = cached.html;
+    return;
+  }
+  if (!body.innerHTML) body.innerHTML = spin();
+  const previous = _reqControllers.get(name);
+  if (previous) previous.abort();
+  const controller = new AbortController();
+  _reqControllers.set(name, controller);
   let prompt = "—";
   let out = "—";
   try {
-    const d = await jget("/api/dialog?task=" + encodeURIComponent(name) + "&full=1");
+    const d = await jget("/api/dialog?task=" + encodeURIComponent(name) + "&full=1",
+                         { signal: controller.signal });
     const steps = d.steps || [];
     const last = steps[steps.length - 1];
     if (last) {
@@ -165,23 +204,35 @@ async function renderBridgeReq(name, req) {
       if (combined) out = combined;
     }
   } catch (e) {
+    if (e.name === "AbortError") return;
     // graceful fallback keeps "—" placeholders
   }
   const html =
     `<div class="note">${esc(t("bridge.log_prompt"))}</div><pre class="mono brg-pre">${esc(prompt)}</pre>` +
     `<div class="note">${esc(t("bridge.log_output"))}</div><pre class="mono brg-pre">${esc(out)}</pre>`;
-  _reqBodyCache[name] = html;
+  boundedCacheSet(_reqBodyCache, name, { key: cacheKey, html });
+  if (_reqControllers.get(name) === controller) _reqControllers.delete(name);
   if (BRG_OPEN_REQS.has(name) && document.body.contains(body)) body.innerHTML = html;
 }
 
 function bridgeCurl(rec) {
   const model = rec.model || (PROVIDERS[rec.engine] || {}).default_model || "default";
   const body = JSON.stringify({model, messages: [{role: "user", content: "ping"}]});
-  const shellBody = "'" + body.replace(/'/g, "'\\''") + "'";
-  return `curl ${rec.base_url}/v1/chat/completions \\\n  -H "Content-Type: application/json" \\\n  -d ${shellBody}`;
+  const quote = value => "'" + String(value).replace(/'/g, "'\\''") + "'";
+  const lines = [
+    "curl " + quote(String(rec.base_url || "") + "/v1/chat/completions"),
+    '  -H "Content-Type: application/json"',
+  ];
+  if (rec.auth) lines.push('  -H "Authorization: Bearer $AGENT_OPENAI_KEY"');
+  lines.push("  -d " + quote(body));
+  return lines.join(" " + String.fromCharCode(92) + "\n");
 }
 
+let _bridgeRefreshing = false, _bridgeRefreshQueued = false, _bridgeRenderKey = "";
 async function refreshBridgeTab() {
+  if (_bridgeRefreshing) { _bridgeRefreshQueued = true; return; }
+  _bridgeRefreshing = true;
+  try {
   let d;
   try {
     d = await jget("/api/bridges");
@@ -190,10 +241,23 @@ async function refreshBridgeTab() {
   }
   const list = $("#brg-list");
   const bridges = d.bridges || [];
+  const renderKey = document.documentElement.lang + ":" + JSON.stringify(bridges.map(b => ({
+    port: b.port, instance_id: b.instance_id, live: b.live, busy: b.busy, lan: b.lan,
+    auth: b.auth, engine: b.engine, model: b.model, label: b.label, effort: b.effort,
+    dir: b.dir, base_url: b.base_url, lan_urls: b.lan_urls, public_url: b.public_url,
+    requests: b.requests, session_active: (b.health || {}).session_active,
+    session_turns: (b.health || {}).session_turns,
+  })));
   if (!bridges.length) {
-    list.innerHTML = `<div class="empty">${t("bridge.none")}</div>`;
+    if (_bridgeRenderKey !== renderKey) list.innerHTML = `<div class="empty">${esc(t("bridge.none"))}</div>`;
+    _bridgeRenderKey = renderKey;
     return;
   }
+  if (_bridgeRenderKey === renderKey) {
+    await refreshOpenBridgeLogs();
+    return;
+  }
+  _bridgeRenderKey = renderKey;
   list.innerHTML = "";
   for (const b of bridges) {
     const h = b.health || {};
@@ -208,7 +272,7 @@ async function refreshBridgeTab() {
     // engine spawns an openai-<port>-* task whose full transcript shows up in the Tasks tab.
     const logsBtn = b.engine === "opencode"
       ? ""
-      : `<button class="mini" onclick="toggleBridgeLogs(${b.port})">${t("bridge.logs")} (${b.requests || 0})</button>`;
+      : `<button class="mini" data-action="logs">${esc(t("bridge.logs"))} (${Number(b.requests) || 0})</button>`;
     const reqLine = b.engine === "opencode"
       ? `<div class="kv"><span>${t("bridge.requests")}</span><b>${t("bridge.opencode_proxy")}</b></div>`
       : `<div class="kv"><span>${t("bridge.requests")}</span><b>${b.requests || 0}</b></div>`;
@@ -220,37 +284,65 @@ async function refreshBridgeTab() {
       <div class="api-run-hd">
         <span class="em">${statusEm}</span>
         <b class="mono">${esc(b.base_url)}</b>
-        <span class="pill pe-${esc(b.engine)}">${esc(b.engine)}</span>
+        <span class="pill">${esc(b.engine)}</span>
         ${b.lan ? `<span class="pill" title="exposed on the LAN">LAN</span>` : ""}
         <span class="sp"></span>
-        <button class="mini" onclick="copyText(this, ${JSON.stringify(v1).replace(/"/g, "&quot;")})">${t("bridge.copy_url")}</button>
+        <button class="mini" data-action="copy-main">${esc(t("bridge.copy_url"))}</button>
         ${logsBtn}
-        <button class="mini danger" onclick="stopBridge(${b.port}, event)">${t("bridge.stop")}</button>
+        <button class="mini danger" data-action="stop">${esc(t("bridge.stop"))}</button>
       </div>
       <div class="api-run-body">
         <div class="kv"><span>${t("form.model")}</span><b>${esc(b.label || b.model || "?")}</b></div>
         <div class="kv"><span>${t("bridge.status")}</span><b>${esc(sess)}</b></div>
         ${reqLine}
         ${(b.lan && (b.lan_urls || []).length)
-          ? b.lan_urls.map(u => `<div class="kv"><span>${t("bridge.lan_url")}</span><b class="mono">${esc(u + "/v1")} <button class="mini" onclick="copyText(this, ${JSON.stringify(u + "/v1").replace(/"/g, "&quot;")})">${t("bridge.copy_url")}</button></b></div>`).join("")
+          ? b.lan_urls.map(u => `<div class="kv"><span>${esc(t("bridge.lan_url"))}</span><b class="mono">${esc(u + "/v1")} <button class="mini" data-copy-url="${esc(u + "/v1")}">${esc(t("bridge.copy_url"))}</button></b></div>`).join("")
           : (b.lan ? `<div class="kv"><span>${t("bridge.lan_url")}</span><b>${t("bridge.lan_unknown")}</b></div>` : "")}
         ${b.public_url
-          ? `<div class="kv"><span>${t("bridge.public_url")}</span><b class="mono">${esc(b.public_url + "/v1")} <button class="mini" onclick="copyText(this, ${JSON.stringify(b.public_url + "/v1").replace(/"/g, "&quot;")})">${t("bridge.copy_url")}</button></b></div><div class="note">${t("bridge.public_hint")}</div>`
+          ? `<div class="kv"><span>${esc(t("bridge.public_url"))}</span><b class="mono">${esc(b.public_url + "/v1")} <button class="mini" data-copy-url="${esc(b.public_url + "/v1")}">${esc(t("bridge.copy_url"))}</button></b></div><div class="note">${esc(t("bridge.public_hint"))}</div>`
           : (b.lan ? `<div class="kv"><span>${t("bridge.public_url")}</span><b>${t("bridge.public_unknown")}</b></div>` : "")}
         ${b.dir ? `<div class="kv"><span>${t("form.project")}</span><b class="mono">${esc(b.dir)}</b></div>` : ""}
         <div class="brg-switch">
           <span class="note">${t("bridge.switch_model")}</span>
           <select class="brg-sw-model"></select>
           <label class="chk"><input type="checkbox" class="brg-sw-local" ${b.lan ? "" : "checked"}> <span>${t("bridge.localhost_short")}</span></label>
-          <button class="mini" data-engine="${esc(b.engine)}" data-effort="${esc(b.effort || "")}" data-dir="${esc(b.dir || "")}" onclick="restartBridge(${b.port}, this)">${t("bridge.switch")}</button>
+          ${b.auth ? `<input type="password" class="brg-sw-key" autocomplete="off" placeholder="API key required to restart">` : ""}
+          <button class="mini" data-action="restart">${esc(t("bridge.switch"))}</button>
         </div>
-        <div class="snippet"><pre class="mono">${esc(bridgeCurl(b))}</pre><button class="mini" onclick="copyText(this, ${JSON.stringify(bridgeCurl(b)).replace(/"/g, "&quot;")})">${t("api.copy")}</button></div>
+        <div class="snippet"><pre class="mono">${esc(bridgeCurl(b))}</pre><button class="mini" data-action="copy-curl">${esc(t("api.copy"))}</button></div>
       </div>`;
     list.appendChild(row);
+    const copyMain = row.querySelector('[data-action="copy-main"]');
+    const logs = row.querySelector('[data-action="logs"]');
+    const stop = row.querySelector('[data-action="stop"]');
+    const restart = row.querySelector('[data-action="restart"]');
+    const copyCurl = row.querySelector('[data-action="copy-curl"]');
+    copyMain.addEventListener("click", () => copyText(copyMain, v1));
+    if (logs) logs.addEventListener("click", () => toggleBridgeLogs(b.port));
+    stop.addEventListener("click", event => stopBridge(b.port, event));
+    restart.dataset.engine = String(b.engine || "");
+    restart.dataset.effort = String(b.effort || "");
+    restart.dataset.dir = String(b.dir || "");
+    restart.addEventListener("click", () => restartBridge(b.port, restart));
+    copyCurl.addEventListener("click", () => copyText(copyCurl, bridgeCurl(b)));
+    row.querySelectorAll("[data-copy-url]").forEach(button =>
+      button.addEventListener("click", () => copyText(button, button.dataset.copyUrl)));
     fillSwitchModels(row.querySelector(".brg-sw-model"), b.engine, b.model);
   }
   for (const p of [...BRG_OPEN_LOGS]) if (!bridges.some(b => b.port === p)) BRG_OPEN_LOGS.delete(p);
-  for (const p of BRG_OPEN_LOGS) renderBridgeLogs(p);
+  await refreshOpenBridgeLogs();
+  } finally {
+    _bridgeRefreshing = false;
+    if (_bridgeRefreshQueued) { _bridgeRefreshQueued = false; refreshBridgeTab(); }
+  }
+}
+
+async function refreshOpenBridgeLogs() {
+  if (!BRG_OPEN_LOGS.size) return;
+  let tasks = [];
+  try { tasks = (await jget("/api/tasks")).tasks || []; }
+  catch (err) { return; }
+  await Promise.all([...BRG_OPEN_LOGS].map(port => renderBridgeLogs(port, tasks)));
 }
 
 // --- switch a running bridge's model / local-vs-LAN binding in place (stop + relaunch same port) ---
@@ -266,9 +358,14 @@ async function fillSwitchModels(sel, engine, current) {
   }
   const cur = current || "";
   const opts = (cur && !models.includes(cur)) ? [cur, ...models] : models.slice();
-  sel.innerHTML = opts.length
-    ? opts.map(m => `<option value="${esc(m)}" ${m === cur ? "selected" : ""}>${esc(m)}</option>`).join("")
-    : `<option value="">${t("form.auto")}</option>`;
+  const values = opts.length ? opts : [""];
+  sel.replaceChildren(...values.map(model => {
+    const option = document.createElement("option");
+    option.value = String(model);
+    option.textContent = model || t("form.auto");
+    option.selected = model === cur;
+    return option;
+  }));
 }
 
 async function restartBridge(port, btn) {
@@ -284,6 +381,8 @@ async function restartBridge(port, btn) {
       port, model, localhost,
       engine: btn.dataset.engine, effort: btn.dataset.effort, dir: btn.dataset.dir,
     };
+    const keyInput = box.querySelector(".brg-sw-key");
+    if (keyInput) body.api_key = keyInput.value.trim();
     // Legacy rows omit identity so the backend can fail closed with the real verification error.
     if (row && row.dataset.instanceId) body.instance_id = row.dataset.instanceId;
     const r = await jpost("/api/bridge/restart", body);

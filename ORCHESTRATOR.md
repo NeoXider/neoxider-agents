@@ -3,7 +3,8 @@
 A ready-to-paste prompt for running a session as an **orchestrator** that delegates work to CLI
 subagents via `agent.sh` (neoxider), plus a matrix of which model fits which task.
 
-`SK=~/.claude/skills/neoxider-agents/agent.sh` (or the `neoxider` command).
+For a plugin install use `SK="$CLAUDE_PLUGIN_ROOT/agent.sh"`; for a manual skill install use
+`SK="$HOME/.claude/skills/neoxider-agents/agent.sh"` (or use the `neoxider` command).
 
 ---
 
@@ -54,7 +55,7 @@ matters more than prompt wording.
 | Regular coding / refactor / docs | `-e codex` (default `gpt-5.6-terra`, medium) **or** `-e claude -m sonnet` | Sonnet is a fine everyday default too; use it when Codex limits are tight. |
 | Harder reasoning / tricky bug / careful refactor | `-e codex -m high` (`gpt-5.6-sol`, high effort) | Bump effort, not necessarily model. |
 | Long-horizon coding / multimodal agent work | `-e kimi` (default Kimi K3) | Use Kimi Code after `kimi login`; `-m highspeed` selects the managed fast coding route. |
-| Deepest / architecture / security review | `-e claude -m opus`, or keep it yourself | Reserve top-tier for genuinely hard work. |
+| Deepest / architecture / security review | `-e claude -m opus5`, or keep it yourself | Reserve current Opus 5 for genuinely hard work; bare `opus` is the legacy 4.8 alias. |
 | 5.6 variant A/B or if `terra` is rate-limited | `-m sol` (`gpt-5.6-sol`) / `-m luna` (`gpt-5.6-luna`) | Alternative 5.6 models. **Observed speed (n=1): luna 41s < sol 56s < terra 105s.** In that same run only `sol` produced code whose own tests passed (luna/terra picked non-palindrome examples) — `terra` is the default per user preference, so still verify its output. |
 | Local / offline / free | `-e opencode -m free` (Muse Spark 1.2), or `-m lmstudio/<model>` | `free`/`spark`/`muse`, `ox`/`alpha`, `pickle`, `hy3`, `mimo`, `nemotron`/`ultra`, `lightning` alias the OpenCode Zen free tier. Unranked — `free` is a user preference, not a measurement. `opencode models` shows the live list. |
 

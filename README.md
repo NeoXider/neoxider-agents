@@ -9,7 +9,7 @@ across **Codex · Claude Code · Kimi Code · opencode · Gemini CLI**.
 
 [![zero dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)](#installation)
 [![python stdlib only](https://img.shields.io/badge/python-stdlib%20only-blue)](#installation)
-[![tests](https://img.shields.io/badge/tests-432%20offline-success)](#development)
+[![tests](https://img.shields.io/badge/tests-offline%20suites-success)](#development)
 [![license MIT](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
 
 </div>
@@ -25,7 +25,7 @@ agent.sh reply fix-readme "yes, use option B"                                 # 
 agent.sh status fix-readme                                                    # done? stuck? what changed?
 ```
 
-No daemon. No database. No npm/cargo/pip step. `agent.sh` is plain POSIX shell, `gui.py`
+No daemon. No database. No npm/cargo/pip step. `agent.sh` targets Bash 4+, `gui.py`
 is Python standard library only, the frontend is classic `<script>` tags — no bundler,
 no framework.
 
@@ -83,7 +83,8 @@ cd neoxider-agents
 
 Requirements (you already have these if you use any of the CLIs below):
 
-- `bash` (git-bash on Windows, already installed with Git for Windows; native on macOS/Linux)
+- Bash 4 or newer (Git Bash on Windows; on macOS install current Bash with `brew install bash` —
+  the system `/bin/bash` 3.2 is too old; Linux distributions normally provide a suitable version)
 - Python 3, standard library only — needed for the GUI and the API bridge, not for `agent.sh`
 - At least one of the wrapped CLIs: [Codex CLI](https://github.com/openai/codex),
   [Claude Code](https://github.com/anthropics/claude-code),
@@ -112,16 +113,18 @@ runs on the machine hosting the server, and every file it touches is a file on t
 
 Both servers refuse to be careless about it:
 
-- **API bridge** (`openai-server`) binds `0.0.0.0` by default and prints the LAN URL plus the
-  Windows firewall command. Set `--api-key SECRET` (or `$AGENT_OPENAI_KEY`) and every caller must
+- **API bridge** (`openai-server`) binds `127.0.0.1` by default. LAN access is explicit via
+  `--lan` and is refused without `--api-key SECRET` (or `$AGENT_OPENAI_KEY`); every caller must
   send the standard `Authorization: Bearer SECRET` header — any OpenAI client already does, it's
   just the `api_key` field. `/health` stays open for liveness probes; everything that can spend
-  tokens returns 401 without the key. With no key the banner tells you, loudly, that you're open.
+  tokens returns 401 without the key. Codex/Gemini bridges remain loopback-only because their
+  CLI restrictions still permit host reads.
 - **Web panel** (`gui`) is loopback-only by default, because it *launches full-auto subagents in
   any directory a caller names* — an open LAN panel is remote code execution. `--lan` therefore
   **refuses to start** without `--token` (or `$AGENT_GUI_TOKEN`). The token is accepted as
-  `?token=` once (then stored in a cookie), as an `X-Agent-Token` header, or from the cookie.
-  Loopback requests never need it.
+  `?token=` once (then redirected to a clean URL and stored in an HttpOnly cookie), as an
+  `X-Agent-Token` header, or from the cookie. When configured, it is required even on loopback,
+  so a reverse proxy cannot bypass it; tokenless local POSTs enforce JSON and same-origin headers.
 - **Over the actual internet:** technically just a port-forward, but neither server speaks TLS,
   so a bearer token would cross the network in clear text. Put it behind a VPN/overlay
   (Tailscale, WireGuard, ZeroTier) or an HTTPS reverse proxy (Caddy/nginx) that forwards to
@@ -349,11 +352,11 @@ into **real CLI-level restrictions**, not a prompt request:
 
 | Engine | What chat-only actually does |
 |---|---|
-| `codex` | `--sandbox read-only --ignore-user-config` — no file/shell execution, and `~/.codex/config.toml` (where this machine's real `[mcp_servers.*]`, e.g. a live `unityMCP`, are defined) is not loaded |
-| `claude` | `--strict-mcp-config` (zero MCP servers) + `--disallowedTools Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, `--permission-mode acceptEdits` |
+| `codex` | `--sandbox read-only --ignore-user-config` — blocks writes and user MCP config, but still permits host reads; therefore Codex bridges are loopback-only |
+| `claude` | `--strict-mcp-config --tools ""` — no MCP or native tools |
 | `kimi` | an explicit `tools: []` agent profile |
 | `opencode` | an agent profile whose tool map is `{"*": false}` (`providers/opencode/chat-only.json`, via `OPENCODE_CONFIG` + `--agent neoxider-chat-only`) — disables built-ins **and** MCP tools |
-| `gemini` | `--approval-mode plan` instead of `--yolo` — no writes, no exec, but Gemini has **no flag that removes the READ tools**. Don't put a gemini-backed bridge on a network. |
+| `gemini` | `--approval-mode plan` instead of `--yolo` — no writes/exec, but read tools remain; therefore Gemini bridges are loopback-only |
 
 This mode ignores `AGENT_CODEX_SANDBOX` and `AGENT_CLAUDE_PERMISSION` on purpose: the HTTP endpoint
 turns arbitrary callers into CLI invocations, so environment overrides must never grant it write,
@@ -393,6 +396,10 @@ OpenAI-style `{"error": {...}}` HTTP 500, never a bare connection reset. A CLI a
 provider's usage-limit banner ("You've hit your session limit · resets …") becomes an HTTP 429
 `rate_limit_error`, so a rate-limited account reads as an environment problem rather than a model
 that suddenly scores zero.
+
+The bridge disables `agent.sh`'s inner retry layer (`AGENT_RETRIES=0`) for its child calls, so
+`--retries N` means exactly one initial provider call plus at most N bridge retries rather than a
+hidden multiplication of both retry loops.
 
 `content` is a clean answer for every bundled engine. `codex`'s non-interactive `exec` mode
 otherwise mixes its startup banner/session-id/error-log/"tokens used" chrome (and, on Windows, a
@@ -459,7 +466,7 @@ provider that *can* block on an approval prompt hangs forever unless `run_cmd` p
 | Provider | Full-auto flag | Chat-only (bridge) |
 |---|---|---|
 | Codex | `--sandbox danger-full-access --skip-git-repo-check` (opt down: `AGENT_CODEX_SANDBOX`) | `--sandbox read-only --ignore-user-config` |
-| Claude Code | `--dangerously-skip-permissions` (opt down: `AGENT_CLAUDE_PERMISSION`) | `--strict-mcp-config --disallowedTools …` |
+| Claude Code | `--dangerously-skip-permissions` (opt down: `AGENT_CLAUDE_PERMISSION`) | `--strict-mcp-config --tools ""` |
 | Kimi Code | `-p` uses the built-in auto policy (`--auto` must not be combined with it) | `--agent-file chat-only-agent.md` |
 | opencode | `--auto` | `--agent neoxider-chat-only` + `OPENCODE_CONFIG` |
 | Gemini CLI | `--yolo` | `--approval-mode plan` (read tools remain) |
@@ -507,7 +514,8 @@ python tests/test_openai_server.py   # bridge: tool-call parsing (all spellings)
 python -m unittest discover tests    # all of the Python ones at once
 ```
 
-432 offline checks, zero dependencies — stdlib and bash only, no pytest, no bats. They never
+Two offline test suites plus launcher/distribution checks, zero dependencies — stdlib and bash
+only, no pytest, no bats. They never
 invoke a real CLI and never touch your real `~/.claude/agent-cli-logs`.
 
 For a real end-to-end check against a live CLI subagent (health, error codes, auth, fresh

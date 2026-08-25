@@ -22,12 +22,11 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   bridge: `POST /api/run` launches a real subagent in full-auto mode in any directory the caller
   names, so binding the network without authentication is remote code execution — `parse_argv`
   raises `SystemExit` with an explanation rather than starting. Auth itself is `gui_authorized()`:
-  no token configured → open (the historic loopback behaviour); loopback client → always allowed
-  (a local process could run `agent.sh` directly anyway, and requiring it there would break
-  `is_our_panel()`'s "already running?" probe); otherwise a constant-time compare against
-  `?token=` / `X-Agent-Token` / the `agent_gui_token` cookie. `_send` sets that cookie on a
-  successful `?token=` load, which is why **no frontend change was needed** — the page's own
-  `fetch()` calls carry it automatically.
+  no token configured → tokenless loopback mode with JSON/same-origin POST guards; token configured
+  → every client, including loopback and reverse-proxy traffic, must pass a constant-time compare
+  against `?token=` / `X-Agent-Token` / the `agent_gui_token` cookie. A successful query-token
+  bootstrap sets an HttpOnly, `SameSite=Strict` cookie and immediately redirects to a query-free
+  URL. `is_our_panel()` authenticates its own probe when a token is configured.
 - **Idempotency vs. a squatted port** (`choose_port()`): one GUI for all providers, `LOGDIR` is shared,
   so a repeated `gui` must not crash or duplicate anything. But "the bind failed" and "my panel is
   already running" are NOT the same thing — the old code assumed they were, and when an unrelated
@@ -102,11 +101,10 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   is the only non-Tasks tab — the old standalone test-api tab was folded away (that feature lives in
   the CLI); `switchTab` now lives in `bridgetab.js`. Pick provider+model (default opencode/big-pickle,
   +effort/port/dir, localhost-vs-LAN, **API key**) → `POST /api/bridge/start` spawns the bridge in
-  the background. The key field maps to `openai_server.py --api-key`; leaving it empty keeps the
-  historic open bridge, and `start_bridge` returns `unprotected_lan: true` for the one genuinely
-  dangerous combination (LAN + no key) so `submitBridgeStart` can raise a warning toast rather than
-  leaving it to a console banner nobody reads. The key itself is never written into
-  `bridges/bridge-<port>.json` — only `auth: true/false`.
+  the background. The key is passed only through the child environment (`AGENT_OPENAI_KEY`), never
+  process argv, and is never written into `bridges/bridge-<port>.json` — only `auth: true/false`.
+  LAN startup without a key is refused by the bridge. Restarting an authenticated bridge requires
+  re-entering its key so a model switch cannot silently downgrade protection.
   Each bridge self-registers a `bridges/bridge-<port>.json` in `LOGDIR` (see `openai_server.py`'s
   `register_bridge`); `GET /api/bridges` lists them and probes each one's `/health` for live status
   (session active/idle + turns). **Pruning is port-based, not health-based**: a registry file is

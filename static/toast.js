@@ -1,6 +1,22 @@
 /* Toast notifications (auto-dismiss ~3s) + persisted history with an unread badge.
    Uses $/esc/t from util.js/i18n.js (loaded earlier). */
-const TOAST_HISTORY = JSON.parse(localStorage.getItem("agentgui_toast_history") || "[]");
+function loadToastHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem("agentgui_toast_history") || "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed.slice(0, 80).filter(item => item && typeof item === "object").map(item => ({
+      kind: String(item.kind || "warning").slice(0, 20),
+      title: String(item.title || "").slice(0, 500),
+      text: String(item.text || "").slice(0, 1000),
+      ts: Number.isFinite(Number(item.ts)) ? Number(item.ts) : Date.now(),
+      seen: Boolean(item.seen),
+    }));
+  } catch (err) {
+    localStorage.removeItem("agentgui_toast_history");
+    return [];
+  }
+}
+const TOAST_HISTORY = loadToastHistory();
 
 function toast(kind, title, text) {
   const rec = { kind, title, text, ts: Date.now() };

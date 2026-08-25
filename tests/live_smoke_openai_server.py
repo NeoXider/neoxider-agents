@@ -137,12 +137,21 @@ def http_post_stream(base, path, body, timeout=200):
     return lines
 
 
-def wait_for_server(base, timeout=15):
+def wait_for_server(base, proc, logdir, port, timeout=15):
+    """Require this exact child/registry identity; a stale fixed-port service cannot pass."""
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
         try:
-            urllib.request.urlopen(base + "/health", timeout=2)
-            return True
+            with urllib.request.urlopen(base + "/health", timeout=2) as response:
+                health = json.loads(response.read().decode("utf-8"))
+            registry = os.path.join(logdir, "bridges", "bridge-%d.json" % port)
+            with open(registry, encoding="utf-8") as f:
+                record = json.load(f)
+            if (record.get("pid") == proc.pid and record.get("instance_id")
+                    and record.get("instance_id") == health.get("instance_id")):
+                return True
         except Exception:
             time.sleep(0.3)
     return False
@@ -194,8 +203,8 @@ def main():
               "scratch logs at %s"
               % (args.engine, args.model, args.effort, args.port, supports_resume, native,
                  bool(args.api_key), scratch_logdir))
-        if not wait_for_server(base):
-            check(False, "server came up within 15s")
+        if not wait_for_server(base, proc, scratch_logdir, args.port):
+            check(False, "the started server instance came up within 15s")
             return 1
 
         if args.api_key:
@@ -211,6 +220,18 @@ def main():
                 check(True, "/health stays reachable without the key (liveness probe)")
             except urllib.error.HTTPError as e:
                 check(False, "/health stays reachable without the key (got %d)" % e.code)
+            before = count_tasks(scratch_logdir, args.port)
+            unauth = urllib.request.Request(
+                base + "/v1/chat/completions",
+                data=b'{"messages":[{"role":"user","content":"DO-NOT-LAUNCH"}]}',
+                headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                urllib.request.urlopen(unauth, timeout=10)
+                check(False, "unauthenticated completion POST -> 401")
+            except urllib.error.HTTPError as e:
+                check(e.code == 401, "unauthenticated completion POST -> 401 (got %d)" % e.code)
+            check(count_tasks(scratch_logdir, args.port) == before,
+                  "unauthenticated POST did not launch an agent.sh task")
 
         status, body = http_get(base, "/health")
         check(status == 200 and body.get("ok") is True, "GET /health returns ok")
@@ -246,7 +267,11 @@ def main():
             "messages": [{"role": "user", "content": "My favorite number is 42. Reply with just: OK"}]
         })
         check(status == 200, "fresh completion returns 200")
-        check(bool(body.get("choices", [{}])[0].get("message", {}).get("content")), "fresh completion has content")
+        first_choice = body.get("choices", [{}])[0]
+        first_message = first_choice.get("message", {})
+        first_answer = first_message.get("content") or ""
+        check("OK" in first_answer, "fresh completion contains the requested marker")
+        check(first_choice.get("finish_reason") == "stop", "fresh completion has finish_reason=stop")
         n1 = count_tasks(scratch_logdir, args.port)
         native_why = "%s uses its native backend, which writes no agent.sh task" % args.engine
         if native:
@@ -258,7 +283,7 @@ def main():
         status, body = http_post_json(base, "/v1/chat/completions", {
             "messages": [
                 {"role": "user", "content": "My favorite number is 42. Reply with just: OK"},
-                {"role": "assistant", "content": "OK"},
+                first_message,
                 {"role": "user", "content": "What is my favorite number? Just the number."},
             ]
         })
@@ -272,7 +297,7 @@ def main():
         else:
             check(n2 == n1 + 1, "engine has no resume support -> continuation started a new session")
         _, health = http_get(base, "/health")
-        check(health.get("session_turns") == 3, "session_turns reflects 3 messages (got %s)" % health.get("session_turns"))
+        check(health.get("session_turns") == 4, "session_turns includes canonical assistant response (got %s)" % health.get("session_turns"))
 
         print("[smoke] tool-call turn ...")
         tools = [{"type": "function", "function": {
@@ -281,7 +306,7 @@ def main():
         status, body = http_post_json(base, "/v1/chat/completions", {
             "messages": [
                 {"role": "user", "content": "My favorite number is 42. Reply with just: OK"},
-                {"role": "assistant", "content": "OK"},
+                first_message,
                 {"role": "user", "content": "What is my favorite number? Just the number."},
                 {"role": "assistant", "content": answer},
                 {"role": "user", "content": "Now check the weather in Oslo. Use the tool."},
@@ -297,7 +322,7 @@ def main():
         status, body = http_post_json(base, "/v1/chat/completions", {
             "messages": [
                 {"role": "user", "content": "My favorite number is 42. Reply with just: OK"},
-                {"role": "assistant", "content": "OK"},
+                first_message,
                 {"role": "user", "content": "What is my favorite number? Just the number."},
                 {"role": "assistant", "content": answer},
                 {"role": "user", "content": "Now check the weather in Oslo. Use the tool."},
@@ -315,13 +340,17 @@ def main():
             check(n_after_tools == n1, "tool round-trip stayed in the same session")
 
         print("[smoke] unrelated conversation (should start a new session) ...")
-        http_post_json(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "Reply with exactly: UNRELATED"}]})
+        _, unrelated = http_post_json(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "Reply with exactly: UNRELATED"}]})
+        unrelated_choice = unrelated.get("choices", [{}])[0]
+        check("UNRELATED" in (unrelated_choice.get("message", {}).get("content") or ""),
+              "divergent response contains its requested marker")
+        check(unrelated_choice.get("finish_reason") == "stop",
+              "divergent response has finish_reason=stop")
         n3 = count_tasks(scratch_logdir, args.port)
         # session_turns is the one divergence signal that works on EVERY backend: an unrelated
-        # single-message conversation replaces the remembered 7-message array rather than extending
-        # it, so the counter drops back to 1 instead of climbing.
+        # single-message conversation plus its canonical response replaces the old transcript.
         _, health = http_get(base, "/health")
-        check(health.get("session_turns") == 1,
+        check(health.get("session_turns") == 2,
               "divergence replaced the remembered conversation (session_turns=%s)" % health.get("session_turns"))
         if native:
             skip("divergence task-count behaviour", native_why)
@@ -334,13 +363,14 @@ def main():
         check(health.get("session_active") is False, "session inactive after reset")
 
         print("[smoke] idle-timeout expiry (waiting past --session-ttl=6s) ...")
-        http_post_json(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "Reply with exactly: TTL-BASE"}]})
+        _, ttl_base = http_post_json(base, "/v1/chat/completions", {"messages": [{"role": "user", "content": "Reply with exactly: TTL-BASE"}]})
+        ttl_message = ttl_base.get("choices", [{}])[0].get("message", {})
         n4 = count_tasks(scratch_logdir, args.port)
         time.sleep(8)
         http_post_json(base, "/v1/chat/completions", {
             "messages": [
                 {"role": "user", "content": "Reply with exactly: TTL-BASE"},
-                {"role": "assistant", "content": "TTL-BASE"},
+                ttl_message,
                 {"role": "user", "content": "Reply with exactly: TTL-AFTER"},
             ]
         })
@@ -357,6 +387,9 @@ def main():
         })
         check(any(l == "data: [DONE]" for l in lines), "streaming response ends with data: [DONE]")
         check(any('"role": "assistant"' in l for l in lines), "streaming response has a role delta")
+        check(any("STREAM-OK" in l for l in lines), "streaming response contains requested marker")
+        check(any('"finish_reason": "stop"' in l for l in lines),
+              "streaming response has finish_reason=stop")
 
         print("[smoke] two concurrent requests ...")
         http_post_json(base, "/reset", {})

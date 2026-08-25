@@ -15,8 +15,12 @@ import io
 import json
 import logging
 import os
+import signal
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -263,6 +267,12 @@ class ExtractToolCallsTests(unittest.TestCase):
         calls, cleaned = srv.extract_tool_calls('```json\n{"tool_calls":[]}\n```')
         self.assertIsNone(calls)
         self.assertEqual(cleaned, "")
+
+    def test_canonical_wrapper_drops_undeclared_tool_names(self):
+        text = ('```json\n{"tool_calls":[{"name":"declared","arguments":{}},'
+                '{"name":"secret_tool","arguments":{}}]}\n```')
+        calls, _ = srv.extract_tool_calls(text, {"declared"})
+        self.assertEqual([c["function"]["name"] for c in calls], ["declared"])
 
 
 class FuncCallSyntaxTests(unittest.TestCase):
@@ -667,25 +677,47 @@ class SessionExpiryTests(unittest.TestCase):
         self.assertFalse(srv.session_expired())
 
     def test_idle_longer_than_ttl_is_expired(self):
-        import time
         srv.SESSION["task_name"] = "some-task"
-        srv.SESSION["last_activity"] = time.time() - 3600  # 1h ago, past the 1800s ttl
+        srv.SESSION["last_activity"] = srv.time.time() - 3600
         self.assertTrue(srv.session_expired())
 
     def test_idle_seconds_reports_elapsed_time(self):
-        import time
         srv.SESSION["task_name"] = "some-task"
-        srv.SESSION["last_activity"] = time.time() - 100
+        srv.SESSION["last_activity"] = srv.time.time() - 100
         idle = srv.session_idle_seconds()
         self.assertGreaterEqual(idle, 100)
-        self.assertLess(idle, 105)  # generous slack for test execution time
+        self.assertLess(idle, 105)
 
     def test_one_second_under_the_ttl_is_not_yet_expired(self):
-        import time
         srv.SESSION["task_name"] = "some-task"
-        srv.SESSION["last_activity"] = time.time() - 1799  # 1s under the 1800s ttl
+        srv.SESSION["last_activity"] = srv.time.time() - 1799
         self.assertFalse(srv.session_expired())
 
+
+class ClaudeNativeFreshBoundaryTests(unittest.TestCase):
+    def test_non_extension_recreates_unpinned_scratch_even_when_dir_was_already_set(self):
+        saved = (srv.CFG, srv.SESSION, srv.claude_native_alive, srv.claude_native_kill,
+                 srv.claude_native_send, srv.fresh_session_dir)
+        class FakeCfg:
+            engine, model, effort, dir = "claude", "sonnet", "low", ""
+            timeout, retries, session_ttl = 60, 0, 1800
+        wipes = []
+        srv.CFG = FakeCfg()
+        srv.SESSION = {"task_name": srv.CLAUDE_NATIVE_TASK,
+                       "messages": [{"role": "user", "content": "old"}],
+                       "dir": "/old/scratch", "last_activity": srv.time.time()}
+        srv.claude_native_alive = lambda: True
+        srv.claude_native_kill = lambda: None
+        srv.claude_native_send = lambda *a, **k: "fresh answer"
+        srv.fresh_session_dir = lambda wipe=True: wipes.append(wipe) or "/fresh/scratch"
+        try:
+            srv._claude_native_raw([{"role": "user", "content": "different"}], None,
+                                   "none", None, None, None, False)
+            self.assertEqual(wipes, [True])
+            self.assertEqual(srv.SESSION["dir"], "/fresh/scratch")
+        finally:
+            (srv.CFG, srv.SESSION, srv.claude_native_alive, srv.claude_native_kill,
+             srv.claude_native_send, srv.fresh_session_dir) = saved
 
 class ChatOnlyEnvTests(unittest.TestCase):
     """run_agent/reply_agent must launch agent.sh with AGENT_CHAT_ONLY=1 in the subprocess env --
@@ -700,39 +732,51 @@ class ChatOnlyEnvTests(unittest.TestCase):
     def test_run_agent_passes_chatonly_env_to_subprocess(self):
         captured = {}
 
-        def fake_run(args, **kwargs):
-            captured.update(kwargs)
-            class R:
-                pass
-            return R()
+        def fake_run(args, timeout, env):
+            captured.update({"timeout": timeout, "env": env})
 
-        real_run, real_read_log = srv.subprocess.run, srv.read_log
-        srv.subprocess.run = fake_run
+        real_run, real_read_log = srv._run_agent_process, srv.read_log
+        srv._run_agent_process = fake_run
         srv.read_log = lambda name: ""
         try:
             srv.run_agent("codex", "spark", "medium", "/tmp/x", "hi", "t", 60)
         finally:
-            srv.subprocess.run, srv.read_log = real_run, real_read_log
+            srv._run_agent_process, srv.read_log = real_run, real_read_log
         self.assertEqual(captured.get("env", {}).get("AGENT_CHAT_ONLY"), "1")
 
     def test_reply_agent_passes_chatonly_env_to_subprocess(self):
         captured = {}
 
-        def fake_run(args, **kwargs):
-            captured.update(kwargs)
-            class R:
-                pass
-            return R()
+        def fake_run(args, timeout, env):
+            captured.update({"timeout": timeout, "env": env})
 
-        real_run, real_read_log, real_read_meta = srv.subprocess.run, srv.read_log, srv.read_meta
-        srv.subprocess.run = fake_run
+        real_run, real_read_log, real_read_meta = srv._run_agent_process, srv.read_log, srv.read_meta
+        srv._run_agent_process = fake_run
         srv.read_log = lambda name: ""  # log never grows -> reply_agent returns None, that's fine
         srv.read_meta = lambda name: {"state": "done"}
         try:
             srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60)
         finally:
-            srv.subprocess.run, srv.read_log, srv.read_meta = real_run, real_read_log, real_read_meta
+            srv._run_agent_process, srv.read_log, srv.read_meta = real_run, real_read_log, real_read_meta
         self.assertEqual(captured.get("env", {}).get("AGENT_CHAT_ONLY"), "1")
+
+    def test_inherited_watchdog_cannot_exceed_outer_timeout(self):
+        class FakeCfg:
+            timeout = 40
+        old_cfg = srv.CFG
+        old_value = os.environ.get("AGENT_TIMEOUT_SEC")
+        srv.CFG = FakeCfg()
+        os.environ["AGENT_TIMEOUT_SEC"] = "999999"
+        try:
+            env = srv._chatonly_env()
+            self.assertEqual(env["AGENT_TIMEOUT_SEC"], "35")
+            self.assertEqual(env["AGENT_RETRIES"], "0")
+        finally:
+            srv.CFG = old_cfg
+            if old_value is None:
+                os.environ.pop("AGENT_TIMEOUT_SEC", None)
+            else:
+                os.environ["AGENT_TIMEOUT_SEC"] = old_value
 
 
 class ReplyAgentStaleGuardTests(unittest.TestCase):
@@ -741,14 +785,14 @@ class ReplyAgentStaleGuardTests(unittest.TestCase):
     falls back to a fresh run rather than silently echoing the stale prior answer."""
 
     def setUp(self):
-        self._real_run = srv.subprocess.run
+        self._real_run = srv._run_agent_process
         self._real_read_log = srv.read_log
         self._real_read_meta = srv.read_meta
-        srv.subprocess.run = lambda *a, **k: None  # never actually shell out
+        srv._run_agent_process = lambda *a, **k: None  # never actually shell out
         srv.read_meta = lambda name: {"state": "done"}  # default: a healthy finished task
 
     def tearDown(self):
-        srv.subprocess.run = self._real_run
+        srv._run_agent_process = self._real_run
         srv.read_log = self._real_read_log
         srv.read_meta = self._real_read_meta
 
@@ -774,8 +818,6 @@ class ReplyAgentStaleGuardTests(unittest.TestCase):
                          "NEW ANSWER\n")
 
     def test_returns_none_when_log_grew_but_state_error(self):
-        # A provider that fails AFTER the reply header still grows the log; the meta-state guard
-        # must reject it so _run falls back to a fresh run instead of returning the error block.
         self._grow()
         srv.read_meta = lambda name: {"state": "error"}
         self.assertIsNone(srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60))
@@ -785,6 +827,417 @@ class ReplyAgentStaleGuardTests(unittest.TestCase):
         srv.read_meta = lambda name: {"state": "waiting"}
         self.assertEqual(srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60),
                          "NEW ANSWER\n")
+
+
+class ProcessTreeTimeoutTests(unittest.TestCase):
+    @staticmethod
+    def _pid_alive(pid):
+        if os.name == "nt":
+            out = subprocess.check_output(
+                ["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],
+                text=True, errors="replace")
+            return str(pid) in out and "No tasks" not in out
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def test_outer_timeout_kills_and_reaps_child_sleeper_tree(self):
+        d = tempfile.mkdtemp()
+        pid_file = os.path.join(d, "child.pid")
+        script = ("import subprocess,sys,time; "
+                  "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+                  "open(sys.argv[1],'w').write(str(p.pid)); time.sleep(60)")
+        try:
+            srv._run_agent_process([sys.executable, "-c", script, pid_file], 0.5,
+                                   dict(os.environ))
+            self.assertTrue(os.path.exists(pid_file))
+            with open(pid_file, encoding="ascii") as f:
+                child_pid = int(f.read())
+            deadline = srv.time.time() + 5
+            while self._pid_alive(child_pid) and srv.time.time() < deadline:
+                srv.time.sleep(0.05)
+            self.assertFalse(self._pid_alive(child_pid))
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_timeout_kills_orphan_grandchild_after_direct_wrapper_exits(self):
+        """The direct child can exit while its grandchild keeps inherited pipes open.  The
+        timeout must target the launch-time group/job, not require the dead wrapper PID."""
+        d = tempfile.mkdtemp()
+        pid_file = os.path.join(d, "orphan.pid")
+        script = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'], "
+            "stdout=sys.stdout, stderr=sys.stderr); "
+            "open(sys.argv[1],'w').write(str(p.pid))")
+        orphan_pid = None
+        try:
+            srv._run_agent_process([sys.executable, "-c", script, pid_file], 0.5,
+                                   dict(os.environ))
+            self.assertTrue(os.path.exists(pid_file))
+            with open(pid_file, encoding="ascii") as f:
+                orphan_pid = int(f.read())
+            deadline = srv.time.time() + 5
+            while self._pid_alive(orphan_pid) and srv.time.time() < deadline:
+                srv.time.sleep(0.05)
+            self.assertFalse(self._pid_alive(orphan_pid))
+        finally:
+            if orphan_pid and self._pid_alive(orphan_pid):
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(orphan_pid), "/F"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   check=False)
+                else:
+                    try:
+                        os.kill(orphan_pid, srv.signal.SIGKILL)
+                    except OSError:
+                        pass
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class ProcessTreeLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.saved_registry = srv._PROCESS_TREES
+        self.saved_shutdown = srv._PROCESS_TREES_SHUTTING_DOWN
+        self.saved_sigterm_active = getattr(srv, "_SIGTERM_HANDLER_ACTIVE", False)
+        srv._PROCESS_TREES = {}
+        srv._PROCESS_TREES_SHUTTING_DOWN = False
+        srv._SIGTERM_HANDLER_ACTIVE = False
+
+    def tearDown(self):
+        srv._PROCESS_TREES = self.saved_registry
+        srv._PROCESS_TREES_SHUTTING_DOWN = self.saved_shutdown
+        srv._SIGTERM_HANDLER_ACTIVE = self.saved_sigterm_active
+
+    def test_release_claims_job_handle_once(self):
+        closes = []
+
+        class Kernel:
+            def CloseHandle(self, handle):
+                closes.append(handle)
+
+        class Proc:
+            _neoxider_tree_state = "active"
+            _neoxider_job = 123
+            _neoxider_kernel32 = Kernel()
+
+        proc = Proc()
+        srv._PROCESS_TREES[id(proc)] = proc
+        real_terminate = srv._terminate_claimed_process_tree
+        srv._terminate_claimed_process_tree = srv._close_process_tree_container
+        try:
+            srv._release_process_tree(proc)
+            srv._release_process_tree(proc)
+            self.assertEqual(closes, [123])
+            self.assertEqual(proc._neoxider_tree_state, "closed")
+            self.assertNotIn(id(proc), srv._PROCESS_TREES)
+        finally:
+            srv._terminate_claimed_process_tree = real_terminate
+
+    def test_release_racing_global_shutdown_still_closes_container_once(self):
+        closes = []
+        barrier = threading.Barrier(3)
+
+        class Kernel:
+            def CloseHandle(self, handle):
+                closes.append(handle)
+
+        class Proc:
+            _neoxider_tree_state = "active"
+            _neoxider_job = 456
+            _neoxider_kernel32 = Kernel()
+
+        proc = Proc()
+        srv._PROCESS_TREES[id(proc)] = proc
+        real_terminate = srv._terminate_claimed_process_tree
+        srv._terminate_claimed_process_tree = srv._close_process_tree_container
+
+        def release():
+            barrier.wait()
+            srv._release_process_tree(proc)
+
+        def shutdown():
+            barrier.wait()
+            srv._shutdown_process_trees()
+
+        threads = [threading.Thread(target=release), threading.Thread(target=shutdown)]
+        try:
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join(timeout=5)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(closes, [456])
+        finally:
+            srv._terminate_claimed_process_tree = real_terminate
+
+    def test_shutdown_atomically_drains_registry_once_and_rejects_late_launch(self):
+        class Proc:
+            _neoxider_tree_state = "active"
+
+        first, second = Proc(), Proc()
+        srv._PROCESS_TREES = {id(first): first, id(second): second}
+        terminated = []
+        real_terminate = srv._terminate_claimed_process_tree
+        srv._terminate_claimed_process_tree = lambda proc: terminated.append(proc)
+        try:
+            srv._shutdown_process_trees()
+            srv._shutdown_process_trees()
+            self.assertCountEqual(terminated, [first, second])
+            self.assertEqual(srv._PROCESS_TREES, {})
+            with self.assertRaises(RuntimeError):
+                srv._popen_process_tree([sys.executable, "-c", "pass"])
+        finally:
+            srv._terminate_claimed_process_tree = real_terminate
+
+    def test_sigterm_handler_cleans_before_exiting(self):
+        calls = []
+        real_shutdown = srv._shutdown_process_trees
+        srv._shutdown_process_trees = lambda: calls.append("cleanup")
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                srv._handle_sigterm(srv.signal.SIGTERM, None)
+            self.assertEqual(calls, ["cleanup"])
+            self.assertEqual(raised.exception.code, 128 + srv.signal.SIGTERM)
+        finally:
+            srv._shutdown_process_trees = real_shutdown
+
+    def test_reentrant_sigterm_during_first_termination_drains_both_trees_once(self):
+        class Proc:
+            _neoxider_tree_state = "active"
+
+        first, second = Proc(), Proc()
+        srv._PROCESS_TREES = {id(first): first, id(second): second}
+        terminated = []
+        real_terminate = srv._terminate_claimed_process_tree
+
+        def terminate(proc):
+            terminated.append(proc)
+            if proc is first:
+                srv._handle_sigterm(signal.SIGTERM, None)
+
+        srv._terminate_claimed_process_tree = terminate
+        try:
+            with self.assertRaises(SystemExit) as raised:
+                srv._handle_sigterm(signal.SIGTERM, None)
+            self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+            self.assertEqual(terminated, [first, second])
+            self.assertEqual(srv._PROCESS_TREES, {})
+        finally:
+            srv._terminate_claimed_process_tree = real_terminate
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group regression")
+    def test_success_release_kills_background_child_before_forgetting_group(self):
+        d = tempfile.mkdtemp()
+        pid_file = os.path.join(d, "background.pid")
+        wrapper = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'], "
+            "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "open(sys.argv[1],'w').write(str(p.pid))")
+        child_pid = None
+        try:
+            srv._run_agent_process([sys.executable, "-c", wrapper, pid_file], 10,
+                                   dict(os.environ))
+            with open(pid_file, encoding="ascii") as stream:
+                child_pid = int(stream.read())
+            deadline = time.time() + 5
+            while ProcessTreeTimeoutTests._pid_alive(child_pid) and time.time() < deadline:
+                stat_path = "/proc/%d/stat" % child_pid
+                if os.path.exists(stat_path):
+                    with open(stat_path, encoding="ascii") as stream:
+                        if stream.read().split()[2] == "Z":
+                            break
+                time.sleep(0.05)
+            else:
+                self.assertFalse(ProcessTreeTimeoutTests._pid_alive(child_pid))
+            self.assertEqual(srv._PROCESS_TREES, {})
+        finally:
+            if child_pid and ProcessTreeTimeoutTests._pid_alive(child_pid):
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_global_cleanup_kills_registered_provider_tree(self):
+        d = tempfile.mkdtemp()
+        pid_file = os.path.join(d, "child.pid")
+        script = (
+            "import subprocess,sys,time; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+            "open(sys.argv[1],'w').write(str(p.pid)); time.sleep(60)")
+        child_pid = None
+        try:
+            srv._popen_process_tree(
+                [sys.executable, "-c", script, pid_file],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            deadline = time.time() + 5
+            while not os.path.exists(pid_file) and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(pid_file))
+            with open(pid_file, encoding="ascii") as stream:
+                child_pid = int(stream.read())
+            srv._shutdown_process_trees()
+            deadline = time.time() + 5
+            while ProcessTreeTimeoutTests._pid_alive(child_pid) and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(ProcessTreeTimeoutTests._pid_alive(child_pid))
+        finally:
+            if child_pid and ProcessTreeTimeoutTests._pid_alive(child_pid):
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(child_pid), "/F"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   check=False)
+                else:
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process-group regression")
+    def test_sigterm_kills_orphan_in_registered_provider_group(self):
+        d = tempfile.mkdtemp()
+        pid_file = os.path.join(d, "orphan.pid")
+        module_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        wrapper = (
+            "import subprocess,sys; "
+            "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+            "open(sys.argv[1],'w').write(str(p.pid))")
+        helper = (
+            "import os,signal,subprocess,sys,time; "
+            "sys.path.insert(0,%s); import openai_server as srv; "
+            "signal.signal(signal.SIGTERM,srv._handle_sigterm); "
+            "srv._popen_process_tree([sys.executable,'-c',%s,%s],"
+            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+            "\nwhile not os.path.exists(%s): time.sleep(.01)\n"
+            "print('READY',flush=True)\n"
+            "while True: time.sleep(1)" % (
+                repr(module_dir), repr(wrapper), repr(pid_file), repr(pid_file)))
+        bridge = subprocess.Popen(
+            [sys.executable, "-c", helper], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True)
+        orphan_pid = None
+        try:
+            self.assertEqual(bridge.stdout.readline().strip(), "READY")
+            with open(pid_file, encoding="ascii") as stream:
+                orphan_pid = int(stream.read())
+            os.kill(bridge.pid, signal.SIGTERM)
+            bridge.wait(timeout=10)
+            deadline = time.time() + 5
+            while ProcessTreeTimeoutTests._pid_alive(orphan_pid) and time.time() < deadline:
+                # A killed process may briefly remain as a zombie; it is no longer an orphaned
+                # provider workload and init will reap it.
+                stat_path = "/proc/%d/stat" % orphan_pid
+                if os.path.exists(stat_path):
+                    with open(stat_path, encoding="ascii") as stream:
+                        if stream.read().split()[2] == "Z":
+                            break
+                time.sleep(0.05)
+            else:
+                self.assertFalse(ProcessTreeTimeoutTests._pid_alive(orphan_pid))
+        finally:
+            if bridge.poll() is None:
+                bridge.kill()
+                bridge.wait(timeout=5)
+            if orphan_pid and ProcessTreeTimeoutTests._pid_alive(orphan_pid):
+                try:
+                    os.kill(orphan_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class PersistentProcessReplacementTests(unittest.TestCase):
+    def test_dead_opencode_wrapper_is_disposed_before_state_clear_and_replacement(self):
+        events = []
+
+        class OldProc:
+            def poll(self):
+                return 7
+
+        class NewProc:
+            def poll(self):
+                return None
+
+        class Response:
+            status = 200
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args):
+                return False
+
+        old = OldProc()
+        saved = (srv._OC, srv._free_port, srv._popen_process_tree,
+                 srv._terminate_process_tree, srv._urlreq.urlopen)
+        srv._OC = {"base": "http://stale", "proc": old, "lock": threading.Lock()}
+        srv._free_port = lambda: 18181
+
+        def terminate(proc):
+            self.assertIs(srv._OC["proc"], old)
+            events.append(("terminate", proc))
+
+        def popen(*_args, **_kwargs):
+            self.assertIsNone(srv._OC["proc"])
+            events.append(("spawn", None))
+            return NewProc()
+
+        srv._terminate_process_tree = terminate
+        srv._popen_process_tree = popen
+        srv._urlreq.urlopen = lambda *_args, **_kwargs: Response()
+        try:
+            self.assertEqual(srv._ensure_opencode_server(), "http://127.0.0.1:18181")
+            self.assertEqual([event[0] for event in events], ["terminate", "spawn"])
+            self.assertIsInstance(srv._OC["proc"], NewProc)
+        finally:
+            (srv._OC, srv._free_port, srv._popen_process_tree,
+             srv._terminate_process_tree, srv._urlreq.urlopen) = saved
+
+    def test_dead_claude_wrapper_is_disposed_before_state_clear_and_replacement(self):
+        events = []
+
+        class OldProc:
+            def poll(self):
+                return 9
+
+        class NewProc:
+            stdout = ()
+            def poll(self):
+                return None
+
+        old = OldProc()
+        saved = (srv._CL, srv._popen_process_tree, srv._terminate_process_tree,
+                 srv._claude_native_cmd)
+        srv._CL = {"proc": old, "queue": object(), "lock": threading.RLock()}
+
+        def terminate(proc):
+            self.assertIs(srv._CL["proc"], old)
+            events.append(("terminate", proc))
+
+        def popen(*_args, **_kwargs):
+            self.assertIsNone(srv._CL["proc"])
+            events.append(("spawn", None))
+            return NewProc()
+
+        srv._terminate_process_tree = terminate
+        srv._popen_process_tree = popen
+        srv._claude_native_cmd = lambda: "claude"
+        try:
+            srv._claude_native_ensure()
+            self.assertEqual([event[0] for event in events], ["terminate", "spawn"])
+            self.assertIsInstance(srv._CL["proc"], NewProc)
+        finally:
+            (srv._CL, srv._popen_process_tree, srv._terminate_process_tree,
+             srv._claude_native_cmd) = saved
 
 
 class AdversarialParsingTests(unittest.TestCase):
@@ -1231,7 +1684,7 @@ class RunRetryAndFallbackTests(unittest.TestCase):
         self.assertEqual(text, "REAL ANSWER")
         self.assertEqual(len(attempts), 2)
 
-    def test_retries_exhausted_returns_last_result_without_raising(self):
+    def test_retries_exhausted_fails_instead_of_returning_empty_success(self):
         attempts = []
 
         def fake_run(engine, model, effort, workdir, prompt, name, timeout):
@@ -1239,9 +1692,8 @@ class RunRetryAndFallbackTests(unittest.TestCase):
             return ""
 
         srv.run_agent = fake_run
-        text, calls, _usage = self._call([{"role": "user", "content": "hi"}])
-        self.assertEqual(text, "")
-        self.assertIsNone(calls)
+        with self.assertRaises(srv.CompletionFailed):
+            self._call([{"role": "user", "content": "hi"}])
         self.assertEqual(len(attempts), 2)  # retries=1 -> 2 total attempts, then give up
 
     def test_empty_resume_answer_falls_back_to_fresh_run(self):
@@ -1291,6 +1743,82 @@ class RunRetryAndFallbackTests(unittest.TestCase):
                          usage["prompt_tokens"] + usage["completion_tokens"])
 
 
+class ToolChoiceContractTests(unittest.TestCase):
+    TOOLS = [
+        {"type": "function", "function": {"name": "alpha", "parameters": {"type": "object"}}},
+        {"type": "function", "function": {"name": "beta", "parameters": {"type": "object"}}},
+    ]
+    MESSAGES = [{"role": "user", "content": "act"}]
+
+    def setUp(self):
+        self.saved = (srv.run_agent, srv.read_meta, srv.SESSION, srv.CFG,
+                      srv.PROVIDERS, srv.time.sleep, srv.claude_native_kill)
+
+        class FakeCfg:
+            engine, model, effort, dir = "fakeeng", "m", "", "/pinned/project"
+            port, timeout, session_ttl, retries = 8996, 60, 1800, 0
+
+        srv.CFG = FakeCfg()
+        srv.PROVIDERS = {"fakeeng": {"supports_resume": False}}
+        srv.SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
+        srv.read_meta = lambda name: {"state": "done"}
+        srv.time.sleep = lambda seconds: None
+        srv.claude_native_kill = lambda: None
+        self.prompts = []
+
+    def tearDown(self):
+        (srv.run_agent, srv.read_meta, srv.SESSION, srv.CFG,
+         srv.PROVIDERS, srv.time.sleep, srv.claude_native_kill) = self.saved
+
+    def _answers(self, *answers):
+        values = iter(answers)
+
+        def fake_run(engine, model, effort, workdir, prompt, name, timeout):
+            self.prompts.append(prompt)
+            return next(values)
+
+        srv.run_agent = fake_run
+
+    @staticmethod
+    def _call(name):
+        return ('```json\n{"tool_calls":[{"name":"%s","arguments":{"x":1}}]}\n```'
+                % name)
+
+    def test_none_suppresses_calls_and_retries_to_plain_text(self):
+        self._answers(self._call("alpha"), "plain answer")
+        text, calls, _usage = srv.H._run(
+            object(), self.MESSAGES, self.TOOLS, "none")
+        self.assertEqual(text, "plain answer")
+        self.assertIsNone(calls)
+        self.assertIn("Tool use is disabled", self.prompts[0])
+        self.assertNotIn('"name": "alpha"', self.prompts[0])
+
+    def test_required_fails_closed_when_provider_never_calls(self):
+        self._answers("prose only", "still prose")
+        with self.assertRaises(srv.CompletionFailed):
+            srv.H._run(object(), self.MESSAGES, self.TOOLS, "required")
+        self.assertIsNone(srv.SESSION["task_name"])
+        self.assertEqual(srv.SESSION["messages"], self.MESSAGES)
+
+    def test_specific_function_rejects_other_function_and_returns_only_selected(self):
+        choice = {"type": "function", "function": {"name": "beta"}}
+        self._answers(self._call("alpha"), self._call("beta"))
+        _text, calls, _usage = srv.H._run(
+            object(), self.MESSAGES, self.TOOLS, choice)
+        self.assertEqual([c["function"]["name"] for c in calls], ["beta"])
+        self.assertIn("MUST call", self.prompts[0])
+        self.assertIn('"name": "beta"', self.prompts[0])
+        self.assertNotIn('"name": "alpha"', self.prompts[0])
+
+    def test_validation_propagates_normalized_choice_and_rejects_impossible_required(self):
+        body = {"messages": self.MESSAGES, "tools": self.TOOLS, "tool_choice": "required"}
+        _messages, _tools, choice, stream = srv.validate_chat_request(body)
+        self.assertEqual(choice, "required")
+        self.assertFalse(stream)
+        with self.assertRaises(srv.RequestValidationError):
+            srv.validate_chat_request({"messages": self.MESSAGES, "tool_choice": "required"})
+
+
 class ToolCallNudgeSessionTests(unittest.TestCase):
     """Synthetic recovery turns must not become client-visible session history."""
 
@@ -1300,12 +1828,10 @@ class ToolCallNudgeSessionTests(unittest.TestCase):
     FIRST_MSGS = [{"role": "user", "content": "spawn a player"}]
 
     @classmethod
-    def _followup_msgs(cls):
+    def _followup_msgs(cls, calls):
         return list(cls.FIRST_MSGS) + [
-            {"role": "assistant", "content": None, "tool_calls": [
-                {"id": "call_x", "type": "function",
-                 "function": {"name": "world_command", "arguments": '{"action": "spawn"}'}}]},
-            {"role": "tool", "tool_call_id": "call_x", "content": "spawned"},
+            {"role": "assistant", "content": None, "tool_calls": calls},
+            {"role": "tool", "tool_call_id": calls[0]["id"], "content": "spawned"},
             {"role": "user", "content": "now add a gate"},
         ]
 
@@ -1334,11 +1860,12 @@ class ToolCallNudgeSessionTests(unittest.TestCase):
         (srv.run_agent, srv.reply_agent, srv.read_meta, srv.SESSION, srv.CFG,
          srv.PROVIDERS, srv.time.sleep) = self._saved
 
-    def _install_fakes(self, reply_answers_in_order):
+    def _install_fakes(self, reply_answers_in_order, run_answers=None):
         def fake_run(engine, model, effort, workdir, prompt, name, timeout):
             self.run_prompts.append(prompt)
             self.run_names.append(name)
-            return "I'll call world_command to spawn the player."
+            answers = run_answers or ["I'll call world_command to spawn the player."]
+            return answers[min(len(self.run_names) - 1, len(answers) - 1)]
 
         def fake_reply(engine, model, effort, workdir, name, answer, timeout):
             self.reply_answers.append(answer)
@@ -1352,23 +1879,22 @@ class ToolCallNudgeSessionTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["name"], "world_command")
         # the nudge DID reach the underlying CLI session (as the resume prompt) ...
         self.assertIn("did not emit a tool call", self.reply_answers[0])
-        # ... but SESSION records only the client-visible history
-        self.assertEqual(srv.SESSION["messages"], self.FIRST_MSGS)
+        # ... and SESSION records the exact client-visible assistant response, never the nudge.
+        self.assertEqual(srv.SESSION["messages"][-1]["tool_calls"], calls)
         self.assertNotIn("did not emit a tool call", json.dumps(srv.SESSION["messages"]))
-        self.assertEqual(srv.SESSION["task_name"], self.run_names[0])
+        self.assertIsNone(srv.SESSION["task_name"])
 
-    def test_follow_up_turn_after_nudge_retry_resumes_the_same_task(self):
-        self._install_fakes([self.FENCE, "Gate added."])
-        srv.H._run(object(), list(self.FIRST_MSGS), self.TOOLS)
-        task_after_first = srv.SESSION["task_name"]
-        followup = self._followup_msgs()
+    def test_follow_up_turn_after_nudge_retry_starts_fresh(self):
+        self._install_fakes([self.FENCE], ["I'll call world_command to spawn the player.", "Gate added."])
+        _text, first_calls, _usage = srv.H._run(object(), list(self.FIRST_MSGS), self.TOOLS)
+        followup = self._followup_msgs(first_calls)
         text, calls, _usage = srv.H._run(object(), followup, self.TOOLS)
         self.assertIsNone(calls)
         self.assertEqual(text, "Gate added.")
-        self.assertEqual(srv.SESSION["task_name"], task_after_first)  # resumed, not restarted
-        self.assertEqual(srv.SESSION["messages"], followup)
-        self.assertEqual(len(self.run_names), 1)   # one fresh run total ...
-        self.assertEqual(len(self.reply_answers), 2)  # ... both later turns were replies
+        self.assertEqual(srv.SESSION["messages"], followup + [
+            {"role": "assistant", "content": "Gate added."}])
+        self.assertEqual(len(self.run_names), 2)
+        self.assertEqual(len(self.reply_answers), 1)
         self.assertEqual(srv.SESSION["dir"], "/pinned/project")
 
     def test_unsuccessful_nudge_invalidates_the_diverged_cli_session(self):
@@ -1377,7 +1903,50 @@ class ToolCallNudgeSessionTests(unittest.TestCase):
         self.assertIsNone(calls)
         self.assertIn("world_command", text)
         self.assertIsNone(srv.SESSION["task_name"])
-        self.assertEqual(srv.SESSION["messages"], self.FIRST_MSGS)
+        self.assertEqual(srv.SESSION["messages"], self.FIRST_MSGS + [
+            {"role": "assistant", "content": "I'll call world_command to spawn the player."}])
+
+
+class CanonicalSessionContinuityTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = (srv.run_agent, srv.reply_agent, srv.read_meta, srv.SESSION, srv.CFG,
+                      srv.PROVIDERS)
+        class FakeCfg:
+            engine, model, effort, dir = "fakeeng", "m", "", "/pinned/project"
+            port, timeout, session_ttl, retries = 8997, 60, 1800, 0
+        srv.CFG = FakeCfg()
+        srv.PROVIDERS = {"fakeeng": {"supports_resume": True}}
+        srv.SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
+        srv.read_meta = lambda name: {"state": "done"}
+        self.runs, self.replies = [], []
+        srv.run_agent = lambda *a: self.runs.append(a[4]) or "CANONICAL"
+        srv.reply_agent = lambda *a: self.replies.append(a[5]) or "CONTINUED"
+
+    def tearDown(self):
+        (srv.run_agent, srv.reply_agent, srv.read_meta, srv.SESSION, srv.CFG,
+         srv.PROVIDERS) = self.saved
+
+    def test_exact_returned_assistant_turn_resumes_without_resending_it(self):
+        first = [{"role": "user", "content": "one"}]
+        srv.H._run(object(), first, None)
+        self.assertEqual(srv.SESSION["messages"], first + [
+            {"role": "assistant", "content": "CANONICAL"}])
+        next_messages = list(srv.SESSION["messages"]) + [{"role": "user", "content": "two"}]
+        srv.H._run(object(), next_messages, None)
+        self.assertEqual(len(self.runs), 1)
+        self.assertEqual(len(self.replies), 1)
+        self.assertIn("[USER]\ntwo", self.replies[0])
+        self.assertNotIn("CANONICAL", self.replies[0])
+
+    def test_tampered_assistant_turn_starts_fresh(self):
+        first = [{"role": "user", "content": "one"}]
+        srv.H._run(object(), first, None)
+        tampered = first + [{"role": "assistant", "content": "EDITED"},
+                            {"role": "user", "content": "two"}]
+        srv.H._run(object(), tampered, None)
+        self.assertEqual(len(self.runs), 2)
+        self.assertEqual(self.replies, [])
+        self.assertIn("EDITED", self.runs[-1])
 
 
 class ParametersKeyAliasTests(unittest.TestCase):
@@ -2072,8 +2641,10 @@ class _DoPostHarness(unittest.TestCase):
             _read_content_length = h._read_content_length
             _send_json = staticmethod(lambda code, obj: sent.append((code, obj)))
             _reset_session = staticmethod(lambda: hit.append("reset"))
-            _sync_response = staticmethod(lambda messages, tools: hit.append(("sync", messages)))
-            _stream_response = staticmethod(lambda messages, tools: hit.append("stream"))
+            _sync_response = staticmethod(
+                lambda messages, tools, tool_choice: hit.append(("sync", messages, tool_choice)))
+            _stream_response = staticmethod(
+                lambda messages, tools, tool_choice: hit.append(("stream", tool_choice)))
 
             def __init__(self):
                 self.path = path
@@ -2209,6 +2780,42 @@ class PostBodyGuardTests(_DoPostHarness):
         self.assertEqual(self.sent[0][0], 400)
         self.assertIn("messages", self.sent[0][1]["error"]["message"])
 
+    def test_malformed_chat_schema_table_never_reaches_provider(self):
+        valid = {"messages": [{"role": "user", "content": "hi"}]}
+        cases = [
+            ({"messages": "bad"}, "messages"),
+            ({"messages": [7]}, "messages[0]"),
+            ({"messages": [{"role": 7, "content": "x"}]}, "messages[0].role"),
+            ({"messages": [{"role": "user", "content": {}}]}, "messages[0].content"),
+            ({"messages": [{"role": "assistant", "content": None, "tool_calls": {}}]},
+             "messages[0].tool_calls"),
+            ({"messages": [{"role": "assistant", "content": None, "tool_calls": [
+                {"id": "x", "type": "function", "function": {"name": "f", "arguments": {}}}]}]},
+             "messages[0].tool_calls[0].function.arguments"),
+            (dict(valid, tools={}), "tools"),
+            (dict(valid, tools=[{"type": "function", "function": {"name": "bad name"}}]),
+             "tools[0].function.name"),
+            (dict(valid, tools=[{"type": "function", "function": {
+                "name": "ok", "parameters": []}}]), "tools[0].function.parameters"),
+            (dict(valid, tool_choice=7), "tool_choice"),
+            (dict(valid, stream="true"), "stream"),
+        ]
+        for body, param in cases:
+            with self.subTest(param=param):
+                self.sent.clear(); self.hit.clear()
+                self._call("/v1/chat/completions", json.dumps(body).encode("utf-8"))
+                self.assertEqual(self.sent[0][0], 400)
+                self.assertEqual(self.sent[0][1]["error"]["param"], param)
+                self.assertEqual(self.sent[0][1]["error"]["code"], "invalid_parameter")
+                self.assertFalse(self.hit)
+
+    def test_handler_auth_gate_runs_before_body_or_provider(self):
+        srv.CFG.api_key = "secret"
+        self._call("/v1/chat/completions",
+                   b'{"messages":[{"role":"user","content":"hi"}]}')
+        self.assertEqual(self.sent[0][0], 401)
+        self.assertFalse(self.hit)
+
 
 class InstanceIdTests(unittest.TestCase):
     """Each bridge process publishes a random instance_id in its registry record and in
@@ -2317,6 +2924,54 @@ class LoggingTests(unittest.TestCase):
         self.assertNotIn("Authorization", joined)
 
 
+class LiveDisconnectSessionTests(unittest.TestCase):
+    def test_broken_pipe_invalidates_resume_without_recording_partial_assistant(self):
+        messages = [{"role": "user", "content": "stream this"}]
+        saved = (srv.CFG, srv.SESSION, srv.claude_native_kill)
+
+        class FakeCfg:
+            engine, model, effort = "claude", "sonnet", "low"
+
+        class BreakOnFinish:
+            def __init__(self):
+                self.writes = 0
+
+            def write(self, data):
+                self.writes += 1
+                if self.writes >= 2:
+                    raise BrokenPipeError("client disconnected")
+                return len(data)
+
+            def flush(self):
+                pass
+
+        class Fake:
+            def __init__(self):
+                self.wfile = BreakOnFinish()
+
+            def _sse_headers(self):
+                self._sse_started = True
+
+            def _raw_completion(self, request_messages, tools, tool_choice="auto", **kwargs):
+                srv.SESSION["task_name"] = "live-task"
+                srv.SESSION["messages"] = list(request_messages)
+                kwargs["on_delta"]("partial answer")
+                return "partial answer"
+
+        srv.CFG = FakeCfg()
+        srv.SESSION = {"task_name": None, "messages": [], "dir": "/tmp/live",
+                       "last_activity": 0.0}
+        srv.claude_native_kill = lambda: None
+        try:
+            fake = Fake()
+            srv.H._stream_response_live(fake, messages, None, "none")
+            self.assertIsNone(srv.SESSION["task_name"])
+            self.assertEqual(srv.SESSION["messages"], messages)
+            self.assertNotIn("assistant", json.dumps(srv.SESSION["messages"]))
+        finally:
+            srv.CFG, srv.SESSION, srv.claude_native_kill = saved
+
+
 class StreamErrorSafetyTests(unittest.TestCase):
     """Late failures close SSE without appending a second HTTP response."""
 
@@ -2348,7 +3003,7 @@ class StreamErrorSafetyTests(unittest.TestCase):
                 self._sse_started = sse_started
                 holder["w"] = self.wfile
 
-            def _stream_response(self, messages, tools):
+            def _stream_response(self, messages, tools, tool_choice):
                 raise exc
 
         try:
@@ -2360,20 +3015,23 @@ class StreamErrorSafetyTests(unittest.TestCase):
     def test_exception_after_sse_started_never_sends_a_second_status_line(self):
         sent, wfile = self._drive(True, RuntimeError("boom after headers"))
         self.assertEqual(sent, [], "a 500 JSON response must NOT follow SSE bytes")
-        self.assertTrue(wfile.endswith(b"data: [DONE]\n\n"))
+        self.assertIn(b"event: error", wfile)
+        self.assertNotIn(b"[DONE]", wfile)
 
     def test_provider_limit_after_sse_started_also_closes_safely(self):
         exc = srv.ProviderLimitError("You've hit your session limit")
         sent, wfile = self._drive(True, exc)
         self.assertEqual(sent, [])
-        self.assertTrue(wfile.endswith(b"data: [DONE]\n\n"))
+        self.assertIn(b"event: error", wfile)
+        self.assertNotIn(b"[DONE]", wfile)
 
     def test_exception_before_any_byte_still_gets_openai_style_500(self):
         sent, wfile = self._drive(False, RuntimeError("boom"))
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], 500)
-        self.assertIn("bridge failure", sent[0][1]["error"]["message"])
+        self.assertEqual(sent[0][1]["error"]["message"], "bridge request failed")
         self.assertIn("server_error", sent[0][1]["error"]["type"])
+        self.assertNotIn("boom", json.dumps(sent[0][1]))
         self.assertEqual(wfile, b"", "no stream bytes may be written on the sync error path")
 
     def test_real_sse_headers_mark_the_response_as_started(self):
@@ -2414,6 +3072,103 @@ class PortArgTests(unittest.TestCase):
         for v in ("abc", "", None, "0", "-1", "65536", "70000"):
             with self.subTest(port=v), self.assertRaises(argparse.ArgumentTypeError):
                 srv._port_arg(v)
+
+
+class GetRouteAndHealthStateTests(unittest.TestCase):
+    def setUp(self):
+        self.old = (srv.CFG, srv.SESSION, srv.ACTIVE_REQUESTS)
+        class C:
+            api_key = ""
+            engine, model, effort = "codex", "spark", ""
+            timeout, retries, session_ttl = 60, 1, 1800
+        srv.CFG = C()
+        srv.SESSION = {"task_name": "reusable", "messages": [], "dir": None,
+                       "last_activity": srv.time.time()}
+        srv.ACTIVE_REQUESTS = 0
+
+    def tearDown(self):
+        srv.CFG, srv.SESSION, srv.ACTIVE_REQUESTS = self.old
+
+    def call(self, path):
+        sent = []
+        class F:
+            headers = {}
+            _reject_unauthorized = srv.H._reject_unauthorized
+            _send_json = staticmethod(lambda code, body: sent.append((code, body)))
+        f = F(); f.path = path
+        srv.H.do_GET(f)
+        return sent[0]
+
+    def test_models_routes_are_exact_not_suffix_matches(self):
+        self.assertEqual(self.call("/models")[0], 200)
+        self.assertEqual(self.call("/v1/models")[0], 200)
+        self.assertEqual(self.call("/attacker/models")[0], 404)
+
+    def test_busy_tracks_inflight_work_not_reusable_session(self):
+        code, body = self.call("/health")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["session_active"])
+        self.assertFalse(body["busy"])
+        srv.ACTIVE_REQUESTS = 1
+        self.assertTrue(self.call("/health")[1]["busy"])
+
+
+class NetworkSafetyTests(unittest.TestCase):
+    @staticmethod
+    def cfg(engine="claude", host="127.0.0.1", key=""):
+        class C:
+            lan = localhost = False
+            model, effort = "sonnet", "low"
+        c = C()
+        c.engine, c.host, c.api_key = engine, host, key
+        return c
+
+    def test_loopback_is_safe_without_key(self):
+        self.assertIsNone(srv.validate_network_config(self.cfg()))
+
+    def test_default_bind_is_loopback(self):
+        old = os.environ.pop("AGENT_OPENAI_HOST", None)
+        try:
+            self.assertEqual(srv.default_bind_host(), "127.0.0.1")
+        finally:
+            if old is not None:
+                os.environ["AGENT_OPENAI_HOST"] = old
+
+    def test_nonloopback_always_requires_key(self):
+        self.assertIn("requires --api-key",
+                      srv.validate_network_config(self.cfg(host="0.0.0.0")))
+        self.assertIsNone(srv.validate_network_config(
+            self.cfg(host="0.0.0.0", key="secret")))
+
+    def test_read_capable_codex_and_gemini_are_loopback_only_even_with_key(self):
+        for engine in ("codex", "gemini"):
+            with self.subTest(engine=engine):
+                self.assertIn("loopback-only", srv.validate_network_config(
+                    self.cfg(engine=engine, host="0.0.0.0", key="secret")))
+
+    def test_unsafe_native_opencode_is_loopback_only(self):
+        old = srv.OPENCODE_NATIVE
+        srv.OPENCODE_NATIVE = True
+        try:
+            self.assertIn("loopback-only", srv.validate_network_config(
+                self.cfg(engine="opencode", host="0.0.0.0", key="secret")))
+        finally:
+            srv.OPENCODE_NATIVE = old
+
+    def test_native_claude_resolves_alias_effort_and_advertised_label_together(self):
+        model, effort, label = srv.resolve_claude_model("sonnet", "")
+        self.assertEqual((model, effort, label),
+                         ("claude-sonnet-5", "high", "claude/Sonnet 5 (high)"))
+        old_cfg = srv.CFG
+        srv.CFG = self.cfg()
+        try:
+            command = srv._claude_native_cmd()
+            self.assertIn("--tools ''", command)
+            self.assertNotIn("--disallowedTools", command)
+        finally:
+            srv.CFG = old_cfg
+        with self.assertRaises(ValueError):
+            srv.resolve_claude_model("arbitrary-shell-alias", "")
 
 
 if __name__ == "__main__":

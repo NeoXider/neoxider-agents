@@ -5,6 +5,7 @@ let LOCALES = [];
 let LOCALE_DATA = {};
 let FALLBACK_DATA = {};
 const DEFAULT_LOCALE = "en";
+let localeRequestId = 0;
 
 function t(key, fallback) {
   return LOCALE_DATA[key] ?? FALLBACK_DATA[key] ?? fallback ?? key;
@@ -23,31 +24,41 @@ function applyI18n(root) {
 }
 
 async function loadLocale(code) {
+  const requestId = ++localeRequestId;
+  let loaded = {};
   try {
-    LOCALE_DATA = await (await fetch("/locales/" + code + ".json")).json();
+    loaded = await jget("/locales/" + encodeURIComponent(code) + ".json");
   } catch (e) {
-    LOCALE_DATA = {};
+    loaded = {};
   }
+  if (requestId !== localeRequestId) return;
+  LOCALE_DATA = loaded;
   document.documentElement.lang = code;
   applyI18n();
-  if (typeof onLocaleChanged === "function") onLocaleChanged();
+  if (typeof onLocaleChanged === "function") await onLocaleChanged();
 }
 
 async function initI18n() {
   try {
-    FALLBACK_DATA = await (await fetch("/locales/" + DEFAULT_LOCALE + ".json")).json();
+    FALLBACK_DATA = await jget("/locales/" + DEFAULT_LOCALE + ".json");
   } catch (e) {
     FALLBACK_DATA = {};
   }
   try {
-    LOCALES = (await (await fetch("/api/locales")).json()).locales || [];
+    LOCALES = (await jget("/api/locales")).locales || [];
   } catch (e) {
     LOCALES = [{ code: "en", label: "English" }];
   }
   const picker = document.querySelector("#lang-picker");
   if (picker) {
-    picker.innerHTML = LOCALES.map(l => `<option value="${l.code}">${l.label}</option>`).join("");
-    const saved = localStorage.getItem("agentgui_lang") ||
+    picker.replaceChildren(...LOCALES.map(locale => {
+      const option = document.createElement("option");
+      option.value = String(locale.code || "");
+      option.textContent = String(locale.label || locale.code || "");
+      return option;
+    }));
+    const stored = localStorage.getItem("agentgui_lang");
+    const saved = (stored && LOCALES.some(l => l.code === stored) ? stored : "") ||
       (LOCALES.some(l => l.code === DEFAULT_LOCALE) ? DEFAULT_LOCALE : (LOCALES[0] || {}).code);
     picker.value = saved || DEFAULT_LOCALE;
     picker.addEventListener("change", () => {
