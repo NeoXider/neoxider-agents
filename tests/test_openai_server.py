@@ -1291,6 +1291,95 @@ class RunRetryAndFallbackTests(unittest.TestCase):
                          usage["prompt_tokens"] + usage["completion_tokens"])
 
 
+class ToolCallNudgeSessionTests(unittest.TestCase):
+    """Synthetic recovery turns must not become client-visible session history."""
+
+    TOOLS = [{"type": "function", "function": {
+        "name": "world_command", "parameters": {"type": "object", "properties": {}}}}]
+    FENCE = '```json\n{"tool_calls":[{"name":"world_command","arguments":{"action":"spawn"}}]}\n```'
+    FIRST_MSGS = [{"role": "user", "content": "spawn a player"}]
+
+    @classmethod
+    def _followup_msgs(cls):
+        return list(cls.FIRST_MSGS) + [
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "call_x", "type": "function",
+                 "function": {"name": "world_command", "arguments": '{"action": "spawn"}'}}]},
+            {"role": "tool", "tool_call_id": "call_x", "content": "spawned"},
+            {"role": "user", "content": "now add a gate"},
+        ]
+
+    def setUp(self):
+        self._saved = (srv.run_agent, srv.reply_agent, srv.read_meta, srv.SESSION, srv.CFG,
+                       srv.PROVIDERS, srv.time.sleep)
+
+        class FakeCfg:
+            engine = "fakeeng"
+            model = "m"
+            effort = ""
+            dir = "/pinned/project"
+            port = 8998
+            timeout = 60
+            session_ttl = 1800
+            retries = 1
+
+        srv.CFG = FakeCfg()
+        srv.PROVIDERS = {"fakeeng": {"supports_resume": True}}
+        srv.SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
+        srv.read_meta = lambda name: {"state": "done"}
+        srv.time.sleep = lambda s: None
+        self.run_prompts, self.run_names, self.reply_answers = [], [], []
+
+    def tearDown(self):
+        (srv.run_agent, srv.reply_agent, srv.read_meta, srv.SESSION, srv.CFG,
+         srv.PROVIDERS, srv.time.sleep) = self._saved
+
+    def _install_fakes(self, reply_answers_in_order):
+        def fake_run(engine, model, effort, workdir, prompt, name, timeout):
+            self.run_prompts.append(prompt)
+            self.run_names.append(name)
+            return "I'll call world_command to spawn the player."
+
+        def fake_reply(engine, model, effort, workdir, name, answer, timeout):
+            self.reply_answers.append(answer)
+            return reply_answers_in_order[len(self.reply_answers) - 1]
+
+        srv.run_agent, srv.reply_agent = fake_run, fake_reply
+
+    def test_synthetic_nudge_never_lands_in_session_messages(self):
+        self._install_fakes([self.FENCE])
+        text, calls, _usage = srv.H._run(object(), list(self.FIRST_MSGS), self.TOOLS)
+        self.assertEqual(calls[0]["function"]["name"], "world_command")
+        # the nudge DID reach the underlying CLI session (as the resume prompt) ...
+        self.assertIn("did not emit a tool call", self.reply_answers[0])
+        # ... but SESSION records only the client-visible history
+        self.assertEqual(srv.SESSION["messages"], self.FIRST_MSGS)
+        self.assertNotIn("did not emit a tool call", json.dumps(srv.SESSION["messages"]))
+        self.assertEqual(srv.SESSION["task_name"], self.run_names[0])
+
+    def test_follow_up_turn_after_nudge_retry_resumes_the_same_task(self):
+        self._install_fakes([self.FENCE, "Gate added."])
+        srv.H._run(object(), list(self.FIRST_MSGS), self.TOOLS)
+        task_after_first = srv.SESSION["task_name"]
+        followup = self._followup_msgs()
+        text, calls, _usage = srv.H._run(object(), followup, self.TOOLS)
+        self.assertIsNone(calls)
+        self.assertEqual(text, "Gate added.")
+        self.assertEqual(srv.SESSION["task_name"], task_after_first)  # resumed, not restarted
+        self.assertEqual(srv.SESSION["messages"], followup)
+        self.assertEqual(len(self.run_names), 1)   # one fresh run total ...
+        self.assertEqual(len(self.reply_answers), 2)  # ... both later turns were replies
+        self.assertEqual(srv.SESSION["dir"], "/pinned/project")
+
+    def test_unsuccessful_nudge_invalidates_the_diverged_cli_session(self):
+        self._install_fakes(["Still no tool call."])
+        text, calls, _usage = srv.H._run(object(), list(self.FIRST_MSGS), self.TOOLS)
+        self.assertIsNone(calls)
+        self.assertIn("world_command", text)
+        self.assertIsNone(srv.SESSION["task_name"])
+        self.assertEqual(srv.SESSION["messages"], self.FIRST_MSGS)
+
+
 class ParametersKeyAliasTests(unittest.TestCase):
     """Haiku 4.5 live spelling #13: "parameters" instead of "arguments" inside the function
     object -- _to_calls silently took EMPTY args and every call failed schema validation."""
@@ -1996,8 +2085,58 @@ class _DoPostHarness(unittest.TestCase):
         srv.H.do_POST(Fake())
 
 
+class TrailingSlashRouteTests(_DoPostHarness):
+    """Documented POST routes accept one cosmetic trailing slash, and nothing broader."""
+
+    def test_one_trailing_slash_accepted_for_all_documented_post_paths(self):
+        for p in ("/chat/completions/", "/v1/chat/completions/", "/reset/", "/v1/reset/"):
+            with self.subTest(path=p):
+                self.hit.clear()
+                self.sent.clear()
+                self._call(p, b'{"messages":[{"role":"user","content":"hi"}]}')
+                self.assertEqual(self.sent, [])
+                self.assertTrue(self.hit)
+
+    def test_trailing_slash_reset_actually_resets(self):
+        self._call("/v1/reset/")
+        self.assertEqual(self.hit, ["reset"])
+
+    def test_doubled_trailing_slash_is_still_a_404(self):
+        self._call("/v1/chat/completions//")
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.sent[0][0], 404)
+        self.assertFalse(self.hit)
+
+
+class ResetBodyGuardTests(_DoPostHarness):
+    """Reset validates its body before changing session state."""
+
+    def test_invalid_json_body_on_reset_is_400_and_does_not_reset(self):
+        raw = b"{not json"
+        self._call("/v1/reset", body=raw, headers={"Content-Length": str(len(raw))})
+        self.assertEqual(self.sent[0][0], 400)
+        self.assertFalse(self.hit)
+
+    def test_non_object_json_body_on_reset_is_400_and_does_not_reset(self):
+        raw = b"[1,2]"
+        self._call("/reset", body=raw, headers={"Content-Length": str(len(raw))})
+        self.assertEqual(self.sent[0][0], 400)
+        self.assertFalse(self.hit)
+
+    def test_absent_body_still_resets(self):
+        self._call("/v1/reset")
+        self.assertFalse(self.sent)
+        self.assertEqual(self.hit, ["reset"])
+
+    def test_valid_json_object_body_resets(self):
+        self._call("/v1/reset", b'{"why": "not"}')
+        self.assertFalse(self.sent)
+        self.assertEqual(self.hit, ["reset"])
+
+
 class PostRoutingTests(_DoPostHarness):
-    """POST accepts only the four documented exact paths; everything else is a 404."""
+    """POST accepts only the four documented exact paths (plus one harmless trailing slash);
+    everything else is a 404."""
 
     def test_documented_paths_are_accepted(self):
         for p in ("/chat/completions", "/v1/chat/completions", "/reset", "/v1/reset"):
@@ -2010,7 +2149,7 @@ class PostRoutingTests(_DoPostHarness):
 
     def test_lookalike_and_unknown_paths_are_404_without_touching_the_session(self):
         for p in ("/x/chat/completions", "/chat/completions/extra", "/API/reset",
-                  "/v2/reset", "/reset/", "/completions", "/foo", "/health/reset"):
+                  "/v2/reset", "/completions", "/foo", "/health/reset"):
             with self.subTest(path=p):
                 self.hit.clear()
                 self.sent.clear()
@@ -2019,10 +2158,14 @@ class PostRoutingTests(_DoPostHarness):
                 self.assertEqual(self.sent[0][0], 404)
                 self.assertFalse(self.hit)
 
-    def test_double_slash_prefix_collapses_to_the_documented_reset_route(self):
-        self._call("//v1/reset")
-        self.assertEqual(self.sent, [])
-        self.assertEqual(self.hit, ["reset"])
+    def test_network_and_absolute_route_forms_are_rejected(self):
+        for p in ("//v1/reset", "//host/v1/reset", "http://host/v1/reset"):
+            with self.subTest(path=p):
+                self.sent.clear()
+                self.hit.clear()
+                self._call(p)
+                self.assertEqual(self.sent[0][0], 404)
+                self.assertFalse(self.hit)
 
 
 class PostBodyGuardTests(_DoPostHarness):
@@ -2172,6 +2315,94 @@ class LoggingTests(unittest.TestCase):
         joined = "\n".join(cm.output)
         self.assertNotIn(secret, joined)
         self.assertNotIn("Authorization", joined)
+
+
+class StreamErrorSafetyTests(unittest.TestCase):
+    """Late failures close SSE without appending a second HTTP response."""
+
+    BODY = b'{"messages":[{"role":"user","content":"hi"}],"stream":true}'
+
+    def _drive(self, sse_started, exc):
+        """Drives do_POST against a fake receiver whose _stream_response raises `exc`;
+        returns (json responses sent, raw bytes written to the stream)."""
+        sent = []
+
+        class FakeCfg:
+            api_key = ""
+
+        orig_cfg = srv.CFG
+        srv.CFG = FakeCfg()
+        holder = {}
+
+        class Fake:
+            _reject_unauthorized = srv.H._reject_unauthorized
+            _read_content_length = srv.H._read_content_length
+            _abort_stream_safely = srv.H._abort_stream_safely
+            _send_json = staticmethod(lambda code, obj: sent.append((code, obj)))
+
+            def __init__(self):
+                self.path = "/v1/chat/completions"
+                self.headers = {"Content-Length": str(len(StreamErrorSafetyTests.BODY))}
+                self.rfile = io.BytesIO(StreamErrorSafetyTests.BODY)
+                self.wfile = io.BytesIO()
+                self._sse_started = sse_started
+                holder["w"] = self.wfile
+
+            def _stream_response(self, messages, tools):
+                raise exc
+
+        try:
+            srv.H.do_POST(Fake())
+        finally:
+            srv.CFG = orig_cfg
+        return sent, holder["w"].getvalue()
+
+    def test_exception_after_sse_started_never_sends_a_second_status_line(self):
+        sent, wfile = self._drive(True, RuntimeError("boom after headers"))
+        self.assertEqual(sent, [], "a 500 JSON response must NOT follow SSE bytes")
+        self.assertTrue(wfile.endswith(b"data: [DONE]\n\n"))
+
+    def test_provider_limit_after_sse_started_also_closes_safely(self):
+        exc = srv.ProviderLimitError("You've hit your session limit")
+        sent, wfile = self._drive(True, exc)
+        self.assertEqual(sent, [])
+        self.assertTrue(wfile.endswith(b"data: [DONE]\n\n"))
+
+    def test_exception_before_any_byte_still_gets_openai_style_500(self):
+        sent, wfile = self._drive(False, RuntimeError("boom"))
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][0], 500)
+        self.assertIn("bridge failure", sent[0][1]["error"]["message"])
+        self.assertIn("server_error", sent[0][1]["error"]["type"])
+        self.assertEqual(wfile, b"", "no stream bytes may be written on the sync error path")
+
+    def test_real_sse_headers_mark_the_response_as_started(self):
+        class Fake:
+            _sse_headers = srv.H._sse_headers
+
+            def send_response(self, code):
+                pass
+
+            def send_header(self, k, v):
+                pass
+
+            def end_headers(self):
+                pass
+
+        f = Fake()
+        f._sse_headers()
+        self.assertTrue(getattr(f, "_sse_started", False))
+        self.assertTrue(f.close_connection)
+
+    def test_abort_is_best_effort_when_stream_is_already_closed(self):
+        class Closed:
+            def write(self, _data):
+                raise ValueError("closed")
+
+        class Fake:
+            wfile = Closed()
+
+        srv.H._abort_stream_safely(Fake())
 
 
 class PortArgTests(unittest.TestCase):

@@ -16,7 +16,17 @@ All notable changes to this project are documented here. Format follows
   instance identities, reject unsafe PID values, and preserve the registry while aborting restart
   whenever health, identity, or termination cannot be verified.
 - **shell: shared Python/mtime/wait classifier.** Centralize Python discovery, portable file mtime,
-  and final-line input-request classification instead of keeping provider-specific copies.
+  and closing-window input-request classification. All Python entrypoints use the same
+  Windows-aware resolver and fail clearly when no interpreter runs.
+- **shell: safe dispatch and retry state.** Validate engines before writing task artifacts, reject
+  unknown task names in `reply`, validate retry delay, and replace broken control-byte boundaries
+  in the transient-failure classifier.
+- **openai-server: session and SSE recovery.** Synthetic tool-call nudges no longer poison later
+  resume, and late streaming failures close with `[DONE]` instead of a second HTTP response.
+- **openai-server: strict canonical POST routes.** Accept the four documented routes with at most
+  one trailing slash; reject prefixes, network-path forms, and extra segments.
+- **gui: honest legacy bridge restart.** Omit missing `instance_id` values so unverifiable legacy
+  rows reach the existing fail-closed backend path without a misleading identity mismatch.
 
 ### Changed
 
@@ -24,6 +34,11 @@ All notable changes to this project are documented here. Format follows
   and duplicated provider helpers left from earlier iterations.
 - **logging: safe diagnostics.** HTTP request diagnostics are DEBUG opt-in; default warnings expose
   failure type/status only and never log request bodies, prompts, auth headers, or API keys.
+
+### Removed
+
+- **gui: orphan `POST /api/test-api` endpoint.** Its panel tab was removed in 0.2.0 but the backend
+  handler survived; the CLI `agent.sh test-api` command remains the supported path.
 
 ## [0.3.0] - 2026-08-13
 

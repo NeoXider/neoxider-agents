@@ -1274,6 +1274,18 @@ class RestartBridgeTests(unittest.TestCase):
         self.assertEqual(self.spawned, [])
         self.assertTrue(os.path.exists(self._rec_path(port)))
 
+    def test_restart_legacy_record_without_instance_id_fails_closed_honestly(self):
+        """An id-less legacy record cannot authorize a kill or restart."""
+        port = self._free_port()
+        self._write_rec(port, instance_id=None)
+        gui._bridge_health = lambda url: {"instance_id": "some-live-id"}
+        r = gui.restart_bridge({"port": port, "engine": "codex"})  # no instance_id, like the fixed JS
+        self.assertIn("error", r)
+        self.assertIn("could not verify", r["error"])
+        self.assertNotIn("mismatch", r["error"])
+        self.assertEqual(self.spawned, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
     def test_restart_aborts_on_kill_failure_without_spawning(self):
         port = self._free_port()
         self._write_rec(port)
@@ -1333,6 +1345,99 @@ class BridgeStopRouteTests(unittest.TestCase):
             gui.stop_bridge = orig
         self.assertEqual(seen, [(8899, "IID-8899")])
         self.assertEqual(json.loads(sent[0][1])["killed"], True)
+
+
+class BridgeRestartRouteTests(unittest.TestCase):
+    """The restart endpoint forwards the validated body unchanged."""
+
+    def test_route_forwards_body_to_restart_bridge(self):
+        seen = []
+
+        def fake_restart(data):
+            seen.append(dict(data))
+            return {"ok": True, "port": data["port"]}
+
+        orig = gui.restart_bridge
+        gui.restart_bridge = fake_restart
+        try:
+            sent = []
+
+            class Fake:
+                client_address = ("127.0.0.1", 4242)
+                _reject_unauthorized = gui.H._reject_unauthorized
+                _read_json_object_body = gui.H._read_json_object_body
+
+                def __init__(self):
+                    body = json.dumps({"port": 8899, "engine": "codex",
+                                       "instance_id": "IID-8899"}).encode()
+                    self.path = "/api/bridge/restart"
+                    self.headers = {"Content-Length": str(len(body))}
+                    self.rfile = io.BytesIO(body)
+
+                def _send(self, code, body_, ctype="application/json"):
+                    sent.append((code, body_))
+
+            gui.H.do_POST(Fake())
+        finally:
+            gui.restart_bridge = orig
+        self.assertEqual(seen, [{"port": 8899, "engine": "codex", "instance_id": "IID-8899"}])
+        self.assertEqual(json.loads(sent[0][1])["ok"], True)
+
+
+class ApiTestRouteRemovedTests(unittest.TestCase):
+    """The dead GUI endpoint stays gone while CLI-created task rows remain visible."""
+
+    def _post(self, path, body=b"{}"):
+        sent = []
+
+        class Fake:
+            client_address = ("127.0.0.1", 4242)
+            _reject_unauthorized = gui.H._reject_unauthorized
+            _read_json_object_body = gui.H._read_json_object_body
+
+            def __init__(self):
+                self.path = path
+                self.headers = {"Content-Length": str(len(body))}
+                self.rfile = io.BytesIO(body)
+
+            def _send(self, code, body_, ctype="application/json"):
+                sent.append((code, body_))
+
+        gui.H.do_POST(Fake())
+        return sent
+
+    def test_post_test_api_is_404_not_found(self):
+        body = json.dumps({"base_url": "http://127.0.0.1:9", "goal": "probe it"}).encode()
+        self.assertEqual(self._post("/api/test-api", body)[0][0], 404)
+
+    def test_get_test_api_is_404_too(self):
+        sent = []
+
+        class Fake:
+            path = "/api/test-api"
+            client_address = ("127.0.0.1", 4242)
+            headers = {}
+            _reject_unauthorized = gui.H._reject_unauthorized
+
+            def _send(self, code, body_, ctype="application/json"):
+                sent.append((code, body_))
+
+        gui.H.do_GET(Fake())
+        self.assertEqual(sent[0][0], 404)
+
+    def test_kind_api_test_rows_still_display_from_cli_meta(self):
+        scratch = tempfile.mkdtemp()
+        orig = gui.LOGDIR
+        gui.LOGDIR = scratch
+        try:
+            with open(os.path.join(scratch, "api-test-123.meta"), "w", encoding="utf-8") as f:
+                f.write("engine=codex\nmodel=sol\nstate=done\nkind=api-test\n")
+            tasks = [t for t in gui.list_tasks() if t["name"] == "api-test-123"]
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0]["kind"], "api-test")
+        finally:
+            gui.LOGDIR = orig
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 class GuiPostBodyGuardTests(unittest.TestCase):
