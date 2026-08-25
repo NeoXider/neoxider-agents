@@ -4,7 +4,11 @@
 function syncModels() {
   const e = $("#f-engine").value;
   const p = PROVIDERS[e] || {};
-  $("#models").innerHTML = (p.models || []).map(m => `<option value="${m}">`).join("");
+  $("#models").replaceChildren(...(p.models || []).map(model => {
+    const option = document.createElement("option");
+    option.value = String(model);
+    return option;
+  }));
   $("#f-model").placeholder = p.resolved_label ? t("form.auto") + " → " + p.resolved_label : p.default_model ? t("form.auto") + " (" + p.default_model + ")" : t("form.auto");
 
   const effSel = $("#f-effort");
@@ -56,7 +60,10 @@ async function submitRun() {
 
 async function sendReply() {
   const a = $("#answer").value.trim();
-  if (!a || !SEL) return;
+  if (!a || !SEL || !CURRENT_TASKS.has(SEL)) {
+    if (SEL && !CURRENT_TASKS.has(SEL)) clearDeletedSelection();
+    return;
+  }
   const btn = $("#btn-reply");
   const old = btn.innerHTML;
   btn.disabled = true;
@@ -81,13 +88,35 @@ $("#answer").addEventListener("keydown", e => {
 /* ---------- limits panel (for the selected provider); cached server-side, with a manual
    refresh button that bypasses the cache. Never blanks the panel while refreshing -- keeps
    showing the last-known-good data with a small inline spinner until new data arrives. ---------- */
+let providerController = null, providerRequestId = 0;
 async function loadProvider(force) {
   const e = $("#f-engine").value || "codex";
-  $("#lim-title").innerHTML = `${t("limits.title")} · ${(PROVIDERS[e] || {}).label || e}
-    <button class="mini icon" onclick="loadProvider(true)" data-i18n-title="limits.refresh" title="${t("limits.refresh")}">⟳</button>`;
+  if (providerController) providerController.abort();
+  const controller = new AbortController();
+  providerController = controller;
+  const requestId = ++providerRequestId;
+  const title = $("#lim-title");
+  title.textContent = `${t("limits.title")} · ${(PROVIDERS[e] || {}).label || e} `;
+  const refreshButton = document.createElement("button");
+  refreshButton.className = "mini icon";
+  refreshButton.title = t("limits.refresh");
+  refreshButton.textContent = "⟳";
+  refreshButton.addEventListener("click", () => loadProvider(true));
+  title.appendChild(refreshButton);
   const box = $("#limits");
   if (!box.dataset.loaded) box.innerHTML = `<span class="empty">${spin(t("limits.loading"))}</span>`;
-  const d = await jget("/api/provider?engine=" + encodeURIComponent(e) + (force ? "&force=1" : ""));
+  let d;
+  try {
+    d = await jget("/api/provider?engine=" + encodeURIComponent(e) + (force ? "&force=1" : ""),
+      { signal: controller.signal });
+  } catch (err) {
+    if (err.name === "AbortError") return;
+    throw err;
+  } finally {
+    if (providerController === controller) providerController = null;
+  }
+  if (requestId !== providerRequestId || controller.signal.aborted ||
+      ($("#f-engine").value || "codex") !== e) return;
   if (!d.available) {
     box.innerHTML = `<span class="empty">${esc(e)} ${t("limits.not_found")}</span>`;
     box.dataset.loaded = "1";
@@ -120,17 +149,38 @@ async function loadProvider(force) {
 
 /* re-render whatever's currently dynamic when the language changes (static text is handled by
    applyI18n()'s data-i18n scan; these bits build their own HTML strings with t() baked in) */
-function onLocaleChanged() {
+async function onLocaleChanged() {
   syncModels();
-  if (SEL) { lastLog = ""; refresh(); }
+  if (SEL) { lastLog = ""; await refresh(); }
   if (typeof syncBridgeModels === "function" && $("#brg-engine") && $("#brg-engine").options.length) {
-    syncBridgeModels();
-    if (localStorage.getItem("agentgui_tab") === "bridge") refreshBridgeTab();
+    await syncBridgeModels();
+    if (localStorage.getItem("agentgui_tab") === "bridge") await refreshBridgeTab();
   }
 }
 
 makeResizer("rez-left", "left", "left");
 makeResizer("rez-right", "right", "right");
+
+$("#btn-doctor").addEventListener("click", () => openDoctor());
+$("#btn-history").addEventListener("click", openHistory);
+$("#btn-refresh").addEventListener("click", refresh);
+document.querySelectorAll(".tabbtn[data-tab]").forEach(button =>
+  button.addEventListener("click", () => switchTab(button.dataset.tab)));
+$("#btn-add-project").addEventListener("click", () => openBrowse("add-project"));
+$("#btn-reply").addEventListener("click", sendReply);
+$("#btn-pick-field").addEventListener("click", () => openBrowse("pick-field"));
+$("#f-engine").addEventListener("change", syncModels);
+$("#btn-run").addEventListener("click", submitRun);
+$("#brg-engine").addEventListener("change", syncBridgeModels);
+$("#btn-pick-bridge").addEventListener("click", () => openBrowse("pick-bridge"));
+$("#btn-brg-start").addEventListener("click", submitBridgeStart);
+$("#btn-brg-refresh").addEventListener("click", refreshBridgeTab);
+$("#btn-doctor-refresh").addEventListener("click", refreshDoctor);
+$("#btn-doctor-deep").addEventListener("click", deepDoctor);
+$("#btn-history-clear").addEventListener("click", clearHistory);
+$("#btn-browse-choose").addEventListener("click", chooseBrowsed);
+document.querySelectorAll("[data-close-modal]").forEach(button =>
+  button.addEventListener("click", () => closeModal(button.dataset.closeModal)));
 
 (async function init() {
   await initI18n();
@@ -142,7 +192,12 @@ makeResizer("rez-right", "right", "right");
   if (savedTab !== "tasks" && savedTab !== "bridge") savedTab = "tasks";  // migrate the removed "api" tab
   if (!$("#brg-engine").options.length) {
     // default the bridge provider to opencode + big-pickle when present (its dynamic catalog is the point)
-    $("#brg-engine").innerHTML = ENGINES.map(e => `<option value="${e}">${esc((PROVIDERS[e] || {}).label || e)}</option>`).join("");
+    $("#brg-engine").replaceChildren(...ENGINES.map(engine => {
+      const option = document.createElement("option");
+      option.value = engine;
+      option.textContent = (PROVIDERS[engine] || {}).label || engine;
+      return option;
+    }));
     if (ENGINES.includes("opencode")) {
       $("#brg-engine").value = "opencode";
       if (!$("#brg-model").value) $("#brg-model").value = "opencode/big-pickle";

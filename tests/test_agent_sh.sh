@@ -14,8 +14,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE" || exit 1
 
 # --- scratch LOGDIR: never touch the real ~/.claude/agent-cli-logs -----------------------
-SCRATCH_LOGDIR="$(mktemp -d)"
-cleanup() { rm -rf "$SCRATCH_LOGDIR"; }
+SCRATCH_LOGDIR="$(mktemp -d)" || { echo "FAIL: mktemp could not create the test scratch directory" >&2; exit 1; }
+if [ -z "$SCRATCH_LOGDIR" ] || [ ! -d "$SCRATCH_LOGDIR" ]; then
+    echo "FAIL: mktemp returned an empty or invalid test scratch directory" >&2
+    exit 1
+fi
+cleanup() {
+    case "${SCRATCH_LOGDIR:-}" in ''|/|.|..) echo "REFUSING unsafe test cleanup target: '${SCRATCH_LOGDIR:-}'" >&2; return 1 ;; esac
+    rm -rf -- "$SCRATCH_LOGDIR"
+}
 trap cleanup EXIT
 
 export AGENT_CLI_LOGS="$SCRATCH_LOGDIR"
@@ -26,6 +33,14 @@ export AGENT_CLI_LOGS="$SCRATCH_LOGDIR"
 # script just returns control to us instead of exiting this test process.
 # shellcheck disable=SC1091
 source "$HERE/agent.sh" list >/dev/null 2>&1
+
+# agent logs can contain prompts, source, paths and provider diagnostics. Newly created state must
+# stay owner-only even when the invoking shell starts with a permissive umask.
+PERM_LOGDIR="$SCRATCH_LOGDIR/permissions"
+( umask 022; AGENT_CLI_LOGS="$PERM_LOGDIR" source "$HERE/agent.sh" list >/dev/null 2>&1; meta_set secret_task token secret )
+perm_dir="$(stat -c '%a' "$PERM_LOGDIR" 2>/dev/null || stat -f '%Lp' "$PERM_LOGDIR" 2>/dev/null)"
+perm_meta="$(stat -c '%a' "$PERM_LOGDIR/secret_task.meta" 2>/dev/null || stat -f '%Lp' "$PERM_LOGDIR/secret_task.meta" 2>/dev/null)"
+preserved_umask="$(umask 022; AGENT_CLI_LOGS="$SCRATCH_LOGDIR/umask-preserved" source "$HERE/agent.sh" list >/dev/null 2>&1; umask)"
 
 # --- tiny assert framework ----------------------------------------------------------------
 PASS=0
@@ -52,11 +67,23 @@ assert_match() {
     fi
 }
 
+assert_private_mode() {
+    local desc="$1" expected="$2" actual="$3"
+    case "$(uname -s 2>/dev/null)" in
+        MINGW*|MSYS*) pass "$desc (POSIX mode bits are not observable on Git Bash/NTFS)" ;;
+        *) assert_eq "$desc" "$expected" "$actual" ;;
+    esac
+}
+
 section() { echo; echo "=== $1 ==="; }
 
 # ============================================================================================
 section "meta_set / meta_get round-trip"
 # ============================================================================================
+
+assert_private_mode "LOGDIR created under umask 022 is owner-only" "700" "$perm_dir"
+assert_private_mode "metadata created under umask 022 is owner-only" "600" "$perm_meta"
+assert_eq "sourcing agent.sh preserves the caller umask" "0022" "$preserved_umask"
 
 meta_set roundtrip_task foo "hello world"
 assert_eq "meta_get returns the value that was set" "hello world" "$(meta_get roundtrip_task foo)"
@@ -100,7 +127,7 @@ section "meta_set concurrency (regression test for the mkdir-mutex fix)"
 CONC_TASK="concurrent_task"
 N=10
 pids=()
-for i in $(seq 1 "$N"); do
+for ((i=1; i<=N; i++)); do
     ( meta_set "$CONC_TASK" "key$i" "val$i" ) &
     pids+=("$!")
 done
@@ -109,7 +136,7 @@ for p in "${pids[@]}"; do
 done
 
 survived=0
-for i in $(seq 1 "$N"); do
+for ((i=1; i<=N; i++)); do
     v="$(meta_get "$CONC_TASK" "key$i")"
     if [ "$v" = "val$i" ]; then
         survived=$((survived + 1))
@@ -383,7 +410,7 @@ OPENCODE_STREAM_FILE="$SCRATCH_LOGDIR/opencode-stream"
     } | _provider_opencode_emit > "$OPENCODE_STREAM_FILE"
 ) &
 opencode_stream_pid=$!
-for _ in $(seq 1 15); do
+for ((poll_i=1; poll_i<=15; poll_i++)); do
     [ -s "$OPENCODE_STREAM_FILE" ] && break
     sleep 0.1
 done
@@ -424,6 +451,13 @@ assert_match "opencode provider keeps prefixed stderr diagnostics" \
 unset -f opencode
 unset AGENT_OPENCODE_TIMEOUT_SEC
 
+AGENT_OPENCODE_CHATONLY_CONFIG="$SCRATCH_LOGDIR/weakened.json"
+opencode_expected_config="$HERE/providers/opencode/chat-only.json"
+command -v cygpath >/dev/null 2>&1 && opencode_expected_config="$(cygpath -m "$opencode_expected_config")"
+assert_eq "opencode chat-only config cannot be replaced by an environment override" \
+    "$opencode_expected_config" "$(_provider_opencode_chatonly_config)"
+unset AGENT_OPENCODE_CHATONLY_CONFIG
+
 # A real executable test double exercises GNU timeout (shell functions cannot be exec'd by timeout).
 OPENCODE_FAKE_BIN="$SCRATCH_LOGDIR/opencode-bin"
 mkdir -p "$OPENCODE_FAKE_BIN"
@@ -453,7 +487,7 @@ section "AGENT_CHAT_ONLY sandboxing (codex + claude provider flags)"
 # access to do real coding work. Verified LIVE (not just here) that --sandbox read-only blocks a
 # real file write without hanging, and --ignore-user-config empties codex's configured MCP servers
 # (a real unityMCP call otherwise succeeded even with `-c mcp_servers={}`); and that claude's
-# --strict-mcp-config + --disallowedTools blocks a real file write/MCP use without hanging or
+# --strict-mcp-config + an empty --tools set blocks real file/MCP use without denylist drift or
 # breaking the tool-calling prompt. These assertions just lock in the FLAG WIRING so a refactor
 # can't silently drop it; the "does it actually restrict" claim is a live/manual check, not here.
 
@@ -518,9 +552,8 @@ assert_eq "claude default (no AGENT_CHAT_ONLY): no extra flags" "" "$claude_defa
 AGENT_CHAT_ONLY=1
 mapfile -t claude_chatonly < <(_provider_claude_chatonly_args)
 assert_eq "claude chat-only: adds strict-mcp-config" "--strict-mcp-config" "${claude_chatonly[0]}"
-assert_eq "claude chat-only: adds disallowedTools flag" "--disallowedTools" "${claude_chatonly[1]}"
-assert_match "claude chat-only: denylist blocks Bash/Edit/Write/Task/Web*" \
-    'Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch' "${claude_chatonly[2]}"
+assert_eq "claude chat-only: uses the CLI's fail-closed zero-tools flag" "--tools" "${claude_chatonly[1]}"
+assert_eq "claude chat-only: passes an empty tool set (no denylist drift)" "" "${claude_chatonly[2]}"
 unset AGENT_CHAT_ONLY
 
 # ============================================================================================
@@ -666,6 +699,246 @@ if printf '%s' "$clean_out" | grep -q 'st_clean_idle'; then
 else
     pass "clean skips an idle task exactly like a running one"
 fi
+
+# ============================================================================================
+section "task-name safety and option operand errors"
+# ============================================================================================
+
+for bad_name in '../escape' 'bad/name' 'bad\name' '-option' '.hidden' '_leading' '.' '..' 'has space' $'control\nname'; do
+    bad_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" run -t "$bad_name" "hi" 2>&1)"
+    bad_rc=$?
+    assert_eq "invalid task name exits non-zero: [$bad_name]" "1" "$bad_rc"
+    assert_match "invalid task name is explained: [$bad_name]" 'invalid task name|needs an operand' "$bad_out"
+done
+if [ -e "$SCRATCH_LOGDIR/escape.meta" ] || [ -e "$SCRATCH_LOGDIR/escape.log" ]; then
+    fail "invalid traversal task name created an artifact"
+else
+    pass "invalid task names create/truncate no task artifacts"
+fi
+
+for invocation in 'run -t' 'run -e' 'run -C' 'log -n'; do
+    operand_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" $invocation 2>&1)"
+    operand_rc=$?
+    assert_eq "missing option operand is a usage error: $invocation" "1" "$operand_rc"
+    assert_match "missing option operand never becomes an unbound-variable crash: $invocation" 'needs an operand' "$operand_out"
+done
+
+# Exact task names win even when they look like provider session identifiers.
+printf 'engine=opencode\nmodel=exact-model\ndir=%s\nstate=done\n' "$SCRATCH_LOGDIR" > "$SCRATCH_LOGDIR/ses_exact.meta"
+printf 'engine=gemini\nsession=ses_exact\ndir=%s\nstate=done\n' "$SCRATCH_LOGDIR" > "$SCRATCH_LOGDIR/session_decoy.meta"
+exact_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" reply ses_exact continue 2>&1)"
+assert_match "session-looking exact task name is resolved before session lookup" \
+    "engine 'opencode'.*task 'ses_exact'" "$exact_out"
+
+# No `ls` parsing: a LOGDIR containing spaces still supports latest/list correctly.
+SPACE_LOGDIR="$SCRATCH_LOGDIR/log dir with spaces"
+mkdir -p "$SPACE_LOGDIR"
+printf 'engine=codex\nmodel=m1\nstate=done\n' > "$SPACE_LOGDIR/older.meta"
+sleep 1
+printf 'engine=claude\nmodel=m2\nstate=done\n' > "$SPACE_LOGDIR/newer.meta"
+space_list="$(AGENT_CLI_LOGS="$SPACE_LOGDIR" bash "$HERE/agent.sh" list 2>&1)"
+assert_match "list works when AGENT_CLI_LOGS contains spaces" 'newer.*claude.*m2' "$space_list"
+space_status="$(AGENT_CLI_LOGS="$SPACE_LOGDIR" bash "$HERE/agent.sh" status 2>&1)"
+assert_match "latest task works when AGENT_CLI_LOGS contains spaces" 'task=newer' "$space_status"
+
+# Legacy versions could crash after creating owner.<token> but before printf wrote pid/token. Empty
+# published state is recoverable after the grace period; the new protocol tested below cannot
+# publish such a state at all. Every blocking regression uses agent.sh's own bounded watchdog.
+EMPTY_PRIMARY_TASK="empty_primary_owner_task"
+EMPTY_PRIMARY_OWNER="$SCRATCH_LOGDIR/$EMPTY_PRIMARY_TASK.meta.lock.d/owner.crashed-primary"
+mkdir "$SCRATCH_LOGDIR/$EMPTY_PRIMARY_TASK.meta.lock.d"
+: > "$EMPTY_PRIMARY_OWNER"
+touch -d '@1' "$EMPTY_PRIMARY_OWNER" 2>/dev/null || touch -t 197001010000 "$EMPTY_PRIMARY_OWNER"
+_guarded_run 5 meta_set "$EMPTY_PRIMARY_TASK" recovered primary >/dev/null 2>&1
+empty_primary_rc=$?
+assert_eq "aged empty primary owner is recovered within the bounded watchdog" "0" "$empty_primary_rc"
+assert_eq "writer commits after recovering an aged empty primary owner" \
+    "primary" "$(meta_get "$EMPTY_PRIMARY_TASK" recovered)"
+
+FRESH_PRIMARY_TASK="fresh_empty_primary_owner_task"
+FRESH_PRIMARY_OWNER="$SCRATCH_LOGDIR/$FRESH_PRIMARY_TASK.meta.lock.d/owner.live-create"
+mkdir "$SCRATCH_LOGDIR/$FRESH_PRIMARY_TASK.meta.lock.d"
+: > "$FRESH_PRIMARY_OWNER"
+_guarded_run 5 meta_set "$FRESH_PRIMARY_TASK" after_release preserved >/dev/null 2>&1 &
+fresh_primary_waiter=$!
+sleep 0.3
+if kill -0 "$fresh_primary_waiter" 2>/dev/null && [ -e "$FRESH_PRIMARY_OWNER" ]; then
+    pass "fresh empty primary owner is not reclaimed while its creator may still fill it"
+else
+    fail "fresh empty primary owner was stolen before the grace period"
+fi
+rm -- "$FRESH_PRIMARY_OWNER"
+rmdir "$SCRATCH_LOGDIR/$FRESH_PRIMARY_TASK.meta.lock.d"
+wait "$fresh_primary_waiter"
+fresh_primary_rc=$?
+assert_eq "writer finishes after a fresh empty primary generation is released" "0" "$fresh_primary_rc"
+
+# Deterministically pause a creator after its owner is complete but before atomic publication. The
+# fixed lock must still be absent, so another writer can acquire/release it; when the first creator
+# resumes, both updates survive. This is the exact old read/mtime -> creator resumes -> rm/mv window.
+PUBLICATION_TASK="atomic_publication_task"
+PUBLICATION_LOCK="$SCRATCH_LOGDIR/$PUBLICATION_TASK.meta.lock.d"
+PUBLICATION_HOOK_DIR="$SCRATCH_LOGDIR/publication-hook-once"
+PUBLICATION_READY="$SCRATCH_LOGDIR/publication-ready"
+PUBLICATION_RESUME="$SCRATCH_LOGDIR/publication-resume"
+_meta_lock_before_publish_hook() {
+    if mkdir "$PUBLICATION_HOOK_DIR" 2>/dev/null; then
+        : > "$PUBLICATION_READY"
+        while [ ! -e "$PUBLICATION_RESUME" ]; do sleep 0.05; done
+    fi
+}
+_guarded_run 8 meta_set "$PUBLICATION_TASK" paused_creator resumed >/dev/null 2>&1 &
+publication_creator=$!
+publication_ready=0
+for ((poll_i=0; poll_i<50; poll_i++)); do
+    [ -e "$PUBLICATION_READY" ] && { publication_ready=1; break; }
+    sleep 0.1
+done
+assert_eq "creator reaches the deterministic pre-publication pause" "1" "$publication_ready"
+if [ ! -e "$PUBLICATION_LOCK" ] && compgen -G "$PUBLICATION_LOCK.candidate.*" >/dev/null; then
+    pass "fully prepared candidate remains private until atomic publication"
+else
+    fail "pre-publication pause exposed a partial fixed lock generation"
+fi
+_guarded_run 5 meta_set "$PUBLICATION_TASK" rival_writer committed >/dev/null 2>&1
+publication_rival_rc=$?
+assert_eq "rival writer completes while the first creator is paused before publication" "0" "$publication_rival_rc"
+: > "$PUBLICATION_RESUME"
+wait "$publication_creator"
+publication_creator_rc=$?
+unset -f _meta_lock_before_publish_hook
+assert_eq "paused creator resumes and acquires a later complete generation" "0" "$publication_creator_rc"
+assert_eq "rival update survives creator resume" "committed" "$(meta_get "$PUBLICATION_TASK" rival_writer)"
+assert_eq "resumed creator update survives rival publication" "resumed" "$(meta_get "$PUBLICATION_TASK" paused_creator)"
+
+# A loser can itself pause after POSIX mv has nested its candidate under the winner. Once the winner
+# unlocks there is no top-level owner, so that nested directory cannot block a third writer merely
+# because the loser's PID is alive. The third writer removes the non-owning candidate; the loser
+# later resumes, observes no ownership, and retries normally.
+NESTED_TASK="paused_nested_loser_task"
+NESTED_FILE="$SCRATCH_LOGDIR/$NESTED_TASK.meta"
+NESTED_LOCK="$NESTED_FILE.lock.d"
+NESTED_WINNER_STATE="$NESTED_LOCK/owner.synthetic-winner"
+NESTED_HOOK_ONCE="$SCRATCH_LOGDIR/nested-hook-once"
+NESTED_READY="$SCRATCH_LOGDIR/nested-ready"
+NESTED_RESUME="$SCRATCH_LOGDIR/nested-resume"
+_meta_lock_before_publish_hook() {
+    if mkdir "$NESTED_HOOK_ONCE" 2>/dev/null; then
+        mkdir "$2"
+        printf '%s %s\n' "$$" synthetic-winner > "$NESTED_WINNER_STATE"
+    fi
+}
+_meta_lock_after_nested_publish_hook() {
+    : > "$NESTED_READY"
+    while [ ! -e "$NESTED_RESUME" ]; do sleep 0.05; done
+}
+_guarded_run 15 meta_set "$NESTED_TASK" paused_loser resumed >/dev/null 2>&1 &
+nested_loser=$!
+nested_ready=0
+for ((poll_i=0; poll_i<50; poll_i++)); do
+    [ -e "$NESTED_READY" ] && { nested_ready=1; break; }
+    sleep 0.1
+done
+assert_eq "loser reaches the deterministic post-nested-mv pause" "1" "$nested_ready"
+unset -f _meta_lock_before_publish_hook
+_META_LOCK_STATE="$NESTED_WINNER_STATE"
+_META_LOCK_TOKEN=synthetic-winner
+_meta_unlock "$NESTED_FILE"
+if [ -d "$NESTED_LOCK" ] && [ ! -e "$NESTED_WINNER_STATE" ]; then
+    pass "winner unlock leaves only the paused loser's non-owning nested candidate"
+else
+    fail "nested-loser fixture did not reach the ownerless fixed-lock state"
+fi
+_guarded_run 5 meta_set "$NESTED_TASK" third_writer progressed >/dev/null 2>&1
+nested_third_rc=$?
+assert_eq "third writer progresses past a live paused nested loser" "0" "$nested_third_rc"
+: > "$NESTED_RESUME"
+wait "$nested_loser"
+nested_loser_rc=$?
+unset -f _meta_lock_after_nested_publish_hook
+assert_eq "paused nested loser resumes and retries acquisition" "0" "$nested_loser_rc"
+assert_eq "third writer update survives nested-loser recovery" \
+    "progressed" "$(meta_get "$NESTED_TASK" third_writer)"
+assert_eq "resumed nested loser update survives its retry" \
+    "resumed" "$(meta_get "$NESTED_TASK" paused_loser)"
+
+# An abandoned recovery mutex from the old two-level protocol is now irrelevant: the atomic
+# publication protocol has no recovery gate, so even a fresh empty legacy owner cannot block it.
+LEGACY_RECOVERY_TASK="legacy_recovery_owner_task"
+LEGACY_RECOVERY_OWNER="$SCRATCH_LOGDIR/$LEGACY_RECOVERY_TASK.meta.lock.recover.d/owner.crashed-recovery"
+mkdir "$SCRATCH_LOGDIR/$LEGACY_RECOVERY_TASK.meta.lock.recover.d"
+: > "$LEGACY_RECOVERY_OWNER"
+_guarded_run 5 meta_set "$LEGACY_RECOVERY_TASK" recovered without_gate >/dev/null 2>&1
+legacy_recovery_rc=$?
+assert_eq "legacy empty recovery owner cannot block the new protocol" "0" "$legacy_recovery_rc"
+assert_eq "writer commits without a secondary recovery gate" \
+    "without_gate" "$(meta_get "$LEGACY_RECOVERY_TASK" recovered)"
+
+# Atomic publication must still serialize a full 20-writer collision after reclaiming one legacy
+# aged empty primary generation.
+STALE_TASK="stale_lock_stress_task"
+STALE_PRIMARY_OWNER="$SCRATCH_LOGDIR/$STALE_TASK.meta.lock.d/owner.crashed-primary"
+mkdir "$SCRATCH_LOGDIR/$STALE_TASK.meta.lock.d"
+: > "$STALE_PRIMARY_OWNER"
+touch -d '@1' "$STALE_PRIMARY_OWNER" 2>/dev/null || touch -t 197001010000 "$STALE_PRIMARY_OWNER"
+run_stale_lock_stress() {
+    local i p failures=0
+    local stress_pids=()
+    for ((i=1; i<=20; i++)); do
+        ( meta_set "$STALE_TASK" "stale$i" "value$i" ) &
+        stress_pids+=("$!")
+    done
+    for p in "${stress_pids[@]}"; do
+        wait "$p" || failures=$((failures + 1))
+    done
+    [ "$failures" = 0 ]
+}
+_guarded_run 30 run_stale_lock_stress >/dev/null 2>&1
+stale_stress_rc=$?
+unset -f run_stale_lock_stress
+assert_eq "20 concurrent atomic-publication writers finish within the bounded watchdog" "0" "$stale_stress_rc"
+stale_survived=0
+for ((i=1; i<=20; i++)); do
+    [ "$(meta_get "$STALE_TASK" "stale$i")" = "value$i" ] && stale_survived=$((stale_survived + 1))
+done
+assert_eq "all 20 concurrent atomic-publication writers retain their keys" "20" "$stale_survived"
+if compgen -G "$SCRATCH_LOGDIR/*.meta.lock.d.candidate.*" >/dev/null; then
+    fail "atomic publication left a sibling candidate directory after the 20-writer stress"
+else
+    pass "atomic publication leaves no sibling candidate directories after 20 writers"
+fi
+if [ -d "$SCRATCH_LOGDIR/$STALE_TASK.meta.lock.d" ]; then
+    fail "stale-owner recovery left a primary lock directory behind"
+else
+    pass "stale-owner recovery releases the reacquired primary lock"
+fi
+
+# An old timestamp alone never makes a live owner recoverable. A waiting writer must leave the live
+# generation intact, then complete normally after that owner releases it.
+LIVE_TASK="live_lock_task"
+LIVE_FILE="$SCRATCH_LOGDIR/$LIVE_TASK.meta"
+_meta_lock "$LIVE_FILE"
+live_state="$_META_LOCK_STATE"
+touch -d '@1' "$live_state" 2>/dev/null || touch -t 197001010000 "$live_state"
+( meta_set "$LIVE_TASK" after_release preserved ) &
+live_waiter=$!
+sleep 0.3
+if kill -0 "$live_waiter" 2>/dev/null && [ -r "$live_state" ]; then
+    pass "stale-age recovery does not claim a lock whose owner PID is alive"
+else
+    fail "stale-age recovery disturbed a live lock owner"
+fi
+_meta_unlock "$LIVE_FILE"
+wait "$live_waiter"
+assert_eq "waiting writer commits after the live owner releases the lock" \
+    "preserved" "$(meta_get "$LIVE_TASK" after_release)"
+
+# Per-writer temporary files must never survive a successful metadata update.
+if compgen -G "$SCRATCH_LOGDIR/*.meta.tmp.*" >/dev/null; then
+    fail "meta_set left per-writer temporary files behind"
+else
+    pass "meta_set leaves no per-writer temporary files behind"
+fi
 rm -f "$SCRATCH_LOGDIR/st_clean_idle.md"
 
 # ============================================================================================
@@ -776,6 +1049,10 @@ LOOKS_WAITING_POSITIVE=(
     "подтверди продолжение."
     "как мне поступить дальше?"
     "какой из вариантов тебе нужен?"
+    "Продолжаем?"
+    "Что выбрать?"
+    "¿Continuamos?"
+    "你好?"
     'Continue? (yes/no)'
     'Ready?"'
     "y?"
@@ -799,6 +1076,9 @@ LOOKS_WAITING_NEGATIVE=(
     "This section documents which options the CLI supports."
     "Below we describe which of these approaches fits each case."
     "Please see the README for the full option list."
+    "🤔?"
+    "¿?"
+    "—…?"
 )
 for l in "${LOOKS_WAITING_POSITIVE[@]}"; do
     if looks_waiting "$l"; then
@@ -920,6 +1200,92 @@ assert_eq "non-numeric AGENT_RETRY_DELAY falls back to the default" "8" \
     "$(AGENT_RETRY_DELAY='soon' bash -c "export AGENT_CLI_LOGS='$SCRATCH_LOGDIR'; source '$HERE/agent.sh' list >/dev/null 2>&1; echo \"\$AGENT_RETRY_DELAY\"")"
 
 # ============================================================================================
+section "retry attempt isolation and resume model inheritance"
+# ============================================================================================
+
+AGENT_RETRIES=2; AGENT_RETRY_DELAY=0; effort_override=""; model_explicit=0; effort_explicit=0
+
+# Provider-created working-tree files must use the caller's normal umask. State written by the
+# dispatcher remains private independently of that umask.
+UMASK_WORKDIR="$SCRATCH_LOGDIR/provider-workdir"
+mkdir -p "$UMASK_WORKDIR"
+provider_umaskprobe_run_cmd() {
+    local d="$1"
+    : > "$d/provider-created.txt"
+    printf '%s\n' '---------- output ----------' ok
+}
+log="$SCRATCH_LOGDIR/umask_probe.log"; _secure_state_truncate "$log"
+( umask 022; provider_dispatch_run umaskprobe "model" "$UMASK_WORKDIR" prompt umask_probe >/dev/null )
+provider_file_mode="$(stat -c '%a' "$UMASK_WORKDIR/provider-created.txt" 2>/dev/null || stat -f '%Lp' "$UMASK_WORKDIR/provider-created.txt" 2>/dev/null)"
+umask_meta_mode="$(stat -c '%a' "$SCRATCH_LOGDIR/umask_probe.meta" 2>/dev/null || stat -f '%Lp' "$SCRATCH_LOGDIR/umask_probe.meta" 2>/dev/null)"
+assert_eq "provider working-tree files inherit the caller umask" "644" "$provider_file_mode"
+assert_private_mode "provider dispatch metadata remains owner-only" "600" "$umask_meta_mode"
+unset -f provider_umaskprobe_run_cmd
+
+RETRY_COUNT_FILE="$SCRATCH_LOGDIR/retry-count"
+provider_retryprobe_run_cmd() {
+    local count=0
+    [ -f "$RETRY_COUNT_FILE" ] && count="$(cat "$RETRY_COUNT_FILE")"
+    count=$((count + 1)); printf '%s' "$count" > "$RETRY_COUNT_FILE"
+    case "${RETRY_SCENARIO:-}" in
+        prior)
+            [ "$count" = 1 ] && { printf 'HTTP 503 temporary\n'; return 75; }
+            printf 'invalid api key\n'; return 76 ;;
+        session)
+            printf 'session id: ses_started\nHTTP 503 temporary\n'; return 75 ;;
+        success)
+            printf 'session id: ses_success\n---------- output ----------\nok\n'; return 0 ;;
+    esac
+}
+
+log="$SCRATCH_LOGDIR/retry_prior.log"; : > "$log"; : > "$RETRY_COUNT_FILE"
+RETRY_SCENARIO=prior provider_dispatch_run retryprobe "model" "$SCRATCH_LOGDIR" prompt retry_prior >/dev/null
+assert_eq "a permanent second failure is not retried because of prior-attempt transient text" "2" "$(cat "$RETRY_COUNT_FILE")"
+
+log="$SCRATCH_LOGDIR/retry_session.log"; : > "$log"; : > "$RETRY_COUNT_FILE"
+RETRY_SCENARIO=session provider_dispatch_run retryprobe "model" "$SCRATCH_LOGDIR" prompt retry_session >/dev/null
+assert_eq "a failed attempt with session activity is not blindly retried" "1" "$(cat "$RETRY_COUNT_FILE")"
+assert_eq "failed active session remains resumable" "ses_started" "$(meta_get retry_session session)"
+
+log="$SCRATCH_LOGDIR/retry_success.log"
+printf 'session id: ses_failed_old\n' > "$log"; : > "$RETRY_COUNT_FILE"
+RETRY_SCENARIO=success provider_dispatch_run retryprobe "model" "$SCRATCH_LOGDIR" prompt retry_success >/dev/null
+assert_eq "successful attempt session wins over an older failed/shared-log session" "ses_success" "$(meta_get retry_success session)"
+unset RETRY_SCENARIO
+unset -f provider_retryprobe_run_cmd
+
+RESUME_ARGS_FILE="$SCRATCH_LOGDIR/resume-args"
+PROVIDER_INHERITPROBE_RESUME_NEEDS_MODEL=1
+provider_inheritprobe_resolve() { P_MODEL="resolved-${1:-default}"; P_EFFORT="resolver-effort"; }
+provider_inheritprobe_resume_cmd() { printf '%s|%s\n' "$P_MODEL" "$P_EFFORT" > "$RESUME_ARGS_FILE"; }
+meta_set inherit_task resolved_model original-model
+meta_set inherit_task effort original-effort
+log="$SCRATCH_LOGDIR/inherit_task.log"; : > "$log"
+model=""; model_explicit=0; effort_override=""; effort_explicit=0
+provider_dispatch_resume inheritprobe "$SCRATCH_LOGDIR" ses_x answer inherit_task >/dev/null
+assert_eq "bare reply inherits the original resolved model and effort" \
+    "original-model|original-effort" "$(cat "$RESUME_ARGS_FILE")"
+model="override-alias"; model_explicit=1; effort_override="explicit-effort"; effort_explicit=1
+provider_dispatch_resume inheritprobe "$SCRATCH_LOGDIR" ses_x answer inherit_task >/dev/null
+assert_eq "explicit reply model/effort override replaces inherited values" \
+    "resolved-override-alias|explicit-effort" "$(cat "$RESUME_ARGS_FILE")"
+unset -f provider_inheritprobe_resolve provider_inheritprobe_resume_cmd
+
+# Before resolved_model/effort existed, Codex persisted a single display value. A bare reply must
+# split that value instead of treating it as a literal model id and appending effort a second time.
+provider_codex_resume_cmd() { printf '%s|%s\n' "$P_MODEL" "$P_EFFORT" > "$RESUME_ARGS_FILE"; }
+meta_set legacy_codex_task model gpt-5.6-terra-medium
+log="$SCRATCH_LOGDIR/legacy_codex_task.log"; _secure_state_truncate "$log"
+model=""; model_explicit=0; effort_override=""; effort_explicit=0
+provider_dispatch_resume codex "$SCRATCH_LOGDIR" ses_legacy answer legacy_codex_task >/dev/null
+assert_eq "bare reply splits the legacy Codex model-effort display value" \
+    "gpt-5.6-terra|medium" "$(cat "$RESUME_ARGS_FILE")"
+assert_eq "bare reply migrates legacy Codex resolved_model metadata" \
+    "gpt-5.6-terra" "$(meta_get legacy_codex_task resolved_model)"
+assert_eq "bare reply migrates legacy Codex effort metadata" \
+    "medium" "$(meta_get legacy_codex_task effort)"
+
+# ============================================================================================
 section "run/fan validate the engine BEFORE any task artifact exists"
 # ============================================================================================
 # An unknown engine used to die only inside provider_dispatch_run — after .log/.meta with
@@ -940,7 +1306,7 @@ fan_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" fan -e nosuche
 fan_rc=$?
 assert_eq "fan with an unknown engine exits non-zero synchronously" "1" "$fan_rc"
 assert_match "fan reports the unknown engine visibly" 'unknown engine: nosuchengine' "$fan_out"
-if [ -n "$(ls "$SCRATCH_LOGDIR"/ghost_fan-* 2>/dev/null)" ]; then
+if compgen -G "$SCRATCH_LOGDIR/ghost_fan-*" >/dev/null; then
     fail "fan with an unknown engine created ghost task records"
 else
     pass "fan with an unknown engine launches nothing and leaves no records"

@@ -51,9 +51,13 @@ try:
 except Exception:
     pass
 MARK = "---------- output ----------"
-sid = None; msg = None; raw = []
+RAW_LIMIT = 262144
+sid = None; msg = None; raw = []; raw_size = 0
 for line in sys.stdin:
     raw.append(line)
+    raw_size += len(line.encode("utf-8", "ignore"))
+    while raw_size > RAW_LIMIT and len(raw) > 1:
+        raw_size -= len(raw.pop(0).encode("utf-8", "ignore"))
     s = line.strip()
     if not s or s[0] != "{":
         continue
@@ -245,8 +249,8 @@ provider_codex_doctor_deep() {
     fi
     local secs="${AGENT_CODEX_DOCTOR_TIMEOUT:-60}" tmpd marker out rc t0 elapsed
     provider_codex_resolve "${AGENT_CODEX_DOCTOR_MODEL:-spark}"
-    tmpd="$(mktemp -d 2>/dev/null)" || tmpd="${TMPDIR:-/tmp}/codex-doctor-$$"
-    mkdir -p "$tmpd" 2>/dev/null
+    tmpd="$(mktemp -d 2>/dev/null)" || { printf '  codex shell: BROKEN — cannot create temporary directory\n'; return 0; }
+    [ -n "$tmpd" ] && [ -d "$tmpd" ] || { printf '  codex shell: BROKEN — invalid temporary directory\n'; return 0; }
     marker="RSDOCTOR${RANDOM}${RANDOM}"
     : > "$tmpd/$marker.txt"
     local -a sbargs; mapfile -t sbargs < <(_provider_codex_chatonly_args)
@@ -291,7 +295,12 @@ provider_codex_doctor() {
     if command -v codex >/dev/null 2>&1; then
         ver="$(codex --version 2>&1 | head -1)"
         login="$(codex login status 2>&1 | head -1)"
-        PYTHONIOENCODING=utf-8 python - "$ver" "$login" <<'PY'
+        if ! _agent_python; then
+            printf '{"engine":"codex","version":%s,"available":true,"login":%s,"limits":null,"note":"Python unavailable; limits probe skipped."}\n' \
+                "$(_json_str "$ver")" "$(_json_str "$login")"
+            return 0
+        fi
+        PYTHONIOENCODING=utf-8 "$_AGENT_PY" - "$ver" "$login" <<'PY'
 import json, glob, os, sys
 ver, login = sys.argv[1], sys.argv[2]
 files = sorted(glob.glob(os.path.expanduser('~/.codex/sessions/**/*.jsonl'), recursive=True), key=os.path.getmtime)[-8:]

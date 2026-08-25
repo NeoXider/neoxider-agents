@@ -18,11 +18,17 @@ function notifyTransitions(tasks) {
   firstLoad = false;
 }
 
+let _refreshing = false, _refreshQueued = false;
+
 async function refresh() {
+  if (_refreshing) { _refreshQueued = true; return; }
+  _refreshing = true;
+  try {
   const d = await jget("/api/tasks");
   ENGINES = d.engines;
   CWD = d.cwd;
   PROVIDERS = d.providers || {};
+  CURRENT_TASKS = new Map((d.tasks || []).map(task => [task.name, task]));
   $("#cwd").textContent = d.cwd;
   if (activeDir === null) activeDir = d.cwd;
   if (!$("#f-engine").options.length) {
@@ -67,30 +73,58 @@ async function refresh() {
       });
       const renderTask = x => {
         const sub = kids[x.name] ? `<div class="tasks">${sortU(kids[x.name]).map(renderTask).join("")}</div>` : "";
-        return `<div class="task ${x.name === SEL ? "sel" : ""} ${isStrike(x.state) ? "strike" : ""}" onclick="select('${x.name}',event)">
+        return `<div class="task ${x.name === SEL ? "sel" : ""} ${isStrike(x.state) ? "strike" : ""}" data-task="${esc(x.name)}">
         <span class="em ${isLive(x.state) ? "running" : ""}" title="${esc(stateLabel(x.state, x.idle_sec))}">${x.act || ""}${x.topic || ""}</span>
         <span class="nm" title="${esc(x.name)}">${esc(x.title || x.name)}</span>
-        <span class="pill pe-${x.engine}">${x.engine}/${esc(x.model)}</span>
+        <span class="pill">${esc(x.engine)}/${esc(x.model)}</span>
       </div>${sub}`;
       };
       const rows = sortU(roots).map(renderTask).join("") || `<div class="task empty-row">${t("tree.no_tasks")}</div>`;
       const col = collapsed.has(dir) ? "col" : "";
       const act = dir === activeDir ? "active" : "";
       return `<div class="proj ${col} ${act}" data-dir="${esc(dir)}">
-      <div class="ph" onclick="selectProj('${esc(dir)}',event)">
-        <span class="caret" onclick="toggleCollapse('${esc(dir)}',event)">▾</span>
+      <div class="ph" data-project="${esc(dir)}">
+        <span class="caret" data-collapse>▾</span>
         <span class="pname" title="${esc(dir || "")}">📁 ${esc(base(dir))}</span>
         <span class="cnt">${all.length}</span>
-        <button class="mini" onclick="newHere('${esc(dir)}',event)" data-i18n-title="tree.new_task_here" title="${t("tree.new_task_here")}">＋</button>
+        <button class="mini" data-new-task data-i18n-title="tree.new_task_here" title="${esc(t("tree.new_task_here"))}">＋</button>
       </div>
       <div class="tasks">${rows}</div></div>`;
     })
     .join("");
 
+  document.querySelectorAll("#tree .task[data-task]").forEach(el =>
+    el.addEventListener("click", event => select(el.dataset.task, event)));
+  document.querySelectorAll("#tree .ph[data-project]").forEach(el => {
+    el.addEventListener("click", event => selectProj(el.dataset.project, event));
+    const caret = el.querySelector("[data-collapse]");
+    const add = el.querySelector("[data-new-task]");
+    if (caret) caret.addEventListener("click", event => toggleCollapse(el.dataset.project, event));
+    if (add) add.addEventListener("click", event => newHere(el.dataset.project, event));
+  });
+
   if (SEL) {
     const task = d.tasks.find(x => x.name === SEL);
-    if (task) loadThread(task);
+    if (task) await loadThread(task);
+    else clearDeletedSelection();
   }
+  } catch (err) {
+    if (err.name !== "AbortError") surfaceApiError(err);
+  } finally {
+    _refreshing = false;
+    if (_refreshQueued) { _refreshQueued = false; refresh(); }
+  }
+}
+
+function clearDeletedSelection() {
+  if (dialogController) dialogController.abort();
+  SEL = null;
+  dlgTask = "";
+  lastLog = "";
+  $("#replybar").style.display = "none";
+  $("#btn-reply").disabled = true;
+  $("#chead").textContent = t("chat.select_prompt");
+  $("#chat").textContent = t("chat.empty_thread");
 }
 
 // clicking a project row: makes it active (default dir for a new task) and GUARANTEES it's
@@ -120,6 +154,7 @@ function newHere(dir, e) {
 function select(n, e) {
   e && e.stopPropagation();
   SEL = n;
+  $("#btn-reply").disabled = false;
   lastLog = "";
   refresh();
 }

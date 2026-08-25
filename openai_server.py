@@ -76,7 +76,7 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
 (does not import gui.py) so the two servers can run/fail independently.
 """
-import argparse, atexit, glob, json, logging, os, queue, re, shlex, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
+import argparse, atexit, glob, ipaddress, json, logging, os, queue, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -222,24 +222,264 @@ def is_extension(prev, new):
     return len(new) > len(prev) and new[:len(prev)] == prev
 
 
+def _process_group_kwargs():
+    """Start a subprocess in a group we can terminate as one process tree."""
+    if os.name == "nt":
+        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+    return {"start_new_session": True}
+
+
+_PROCESS_TREES_LOCK = threading.RLock()
+_PROCESS_TREES = {}
+_PROCESS_TREES_SHUTTING_DOWN = False
+_SIGTERM_HANDLER_ACTIVE = False
+
+
+def _attach_process_tree(proc):
+    """Remember a killable process container even if the direct child exits first.
+
+    POSIX process groups outlive their leader, so the launch-time pgid is sufficient.  On
+    Windows, ancestry-based ``taskkill /T`` stops working as soon as the wrapper exits; a Job
+    Object remains a stable handle to every descendant and is therefore the primary mechanism.
+    The Job setup is best-effort because some restricted hosts disallow nested jobs; taskkill is
+    retained as a fallback for the ordinary live-wrapper case.
+    """
+    proc._neoxider_tree_state = "active"
+    if os.name != "nt":
+        proc._neoxider_pgid = proc.pid
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("PerProcessUserTimeLimit", ctypes.c_longlong),
+                ("PerJobUserTimeLimit", ctypes.c_longlong),
+                ("LimitFlags", wintypes.DWORD),
+                ("MinimumWorkingSetSize", ctypes.c_size_t),
+                ("MaximumWorkingSetSize", ctypes.c_size_t),
+                ("ActiveProcessLimit", wintypes.DWORD),
+                ("Affinity", ctypes.c_size_t),
+                ("PriorityClass", wintypes.DWORD),
+                ("SchedulingClass", wintypes.DWORD),
+            ]
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("ReadOperationCount", ctypes.c_ulonglong),
+                ("WriteOperationCount", ctypes.c_ulonglong),
+                ("OtherOperationCount", ctypes.c_ulonglong),
+                ("ReadTransferCount", ctypes.c_ulonglong),
+                ("WriteTransferCount", ctypes.c_ulonglong),
+                ("OtherTransferCount", ctypes.c_ulonglong),
+            ]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [
+                ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                ("IoInfo", IO_COUNTERS),
+                ("ProcessMemoryLimit", ctypes.c_size_t),
+                ("JobMemoryLimit", ctypes.c_size_t),
+                ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                ("PeakJobMemoryUsed", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        kernel32.SetInformationJobObject.argtypes = (
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+        kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            return
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
+        configured = kernel32.SetInformationJobObject(
+            job, 9, ctypes.byref(info), ctypes.sizeof(info))
+        assigned = configured and kernel32.AssignProcessToJobObject(
+            job, wintypes.HANDLE(int(proc._handle)))
+        if not assigned:
+            kernel32.CloseHandle(job)
+            return
+        proc._neoxider_job = job
+        proc._neoxider_kernel32 = kernel32
+    except Exception:
+        # Containment is best-effort on restricted/nested Windows hosts. The process remains in
+        # the registry and falls back to taskkill, so an unusual ctypes failure must not untrack it.
+        return
+
+
+def _close_process_tree_container(proc):
+    """Close one claimed container. The caller exclusively owns it."""
+    job = getattr(proc, "_neoxider_job", None)
+    kernel32 = getattr(proc, "_neoxider_kernel32", None)
+    if job and kernel32:
+        try:
+            kernel32.CloseHandle(job)
+        except (AttributeError, OSError):
+            pass
+        proc._neoxider_job = None
+    proc._neoxider_tree_state = "closed"
+
+
+def _claim_process_tree(proc):
+    """Atomically take cleanup ownership so a Job/PGID is never closed or killed twice."""
+    if proc is None:
+        return False
+    with _PROCESS_TREES_LOCK:
+        state = getattr(proc, "_neoxider_tree_state", None)
+        if state in ("claimed", "closed"):
+            return False
+        registered = _PROCESS_TREES.get(id(proc))
+        if registered is proc:
+            del _PROCESS_TREES[id(proc)]
+        proc._neoxider_tree_state = "claimed"
+        return True
+
+
+def _release_process_tree(proc):
+    """Release containment only after removing descendants left by a successful wrapper.
+
+    Closing a Windows Job Object has KILL_ON_JOB_CLOSE semantics.  POSIX has no equivalent
+    closeable handle, so explicitly terminate the launch-time process group while this claimed
+    ``proc`` still owns its identity; never rediscover a group from a possibly reused wrapper PID.
+    """
+    if not _claim_process_tree(proc):
+        return
+    if os.name == "nt":
+        _close_process_tree_container(proc)
+    else:
+        _terminate_claimed_process_tree(proc)
+
+
+def _popen_process_tree(args, **kwargs):
+    # Keep launch+registration atomic with shutdown. Otherwise SIGTERM could drain the registry
+    # after Popen but before registration, leaving exactly one untracked provider tree behind.
+    with _PROCESS_TREES_LOCK:
+        if _PROCESS_TREES_SHUTTING_DOWN:
+            raise RuntimeError("bridge process shutdown is already in progress")
+        proc = subprocess.Popen(args, **kwargs, **_process_group_kwargs())
+        _attach_process_tree(proc)
+        _PROCESS_TREES[id(proc)] = proc
+        return proc
+
+
+def _terminate_claimed_process_tree(proc):
+    """Terminate a process tree already claimed from the central registry."""
+    try:
+        if os.name == "nt":
+            job = getattr(proc, "_neoxider_job", None)
+            kernel32 = getattr(proc, "_neoxider_kernel32", None)
+            if job and kernel32:
+                kernel32.TerminateJobObject(job, 1)
+            elif proc.poll() is None:
+                # taskkill /T is the supported way to include grandchildren created by bash.
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=10, check=False)
+            if proc.poll() is None:
+                proc.kill()  # taskkill failure is reported by exit code, not an exception
+        else:
+            # The group survives its leader. Never look the pgid up through proc.pid here: the
+            # direct wrapper may already have exited while descendants remain in the group.
+            os.killpg(getattr(proc, "_neoxider_pgid", proc.pid), signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    finally:
+        _close_process_tree_container(proc)
+
+
+def _terminate_process_tree(proc):
+    """Terminate and reap proc plus descendants. Safe when proc already exited."""
+    if not _claim_process_tree(proc):
+        return
+    _terminate_claimed_process_tree(proc)
+
+
+def _shutdown_process_trees():
+    """Permanently stop new launches and terminate every registered provider container."""
+    global _PROCESS_TREES_SHUTTING_DOWN
+    with _PROCESS_TREES_LOCK:
+        _PROCESS_TREES_SHUTTING_DOWN = True
+        processes = list(_PROCESS_TREES.values())
+        _PROCESS_TREES.clear()
+        for proc in processes:
+            proc._neoxider_tree_state = "claimed"
+    for proc in processes:
+        try:
+            _terminate_claimed_process_tree(proc)
+        except Exception:
+            # Shutdown must make a best effort on every registered tree even if one platform
+            # primitive misbehaves; never let the first broken handle skip all later providers.
+            LOG.exception("failed to terminate provider process tree pid=%s", getattr(proc, "pid", "?"))
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            _close_process_tree_container(proc)
+
+
+def _handle_sigterm(signum, _frame):
+    """Make GUI ``kill(SIGTERM)`` deterministic even though default SIGTERM skips atexit."""
+    global _SIGTERM_HANDLER_ACTIVE
+    if _SIGTERM_HANDLER_ACTIVE:
+        # Python may dispatch another SIGTERM while the first handler is between two tree
+        # terminations.  The outer handler already owns the drained list; raising here would
+        # abandon its remaining entries after the central registry has been cleared.
+        return
+    _SIGTERM_HANDLER_ACTIVE = True
+    try:
+        _shutdown_process_trees()
+    finally:
+        raise SystemExit(128 + signum)
+
+
+def _run_agent_process(args, timeout, env):
+    """Run an agent.sh step with an outer deadline that cannot orphan CLI grandchildren."""
+    proc = _popen_process_tree(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, encoding="utf-8", errors="replace", cwd=HERE, env=env)
+    try:
+        proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(proc)
+    else:
+        _release_process_tree(proc)
+
+
 def _chatonly_env():
-    """Env for every agent.sh subprocess this bridge launches: AGENT_CHAT_ONLY=1 tells the
-    codex/claude provider scripts to lock the CLI down to text-only completion -- no file writes,
-    no shell execution, no MCP servers (verified live: without this, codex could actually call a
-    real configured MCP tool, e.g. a live Unity Editor's unityMCP server, instead of just
-    answering in text). Unset for a normal `agent.sh run`/`reply` outside this bridge, which
-    legitimately needs full file/shell/MCP access to do real coding work -- see
-    providers/{codex,claude}/provider.sh's `_provider_*_chatonly_args`."""
+    """Least-privilege env for every agent.sh subprocess launched by this bridge.
+
+    AGENT_CHAT_ONLY=1 removes writes and MCP access through provider-specific controls. Claude and
+    opencode have their tools fully disabled; Codex and Gemini retain read capability and therefore
+    may only back a loopback bridge. Normal `agent.sh run`/`reply` calls leave the variable unset and
+    retain the full file, shell, and MCP access needed for coding work.
+    """
     env = dict(os.environ)
     env["AGENT_CHAT_ONLY"] = "1"
+    # The bridge owns request-level retries. Disable agent.sh's nested retry layer so one
+    # configured retry cannot multiply into several provider invocations.
+    env["AGENT_RETRIES"] = "0"
     # Hand agent.sh a deadline slightly SHORTER than our own subprocess timeout, so its step
     # watchdog kills the CLI's whole process tree (and marks the task error/124) before we give
     # up on the subprocess. Without that, killing only the wrapper left an orphaned CLI grandchild
     # alive, still appending to the task log -- the exact case the "healthy" resume check below
-    # has to defend against. An explicit AGENT_TIMEOUT_SEC in the environment always wins.
+    # has to defend against. Do not inherit an unbounded/larger value: the inner watchdog must
+    # always fire before this process's outer timeout.
     if CFG is not None and getattr(CFG, "timeout", None):
         try:
-            env.setdefault("AGENT_TIMEOUT_SEC", str(max(30, int(CFG.timeout) - 5)))
+            env["AGENT_TIMEOUT_SEC"] = str(max(1, int(CFG.timeout) - 5))
         except (TypeError, ValueError):
             pass
     return env
@@ -252,11 +492,7 @@ def run_agent(engine, model, effort, workdir, prompt, name, timeout):
     if effort:
         args += ["-f", effort]
     args.append(prompt)
-    try:
-        subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                        errors="replace", timeout=timeout, cwd=HERE, env=_chatonly_env())
-    except subprocess.TimeoutExpired:
-        pass  # the log up to the timeout is still readable/useful below
+    _run_agent_process(args, timeout, _chatonly_env())
     return last_output(read_log(name))
 
 
@@ -277,11 +513,7 @@ def reply_agent(engine, model, effort, workdir, name, answer, timeout):
         args += ["-f", effort]
     args += ["-C", to_git_bash_path(workdir), name, answer]
     before = len(read_log(name))
-    try:
-        subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
-                        errors="replace", timeout=timeout, cwd=HERE, env=_chatonly_env())
-    except subprocess.TimeoutExpired:
-        pass
+    _run_agent_process(args, timeout, _chatonly_env())
     after = read_log(name)
     if len(after) == before:
         return None  # nothing was appended -> the resume died before its block; don't echo stale
@@ -378,10 +610,7 @@ def _tail_task_log(name, proc, timeout, on_delta, start_size=0):
         if not alive:
             break
         if not killed and time.time() > deadline:
-            try:
-                proc.kill()
-            except OSError:
-                pass
+            _terminate_process_tree(proc)
             killed = True
         time.sleep(0.05)
 
@@ -395,9 +624,12 @@ def run_agent_live(engine, model, effort, workdir, prompt, name, timeout, on_del
     if effort:
         args += ["-f", effort]
     args.append(prompt)
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            cwd=HERE, env=_stream_env())
-    _tail_task_log(name, proc, timeout, on_delta)
+    proc = _popen_process_tree(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               cwd=HERE, env=_stream_env())
+    try:
+        _tail_task_log(name, proc, timeout, on_delta)
+    finally:
+        _release_process_tree(proc)
     return last_output(read_log(name))
 
 
@@ -413,9 +645,12 @@ def reply_agent_live(engine, model, effort, workdir, name, answer, timeout, on_d
     args += ["-C", to_git_bash_path(workdir), name, answer]
     before_bytes = _log_size(name)
     before_text = len(read_log(name))
-    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                            cwd=HERE, env=_stream_env())
-    _tail_task_log(name, proc, timeout, on_delta, start_size=before_bytes)
+    proc = _popen_process_tree(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               cwd=HERE, env=_stream_env())
+    try:
+        _tail_task_log(name, proc, timeout, on_delta, start_size=before_bytes)
+    finally:
+        _release_process_tree(proc)
     after = read_log(name)
     if len(after) == before_text:
         return None
@@ -451,7 +686,7 @@ OPENCODE_CHATONLY_CONFIG = os.environ.get("AGENT_OPENCODE_CHATONLY_CONFIG") or o
 # it has, while the identical profile applied over HTTP (agent on POST /api/session, and again via
 # POST /api/session/{id}/agent) still answers "apply_patch, bash, edit, glob, grep, question, read,
 # skill, todowrite, webfetch, websearch, write" -- the server path does not honour the agent's tool
-# map. Before this default flipped, a bridge on 0.0.0.0 (which is the default bind!) handed every
+# map. Before this default flipped, a LAN-bound bridge handed every
 # device on the network shell and write access to this machine, plus every configured MCP server:
 # "create notes.txt" really created the file, in the bridge's own checkout.
 # AGENT_OPENCODE_NATIVE_UNSAFE=1 opts back in, with a loud banner, for a loopback-only bridge where
@@ -475,12 +710,20 @@ def _ensure_opencode_server():
     with _OC["lock"]:
         if _OC["base"] and _OC["proc"] and _OC["proc"].poll() is None:
             return _OC["base"]
+        stale_proc = _OC.get("proc")
+        if stale_proc is not None:
+            # A dead wrapper can still own a live POSIX group or Windows Job descendants. Dispose
+            # that launch-time container before forgetting it or installing its replacement.
+            _terminate_process_tree(stale_proc)
+        _OC["proc"] = None
+        _OC["base"] = None
         port = _free_port()
         env = dict(os.environ)
         env["OPENCODE_CONFIG"] = OPENCODE_CHATONLY_CONFIG.replace("\\", "/")
-        proc = subprocess.Popen(
+        proc = _popen_process_tree(
             [BASH, "-lc", "opencode serve --port %d --hostname 127.0.0.1" % port],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        )
         base = "http://127.0.0.1:%d" % port
         # wait for /api/health
         for _ in range(120):
@@ -493,11 +736,17 @@ def _ensure_opencode_server():
                         return base
             except Exception:
                 time.sleep(0.5)
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+        _terminate_process_tree(proc)
         raise RuntimeError("opencode serve did not become healthy on %s" % base)
+
+
+def opencode_native_kill():
+    with _OC["lock"]:
+        proc = _OC.get("proc")
+        _terminate_process_tree(proc)
+        if _OC.get("proc") is proc:
+            _OC["proc"] = None
+            _OC["base"] = None
 
 
 def _oc_json(base, path, method="GET", body=None, timeout=30):
@@ -620,7 +869,7 @@ def _use_opencode_native():
 # ======================================================================================
 CLAUDE_NATIVE = os.environ.get("CLAUDE_NO_NATIVE") != "1"
 CLAUDE_NATIVE_TASK = "__claude_native__"
-_CL = {"proc": None, "queue": None}
+_CL = {"proc": None, "queue": None, "lock": threading.RLock()}
 
 
 def _use_claude_native():
@@ -632,54 +881,63 @@ def _claude_native_cmd():
     # REQUIRED by --print + stream-json, partial messages give live deltas for stream:true.
     cmd = ("claude -p --verbose --input-format stream-json --output-format stream-json "
            "--include-partial-messages --strict-mcp-config --disable-slash-commands "
-           "--disallowedTools Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch,"
-           "Glob,Grep,Read,PowerShell,Skill,ToolSearch")
-    if CFG.model:
-        cmd += " --model " + shlex.quote(CFG.model)
-    if CFG.effort:
-        cmd += " --effort " + shlex.quote(CFG.effort)
+           "--tools ''")
+    resolved_model, resolved_effort, _label = resolve_claude_model(CFG.model, CFG.effort)
+    cmd += " --model " + shlex.quote(resolved_model)
+    if resolved_effort:
+        cmd += " --effort " + shlex.quote(resolved_effort)
     return cmd
 
 
 def claude_native_alive():
-    p = _CL["proc"]
-    return p is not None and p.poll() is None
+    with _CL["lock"]:
+        p = _CL["proc"]
+        return p is not None and p.poll() is None
 
 
 def claude_native_kill():
-    p = _CL["proc"]
-    _CL["proc"] = None
-    _CL["queue"] = None
-    if p is not None:
-        try:
-            p.kill()
-        except Exception:
-            pass
+    with _CL["lock"]:
+        p = _CL["proc"]
+        # Keep the stale state visible until its container is disposed. An ensure racing this
+        # kill cannot replace it early, and registry ownership makes repeated cleanup a no-op.
+        _terminate_process_tree(p)
+        if _CL["proc"] is p:
+            _CL["proc"] = None
+            _CL["queue"] = None
 
 
 def _claude_native_ensure():
     """Start (or reuse) the persistent claude process; a reader thread pumps stdout lines into
     a queue so turns can be awaited with a real timeout (blocking readline has none)."""
-    if claude_native_alive():
-        return
-    q = queue.Queue()
-    proc = subprocess.Popen(
-        [BASH, "-lc", _claude_native_cmd()],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        text=True, encoding="utf-8", errors="replace", cwd=SESSION.get("dir") or None)
+    with _CL["lock"]:
+        current = _CL["proc"]
+        if current is not None and current.poll() is None:
+            return
+        if current is not None:
+            # poll() only describes the wrapper. Its separate group/Job can still contain provider
+            # children, so release that container before clearing state and spawning a replacement.
+            _terminate_process_tree(current)
+        _CL["proc"] = None
+        _CL["queue"] = None
+        q = queue.Queue()
+        proc = _popen_process_tree(
+            [BASH, "-lc", _claude_native_cmd()],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", cwd=SESSION.get("dir") or None,
+        )
 
-    def _pump(p=proc, q=q):
-        try:
-            for line in p.stdout:
-                q.put(line)
-        except Exception:
-            pass
-        finally:
-            q.put(None)  # EOF sentinel
+        def _pump(p=proc, q=q):
+            try:
+                for line in p.stdout:
+                    q.put(line)
+            except Exception:
+                pass
+            finally:
+                q.put(None)  # EOF sentinel
 
-    threading.Thread(target=_pump, daemon=True).start()
-    _CL["proc"] = proc
-    _CL["queue"] = q
+        threading.Thread(target=_pump, daemon=True).start()
+        _CL["proc"] = proc
+        _CL["queue"] = q
 
 
 def claude_native_send(prompt, timeout, on_delta=None):
@@ -737,7 +995,7 @@ def claude_native_send(prompt, timeout, on_delta=None):
     return ""
 
 
-def _claude_native_raw(messages, tools, on_delta, can_retry, on_retry, live):
+def _claude_native_raw(messages, tools, tool_choice, on_delta, can_retry, on_retry, live):
     """The session model (see _raw_completion) implemented against the persistent process:
     an extension of the previous messages sends ONLY the new turns to the SAME process (true
     resume, no re-boot); anything else restarts the process with the full history."""
@@ -749,12 +1007,14 @@ def _claude_native_raw(messages, tools, on_delta, can_retry, on_retry, live):
                      and claude_native_alive()
                      and is_extension(prev, messages))
         if extension:
-            prompt = build_prompt(messages[len(prev):], tools)
+            prompt = build_prompt(messages[len(prev):], tools, tool_choice)
         else:
             claude_native_kill()
-            if not SESSION.get("dir"):
-                SESSION["dir"] = fresh_session_dir()
-            prompt = build_prompt(messages, tools)
+            # A non-extension, expired session, or dead native process is a new security
+            # boundary. Always wipe scratch state; fresh_session_dir itself preserves a pinned
+            # operator --dir.
+            SESSION["dir"] = fresh_session_dir(wipe=True)
+            prompt = build_prompt(messages, tools, tool_choice)
         raw = ""
         for attempt in range(CFG.retries + 1):
             raw = claude_native_send(prompt, CFG.timeout, on_delta if live else None)
@@ -766,19 +1026,50 @@ def _claude_native_raw(messages, tools, on_delta, can_retry, on_retry, live):
                 if on_retry is not None:
                     on_retry()
                 claude_native_kill()
-                prompt = build_prompt(messages, tools)  # resume impossible after a kill
+                prompt = build_prompt(messages, tools, tool_choice)  # resume impossible after a kill
                 time.sleep(1)
             else:
                 if live and not raw.strip() and not retry_ok():
-                    SESSION["task_name"] = CLAUDE_NATIVE_TASK
-                    SESSION["messages"] = messages
+                    SESSION["task_name"] = None
                     SESSION["last_activity"] = time.time()
-                    raise LiveStreamDied()
+                    raise CompletionFailed("native Claude stream ended before completion")
                 break
+        if not raw.strip():
+            SESSION["task_name"] = None
+            SESSION["last_activity"] = time.time()
+            raise CompletionFailed("native Claude invocation did not complete")
         SESSION["task_name"] = CLAUDE_NATIVE_TASK
         SESSION["messages"] = messages
         SESSION["last_activity"] = time.time()
         return raw
+
+
+def resolve_claude_model(model, effort):
+    """Mirror provider_claude_resolve with a typed native-CLI result and matching label."""
+    alias = model or "opus5"
+    base = alias
+    derived_effort = ""
+    for suffix in ("low", "medium", "high", "xhigh", "max"):
+        marker = "-" + suffix
+        if alias.endswith(marker):
+            base = alias[:-len(marker)]
+            derived_effort = suffix
+            break
+    resolved = {
+        "": "claude-opus-5", "default": "claude-opus-5", "opus5": "claude-opus-5",
+        "sonnet": "claude-sonnet-5", "opus": "opus", "haiku": "haiku",
+    }.get(base)
+    if resolved is None:
+        raise ValueError("unsupported Claude model alias")
+    resolved_effort = effort or derived_effort or ("high" if base == "sonnet" else "")
+    allowed_efforts = set((PROVIDERS.get("claude") or {}).get("efforts") or ())
+    if resolved_effort and resolved_effort not in allowed_efforts:
+        raise ValueError("unsupported Claude effort")
+    labels = (PROVIDERS.get("claude") or {}).get("model_labels") or {}
+    display = labels.get(base or "opus5", base or "opus5")
+    if resolved_effort:
+        display = "%s (%s)" % (display, resolved_effort)
+    return resolved, resolved_effort, "claude/%s" % display
 
 
 def model_label(engine, model, effort):
@@ -787,6 +1078,8 @@ def model_label(engine, model, effort):
     WHICH real model that alias currently points to (aliases like "opus"/"sonnet" are resolved
     to a specific dated model id by the provider's own CLI or by provider_<engine>_resolve;
     see providers/<engine>/provider.json's "model_labels" for the alias -> display-name map)."""
+    if engine == "claude":
+        return resolve_claude_model(model, effort)[2]
     p = PROVIDERS.get(engine, {})
     alias = model or (p.get("default_model") or "default")
     label = (p.get("model_labels") or {}).get(alias, alias)
@@ -896,10 +1189,44 @@ NEW actions you want carried out now.
 """
 
 
-def build_prompt(messages, tools):
+TOOL_CHOICE_NONE_INSTRUCTIONS = """
+Tool use is disabled for THIS turn. Reply only with a normal prose answer. Do not emit a
+`tool_calls` JSON block or any function-call syntax, even though tool definitions may appear in
+the conversation history.
+"""
+
+
+def _selected_tool_name(tool_choice):
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function")
+        if isinstance(fn, dict):
+            return fn.get("name")
+    return None
+
+
+def _tool_choice_requires_call(tool_choice):
+    return tool_choice == "required" or _selected_tool_name(tool_choice) is not None
+
+
+def build_prompt(messages, tools, tool_choice="auto"):
     text = BASE_INSTRUCTIONS.strip() + "\n\n" + render_messages(messages)
     if tools:
-        text += "\n\n" + (TOOLCALL_INSTRUCTIONS % json.dumps(tools, ensure_ascii=False, indent=2))
+        if tool_choice == "none":
+            text += "\n\n" + TOOL_CHOICE_NONE_INSTRUCTIONS.strip()
+        else:
+            selected = _selected_tool_name(tool_choice)
+            prompt_tools = tools
+            if selected:
+                prompt_tools = [t for t in tools if t.get("function", {}).get("name") == selected]
+            text += "\n\n" + (TOOLCALL_INSTRUCTIONS % json.dumps(
+                prompt_tools, ensure_ascii=False, indent=2))
+            if tool_choice == "required":
+                text += ("\n\nFor THIS turn, at least one action is REQUIRED. Return one or more "
+                         "tool calls in the required JSON format; a prose-only answer is invalid.")
+            elif selected:
+                text += ("\n\nFor THIS turn, you MUST call the function %s at least once and MUST "
+                         "NOT call any other function. A prose-only answer is invalid."
+                         % json.dumps(selected, ensure_ascii=False))
     return text
 
 
@@ -1301,14 +1628,17 @@ def _parse_call_jsonl(body, names):
     return objs or None
 
 
-def _to_calls(raw_calls):
+def _to_calls(raw_calls, declared_names=None):
+    """Canonical normalization for every extracted call; optionally enforce declarations."""
     out = []
     for c in raw_calls:
         if not isinstance(c, dict):
             continue
         fn = c.get("function") if isinstance(c.get("function"), dict) else None
         name = c.get("name") or (fn or {}).get("name")
-        if not name:
+        if not isinstance(name, str) or not name:
+            continue
+        if declared_names is not None and name not in declared_names:
             continue
         args = _args_of(fn) if (fn is not None and any(k in fn for k in _ARGS_KEY_ALIASES)) \
             else _args_of(c)
@@ -1399,13 +1729,13 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
         if calls is None:
             raw = obj.get("tool_calls")
             if isinstance(raw, list) and raw:
-                calls = _to_calls(raw)
+                calls = _to_calls(raw, names)
         # No .strip() here: matches iterate in reverse over ORIGINAL offsets, and stripping
         # leading whitespace mid-loop shifted every earlier match's span, garbling the display
         # text when more than one fence was stripped. One strip at the end is enough.
         cleaned = cleaned[:m.start()] + cleaned[m.end():]
     if calls is None and call_fences:
-        calls = _to_calls([o for fence in reversed(call_fences) for o in fence])
+        calls = _to_calls([o for fence in reversed(call_fences) for o in fence], names)
     if calls is None and not call_fences and "```" in cleaned:
         # Strict pass found nothing: retry with the backtick-tolerant fallback so a tool_calls
         # fence whose string values contain backticks still parses. json.loads gates every
@@ -1416,7 +1746,7 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
             except ValueError:
                 continue
             if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list) and obj["tool_calls"]:
-                found = _to_calls(obj["tool_calls"])
+                found = _to_calls(obj["tool_calls"], names)
                 if found:
                     calls = found
                     cleaned = cleaned[:m.start()] + cleaned[m.end():]
@@ -1439,7 +1769,7 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
                     # calls object-by-object instead of losing the whole turn.
                     salvaged = _salvage_array_calls(stripped, names, tools)
                     if salvaged:
-                        found = _to_calls(salvaged)
+                        found = _to_calls(salvaged, names)
                         if found:
                             calls, cleaned = found, ""
             shaped_list = None
@@ -1460,7 +1790,7 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
                 shaped = [_call_shaped(o, names) for o in obj]
                 shaped_list = shaped if all(shaped) else _bare_args_array(obj, tools)
             if shaped_list:
-                found = _to_calls(shaped_list)
+                found = _to_calls(shaped_list, names)
                 if found:
                     calls, cleaned = found, stripped[end:]
     if calls is None and names:
@@ -1501,9 +1831,7 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
                 found = bare
                 spans = [(0, len(cleaned))] * len(bare)
         if found:
-            calls = [{"id": "call_%s" % uuid.uuid4().hex[:24], "type": "function",
-                      "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}}
-                     for n, a in found]
+            calls = _to_calls([{"name": n, "arguments": a} for n, a in found], names)
             for s, e in reversed(spans):          # strip the call spans from the display text
                 cleaned = cleaned[:s] + cleaned[e:]
             cleaned = cleaned.strip()
@@ -1645,7 +1973,7 @@ class LiveToolCallEmitter:
             self._flush_pending()
 
     def _emit_call_obj(self, obj):
-        converted = _to_calls([obj])
+        converted = _to_calls([obj], self.names)
         if not converted:
             return
         call = converted[0]
@@ -1884,6 +2212,163 @@ CFG = None  # set in main(); read by the request handler
 # conversation is ever in flight against a given bridge instance at a time.
 SESSION_LOCK = threading.Lock()
 SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
+REQUEST_LOCK = threading.Lock()
+ACTIVE_LOCK = threading.Lock()
+ACTIVE_REQUESTS = 0
+
+
+class RequestValidationError(ValueError):
+    def __init__(self, param, message):
+        super().__init__(message)
+        self.param = param
+
+
+def _validate_content(content, param, allow_none=False):
+    if content is None and allow_none:
+        return
+    if isinstance(content, str):
+        return
+    if not isinstance(content, list):
+        raise RequestValidationError(param, "must be a string or an array of content parts")
+    for i, part in enumerate(content):
+        pp = "%s[%d]" % (param, i)
+        if not isinstance(part, dict):
+            raise RequestValidationError(pp, "must be an object")
+        typ = part.get("type")
+        if not isinstance(typ, str) or not typ:
+            raise RequestValidationError(pp + ".type", "must be a non-empty string")
+        if typ == "text" and not isinstance(part.get("text"), str):
+            raise RequestValidationError(pp + ".text", "must be a string")
+        if typ in ("image", "image_url") and "image_url" in part \
+                and not isinstance(part.get("image_url"), (str, dict)):
+            raise RequestValidationError(pp + ".image_url", "must be a string or object")
+
+
+def validate_chat_request(body):
+    """Validate the OpenAI-shaped fields before any provider/session code can run."""
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise RequestValidationError("messages", "is required and must be a non-empty array")
+    roles = {"system", "developer", "user", "assistant", "tool", "function"}
+    for i, message in enumerate(messages):
+        p = "messages[%d]" % i
+        if not isinstance(message, dict):
+            raise RequestValidationError(p, "must be an object")
+        role = message.get("role")
+        if role not in roles:
+            raise RequestValidationError(p + ".role", "must be a supported role")
+        tool_calls = message.get("tool_calls")
+        if tool_calls is not None:
+            if role != "assistant" or not isinstance(tool_calls, list) or not tool_calls:
+                raise RequestValidationError(p + ".tool_calls",
+                                             "must be a non-empty array on an assistant message")
+            for j, call in enumerate(tool_calls):
+                cp = "%s.tool_calls[%d]" % (p, j)
+                if not isinstance(call, dict):
+                    raise RequestValidationError(cp, "must be an object")
+                if call.get("type", "function") != "function":
+                    raise RequestValidationError(cp + ".type", "must equal 'function'")
+                if not isinstance(call.get("id"), str) or not call.get("id"):
+                    raise RequestValidationError(cp + ".id", "must be a non-empty string")
+                fn = call.get("function")
+                if not isinstance(fn, dict):
+                    raise RequestValidationError(cp + ".function", "must be an object")
+                if not isinstance(fn.get("name"), str) or not fn.get("name"):
+                    raise RequestValidationError(cp + ".function.name", "must be a non-empty string")
+                if not isinstance(fn.get("arguments"), str):
+                    raise RequestValidationError(cp + ".function.arguments", "must be a JSON string")
+        _validate_content(message.get("content"), p + ".content",
+                          allow_none=(role == "assistant" and tool_calls is not None))
+        if role == "tool" and (not isinstance(message.get("tool_call_id"), str)
+                               or not message.get("tool_call_id")):
+            raise RequestValidationError(p + ".tool_call_id", "must be a non-empty string")
+        if "name" in message and not isinstance(message.get("name"), str):
+            raise RequestValidationError(p + ".name", "must be a string")
+
+    tools = body.get("tools")
+    declared = set()
+    if tools is not None:
+        if not isinstance(tools, list) or not tools:
+            raise RequestValidationError("tools", "must be a non-empty array")
+        for i, tool in enumerate(tools):
+            p = "tools[%d]" % i
+            if not isinstance(tool, dict):
+                raise RequestValidationError(p, "must be an object")
+            if tool.get("type") != "function":
+                raise RequestValidationError(p + ".type", "must equal 'function'")
+            fn = tool.get("function")
+            if not isinstance(fn, dict):
+                raise RequestValidationError(p + ".function", "must be an object")
+            name = fn.get("name")
+            if (not isinstance(name, str) or not name
+                    or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) is None):
+                raise RequestValidationError(p + ".function.name", "must be a valid function name")
+            if name in declared:
+                raise RequestValidationError(p + ".function.name", "must be unique")
+            declared.add(name)
+            if "description" in fn and not isinstance(fn.get("description"), str):
+                raise RequestValidationError(p + ".function.description", "must be a string")
+            if "parameters" in fn and not isinstance(fn.get("parameters"), dict):
+                raise RequestValidationError(p + ".function.parameters", "must be an object")
+
+    choice = body.get("tool_choice")
+    if choice is not None:
+        if isinstance(choice, str):
+            if choice not in ("none", "auto", "required"):
+                raise RequestValidationError("tool_choice", "must be 'none', 'auto', or 'required'")
+            if choice == "required" and not declared:
+                raise RequestValidationError("tool_choice", "requires at least one declared function")
+        elif isinstance(choice, dict):
+            fn = choice.get("function")
+            if (choice.get("type") != "function" or not isinstance(fn, dict)
+                    or not isinstance(fn.get("name"), str)):
+                raise RequestValidationError("tool_choice", "must select a declared function")
+            if fn["name"] not in declared:
+                raise RequestValidationError("tool_choice.function.name", "must name a declared function")
+        else:
+            raise RequestValidationError("tool_choice", "must be a string or object")
+    else:
+        choice = "auto" if declared else "none"
+    if not declared and choice == "auto":
+        choice = "none"
+
+    stream = body.get("stream", False)
+    if not isinstance(stream, bool):
+        raise RequestValidationError("stream", "must be a boolean")
+    return messages, tools, choice, stream
+
+
+def _canonical_assistant_message(text, tool_calls):
+    message = {"role": "assistant", "content": None if tool_calls else (text or "").strip()}
+    if tool_calls:
+        message["tool_calls"] = json.loads(json.dumps(tool_calls, ensure_ascii=False))
+    return message
+
+
+def _record_completion(messages, text, tool_calls, resumable=True):
+    """Remember exactly the visible transcript, including the response returned to the caller."""
+    canonical = list(messages) + [_canonical_assistant_message(text, tool_calls)]
+    with SESSION_LOCK:
+        SESSION["messages"] = canonical
+        SESSION["last_activity"] = time.time()
+        if not resumable:
+            SESSION["task_name"] = None
+            claude_native_kill()
+
+
+def _invalidate_resume_session(messages):
+    """A disconnected caller cannot be assumed to have received the assistant turn."""
+    with SESSION_LOCK:
+        SESSION["messages"] = list(messages)
+        SESSION["task_name"] = None
+        SESSION["last_activity"] = time.time()
+        claude_native_kill()
+
+
+def _parameter_error(exc):
+    return {"error": {"message": "invalid parameter '%s': %s" % (exc.param, exc),
+                      "type": "invalid_request_error", "param": exc.param,
+                      "code": "invalid_parameter"}}
 
 
 def _configured_api_key():
@@ -1926,6 +2411,10 @@ class ProviderLimitError(Exception):
     MODEL failed, when the account was simply rate-limited. Surfaced as an OpenAI-style 429 so
     the caller can attribute it to the environment (and retrying inside the bridge is pointless
     -- the limit outlives any retry)."""
+
+
+class CompletionFailed(RuntimeError):
+    """Provider invocation exhausted retries without a usable completed answer."""
 
 
 # Deliberately narrow: the whole answer must BE the banner — short, at most two lines, and the
@@ -1998,6 +2487,8 @@ class H(BaseHTTPRequestHandler):
             # (e.g. the GUI's bridge list) would time out and wrongly treat a busy-but-live bridge
             # as dead. A momentarily inconsistent read of these simple fields is fine for /health.
             active, turns = bool(SESSION.get("task_name")), len(SESSION.get("messages") or ())
+            with ACTIVE_LOCK:
+                busy = ACTIVE_REQUESTS > 0
             try:
                 idle = session_idle_seconds()
             except Exception:
@@ -2008,8 +2499,8 @@ class H(BaseHTTPRequestHandler):
                                    "session_idle_seconds": None if idle is None else int(idle),
                                    "session_ttl_seconds": CFG.session_ttl,
                                    "timeout_seconds": CFG.timeout, "retries": CFG.retries,
-                                   "busy": active})
-        elif p.endswith("/models"):
+                                   "busy": busy, "active_requests": ACTIVE_REQUESTS})
+        elif p in ("/models", "/v1/models"):
             self._send_json(200, {"object": "list", "data": [{"id": label, "object": "model", "owned_by": "neoxider-agents"}]})
         elif p == "/":
             with SESSION_LOCK:
@@ -2020,7 +2511,8 @@ class H(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": {"message": "not found: " + p}})
 
-    def _raw_completion(self, messages, tools, on_delta=None, can_retry=None, on_retry=None):
+    def _raw_completion(self, messages, tools, tool_choice="auto", on_delta=None,
+                        can_retry=None, on_retry=None):
         """Implements THE SESSION MODEL (see module docstring): continue the existing CLI
         session via `agent.sh reply` when `messages` is a deterministic extension of what we
         saw last time and that session is still healthy; otherwise fall back to a brand-new
@@ -2037,7 +2529,8 @@ class H(BaseHTTPRequestHandler):
                 and (CFG.engine in LIVE_STREAM_ENGINES or _use_opencode_native())
                 and not getattr(CFG, "no_live_stream", False))
         if _use_claude_native():
-            return _claude_native_raw(messages, tools, on_delta, can_retry, on_retry, live)
+            return _claude_native_raw(messages, tools, tool_choice, on_delta,
+                                      can_retry, on_retry, live)
         retry_ok = can_retry or (lambda: True)
         with SESSION_LOCK:
             supports_resume = bool((PROVIDERS.get(CFG.engine) or {}).get("supports_resume"))
@@ -2054,7 +2547,7 @@ class H(BaseHTTPRequestHandler):
             raw_text = None
             if supports_resume and healthy and is_extension(SESSION["messages"], messages):
                 new_turns = messages[len(SESSION["messages"]):]
-                answer = build_prompt(new_turns, tools)
+                answer = build_prompt(new_turns, tools, tool_choice)
                 if live:
                     raw_text = reply_agent_live(CFG.engine, CFG.model, CFG.effort, SESSION["dir"],
                                                 prev_name, answer, CFG.timeout, on_delta)
@@ -2081,13 +2574,15 @@ class H(BaseHTTPRequestHandler):
                 # runs are retried (--retries, default 1): a real OpenAI endpoint effectively
                 # never returns an empty 200, and a transient CLI hiccup (rate-limit blip, session
                 # startup race) should not zero a whole benchmark scenario.
-                prompt = build_prompt(messages, tools)
+                prompt = build_prompt(messages, tools, tool_choice)
                 # Keep the directory only when this really is the same conversation carrying on
                 # (the normal case for a no-resume engine, where every turn lands here anyway).
-                continuing = (bool(SESSION["dir"]) and not session_expired()
+                continuing = (bool(SESSION["task_name"]) and bool(SESSION["dir"])
+                              and not session_expired()
                               and is_extension(SESSION["messages"], messages))
                 workdir = fresh_session_dir(wipe=not continuing)
                 SESSION["dir"] = workdir
+                completed = False
                 for attempt in range(CFG.retries + 1):
                     name = new_task_name()
                     if _use_opencode_native():
@@ -2097,7 +2592,9 @@ class H(BaseHTTPRequestHandler):
                                 workdir=workdir)
                             state = "done" if raw_text.strip() else "error"
                         except Exception as _oce:
-                            print("[openai-bridge] opencode native error: %s" % _oce, file=sys.stderr)
+                            incident = uuid.uuid4().hex[:12]
+                            LOG.warning("opencode native incident %s exception=%s",
+                                        incident, type(_oce).__name__)
                             raw_text, state = "", "error"
                     elif live:
                         raw_text = run_agent_live(CFG.engine, CFG.model, CFG.effort, workdir,
@@ -2108,6 +2605,7 @@ class H(BaseHTTPRequestHandler):
                                              name, CFG.timeout)
                         state = read_meta(name).get("state")
                     if raw_text.strip() and state != "error":
+                        completed = True
                         break
                     if attempt < CFG.retries and retry_ok():
                         print("[openai-bridge] empty/errored completion (state=%s), retry %d/%d"
@@ -2122,21 +2620,26 @@ class H(BaseHTTPRequestHandler):
                         raise LiveStreamDied()
                     else:
                         break
+                if not completed:
+                    SESSION["task_name"] = None
+                    SESSION["last_activity"] = time.time()
+                    raise CompletionFailed("provider invocation did not complete")
             SESSION["task_name"] = name
             SESSION["messages"] = messages
             SESSION["last_activity"] = time.time()
         return raw_text
 
-    def _run(self, messages, tools, _retry_left=1):
+    def _run(self, messages, tools, tool_choice="auto", _retry_left=1, _record=True):
         # NB: called unbound in tests (H._run(object(), ...)) -- route through the class, not
         # through self, so a dummy receiver keeps working. _retry_left is threaded as an argument
         # (not a self attribute) for the same reason: a dummy object() has no __dict__.
-        raw_text = H._raw_completion(self, messages, tools)
+        raw_text = H._raw_completion(self, messages, tools, tool_choice)
         if looks_like_limit_banner(raw_text):
             raise ProviderLimitError(raw_text.strip())
-        tool_calls, text = extract_tool_calls(raw_text, tool_names(tools), tools,
+        declared_names = tool_names(tools)
+        tool_calls, text = extract_tool_calls(raw_text, declared_names, tools,
                                               prior_call_keys(messages))
-        usage_prompt = _rough_tokens(build_prompt(messages, tools))
+        usage_prompt = _rough_tokens(build_prompt(messages, tools, tool_choice))
         usage_completion = _rough_tokens(raw_text)
         usage = {"prompt_tokens": usage_prompt, "completion_tokens": usage_completion,
                  "total_tokens": usage_prompt + usage_completion,
@@ -2149,7 +2652,16 @@ class H(BaseHTTPRequestHandler):
         # agentic Claude CLI (it sometimes treats the text protocol as optional). Retry ONCE with an explicit
         # nudge; keep the retry only if it actually produced calls, so a legitimate prose answer that happens
         # to mention a tool name is never worsened. Gated off with AGENT_TOOLCALL_RETRY=0.
-        if (tools and not tool_calls and _retry_left > 0
+        selected_name = _selected_tool_name(tool_choice)
+        forbidden_call = bool(tool_calls) and (
+            tool_choice == "none"
+            or (selected_name is not None and any(
+                tc["function"]["name"] != selected_name for tc in tool_calls)))
+        missing_required_call = _tool_choice_requires_call(tool_choice) and not tool_calls
+        choice_violation = forbidden_call or missing_required_call
+        resumable = True
+        result_text, result_calls, result_usage = text, tool_calls, usage
+        if (tools and _retry_left > 0
                 and os.environ.get("AGENT_TOOLCALL_RETRY", "1") not in ("0", "false", "no", "")):
             low = (raw_text or "").lower()
             names_tool = any(n and n.lower() in low for n in tool_names(tools))
@@ -2162,27 +2674,59 @@ class H(BaseHTTPRequestHandler):
                               "starting with", "first, i", "first i", "next, i", "now i", "here's the plan",
                               "i'll start", "step 1", "to build", "let me build", "let me create")
             action_intent = bool(low.strip()) and any(k in low for k in intent_markers)
-            if names_tool or action_intent:
-                nudge = ("You described an action but did not emit a tool call. If the task requires an "
-                         "action, respond with ONLY the fenced ```json {\"tool_calls\":[...]} block from the "
-                         "instructions -- no prose before or after -- and nothing else.")
+            if choice_violation or (not tool_calls and (names_tool or action_intent)):
+                if tool_choice == "none":
+                    nudge = ("Tool use is disabled for this turn. Reply again in plain prose only, "
+                             "without any tool_calls block or function-call syntax.")
+                elif selected_name:
+                    nudge = ("The response must call ONLY %s at least once. Reply with ONLY the "
+                             "fenced ```json {\"tool_calls\":[...]} block and no prose."
+                             % selected_name)
+                elif tool_choice == "required":
+                    nudge = ("At least one tool call is required. Reply with ONLY the fenced "
+                             "```json {\"tool_calls\":[...]} block and no prose.")
+                else:
+                    nudge = ("You described an action but did not emit a tool call. If the task requires an "
+                             "action, respond with ONLY the fenced ```json {\"tool_calls\":[...]} block from the "
+                             "instructions -- no prose before or after -- and nothing else.")
                 retry_messages = list(messages) + [{"role": "user", "content": nudge}]
                 retry_has_calls = False
                 try:
-                    r_text, r_calls, r_usage = H._run(self, retry_messages, tools, _retry_left=0)
+                    r_text, r_calls, r_usage = H._run(
+                        self, retry_messages, tools, tool_choice,
+                        _retry_left=0, _record=False)
                     retry_has_calls = bool(r_calls)
                 finally:
-                    # The synthetic nudge is absent from every later client history.
+                    # Any hidden turn changes native/CLI context, even when it succeeds. The
+                    # next real request must therefore start fresh from its full visible history.
                     with SESSION_LOCK:
                         SESSION["messages"] = list(messages)
-                        if not retry_has_calls:
-                            # The bridge returns the original prose, not the retry answer, so that
-                            # CLI session no longer matches the client-visible conversation.
-                            SESSION["task_name"] = None
-                if r_calls:
-                    return r_text, r_calls, r_usage
+                        SESSION["task_name"] = None
+                        claude_native_kill()
+                    resumable = False
+                if tool_choice == "none" and not r_calls:
+                    result_text, result_calls, result_usage = r_text, r_calls, r_usage
+                elif r_calls:
+                    result_text, result_calls, result_usage = r_text, r_calls, r_usage
 
-        return text, tool_calls, usage
+        # A constrained choice is a response contract, not a hint.  Never downgrade a provider
+        # violation into an OpenAI 200 containing prose or calls to a different function.
+        final_forbidden = bool(result_calls) and (
+            tool_choice == "none"
+            or (selected_name is not None and any(
+                tc["function"]["name"] != selected_name for tc in result_calls)))
+        final_missing = _tool_choice_requires_call(tool_choice) and not result_calls
+        if final_forbidden or final_missing:
+            with SESSION_LOCK:
+                SESSION["messages"] = list(messages)
+                SESSION["task_name"] = None
+                SESSION["last_activity"] = time.time()
+                claude_native_kill()
+            raise CompletionFailed("provider did not satisfy tool_choice")
+
+        if _record:
+            _record_completion(messages, result_text, result_calls, resumable=resumable)
+        return result_text, result_calls, result_usage
 
     def _reset_session(self):
         with SESSION_LOCK:
@@ -2196,8 +2740,8 @@ class H(BaseHTTPRequestHandler):
                 shutil.rmtree(old_dir, ignore_errors=True)
         self._send_json(200, {"ok": True, "reset": True})
 
-    def _sync_response(self, messages, tools):
-        text, tool_calls, usage = self._run(messages, tools)
+    def _sync_response(self, messages, tools, tool_choice="auto"):
+        text, tool_calls, usage = self._run(messages, tools, tool_choice)
         message = {"role": "assistant", "content": None if tool_calls else text.strip()}
         if tool_calls:
             message["tool_calls"] = tool_calls
@@ -2224,20 +2768,27 @@ class H(BaseHTTPRequestHandler):
         self._sse_started = True  # a second HTTP status line is now impossible -- see do_POST
 
     def _abort_stream_safely(self):
-        """Finish an already-started SSE response without writing another HTTP status."""
+        """Close a failed SSE response explicitly; never masquerade as a successful [DONE]."""
         try:
-            self.wfile.write(b"data: [DONE]\n\n")
+            payload = {"error": {"message": "stream terminated before completion",
+                                 "type": "server_error", "code": "stream_failed"}}
+            wire = "event: error\ndata: %s\n\n" % json.dumps(payload, separators=(",", ":"))
+            self.wfile.write(wire.encode("utf-8"))
             self.wfile.flush()
         except (OSError, ValueError):
             pass
 
-    def _stream_response(self, messages, tools):
-        if ((CFG.engine in LIVE_STREAM_ENGINES or _use_opencode_native())
+    def _stream_response(self, messages, tools, tool_choice="auto"):
+        # Required/specific/disabled choices must be parsed and verified before any bytes become
+        # irrevocable.  The replay path still speaks SSE, but can fail closed with a normal error.
+        choice_live_safe = not tools or tool_choice == "auto"
+        if (choice_live_safe
+                and (CFG.engine in LIVE_STREAM_ENGINES or _use_opencode_native())
                 and not getattr(CFG, "no_live_stream", False)):
-            return self._stream_response_live(messages, tools)
+            return self._stream_response_live(messages, tools, tool_choice)
         # Legacy/emulated path (non-live engines): run to completion, then replay the finished
         # answer as word-sized SSE deltas.
-        text, tool_calls, _usage = self._run(messages, tools)
+        text, tool_calls, _usage = self._run(messages, tools, tool_choice)
         cid = "chatcmpl-%s" % uuid.uuid4().hex
         created = int(time.time())
         label = model_label(CFG.engine, CFG.model, CFG.effort)
@@ -2265,16 +2816,16 @@ class H(BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionAbortedError, OSError):
-            pass  # client went away mid-stream -- nothing left to do
+            _invalidate_resume_session(messages)
 
-    def _stream_response_live(self, messages, tools):
+    def _stream_response_live(self, messages, tools, tool_choice="auto"):
         """REAL streaming: SSE chunks go out while the CLI generates. Headers are sent lazily
         on the first actual chunk, so a limit banner (held back, see STREAM_HOLDBACK_CHARS) can
         still surface as a clean HTTP 429 through do_POST's normal error path."""
         cid = "chatcmpl-%s" % uuid.uuid4().hex
         created = int(time.time())
         label = model_label(CFG.engine, CFG.model, CFG.effort)
-        state = {"headers": False, "gone": False}
+        state = {"headers": False, "gone": False, "content": [], "calls": {}}
 
         def emit(delta, finish_reason=None):
             if state["gone"]:
@@ -2290,6 +2841,11 @@ class H(BaseHTTPRequestHandler):
                     state["role_sent"] = True
                     chunk["choices"][0]["delta"] = dict(chunk["choices"][0]["delta"])
                     chunk["choices"][0]["delta"]["role"] = "assistant"
+                if isinstance(delta.get("content"), str):
+                    state["content"].append(delta["content"])
+                for call in delta.get("tool_calls") or []:
+                    state["calls"][call["index"]] = {
+                        "id": call["id"], "type": "function", "function": call["function"]}
                 self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionAbortedError, OSError):
@@ -2301,12 +2857,9 @@ class H(BaseHTTPRequestHandler):
             on_call=lambda call, idx: emit({"tool_calls": [
                 {"index": idx, "id": call["id"], "type": "function", "function": call["function"]}]}),
         )
-        try:
-            raw = self._raw_completion(messages, tools, on_delta=emitter.feed,
-                                       can_retry=lambda: not emitter.wire_started,
-                                       on_retry=emitter.reset)
-        except LiveStreamDied:
-            raw = emitter.raw_text  # finalize with what already reached the client
+        raw = self._raw_completion(messages, tools, tool_choice, on_delta=emitter.feed,
+                                   can_retry=lambda: not emitter.wire_started,
+                                   on_retry=emitter.reset)
         if not emitter.wire_started and looks_like_limit_banner(raw):
             raise ProviderLimitError((raw or "").strip())  # -> 429, headers not sent yet
         fallback_text = emitter.finish()
@@ -2315,13 +2868,20 @@ class H(BaseHTTPRequestHandler):
                 emit({"content": fallback_text.strip()})
             else:
                 emit({})  # empty answer: still open the stream so the client gets a valid turn
+        visible_calls = [state["calls"][i] for i in sorted(state["calls"])] or None
         try:
             emit({}, "tool_calls" if emitter.any_calls else "stop")
             if not state["gone"]:
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionAbortedError, OSError):
-            pass
+            state["gone"] = True
+        if state["gone"]:
+            _invalidate_resume_session(messages)
+        else:
+            # Only a fully delivered stream becomes resumable context.  Recording before the
+            # finish chunk made a BrokenPipe preserve a truncated assistant turn as if received.
+            _record_completion(messages, "".join(state["content"]), visible_calls)
 
     def _read_content_length(self):
         """(n, None) on success or (None, (http_code, message)); missing header -> 0,
@@ -2357,35 +2917,49 @@ class H(BaseHTTPRequestHandler):
             return self._send_json(400, {"error": {"message": "request body must be a JSON object"}})
         if p in ("/reset", "/v1/reset"):
             return self._reset_session()
-        messages = body.get("messages") or []
-        if not messages:
-            return self._send_json(400, {"error": {"message": "'messages' is required and must be a non-empty array"}})
-        tools = body.get("tools") or None
         try:
-            if body.get("stream"):
-                self._stream_response(messages, tools)
-            else:
-                self._sync_response(messages, tools)
+            messages, tools, tool_choice, stream = validate_chat_request(body)
+        except RequestValidationError as e:
+            return self._send_json(400, _parameter_error(e))
+        global ACTIVE_REQUESTS
+        with ACTIVE_LOCK:
+            ACTIVE_REQUESTS += 1
+        try:
+            with REQUEST_LOCK:
+                if stream:
+                    self._stream_response(messages, tools, tool_choice)
+                else:
+                    self._sync_response(messages, tools, tool_choice)
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
-            pass  # client went away -- nothing to answer
-        except ProviderLimitError as e:
+            _invalidate_resume_session(messages)
+        except ProviderLimitError:
+            incident = uuid.uuid4().hex[:12]
+            LOG.warning("provider limit incident %s", incident)
             if getattr(self, "_sse_started", False):
                 return self._abort_stream_safely()  # 429 headers cannot follow an SSE body
             try:
-                self._send_json(429, {"error": {"message": str(e), "type": "rate_limit_error",
+                self._send_json(429, {"error": {"message": "provider quota exceeded",
+                                                 "type": "rate_limit_error",
                                                  "code": "rate_limit_exceeded"}})
             except OSError:
                 pass
         except Exception as e:  # noqa: BLE001 -- a bridge bug must surface as an OpenAI-style
             # error response, not a bare connection reset the client can't distinguish from a
             # network failure. A second status line would corrupt an already-started SSE stream.
+            incident = uuid.uuid4().hex[:12]
+            LOG.warning("bridge incident %s exception=%s", incident, type(e).__name__)
             if getattr(self, "_sse_started", False):
                 return self._abort_stream_safely()
             try:
-                self._send_json(500, {"error": {"message": "bridge failure: %s" % e,
-                                                 "type": "server_error"}})
+                self._send_json(500, {"error": {"message": "bridge request failed",
+                                                 "type": "server_error",
+                                                 "code": "bridge_failure",
+                                                 "incident_id": incident}})
             except OSError:
                 pass
+        finally:
+            with ACTIVE_LOCK:
+                ACTIVE_REQUESTS = max(0, ACTIVE_REQUESTS - 1)
 
 
 def _lan_ips():
@@ -2506,8 +3080,45 @@ def _port_arg(v):
     return p
 
 
+def _host_is_loopback(host):
+    value = (host or "").strip().lower()
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False  # fail closed for hostnames whose bind scope is not self-evident
+
+
+def default_bind_host():
+    return os.environ.get("AGENT_OPENAI_HOST") or "127.0.0.1"
+
+
+def validate_network_config(cfg):
+    """Return a startup refusal reason, or None when the requested bind is safe enough."""
+    if getattr(cfg, "lan", False) and getattr(cfg, "localhost", False):
+        return "--lan and --localhost cannot be used together"
+    if cfg.engine == "claude":
+        try:
+            resolve_claude_model(cfg.model, cfg.effort)
+        except ValueError:
+            return "unsupported Claude model/effort; choose values advertised by the provider"
+    if _host_is_loopback(cfg.host):
+        return None
+    if not (getattr(cfg, "api_key", "") or "").strip():
+        return "non-loopback binding requires --api-key"
+    if cfg.engine in ("codex", "gemini"):
+        return ("%s chat-only mode retains read capability and is loopback-only; "
+                "use --localhost" % cfg.engine)
+    if cfg.engine == "opencode" and OPENCODE_NATIVE:
+        return "unsafe native OpenCode mode is loopback-only; unset AGENT_OPENCODE_NATIVE_UNSAFE"
+    return None
+
+
 def main():
     global CFG
+    if os.name != "nt":
+        os.umask(0o077)
     ap = argparse.ArgumentParser(
         prog="openai_server.py",
         description="OpenAI-compatible /v1/chat/completions bridge over a CLI subagent.")
@@ -2520,13 +3131,12 @@ def main():
                           "wiped and recreated each time a brand-new session starts). Pin this "
                           "to a real project path if the agent should operate there instead.")
     ap.add_argument("-p", "--port", type=_port_arg, default=os.environ.get("AGENT_OPENAI_PORT") or 8801)
-    ap.add_argument("--host", default=os.environ.get("AGENT_OPENAI_HOST") or "0.0.0.0",
-                     help="interface to bind (default: 0.0.0.0 = all interfaces, reachable over the LAN "
-                          "from a phone/APK or another computer). Set AGENT_OPENAI_HOST to change the "
+    ap.add_argument("--host", default=default_bind_host(),
+                     help="interface to bind (default: 127.0.0.1 = this machine only). "
+                          "Set AGENT_OPENAI_HOST to change the "
                           "default, or pass --localhost to restrict to this machine only.")
     ap.add_argument("--lan", action="store_true",
-                     help="explicitly bind all interfaces (0.0.0.0). This is already the default; kept "
-                          "for clarity and to override AGENT_OPENAI_HOST/--host back to LAN.")
+                     help="explicitly bind all interfaces (0.0.0.0); requires an API key")
     ap.add_argument("--localhost", action="store_true",
                      help="restrict to 127.0.0.1 (this machine only). Use when you do NOT want other "
                           "devices on the network to reach the bridge.")
@@ -2551,6 +3161,9 @@ def main():
         CFG.host = "0.0.0.0"
     if getattr(CFG, "localhost", False):
         CFG.host = "127.0.0.1"
+    refusal = validate_network_config(CFG)
+    if refusal:
+        ap.error(refusal)
 
     try:
         srv = ThreadingHTTPServer((CFG.host, CFG.port), H)
@@ -2560,7 +3173,8 @@ def main():
 
     register_bridge(CFG)
     atexit.register(unregister_bridge, CFG.port)
-    atexit.register(claude_native_kill)
+    atexit.register(_shutdown_process_trees)
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     label = model_label(CFG.engine, CFG.model, CFG.effort)
     all_ifaces = CFG.host in ("0.0.0.0", "::")
@@ -2598,6 +3212,9 @@ def main():
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n[openai-bridge] stopped")
+    finally:
+        _shutdown_process_trees()
+        srv.server_close()
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ import importlib.util
 import io
 import json
 import logging
+import glob
 import os
 import socket
 import sys
@@ -758,30 +759,123 @@ class StartBridgeTests(unittest.TestCase):
 
     def setUp(self):
         self.spawned = []
-        self._orig_spawn, self._orig_free = gui.spawn, gui.port_available
-        gui.spawn = lambda args, terminal=False: self.spawned.append(list(args))
+        self.spawn_envs = []
+        self._orig_spawn, self._orig_free, self._orig_ready = \
+            gui.spawn, gui.port_available, gui._await_bridge_ready
+        def fake_spawn(args, terminal=False, extra_env=None):
+            self.spawned.append(list(args))
+            self.spawn_envs.append(extra_env)
+        gui.spawn = fake_spawn
         gui.port_available = lambda port, host="0.0.0.0": True
+        gui._await_bridge_ready = lambda port, proc: ({"port": port}, "")
 
     def tearDown(self):
-        gui.spawn, gui.port_available = self._orig_spawn, self._orig_free
+        gui.spawn, gui.port_available, gui._await_bridge_ready = \
+            self._orig_spawn, self._orig_free, self._orig_ready
 
-    def test_api_key_is_forwarded_to_the_bridge(self):
+    def test_api_key_is_forwarded_only_in_child_environment(self):
         r = gui.start_bridge({"engine": "claude", "port": 8801, "api_key": " s3cret "})
-        self.assertIn("--api-key", self.spawned[0])
-        self.assertEqual(self.spawned[0][self.spawned[0].index("--api-key") + 1], "s3cret")
+        self.assertNotIn("--api-key", self.spawned[0])
+        self.assertNotIn("s3cret", self.spawned[0])
+        self.assertEqual(self.spawn_envs[0], {"AGENT_OPENAI_KEY": "s3cret"})
         self.assertTrue(r["auth"])
-        self.assertFalse(r["unprotected_lan"])
 
     def test_no_key_means_no_flag_and_stays_the_open_bridge(self):
         r = gui.start_bridge({"engine": "claude", "port": 8801, "localhost": True})
         self.assertNotIn("--api-key", self.spawned[0])
         self.assertFalse(r["auth"])
-        self.assertFalse(r["unprotected_lan"])  # loopback without a key is the historic default
 
-    def test_lan_without_a_key_is_flagged_back_to_the_panel(self):
+    def test_lan_without_a_key_is_rejected_before_spawn(self):
         r = gui.start_bridge({"engine": "claude", "port": 8801, "localhost": False})
-        self.assertIn("--lan", self.spawned[0])
-        self.assertTrue(r["unprotected_lan"])
+        self.assertIn("requires an API key", r["error"])
+        self.assertEqual(self.spawned, [])
+
+    def test_legitimate_opaque_values_and_existing_directory_are_forwarded_verbatim(self):
+        workdir = tempfile.mkdtemp(prefix="bridge dir ; $() ")
+        self.addCleanup(shutil.rmtree, workdir, True)
+        model = "openrouter/vendor.model-v2:free@2026/08"
+        effort = "xhigh-v2"
+        api_key = "--sk-live_a.b/c+=:@-opaque"
+
+        r = gui.start_bridge({"engine": "opencode", "port": 8801, "model": model,
+                              "effort": effort, "dir": workdir, "api_key": api_key})
+
+        self.assertTrue(r["ok"])
+        self.assertEqual(self.spawned[0][self.spawned[0].index("-m") + 1], model)
+        self.assertEqual(self.spawned[0][self.spawned[0].index("-f") + 1], effort)
+        self.assertEqual(self.spawned[0][self.spawned[0].index("-C") + 1],
+                         gui.to_git_bash_path(workdir))
+        self.assertEqual(self.spawn_envs[0], {"AGENT_OPENAI_KEY": api_key})
+
+    @unittest.skipUnless(os.name == "nt", "Git-Bash drive paths are a Windows boundary")
+    def test_existing_git_bash_directory_is_accepted_on_windows(self):
+        workdir = tempfile.mkdtemp(prefix="bridge-git-bash-")
+        self.addCleanup(shutil.rmtree, workdir, True)
+        git_bash_dir = gui.to_git_bash_path(workdir)
+
+        result = gui.start_bridge(
+            {"engine": "opencode", "port": 8801, "dir": git_bash_dir})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.spawned[0][self.spawned[0].index("-C") + 1], git_bash_dir)
+
+    def test_launch_fails_closed_when_popen_rejects_argv_or_environment(self):
+        original_spawn = gui.spawn
+        try:
+            for exception in (OSError("cannot execute"), ValueError("embedded null byte")):
+                with self.subTest(exception=type(exception).__name__):
+                    gui.spawn = lambda *args, **kwargs: (_ for _ in ()).throw(exception)
+                    result = gui.start_bridge({"engine": "codex", "port": 8801})
+                    self.assertIn("could not launch", result["error"])
+        finally:
+            gui.spawn = original_spawn
+
+
+class BridgeReadyIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.orig = (gui._read_bridge_registration, gui.port_available, gui.time.time,
+                     gui.time.sleep)
+        self.now = 0.0
+        gui.time.time = self._time
+        gui.time.sleep = lambda seconds: None
+        gui.port_available = lambda port: False
+
+    def tearDown(self):
+        (gui._read_bridge_registration, gui.port_available, gui.time.time,
+         gui.time.sleep) = self.orig
+
+    def _time(self):
+        self.now += 0.05
+        return self.now
+
+    def test_concurrent_start_loser_does_not_accept_winners_registry(self):
+        proc = types.SimpleNamespace(pid=222, poll=lambda: None)
+        gui._read_bridge_registration = lambda port: {
+            "port": port, "pid": 111, "instance_id": "winner"}
+        rec, error = gui._await_bridge_ready(8801, proc, timeout=0.2)
+        self.assertIsNone(rec)
+        self.assertIn("did not bind", error)
+
+    def test_registry_from_spawned_child_is_accepted(self):
+        proc = types.SimpleNamespace(pid=222, poll=lambda: None)
+        expected = {"port": 8801, "pid": 222, "instance_id": "ours"}
+        gui._read_bridge_registration = lambda port: expected
+        rec, error = gui._await_bridge_ready(8801, proc, timeout=0.2)
+        self.assertIs(rec, expected)
+        self.assertEqual(error, "")
+
+    def test_windows_bash_descendant_registry_is_accepted(self):
+        proc = types.SimpleNamespace(pid=222, poll=lambda: None)
+        expected = {"port": 8801, "pid": 333, "instance_id": "ours"}
+        gui._read_bridge_registration = lambda port: expected
+        original = gui._windows_process_descends_from
+        gui._windows_process_descends_from = lambda child, parent: (child, parent) == (333, 222)
+        try:
+            rec, error = gui._await_bridge_ready(8801, proc, timeout=0.2)
+        finally:
+            gui._windows_process_descends_from = original
+        self.assertIs(rec, expected)
+        self.assertEqual(error, "")
 
 
 class GuiAuthTests(unittest.TestCase):
@@ -801,9 +895,11 @@ class GuiAuthTests(unittest.TestCase):
         gui.GUI_TOKEN = ""
         self.assertTrue(gui.gui_authorized("192.168.1.5", {}, "/api/tasks"))
 
-    def test_loopback_never_needs_the_token(self):
+    def test_configured_token_is_required_even_on_loopback(self):
         gui.GUI_TOKEN = "s3cret"
-        self.assertTrue(gui.gui_authorized("127.0.0.1", {}, "/api/tasks"))
+        self.assertFalse(gui.gui_authorized("127.0.0.1", {}, "/api/tasks"))
+        self.assertTrue(gui.gui_authorized(
+            "127.0.0.1", {"X-Agent-Token": "s3cret"}, "/api/tasks"))
 
     def test_network_client_without_the_token_is_rejected(self):
         gui.GUI_TOKEN = "s3cret"
@@ -1218,14 +1314,17 @@ class RestartBridgeTests(unittest.TestCase):
 
     def setUp(self):
         self.scratch = tempfile.mkdtemp()
-        self.orig = (gui.BRIDGES_DIR, gui._bridge_health, gui.kill_pid, gui.spawn)
+        self.orig = (gui.BRIDGES_DIR, gui._bridge_health, gui.kill_pid, gui.spawn,
+                     gui._await_bridge_ready)
         gui.BRIDGES_DIR = self.scratch
         self.spawned = []
-        gui.spawn = lambda args, terminal=False: self.spawned.append(args)
+        gui.spawn = lambda args, terminal=False, extra_env=None: self.spawned.append(args)
+        gui._await_bridge_ready = lambda port, proc: ({"port": port}, "")
         gui.kill_pid = lambda pid: True
 
     def tearDown(self):
-        (gui.BRIDGES_DIR, gui._bridge_health, gui.kill_pid, gui.spawn) = self.orig
+        (gui.BRIDGES_DIR, gui._bridge_health, gui.kill_pid, gui.spawn,
+         gui._await_bridge_ready) = self.orig
         shutil.rmtree(self.scratch, ignore_errors=True)
 
     def _free_port(self):
@@ -1297,6 +1396,89 @@ class RestartBridgeTests(unittest.TestCase):
         self.assertEqual(self.spawned, [])
         self.assertTrue(os.path.exists(self._rec_path(port)))
 
+    def test_restart_preflights_provider_network_rule_before_stopping(self):
+        port = self._free_port()
+        self._write_rec(port)
+        stopped = []
+        original_stop = gui.stop_bridge
+        gui.stop_bridge = lambda *args, **kwargs: stopped.append(args) or {"ok": True}
+        try:
+            r = gui.restart_bridge({"port": port, "engine": "codex", "localhost": False,
+                                    "api_key": "secret"})
+        finally:
+            gui.stop_bridge = original_stop
+        self.assertIn("loopback-only", r["error"])
+        self.assertEqual(stopped, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_restart_preflights_claude_model_and_effort_before_stopping(self):
+        port = self._free_port()
+        self._write_rec(port)
+        stopped = []
+        original_stop = gui.stop_bridge
+        gui.stop_bridge = lambda *args, **kwargs: stopped.append(args) or {"ok": True}
+        try:
+            bad_model = gui.restart_bridge(
+                {"port": port, "engine": "claude", "model": "not-a-claude-model"})
+            bad_effort = gui.restart_bridge(
+                {"port": port, "engine": "claude", "model": "sonnet", "effort": "turbo"})
+        finally:
+            gui.stop_bridge = original_stop
+        self.assertIn("unsupported Claude model/effort", bad_model["error"])
+        self.assertIn("unsupported Claude model/effort", bad_effort["error"])
+        self.assertEqual(stopped, [])
+        self.assertTrue(os.path.exists(self._rec_path(port)))
+
+    def test_restart_rejects_every_unpassable_launch_value_before_stopping(self):
+        port = self._free_port()
+        self._write_rec(port)
+        file_instead_of_dir = os.path.join(self.scratch, "not-a-directory")
+        with open(file_instead_of_dir, "w", encoding="utf-8") as f:
+            f.write("x")
+        missing_dir = os.path.join(self.scratch, "missing")
+        cases = (
+            ("option-looking model", {"model": "--bad"}),
+            ("option-looking effort", {"effort": "-bad"}),
+            ("option-looking dir", {"dir": "--bad"}),
+            ("model NUL", {"model": "good\0bad"}),
+            ("effort NUL", {"effort": "high\0bad"}),
+            ("dir NUL", {"dir": self.scratch + "\0bad"}),
+            ("api key NUL", {"api_key": "secret\0bad"}),
+            ("model line break", {"model": "good\nbad"}),
+            ("effort line break", {"effort": "high\rbad"}),
+            ("dir line break", {"dir": self.scratch + "\nbad"}),
+            ("api key line break", {"api_key": "secret\rbad"}),
+            ("model surrogate", {"model": "model\ud800"}),
+            ("api key surrogate", {"api_key": "secret\udfff"}),
+            ("false engine type", {"engine": False}),
+            ("false model type", {"model": False}),
+            ("numeric effort type", {"effort": 0}),
+            ("list dir type", {"dir": []}),
+            ("object API key type", {"api_key": {}}),
+            ("string localhost type", {"localhost": "true"}),
+            ("numeric terminal type", {"terminal": 1}),
+            ("oversized argv", {"model": "m" * 30001}),
+            ("oversized environment", {"api_key": "k" * 30001}),
+            ("missing dir", {"dir": missing_dir}),
+            ("file instead of dir", {"dir": file_instead_of_dir}),
+        )
+        stopped = []
+        original_stop = gui.stop_bridge
+        gui.stop_bridge = lambda *args, **kwargs: stopped.append(args) or {"ok": True}
+        try:
+            for label, invalid in cases:
+                with self.subTest(label=label):
+                    stopped.clear()
+                    self._write_rec(port)
+                    data = {"port": port, "engine": "opencode"}
+                    data.update(invalid)
+                    result = gui.restart_bridge(data)
+                    self.assertIn("error", result)
+                    self.assertEqual(stopped, [])
+                    self.assertTrue(os.path.exists(self._rec_path(port)))
+        finally:
+            gui.stop_bridge = original_stop
+
     def test_restart_proceeds_after_stale_registry_prune_on_same_port(self):
         port = self._free_port()   # nothing holds it: an already-dead stale registry
         self._write_rec(port)
@@ -1334,7 +1516,8 @@ class BridgeStopRouteTests(unittest.TestCase):
                 def __init__(self):
                     body = json.dumps({"port": 8899, "instance_id": "IID-8899"}).encode()
                     self.path = "/api/bridge/stop"
-                    self.headers = {"Content-Length": str(len(body))}
+                    self.headers = {"Content-Length": str(len(body)),
+                                    "Content-Type": "application/json", "Host": "127.0.0.1:8765"}
                     self.rfile = io.BytesIO(body)
 
                 def _send(self, code, body_, ctype="application/json"):
@@ -1371,7 +1554,8 @@ class BridgeRestartRouteTests(unittest.TestCase):
                     body = json.dumps({"port": 8899, "engine": "codex",
                                        "instance_id": "IID-8899"}).encode()
                     self.path = "/api/bridge/restart"
-                    self.headers = {"Content-Length": str(len(body))}
+                    self.headers = {"Content-Length": str(len(body)),
+                                    "Content-Type": "application/json", "Host": "127.0.0.1:8765"}
                     self.rfile = io.BytesIO(body)
 
                 def _send(self, code, body_, ctype="application/json"):
@@ -1397,7 +1581,8 @@ class ApiTestRouteRemovedTests(unittest.TestCase):
 
             def __init__(self):
                 self.path = path
-                self.headers = {"Content-Length": str(len(body))}
+                self.headers = {"Content-Length": str(len(body)),
+                                "Content-Type": "application/json", "Host": "127.0.0.1:8765"}
                 self.rfile = io.BytesIO(body)
 
             def _send(self, code, body_, ctype="application/json"):
@@ -1454,7 +1639,9 @@ class GuiPostBodyGuardTests(unittest.TestCase):
 
             def __init__(self):
                 self.path = "/api/no-such-route"
-                self.headers = headers if headers is not None else {}
+                self.headers = dict(headers) if headers is not None else {}
+                self.headers.setdefault("Content-Type", "application/json")
+                self.headers.setdefault("Host", "127.0.0.1:8765")
                 if body and "Content-Length" not in self.headers:
                     self.headers["Content-Length"] = str(len(body))
                 self.rfile = io.BytesIO(body)
@@ -1484,6 +1671,114 @@ class GuiPostBodyGuardTests(unittest.TestCase):
     def test_valid_empty_body_reaches_routing(self):
         sent = self._call()   # no header -> {} -> unknown route -> plain 404
         self.assertEqual(sent[0][0], 404)
+
+
+class GuiSecurityRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.orig_token = gui.GUI_TOKEN
+
+    def tearDown(self):
+        gui.GUI_TOKEN = self.orig_token
+
+    def test_tokenless_local_post_requires_json_and_same_origin_headers(self):
+        gui.GUI_TOKEN = ""
+        good = {"Host": "127.0.0.1:8765", "Content-Type": "application/json"}
+        self.assertTrue(gui.tokenless_post_is_same_origin("127.0.0.1", good))
+        self.assertTrue(gui.tokenless_post_is_same_origin(
+            "127.0.0.1", dict(good, Origin="http://127.0.0.1:8765",
+                              **{"Sec-Fetch-Site": "same-origin"})))
+        self.assertFalse(gui.tokenless_post_is_same_origin(
+            "127.0.0.1", dict(good, Origin="https://evil.example")))
+        self.assertFalse(gui.tokenless_post_is_same_origin(
+            "127.0.0.1", dict(good, **{"Sec-Fetch-Site": "cross-site"})))
+        self.assertFalse(gui.tokenless_post_is_same_origin(
+            "127.0.0.1", {"Host": "evil.example", "Content-Type": "application/json"}))
+
+    def test_task_names_never_escape_logdir_or_become_options(self):
+        for bad in ("../victim", r"..\victim", r"C:\victim", r"\\server\share",
+                    "/tmp/victim", "-danger", "has space", "quote'", "", True):
+            self.assertIsNone(gui.safe_task_name(bad), repr(bad))
+            self.assertIsNone(gui.safe_task_path(bad, ".log"), repr(bad))
+        self.assertEqual(gui.safe_task_name("openai-8801-a.b_c"), "openai-8801-a.b_c")
+
+    def test_bool_and_float_ports_and_unknown_provider_never_spawn(self):
+        spawned = []
+        orig = gui.spawn
+        gui.spawn = lambda *args, **kwargs: spawned.append(args)
+        try:
+            for bad in (True, False, 8801.0, 1.5):
+                self.assertIn("error", gui.start_bridge({"engine": "codex", "port": bad}))
+            self.assertIn("error", gui.start_bridge({"engine": "-codex", "port": 8801}))
+            self.assertIn("error", gui.start_bridge({"engine": "unknown", "port": 8801}))
+        finally:
+            gui.spawn = orig
+        self.assertEqual(spawned, [])
+
+    def test_protected_bridge_restart_requires_key_before_stopping(self):
+        scratch = tempfile.mkdtemp()
+        orig_dir, orig_stop = gui.BRIDGES_DIR, gui.stop_bridge
+        gui.BRIDGES_DIR = scratch
+        stopped = []
+        gui.stop_bridge = lambda *args, **kwargs: stopped.append(args) or {"ok": True}
+        try:
+            with open(os.path.join(scratch, "bridge-8801.json"), "w", encoding="utf-8") as f:
+                json.dump({"port": 8801, "auth": True}, f)
+            result = gui.restart_bridge({"port": 8801, "engine": "codex"})
+            self.assertIn("authenticated", result["error"])
+            self.assertEqual(stopped, [])
+        finally:
+            gui.BRIDGES_DIR, gui.stop_bridge = orig_dir, orig_stop
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    def test_token_bootstrap_redirects_to_queryless_url_and_uses_httponly_cookie(self):
+        gui.GUI_TOKEN = "s3cret"
+        sent = {"headers": []}
+
+        class Fake:
+            path = "/?token=s3cret&view=tasks"
+            client_address = ("127.0.0.1", 4242)
+            headers = {"Host": "127.0.0.1:8765"}
+            _reject_unauthorized = gui.H._reject_unauthorized
+            _maybe_set_token_cookie = gui.H._maybe_set_token_cookie
+
+            def send_response(self, code):
+                sent["code"] = code
+
+            def send_header(self, key, value):
+                sent["headers"].append((key, value))
+
+            def end_headers(self):
+                pass
+
+        gui.H.do_GET(Fake())
+        self.assertEqual(sent["code"], 303)
+        headers = dict(sent["headers"])
+        self.assertEqual(headers["Location"], "/?view=tasks")
+        self.assertIn("HttpOnly", headers["Set-Cookie"])
+        self.assertIn("SameSite=Strict", headers["Set-Cookie"])
+
+    def test_frontend_has_no_inline_handlers_and_contains_race_and_secret_guards(self):
+        paths = [os.path.join(REPO_ROOT, "gui.html")] + glob.glob(
+            os.path.join(REPO_ROOT, "static", "*.js"))
+        chunks = []
+        for path in paths:
+            with open(path, encoding="utf-8") as f:
+                chunks.append(f.read())
+        source = "\n".join(chunks)
+        self.assertNotRegex(source, r"\bon(?:click|change)\s*=")
+        self.assertIn("AbortController", source)
+        self.assertIn("CURRENT_TASKS.has(SEL)", source)
+        self.assertIn('Authorization: Bearer $AGENT_OPENAI_KEY', source)
+        self.assertIn("loadToastHistory", source)
+
+    def test_provider_limits_response_cannot_overwrite_a_new_engine_selection(self):
+        with open(os.path.join(REPO_ROOT, "static", "app.js"), encoding="utf-8") as f:
+            source = f.read()
+        self.assertIn("let providerController = null, providerRequestId = 0", source)
+        self.assertIn("providerController.abort()", source)
+        self.assertIn("{ signal: controller.signal }", source)
+        self.assertIn("requestId !== providerRequestId", source)
+        self.assertIn('$("#f-engine").value || "codex") !== e', source)
 
 
 class GuiLoggingTests(unittest.TestCase):
@@ -1517,9 +1812,10 @@ class GuiLoggingTests(unittest.TestCase):
             gui.H.log_message(self._FakeSelf(), '"GET /?token=%s HTTP/1.1" 200 -' % secret)
         line = cm.records[0].getMessage()
         self.assertNotIn(secret, line)
-        self.assertIn("token=<redacted>", line)
-        self.assertIn("api_key=<redacted>", self._fmt("api_key=k3"))
-        self.assertNotIn("k3", self._fmt("api_key=k3"))
+        self.assertNotIn("?", line)
+        self.assertNotIn("token=", line)
+        encoded = self._fmt("GET /?to%6ben=encoded-secret HTTP/1.1")
+        self.assertNotIn("encoded-secret", encoded)
 
     def _fmt(self, requestline):
         with self.assertLogs(gui.LOG, level=logging.DEBUG) as cm:

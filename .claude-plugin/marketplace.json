@@ -1,11 +1,12 @@
 {
   "name": "neoxider-agents",
+  "description": "Local orchestration, GUI, and OpenAI-compatible bridge for coding subagents.",
   "owner": { "name": "NeoXider", "url": "https://github.com/NeoXider" },
   "plugins": [
     {
       "name": "neoxider-agents",
       "source": "./",
-      "description": "A tiny local control room for AI coding subagents across Codex, Claude Code, opencode, and Gemini CLI — one bash wrapper plus an optional zero-dependency web GUI."
+      "description": "A tiny local control room for AI coding subagents across Codex, Claude Code, Kimi Code, opencode, and Gemini CLI — one bash wrapper plus an optional zero-dependency web GUI."
     }
   ]
 }

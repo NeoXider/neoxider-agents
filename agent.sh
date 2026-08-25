@@ -71,10 +71,25 @@
 # Providers are plugins: each providers/<name>/provider.sh defines provider_<name>_resolve,
 # provider_<name>_run_cmd, provider_<name>_resume_cmd (optional), provider_<name>_doctor.
 # Adding a new engine = adding one new providers/<name>/ directory, zero edits to this file.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    printf 'agent.sh: Bash 4 or newer is required (found %s)\n' "${BASH_VERSION:-unknown}" >&2
+    exit 2
+fi
+
 set -uo pipefail
 
 LOGDIR="${AGENT_CLI_LOGS:-$HOME/.claude/agent-cli-logs}"
-mkdir -p "$LOGDIR"
+( umask 077; mkdir -p "$LOGDIR" )
+chmod 700 "$LOGDIR" 2>/dev/null || true
+for _agent_state_file in "$LOGDIR"/*.log "$LOGDIR"/*.meta; do
+    [ -f "$_agent_state_file" ] && chmod 600 "$_agent_state_file" 2>/dev/null || true
+done
+unset _agent_state_file
+
+# State contains prompts, source and provider diagnostics, so create it owner-only without changing
+# the umask inherited by provider processes (their working-tree files must keep the caller's umask).
+_secure_state_file() { ( umask 077; : >> "$1" ) && chmod 600 "$1" 2>/dev/null; }
+_secure_state_truncate() { ( umask 077; : > "$1" ) && chmod 600 "$1" 2>/dev/null; }
 
 # Wall-clock deadline for ONE provider step, and the silence threshold after which a still-alive
 # task is reported as "no output for Nm". Both are shared with gui.py (same names, same defaults),
@@ -215,7 +230,7 @@ cmd="${1:-}"
 [ -n "$cmd" ] || die "usage: agent.sh run|fan|reply|log|last|status|list|clean|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
 shift
 
-engine="claude"; engine_explicit=0; model=""; effort_override=""; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1; terse=1
+engine="claude"; engine_explicit=0; model=""; model_explicit=0; effort_override=""; effort_explicit=0; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1; terse=1
 # ^ engine=claude by default -> Opus 5 (see providers/claude). Pass -e codex for the gpt-5.6 family.
 # ^ progress=1 by default: every task keeps a PROGRESS.md checkpoint (resumable after a crash,
 # and an orchestrator can read the summary without re-running the agent). Disable with --no-progress.
@@ -231,18 +246,24 @@ task_kind=""; base_url=""; test_goal=""; out_file=""   # test-api only (see that
 parse_opts() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            -e) engine="$2"; engine_explicit=1; shift 2 ;;
-            -m) model="$2"; shift 2 ;;
-            -f) effort_override="$2"; shift 2 ;;
-            -C) dir="$2"; shift 2 ;;
-            -t) name="$2"; shift 2 ;;
-            -P) parent="$2"; shift 2 ;;
+            -e|-m|-f|-C|-t|-P|--base-url|--goal|--out)
+                [ $# -ge 2 ] || die "$cmd: option '$1' needs an operand"
+                case "$2" in -*) die "$cmd: option '$1' needs an operand (got option '$2')" ;; esac
+                case "$1" in
+                    -e) engine="$2"; engine_explicit=1 ;;
+                    -m) model="$2"; model_explicit=1 ;;
+                    -f) effort_override="$2"; effort_explicit=1 ;;
+                    -C) dir="$2" ;;
+                    -t) name="$2" ;;
+                    -P) parent="$2" ;;
+                    --base-url) base_url="$2" ;;
+                    --goal) test_goal="$2" ;;
+                    --out) out_file="$2" ;;
+                esac
+                shift 2 ;;
             -p) progress=1; shift ;;                 # kept for compat; progress is on by default
             --no-progress) progress=0; shift ;;      # opt out of the PROGRESS.md checkpoint
             --no-terse|--verbose) terse=0; shift ;;  # opt out of the concision directive
-            --base-url) base_url="$2"; shift 2 ;;
-            --goal) test_goal="$2"; shift 2 ;;
-            --out) out_file="$2"; shift 2 ;;
             *) break ;;
         esac
     done
@@ -295,24 +316,146 @@ note it in one line rather than stopping — ask only if you are truly blocked a
 # flock, which isn't reliably available in git-bash). This matters once this tool is invoked
 # concurrently from multiple agents/providers/installs sharing the same LOGDIR — without it,
 # two near-simultaneous writers to the same task's .meta could silently clobber each other's update.
-meta_file() { echo "$LOGDIR/$1.meta"; }
+valid_task_name() {
+    local n="${1:-}"
+    [ -n "$n" ] && [ ${#n} -le 128 ] || return 1
+    case "$n" in
+        [A-Za-z0-9]*) ;;
+        *) return 1 ;;
+    esac
+    case "$n" in
+        *[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    return 0
+}
+require_task_name() {
+    valid_task_name "${1:-}" || die "invalid task name '${1:-}': use 1-128 ASCII letters/digits followed by letters, digits, '.', '_' or '-'"
+}
+meta_file() { valid_task_name "${1:-}" || return 1; printf '%s/%s.meta\n' "$LOGDIR" "$1"; }
+_meta_prune_nested_candidates() {
+    local lock="$1" nested="" state=""
+    for nested in "$lock/${lock##*/}.candidate."*; do
+        [ -d "$nested" ] || continue
+        # A nested candidate is necessarily a lost two-operand-mv race: only a top-level owner can
+        # hold the lock. Once no top-level owner exists, removing it is safe even if its creator is
+        # paused and alive; that creator will observe no ownership, clean up, and retry.
+        for state in "$nested"/owner.*; do
+            [ -e "$state" ] || continue
+            rm -- "$state" 2>/dev/null
+        done
+        rmdir "$nested" 2>/dev/null
+    done
+}
 _meta_lock() {
-    local lock="$1.lock.d" i=0
-    until mkdir "$lock" 2>/dev/null; do
-        i=$((i + 1))
-        # stale lock (holder crashed / was killed) -> force through after ~5s rather than deadlock forever
-        [ "$i" -gt 50 ] && { rm -rf "$lock" 2>/dev/null; break; }
+    local lock="$1.lock.d" token owner_pid="${BASHPID:-$$}" candidate="" nested=""
+    local state="" owner_state="" state_pid="" state_token="" state_mt=0 state_age=0
+    local found=0
+    token="$owner_pid-${RANDOM:-0}-$(date +%s)"
+    while :; do
+        # Prepare the complete immutable generation out of sight. Plain two-operand `mv` is the
+        # portable Bash 3 / POSIX primitive available in Git Bash and macOS: absent destination
+        # publishes by rename; an existing directory receives the candidate as a nested child.
+        # The top-level owner check below distinguishes those outcomes without mv -T/flock.
+        if [ ! -e "$lock" ]; then
+            candidate="$lock.candidate.$token.${RANDOM:-0}"
+            owner_state="$candidate/owner.$token"
+            if ( umask 077; mkdir "$candidate" \
+                 && printf '%s %s\n' "$owner_pid" "$token" > "$owner_state" ) 2>/dev/null; then
+                if declare -F _meta_lock_before_publish_hook >/dev/null 2>&1; then
+                    _meta_lock_before_publish_hook "$candidate" "$lock"
+                fi
+                if mv "$candidate" "$lock" 2>/dev/null; then
+                    state="$lock/owner.$token"
+                    state_pid=""; state_token=""
+                    if { read -r state_pid state_token < "$state"; } 2>/dev/null \
+                        && [ "$state_pid" = "$owner_pid" ] && [ "$state_token" = "$token" ]; then
+                        _META_LOCK_TOKEN="$token"
+                        _META_LOCK_STATE="$state"
+                        return 0
+                    fi
+                    nested="$lock/${candidate##*/}"
+                    if [ -d "$nested" ] \
+                        && declare -F _meta_lock_after_nested_publish_hook >/dev/null 2>&1; then
+                        _meta_lock_after_nested_publish_hook "$nested" "$lock"
+                    fi
+                fi
+            fi
+            # A lost publication race may have moved our candidate inside the winner. Both cleanup
+            # paths name only our unique token; rmdir of the primary succeeds only when truly empty.
+            rm -f -- "$owner_state" 2>/dev/null
+            rmdir "$candidate" 2>/dev/null
+            nested="$lock/${candidate##*/}"
+            rm -f -- "$nested/owner.$token" 2>/dev/null
+            rmdir "$nested" 2>/dev/null
+            rmdir "$lock" 2>/dev/null
+        fi
+
+        state=""; found=0
+        for candidate in "$lock"/owner "$lock"/owner.*; do
+            [ -r "$candidate" ] || continue
+            found=$((found + 1))
+            state="$candidate"
+        done
+        if [ "$found" -gt 1 ]; then
+            sleep 0.1
+            continue
+        fi
+        if [ "$found" = 0 ]; then
+            if [ -d "$lock" ]; then
+                _meta_prune_nested_candidates "$lock"
+                rmdir "$lock" 2>/dev/null
+            fi
+            sleep 0.1
+            continue
+        fi
+        if [ "$found" = 1 ]; then
+            state_pid=""; state_token=""
+            if { read -r state_pid state_token < "$state"; } 2>/dev/null; then
+                case "$state_pid" in
+                    ''|*[!0-9]*) ;;
+                    *) kill -0 "$state_pid" 2>/dev/null && { sleep 0.1; continue; } ;;
+                esac
+            fi
+            state_mt="$(file_mtime "$state")"
+        fi
+        case "$state_mt" in ''|*[!0-9]*) state_mt=0 ;; esac
+        state_age=$(( $(date +%s) - state_mt ))
+        if [ "$state_age" -ge 10 ]; then
+            if [ "$found" = 1 ]; then
+                # Published generations are immutable. Removing their unique owner path is the
+                # compare-and-delete token; it can never name a later generation.
+                if rm -- "$state" 2>/dev/null; then rmdir "$lock" 2>/dev/null; fi
+            fi
+        fi
         sleep 0.1
     done
 }
-_meta_unlock() { rmdir "$1.lock.d" 2>/dev/null; }
-meta_set()  { local f; f="$(meta_file "$1")"
-    _meta_lock "$f"
-    touch "$f"
-    grep -v "^$2=" "$f" > "$f.tmp" 2>/dev/null || true; echo "$2=$3" >> "$f.tmp"; mv "$f.tmp" "$f"
-    _meta_unlock "$f"
+_meta_unlock() {
+    local lock="$1.lock.d" state="${_META_LOCK_STATE:-}" owner_pid="" owner_token=""
+    [ -n "$state" ] && [ -r "$state" ] || return 0
+    read -r owner_pid owner_token < "$state" || return 0
+    [ "$owner_token" = "${_META_LOCK_TOKEN:-}" ] || return 0
+    rm -f -- "$state"
+    rmdir "$lock" 2>/dev/null
 }
-meta_get()  { grep -m1 "^$2=" "$(meta_file "$1")" 2>/dev/null | cut -d= -f2- ; }
+meta_set()  { local f tmp key="${2:-}"; f="$(meta_file "${1:-}")" || return 1
+    case "$key" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+    _meta_lock "$f" || return 1
+    tmp="$f.tmp.$BASHPID.${RANDOM:-0}"
+    if ( umask 077
+         { [ ! -e "$f" ] || grep -v "^$key=" "$f" || true; } > "$tmp" 2>/dev/null \
+             && printf '%s=%s\n' "$key" "${3:-}" >> "$tmp"
+       ) \
+        && mv "$tmp" "$f"; then
+        chmod 600 "$f" 2>/dev/null || true
+        _meta_unlock "$f"
+        return 0
+    fi
+    rm -f -- "$tmp"
+    _meta_unlock "$f"
+    return 1
+}
+meta_get()  { local f; f="$(meta_file "${1:-}")" || return 1; grep -m1 "^${2:-}=" "$f" 2>/dev/null | cut -d= -f2- ; }
 
 resolve_session() {
     local n="$1" s; s="$(meta_get "$n" session)"; [ -n "$s" ] && { echo "$s"; return; }
@@ -320,8 +463,38 @@ resolve_session() {
 }
 name_by_session() { local s="$1" f
     for f in "$LOGDIR"/*.meta; do [ -e "$f" ] || continue
-        if grep -q "^session=$s$" "$f"; then basename "$f" .meta; return; fi; done; }
-latest_task() { ls -t "$LOGDIR"/*.meta 2>/dev/null | head -1 | xargs -r basename | sed 's/\.meta$//'; }
+        if grep -Fqx "session=$s" "$f"; then
+            local n; n="$(basename "$f" .meta)"; valid_task_name "$n" && { printf '%s\n' "$n"; return; }
+        fi
+    done
+}
+_latest_file() {
+    local suffix="$1" f mt best="" best_mt=-1
+    for f in "$LOGDIR"/*."$suffix"; do
+        [ -f "$f" ] || continue
+        mt="$(file_mtime "$f")"
+        case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
+        if [ "$mt" -gt "$best_mt" ]; then best="$f"; best_mt="$mt"; fi
+    done
+    printf '%s' "$best"
+}
+_sorted_meta_files() {
+    local limit="${1:-20}" f i j best_idx best_mt mt
+    case "$limit" in ''|*[!0-9]*) return 1 ;; esac
+    _SORTED_META_FILES=("$LOGDIR"/*.meta)
+    [ -e "${_SORTED_META_FILES[0]}" ] || { _SORTED_META_FILES=(); return 0; }
+    for ((i=0; i<${#_SORTED_META_FILES[@]}; i++)); do
+        best_idx=$i; best_mt=-1
+        for ((j=i; j<${#_SORTED_META_FILES[@]}; j++)); do
+            mt="$(file_mtime "${_SORTED_META_FILES[j]}")"; case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
+            if [ "$mt" -gt "$best_mt" ]; then best_idx=$j; best_mt=$mt; fi
+        done
+        f="${_SORTED_META_FILES[i]}"; _SORTED_META_FILES[i]="${_SORTED_META_FILES[best_idx]}"; _SORTED_META_FILES[best_idx]="$f"
+        [ "$((i + 1))" -ge "$limit" ] && { _SORTED_META_FILES=("${_SORTED_META_FILES[@]:0:limit}"); break; }
+    done
+    return 0
+}
+latest_task() { local f; f="$(_latest_file meta)"; [ -n "$f" ] && basename "$f" .meta; }
 
 is_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
@@ -446,7 +619,13 @@ _looks_waiting_line() {
     case "$body" in
         *\?)
             local q="${body%\?}"
-            [ -n "$(printf '%s' "$q" | tr -cd '[:alnum:]')" ] && return 0
+            if _agent_python; then
+                printf '%s' "$q" | PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c \
+                    'import sys; raise SystemExit(0 if any(c.isalnum() for c in sys.stdin.read()) else 1)' \
+                    && return 0
+            elif [ -n "$(printf '%s' "$q" | tr -cd '[:alnum:]')" ]; then
+                return 0
+            fi
             ;;
     esac
     printf '%s' "$body" | grep -qiE \
@@ -547,21 +726,49 @@ provider_dispatch_run() {
     [ -n "$effort_override" ] && P_EFFORT="$effort_override"
     if [ -n "$P_MODEL" ]; then
         meta_set "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}"  # resolved model, not the raw alias
+        meta_set "$n" resolved_model "$P_MODEL"
+        meta_set "$n" effort "$P_EFFORT"
     fi
-    local _try=0
+    local _try=0 attempt_log attempt_sid="" worktree_before="" worktree_after=""
+    if git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
+        worktree_before="$(git -C "$d" status --porcelain 2>/dev/null)"
+    fi
     while : ; do
-        _guarded_run "$AGENT_TIMEOUT_SEC" "$fn" "$d" "$P_MODEL" "$P_EFFORT" "$prompt" 2>&1 | tee -a "$log" | tail -40
+        attempt_log="$(mktemp "$LOGDIR/.agent-attempt.XXXXXX" 2>/dev/null)"
+        if [ -z "$attempt_log" ] || [ ! -f "$attempt_log" ]; then
+            printf 'agent.sh: cannot create retry attempt log in %s\n' "$LOGDIR" | tee -a "$log" >&2
+            rc=1
+            break
+        fi
+        _guarded_run "$AGENT_TIMEOUT_SEC" "$fn" "$d" "$P_MODEL" "$P_EFFORT" "$prompt" 2>&1 \
+            | tee -a "$log" "$attempt_log" | tail -40
         rc=${PIPESTATUS[0]}
+        attempt_sid="$(grep -m1 -oE 'session id: [[:alnum:]_.-]+' "$attempt_log" 2>/dev/null | cut -d' ' -f3)"
+        if [ "$rc" = 0 ] && [ -n "$attempt_sid" ]; then
+            meta_set "$n" session "$attempt_sid"
+        fi
         { [ "$rc" = 0 ] || [ "$rc" = 124 ]; } && break
         [ "$_try" -ge "$AGENT_RETRIES" ] && break
-        _is_transient_failure "$log" || break
+        _is_transient_failure "$attempt_log" || break
+        # A provider session means the failed attempt may already have executed tools. Starting a
+        # fresh retry could duplicate writes or external side effects; leave that session resumable.
+        if [ -n "$attempt_sid" ]; then
+            meta_set "$n" session "$attempt_sid"
+            break
+        fi
+        if git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
+            worktree_after="$(git -C "$d" status --porcelain 2>/dev/null)"
+            [ "$worktree_after" = "$worktree_before" ] || break
+        fi
         _try=$((_try+1))
         echo "[agent.sh] ↻ временный сбой провайдера (exit=$rc) — повтор $_try/$AGENT_RETRIES через ${AGENT_RETRY_DELAY}s  task=$n" >&2
         printf '
 --- RETRY %s/%s after transient provider failure ---
 ' "$_try" "$AGENT_RETRIES" >> "$log"
         sleep "$AGENT_RETRY_DELAY"
+        rm -f -- "$attempt_log"
     done
+    [ -n "${attempt_log:-}" ] && rm -f -- "$attempt_log"
     [ "$_try" -gt 0 ] && meta_set "$n" retries "$_try"   # 124 = killed by the step watchdog (see _guarded_run / finish_step)
 }
 
@@ -574,23 +781,38 @@ provider_dispatch_resume() {
             && die "engine '$eng' does not support resuming a session (supports_resume=false) — use 'run' to start a new task"
         die "unknown engine: $eng"
     fi
-    # Only re-resolve model/effort on resume for providers whose resume command actually takes a
-    # model flag (claude and codex both do; PROVIDER_{CLAUDE,CODEX}_RESUME_NEEDS_MODEL=1). Every
-    # other provider opts out by simply not setting this flag, so reply never overwrites their
-    # model= meta.
-    # CAVEAT for providers that DO opt in: a bare `reply` with no explicit -m resolves to that
-    # provider's DEFAULT alias (e.g. codex -> gpt-5.6-sol medium), not whatever model the task
-    # actually started with -- confirmed live: a codex session started with `-m spark` silently
-    # ran under gpt-5.5 on a `reply` that didn't repeat `-m spark`. Callers that need to guarantee
-    # the SAME model across every turn (e.g. openai_server.py) must pass -m/-f explicitly on every
-    # reply, not rely on it being remembered.
     local needs_var="PROVIDER_${eng^^}_RESUME_NEEDS_MODEL" resolve_fn="provider_${eng}_resolve"
     P_MODEL=""; P_EFFORT=""
     if [ "${!needs_var:-0}" = 1 ] && declare -F "$resolve_fn" >/dev/null 2>&1; then
-        "$resolve_fn" "$model"
-        [ -n "$effort_override" ] && P_EFFORT="$effort_override"  # see provider_dispatch_run
+        if [ "$model_explicit" = 1 ]; then
+            "$resolve_fn" "$model"
+        else
+            P_MODEL="$(meta_get "$n" resolved_model)"
+            P_EFFORT="$(meta_get "$n" effort)"
+            if [ -z "$P_MODEL" ]; then
+                local legacy_model
+                legacy_model="$(meta_get "$n" model)"
+                # Older Codex metadata stored one display string, e.g.
+                # model=gpt-5.6-terra-medium. Split only the known effort suffixes; a raw model id
+                # without one still goes through the provider resolver unchanged.
+                if [ "$eng" = codex ]; then
+                    case "$legacy_model" in
+                        *-low|*-medium|*-high|*-xhigh|*-max)
+                            P_EFFORT="${legacy_model##*-}"
+                            P_MODEL="${legacy_model%-*}"
+                            ;;
+                        *) "$resolve_fn" "$legacy_model" ;;
+                    esac
+                else
+                    "$resolve_fn" "$legacy_model"
+                fi
+            fi
+        fi
+        [ "$effort_explicit" = 1 ] && P_EFFORT="$effort_override"
         if [ -n "$P_MODEL" ]; then
             meta_set "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}"  # resolved model, not the raw alias
+            meta_set "$n" resolved_model "$P_MODEL"
+            meta_set "$n" effort "$P_EFFORT"
         fi
     fi
     _guarded_run "$AGENT_TIMEOUT_SEC" "$fn" "$d" "$session" "$answer" 2>&1 | tee -a "$log" | tail -40
@@ -612,8 +834,10 @@ _require_engine_run() {
 # Expects $name/$engine/$model/$dir/$parent/$prompt (and optionally $task_kind) already set.
 _do_run_dispatch() {
     _require_engine_run "$engine"   # BEFORE the first .log/.meta write: no ghost tasks
-    log="$LOGDIR/$name.log"; : > "$log"
+    require_task_name "$name"
+    log="$LOGDIR/$name.log"; _secure_state_truncate "$log" || die "cannot create protected task log: $log"
     meta_set "$name" engine "$engine"; meta_set "$name" model "${model:-default}"
+    meta_set "$name" resolved_model ""; meta_set "$name" effort ""; meta_set "$name" session ""
     meta_set "$name" dir "$dir"; meta_set "$name" state running
     # NB: capture the pid into a variable FIRST. $BASHPID inside a command substitution reports
     # the substitution's own throwaway subshell, so `winpid "$(_winpid "$BASHPID")"` would record
@@ -628,10 +852,6 @@ _do_run_dispatch() {
     hdr run "engine=$engine model=${model:-default} dir=$dir" PROMPT "$prompt" "$log"
     rc=0
     provider_dispatch_run "$engine" "$model" "$dir" "$prompt" "$name"
-    # Every resumable provider emits a normalized `session id: ...` line. Capture it
-    # generically so adding a provider does not require another engine special-case.
-    sid=$(grep -m1 -oE 'session id: [[:alnum:]_.-]+' "$log" 2>/dev/null | cut -d' ' -f3)
-    [ -n "$sid" ] && meta_set "$name" session "$sid"
     finish_step "$name" "$rc"
 }
 
@@ -676,6 +896,7 @@ case "$cmd" in
         parse_opts "$@"
         [ ${#REST[@]} -ge 1 ] || die "fan: needs >=1 prompt (agent.sh fan [opts] \"p1\" \"p2\" ...)"
         _require_engine_run "$engine"   # synchronously + visibly; the backgrounded dispatches would swallow the error
+        require_task_name "$name"
         fan_base="$name"; fan_i=0
         for fan_p in "${REST[@]}"; do
             fan_i=$((fan_i+1))
@@ -731,8 +952,10 @@ except Exception:
         if [ ${#REST[@]} -ge 2 ]; then ref="${REST[0]}"; answer="${REST[1]}"; else ref=""; answer="${REST[0]:-}"; fi
         [ -n "$answer" ] || die "reply: needs an answer text"
         if [ -z "$ref" ]; then tname="$(latest_task)"; [ -n "$tname" ] || die "reply: no tasks — specify name/session id"
+        elif valid_task_name "$ref" && [ -e "$(meta_file "$ref")" ]; then tname="$ref"
         elif [[ "$ref" =~ ^[0-9a-f-]{36}$|^ses_[[:alnum:]_.-]+$|^session_[[:alnum:]_.-]+$ ]]; then tname="$(name_by_session "$ref")"
         else
+            require_task_name "$ref"
             tname="$ref"
             # An explicit NAME must point at a real task. Without this check a typo fell through
             # every lookup empty-handed: engine stayed at the default claude, the session guard
@@ -746,7 +969,7 @@ except Exception:
             mdir="$(meta_get "$tname" dir)"; [ -n "$mdir" ] && dir="$mdir"
             meng="$(meta_get "$tname" engine)"; [ -n "$meng" ] && [ "$engine_explicit" = 0 ] && engine="$meng"
             log="$LOGDIR/$tname.log"
-        else session="$ref"; tname="session-$ref"; log="$LOGDIR/$tname.log"; meta_set "$tname" dir "$dir"; fi
+        else session="$ref"; tname="session-$ref"; require_task_name "$tname"; log="$LOGDIR/$tname.log"; meta_set "$tname" dir "$dir"; fi
         # Validate the engine BEFORE touching .meta. provider_dispatch_resume dies further down, but
         # by then state=running and pid= have already been written, so the dead task shows up as
         # `⚠ stalled` and status helpfully advises re-running the very reply that cannot work. Seen
@@ -760,7 +983,8 @@ except Exception:
         fi
         [ "$progress" = 1 ] && answer="$answer$(progress_proto_reply "$tname")"   # per-task reminder; needs resolved $tname
         [ -n "${session:-}" ] || [ "$engine" = claude ] || die "reply: could not find a session id (task '$tname'); specify uuid explicitly"
-        touch "$log"; meta_set "$tname" state running; meta_set "$tname" pid "$$"
+        _secure_state_file "$log" || die "cannot create protected task log: $log"
+        meta_set "$tname" state running; meta_set "$tname" pid "$$"
         meta_set "$tname" winpid "$(_winpid "$$")"   # $$ is the SHELL's pid, safe inside $( ) — unlike $BASHPID
         meta_set "$tname" timeout ""
         echo "[agent.sh] ▶ reply task=$tname session=$session dir=$dir" >&2
@@ -772,10 +996,12 @@ except Exception:
     log)
         follow=0; lines=0; lastonly=0
         while [ $# -gt 0 ]; do case "$1" in
-            -f) follow=1; shift ;; -n) lines="$2"; shift 2 ;; -l) lastonly=1; shift ;; *) break ;; esac; done
+            -f) follow=1; shift ;;
+            -n) [ $# -ge 2 ] || die "log: option '-n' needs an operand"; case "$2" in ''|*[!0-9]*) die "log: -n needs a non-negative integer" ;; esac; lines="$2"; shift 2 ;;
+            -l) lastonly=1; shift ;; *) break ;; esac; done
         f="${1:-}"
-        if [ -n "$f" ]; then log="$LOGDIR/$f.log"; [ -e "$log" ] || log="$LOGDIR/$f"
-        else log="$(ls -t "$LOGDIR"/*.log 2>/dev/null | head -1)"; fi
+        if [ -n "$f" ]; then require_task_name "$f"; log="$LOGDIR/$f.log"
+        else log="$(_latest_file log)"; fi
         [ -e "${log:-}" ] || die "log not found: ${f:-<latest>}"
         if   [ "$follow" = 1 ]; then tail -f "$log"
         elif [ "$lastonly" = 1 ]; then awk '/^========== \[/{buf=""} {buf=buf $0 ORS} END{printf "%s", buf}' "$log"
@@ -784,12 +1010,13 @@ except Exception:
         ;;
     last)
         f="${1:-}"
-        if [ -n "$f" ]; then log="$LOGDIR/$f.log"; else log="$(ls -t "$LOGDIR"/*.log 2>/dev/null | head -1)"; fi
+        if [ -n "$f" ]; then require_task_name "$f"; log="$LOGDIR/$f.log"; else log="$(_latest_file log)"; fi
         [ -e "${log:-}" ] || die "log not found: ${f:-<latest>}"
         last_output "$log"
         ;;
     status)
         n="${1:-$(latest_task)}"; [ -n "$n" ] || die "no tasks"
+        require_task_name "$n"
         [ -e "$(meta_file "$n")" ] || die "no such task: $n"
         st="$(eff_state "$n")"; e="$(meta_get "$n" engine)"; mo="$(meta_get "$n" model)"
         ex="$(meta_get "$n" exit)"; nf="$(meta_get "$n" files)"; s="$(meta_get "$n" session)"; d="$(meta_get "$n" dir)"
@@ -813,9 +1040,12 @@ except Exception:
         last_output "$LOGDIR/$n.log" | grep -v '^[[:space:]]*$' | tail -4 | sed 's/^/   /'
         ;;
     list)
+        list_limit="${1:-20}"; case "$list_limit" in ''|*[!0-9]*) die "list: limit must be a non-negative integer" ;; esac
         printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %s\n' "" TASK STATE ENGINE MODEL AGE FILES SESSION
-        for m in $(ls -t "$LOGDIR"/*.meta 2>/dev/null | head -"${1:-20}"); do
+        _sorted_meta_files "$list_limit" || die "list: invalid limit '$list_limit'"
+        for m in "${_SORTED_META_FILES[@]}"; do
             n="$(basename "$m" .meta)"
+            valid_task_name "$n" || continue
             e="$(meta_get "$n" engine)"; mo="$(meta_get "$n" model)"; s="$(meta_get "$n" session)"
             st="$(eff_state "$n")"; nf="$(meta_get "$n" files)"
             fm="$(file_mtime "$m")"
@@ -844,7 +1074,16 @@ except Exception:
         # file (so output can never interleave), wait once, then parse/render every JSON object in a
         # single Python process. The old implementation serialized all probes, spawned Python three
         # times per JSON object, and then repeated Codex + Claude for their limit blocks.
+        _agent_python || die "doctor: needs python to render the report (python3/python/py in PATH or \$AGENT_PYTHON) — none runnable"
         doctor_tmp="$(mktemp -d "${TMPDIR:-/tmp}/agent-doctor.XXXXXX")" || die "doctor: cannot create temp dir"
+        [ -n "$doctor_tmp" ] && [ -d "$doctor_tmp" ] || die "doctor: mktemp returned an invalid temp dir"
+        _doctor_cleanup() {
+            local base
+            base="$(basename "${doctor_tmp:-}")"
+            case "$base" in agent-doctor.*) [ -n "${doctor_tmp:-}" ] && [ -d "$doctor_tmp" ] && rm -rf -- "$doctor_tmp" ;; esac
+        }
+        trap _doctor_cleanup EXIT
+        trap '_doctor_cleanup; exit 130' HUP INT TERM
         doctor_engines=(); doctor_pids=(); doctor_deep_engines=()
         for pdir in "$PROVIDERS_DIR"/*/; do
             [ -d "$pdir" ] || continue
@@ -862,7 +1101,6 @@ except Exception:
 
         doctor_engine_csv="$(IFS=,; echo "${doctor_engines[*]}")"
         doctor_deep_csv="$(IFS=,; echo "${doctor_deep_engines[*]}")"
-        _agent_python || die "doctor: needs python to render the report (python3/python/py in PATH or \$AGENT_PYTHON) — none runnable"
         PYTHONIOENCODING=utf-8 "$_AGENT_PY" - "$doctor_tmp" "$doctor_json" "$doctor_engine_csv" "$doctor_deep_csv" "$deep" <<'PY'
 import datetime, json, os, sys, time
 root, as_json, engine_csv, deep_csv, deep = sys.argv[1:6]
@@ -989,8 +1227,10 @@ if as_json == '1':
 else:
     sys.stdout.write(payload['raw'])
 PY
-        rm -f "$doctor_tmp"/*.json 2>/dev/null || true
-        rmdir "$doctor_tmp" 2>/dev/null || true
+        doctor_render_rc=$?
+        _doctor_cleanup
+        trap - EXIT HUP INT TERM
+        [ "$doctor_render_rc" = 0 ] || die "doctor: failed to render provider report (exit $doctor_render_rc)"
         # --- deep checks --------------------------------------------------------------------
         # Everything above is metadata: binary present, version, login, limits. None of it can
         # catch the failure that actually bit us -- the model answers fine but every shell command
@@ -1038,7 +1278,7 @@ PY
         tasks=0; files=0
         for f in "$LOGDIR"/*.meta; do
             [ -e "$f" ] || continue
-            n="$(basename "$f" .meta)"; st="$(eff_state "$n")"
+            n="$(basename "$f" .meta)"; valid_task_name "$n" || continue; st="$(eff_state "$n")"
             case "$st" in
                 # `idle` is a LIVE task (alive pid, just quiet) -- it must be skipped exactly like
                 # `running`, otherwise --purge deletes the .log/.meta of a process that is still

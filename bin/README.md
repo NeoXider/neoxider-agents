@@ -28,13 +28,15 @@ powershell -ExecutionPolicy Bypass -File .\bin\install.ps1
 Uses `[Environment]::SetEnvironmentVariable(..., "User")`, not `setx` — `setx` has a
 documented bug where it silently truncates an already-long `PATH`.
 
-**macOS / Linux / git-bash**:
+**macOS / Linux / git-bash** (runtime requires Bash 4 or newer; macOS users should run
+`brew install bash` first):
 
 ```bash
 bash bin/install.sh
 ```
 
-Appends a `PATH` export to `~/.bashrc` (or `~/.zshrc` if that's your shell).
+Appends a `PATH` export to the startup file selected from `$SHELL` (`~/.zshrc`, `~/.bashrc`,
+or `~/.profile`).
 
 Either way: open a **new** terminal window afterward, then verify with
 `neoxider doctor` — it should print the engines/rate-limits table from any shell,
@@ -59,7 +61,7 @@ alias neoxider='bash /path/to/neoxider-agents/bin/neoxider'
 a new window:
 
 ```powershell
-function neoxider { & bash "C:\path\to\neoxider-agents\bin\neoxider.ps1" @args }
+function neoxider { & "C:\path\to\neoxider-agents\bin\neoxider.ps1" @args }
 ```
 
 **Plain `cmd.exe`** has no per-session profile/rc file to hook into — use the `PATH`

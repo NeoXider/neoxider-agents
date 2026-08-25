@@ -6,8 +6,11 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-rc="$HOME/.bashrc"
-[ -n "${ZSH_VERSION:-}" ] && rc="$HOME/.zshrc"
+case "${SHELL##*/}" in
+    zsh) rc="$HOME/.zshrc" ;;
+    bash) rc="$HOME/.bashrc" ;;
+    *) rc="$HOME/.profile" ;;
+esac
 line="export PATH=\"$HERE:\$PATH\""
 
 if [ -f "$rc" ] && grep -qF "$HERE" "$rc" 2>/dev/null; then

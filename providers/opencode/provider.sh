@@ -48,10 +48,14 @@ try:
 except Exception:
     pass
 MARK = "---------- output ----------"
-sid = None; parts = {}; order = []; raw = []
+RAW_LIMIT = 262144
+sid = None; parts = {}; order = []; raw = []; raw_size = 0
 last_activity = 0.0
 for line in sys.stdin:
     raw.append(line)
+    raw_size += len(line.encode("utf-8", "ignore"))
+    while raw_size > RAW_LIMIT and len(raw) > 1:
+        raw_size -= len(raw.pop(0).encode("utf-8", "ignore"))
     s = line.strip()
     if not s or s[0] != "{":
         continue
@@ -101,7 +105,8 @@ _provider_opencode_chatonly() { [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; }
 # `cygpath -m` because opencode is a NATIVE Windows binary: it cannot open a git-bash
 # /c/Users/... path, only C:/Users/... . A no-op (plain path) on Linux/macOS.
 _provider_opencode_chatonly_config() {
-    local p="${AGENT_OPENCODE_CHATONLY_CONFIG:-$HERE/providers/opencode/chat-only.json}"
+    local p="$HERE/providers/opencode/chat-only.json"
+    [ -r "$p" ] || return 1
     command -v cygpath >/dev/null 2>&1 && p="$(cygpath -m "$p" 2>/dev/null || printf '%s' "$p")"
     printf '%s' "$p"
 }
@@ -126,7 +131,12 @@ provider_opencode_run_cmd() {
     [ -n "$effort" ] && args+=(--variant "$effort")
     mapfile -t -O ${#args[@]} args < <(_provider_opencode_chatonly_args)
     if _provider_opencode_chatonly; then
-        export OPENCODE_CONFIG="$(_provider_opencode_chatonly_config)"
+        local chat_config
+        chat_config="$(_provider_opencode_chatonly_config)" \
+            || { printf '[opencode] bundled chat-only config is unavailable\n' >&2; return 1; }
+        [ -n "$chat_config" ] \
+            || { printf '[opencode] bundled chat-only config resolved to an empty path\n' >&2; return 1; }
+        export OPENCODE_CONFIG="$chat_config"
     fi
     # stdout carries JSONL only. Keep stderr visible without corrupting that stream: diagnostics are
     # prefixed and sent through the provider stderr, which generic dispatch records in the task log.
@@ -143,7 +153,10 @@ provider_opencode_run_cmd() {
     # deadlock on.
     local -a command=(opencode run "${args[@]}" "$prompt")
     local -a statuses
-    local errfile; errfile="$(mktemp -t opencode-stderr-XXXXXX 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/opencode-stderr-$$")"
+    local errfile; errfile="$(mktemp -t opencode-stderr-XXXXXX 2>/dev/null)" \
+        || { printf '[opencode] cannot create temporary stderr file\n' >&2; return 1; }
+    [ -n "$errfile" ] && [ -f "$errfile" ] \
+        || { printf '[opencode] mktemp returned an invalid stderr file\n' >&2; return 1; }
     if [ "$timeout_sec" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
         ( cd "$dir" && timeout --foreground --kill-after=10s "${timeout_sec}s" "${command[@]}" </dev/null 2>"$errfile" ) \
             | _provider_opencode_emit

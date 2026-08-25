@@ -33,9 +33,13 @@ try:
 except Exception:
     pass
 MARK = "---------- output ----------"
-raw, answers, sid = [], [], None
+RAW_LIMIT = 262144
+raw, answers, sid, raw_size = [], [], None, 0
 for line in sys.stdin:
     raw.append(line)
+    raw_size += len(line.encode("utf-8", "ignore"))
+    while raw_size > RAW_LIMIT and len(raw) > 1:
+        raw_size -= len(raw.pop(0).encode("utf-8", "ignore"))
     s = line.strip()
     if not s.startswith("{"):
         continue

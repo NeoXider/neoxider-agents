@@ -13,8 +13,8 @@ completion bridge, safe enough to expose on a LAN), this panel LAUNCHES REAL SUB
 from the network without authentication, that is unauthenticated remote code execution on this
 machine, so `--lan` REFUSES TO START without `--token SECRET` (or $AGENT_GUI_TOKEN). The token is
 accepted as `?token=` (once -- it is then stored in a cookie), an `X-Agent-Token` header, or the
-`agent_gui_token` cookie. Requests from loopback never need it: a local process could run agent.sh
-directly anyway, and requiring it there would break the "is our panel already up?" probe.
+`agent_gui_token` cookie. When configured, the token is required even on loopback (including behind
+a reverse proxy); tokenless loopback POSTs enforce JSON plus same-origin browser headers.
 
 The backend reads <name>.meta / <name>.log directly (fast, no parsing of `list`'s text),
 while actions (run/reply/doctor) shell out to agent.sh so all the logic lives in one place.
@@ -24,7 +24,10 @@ per-provider info (version/login/rate limits) is fetched by shelling out to
 does not hardcode any per-engine behavior.
 """
 import json, math, logging, os, re, sys, time, subprocess, socket, urllib.parse, urllib.request, glob, threading
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import openai_server as _bridge_runtime
 
 # Opt-in diagnostics, same convention as openai_server.py: quiet (WARNING) unless AGENT_LOG_LEVEL
 # says otherwise -- request lines at DEBUG, a bridge kill that could not go through at WARNING,
@@ -79,6 +82,7 @@ STALE_SEC = int(os.environ.get("AGENT_STALE_SEC") or 300)
 MAX_BODY_BYTES = 10 * 1024 * 1024      # POST bodies above this get 413 before any byte is read
 DEFAULT_WAIT_TIMEOUT = 60.0            # /api/wait ?timeout= is clamped to finite [0, cap]
 WAIT_TIMEOUT_CAP = 300.0
+_PROJECTS_LOCK = threading.Lock()
 
 _DEFAULT_PROVIDERS = {
     "codex":   {"label": "Codex", "models": ["5.5", "5.5-high", "spark"], "limits": "codex"},
@@ -117,33 +121,98 @@ def list_locales():
             continue
     return out
 
-def load_projects():
+def _load_projects_unlocked():
     try:
         with open(PROJECTS_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            value = json.load(f)
+            return value if isinstance(value, list) else []
     except Exception:
         return []
-def save_projects(lst):
+
+def load_projects():
+    with _PROJECTS_LOCK:
+        return _load_projects_unlocked()
+
+def register_project(project_dir):
+    """Locked read-modify-write used by both /api/project and /api/run."""
+    tmp = ""
     try:
-        with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(lst, f, ensure_ascii=False)
+        with _PROJECTS_LOCK:
+            projects = _load_projects_unlocked()
+            if project_dir in projects:
+                return projects
+            projects.append(project_dir)
+            os.makedirs(os.path.dirname(PROJECTS_FILE), exist_ok=True)
+            tmp = "%s.tmp.%d.%d" % (PROJECTS_FILE, os.getpid(), threading.get_ident())
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(projects, f, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, PROJECTS_FILE)
+            return projects
     except OSError:
-        pass
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return load_projects()
+
+
+def safe_task_name(value):
+    """Return a task basename safe for argv and files below LOGDIR, else ``None``.
+
+    Task names are identifiers, never paths.  Reject Windows drives/UNC even when this module
+    is tested on POSIX, all separators/traversal, control characters, and option-looking names.
+    The final common-path check is deliberately repeated in ``safe_task_path`` at the boundary.
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name or len(name) > 128 or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) is None:
+        return None
+    return name
+
+
+def safe_task_path(value, suffix, must_exist=False):
+    """Resolve one task artifact under LOGDIR; never return a path outside that directory."""
+    name = safe_task_name(value)
+    if name is None or suffix not in (".log", ".meta"):
+        return None
+    root = os.path.abspath(LOGDIR)
+    path = os.path.abspath(os.path.join(root, name + suffix))
+    try:
+        if os.path.commonpath((root, path)) != root:
+            return None
+    except ValueError:
+        return None
+    if must_exist and not os.path.isfile(path):
+        return None
+    return path
+
+
+def task_exists(name):
+    return safe_task_path(name, ".meta", True) is not None or \
+           safe_task_path(name, ".log", True) is not None
 
 def task_state(name):
     """Effective state + raw meta for one task, for the /api/wait convenience endpoint --
     a lighter-weight lookup than list_tasks() since it only needs a single named task."""
     meta = read_meta(name)
     try:
-        lm = os.path.getmtime(os.path.join(LOGDIR, name + ".log"))
+        log_path = safe_task_path(name, ".log")
+        lm = os.path.getmtime(log_path) if log_path else 0
     except OSError:
         lm = 0
     return eff_state(meta, lm, time.time()), meta
 
 def read_meta(name):
     d = {}
+    path = safe_task_path(name, ".meta")
+    if path is None:
+        return d
     try:
-        with open(os.path.join(LOGDIR, name + ".meta"), encoding="utf-8", errors="ignore") as f:
+        with open(path, encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if "=" in line:
                     k, v = line.rstrip("\n").split("=", 1)
@@ -297,6 +366,8 @@ def list_tasks():
         metas = []
     for mf in metas:
         name = mf[:-5]
+        if safe_task_name(name) is None:
+            continue
         meta = read_meta(name)
         logp = os.path.join(LOGDIR, name + ".log")
         try:
@@ -351,8 +422,11 @@ def browse(raw):
     }
 
 def read_log(name):
+    path = safe_task_path(name, ".log")
+    if path is None:
+        return ""
     try:
-        with open(os.path.join(LOGDIR, name + ".log"), encoding="utf-8", errors="ignore") as f:
+        with open(path, encoding="utf-8", errors="ignore") as f:
             return f.read()
     except OSError:
         return ""
@@ -656,7 +730,9 @@ def dialog_payload(name, full=False, offset=None, limit=None):
     Parsed steps are cached keyed by (mtime, size) so the 3s auto-refresh re-parses only
     when the log actually changed."""
     try:
-        logp = os.path.join(LOGDIR, name + ".log")
+        logp = safe_task_path(name, ".log")
+        if logp is None:
+            raise ValueError("invalid task name")
         st_ = os.stat(logp)
         mtime, size = st_.st_mtime, st_.st_size
     except OSError:
@@ -699,9 +775,13 @@ def dialog_payload(name, full=False, offset=None, limit=None):
             "has_more": off > 0, "steps": out, "now": now,
             "mtime": mtime, "log_size": size}
 
-def spawn(args, terminal=False):
+def spawn(args, terminal=False, extra_env=None):
     """Background launch of agent.sh. terminal=True -> a separate console window with a live chat view."""
     kw = dict(cwd=HERE)
+    if extra_env:
+        child_env = os.environ.copy()
+        child_env.update(extra_env)
+        kw["env"] = child_env
     if terminal and os.name == "nt":
         kw["creationflags"] = 0x00000010  # CREATE_NEW_CONSOLE — chat visible live
     elif os.name == "nt":
@@ -710,7 +790,7 @@ def spawn(args, terminal=False):
     else:
         kw.update(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         kw["start_new_session"] = True
-    subprocess.Popen([BASH, SK] + args, **kw)
+    return subprocess.Popen([BASH, SK] + args, **kw)
 
 def run_sync(args, timeout=30):
     try:
@@ -1075,28 +1155,264 @@ def kill_pid(pid):
 def coerce_port(value, default=None):
     """An integer TCP port in 1..65535, or `default`; every user-supplied bridge port goes
     through this so garbage can't become bridge--1.json or a 70000 bind."""
-    try:
-        p = int(value)
-    except (TypeError, ValueError):
+    if isinstance(value, bool) or isinstance(value, float):
+        return default
+    if isinstance(value, int):
+        p = value
+    elif isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
+        p = int(value.strip())
+    else:
         return default
     return p if 1 <= p <= 65535 else default
 
 
-def start_bridge(data):
-    """Spawn `agent.sh openai-server` in the background from the GUI's form. Returns a dict
-    with ok/error and the resolved base_url."""
-    engine = data.get("engine") or "codex"
+def _read_bridge_registration(port):
+    path = os.path.join(BRIDGES_DIR, "bridge-%d.json" % port)
+    try:
+        with open(path, encoding="utf-8") as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) and coerce_port(rec.get("port")) == port else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _windows_process_descends_from(child_pid, ancestor_pid):
+    """Use the native process snapshot to prove a Windows child belongs to our bash wrapper."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessEntry32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.Process32FirstW.argtypes = (wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W))
+        kernel32.Process32FirstW.restype = wintypes.BOOL
+        kernel32.Process32NextW.argtypes = (wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W))
+        kernel32.Process32NextW.restype = wintypes.BOOL
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+        if snapshot == wintypes.HANDLE(-1).value:
+            return False
+        try:
+            parents = {}
+            entry = ProcessEntry32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while ok:
+                parents[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+                ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+        finally:
+            kernel32.CloseHandle(snapshot)
+        current = child_pid
+        seen = set()
+        while current and current not in seen:
+            if current == ancestor_pid:
+                return True
+            seen.add(current)
+            current = parents.get(current)
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    return False
+
+
+def _registration_belongs_to_process(rec, proc):
+    """Return whether this exact spawned child wrote the registry record.
+
+    Two concurrent starts can both observe a free port before either binds it. The losing child
+    may remain alive just long enough to observe the winner's registry and occupied socket, so
+    liveness plus port ownership alone is not proof that *our* child became ready.
+    """
+    expected_pid = getattr(proc, "pid", None)
+    registered_pid = rec.get("pid") if isinstance(rec, dict) else None
+    if not (isinstance(expected_pid, int) and not isinstance(expected_pid, bool)
+            and expected_pid > 0 and isinstance(registered_pid, int)
+            and not isinstance(registered_pid, bool) and registered_pid > 0):
+        return False
+    return (registered_pid == expected_pid
+            or _windows_process_descends_from(registered_pid, expected_pid))
+
+
+def _await_bridge_ready(port, proc, timeout=15.0):
+    """Wait until this exact child is alive, bound, and owns the registry for the port."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc is not None and hasattr(proc, "poll") and proc.poll() is not None:
+            return None, "bridge process exited before it became ready"
+        rec = _read_bridge_registration(port)
+        if (rec is not None and _registration_belongs_to_process(rec, proc)
+                and not port_available(port)):
+            # Registration is written after bind. Recheck child liveness after both observations
+            # so a process that exited during the probe is never reported as ready.
+            if proc is not None and hasattr(proc, "poll") and proc.poll() is not None:
+                return None, "bridge process exited while registering"
+            return rec, ""
+        time.sleep(0.1)
+    return None, "bridge did not bind and register within %.1fs" % timeout
+
+
+@dataclass(frozen=True)
+class BridgeLaunchConfig:
+    engine: str
+    port: int
+    model: str
+    effort: str
+    dir: str
+    terminal: bool
+    api_key: str
+    localhost: bool
+    lan: bool
+    host: str
+
+
+def _bridge_text_error(field, value, option_operand=False):
+    """Return why a form string cannot survive the argv/env boundaries, or ``None``.
+
+    ``Popen`` rejects NUL outright. Lone UTF-16 surrogates cannot be encoded reliably across
+    POSIX argv, Windows command lines, and Git Bash. Newlines would corrupt agent.sh's line-based
+    task metadata (and cannot form a usable HTTP API-key header). Model/effort/dir are operands to
+    parsers that deliberately treat a leading dash as another option.
+    """
+    if "\0" in value:
+        return "%s must not contain NUL" % field
+    if "\r" in value or "\n" in value:
+        return "%s must not contain line breaks" % field
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+        return "%s contains text that cannot be passed to a child process" % field
+    if option_operand and value.startswith("-"):
+        return "%s must not look like a command-line option" % field
+    return None
+
+
+def _bridge_native_dir(path):
+    """Translate the supported GUI directory forms to a path native Python can inspect.
+
+    The child still receives the canonical Git-Bash form. This conversion exists only for the
+    no-shell preflight: on Windows, ``/c/Work`` must be checked as ``C:/Work`` rather than against
+    the current drive's root. Relative paths are resolved exactly where ``spawn`` launches the
+    bridge (``HERE``), so validation and eventual execution agree.
+    """
+    candidate = path.replace("\\", "/")
+    if os.name == "nt":
+        drive_path = re.match(r"^/([A-Za-z])(?:/(.*))?$", candidate)
+        if drive_path:
+            candidate = "%s:/%s" % (drive_path.group(1).upper(), drive_path.group(2) or "")
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(HERE, candidate)
+    return candidate
+
+
+_BRIDGE_PORTABLE_PROCESS_TEXT_LIMIT = 30000
+
+
+def _bridge_command_args(cfg, port):
+    """The one argv contract shared by preflight sizing and the actual launch."""
+    args = ["openai-server", "-e", cfg.engine, "-p", str(port)]
+    if cfg.model:
+        args += ["-m", cfg.model]
+    if cfg.effort:
+        args += ["-f", cfg.effort]
+    if cfg.dir:
+        args += ["-C", cfg.dir]
+    args += ["--localhost"] if cfg.localhost else ["--lan"]
+    return args
+
+
+def _bridge_process_payload_error(cfg):
+    """Reject payloads beyond a conservative cross-platform argv/environment boundary."""
+    command_line = subprocess.list2cmdline([BASH, SK] + _bridge_command_args(cfg, cfg.port))
+    if len(command_line) > _BRIDGE_PORTABLE_PROCESS_TEXT_LIMIT:
+        return "bridge command-line values are too long to launch portably"
+    if cfg.api_key:
+        child_env = os.environ.copy()
+        child_env["AGENT_OPENAI_KEY"] = cfg.api_key
+        environment_size = 1 + sum(
+            len(key) + len(value) + 2 for key, value in child_env.items())
+        if environment_size > _BRIDGE_PORTABLE_PROCESS_TEXT_LIMIT:
+            return "api_key is too long to pass in the child environment"
+    return None
+
+
+def _bridge_preflight(data):
+    """Normalize and fully validate one bridge launch before stopping/spawning anything."""
+    if not isinstance(data, dict):
+        return None, "bridge configuration must be a JSON object"
+    engine_value = data.get("engine", "codex")
+    if engine_value is None or engine_value == "":
+        engine_value = "codex"
+    if not isinstance(engine_value, str):
+        return None, "provider must be a known provider id"
+    engine = engine_value.strip()
+    if engine.startswith("-") or engine not in PROVIDERS:
+        return None, "unknown provider: %s" % engine[:80]
     asked_raw = data.get("port")
     port = 8801 if asked_raw in (None, "") else coerce_port(asked_raw)
     if port is None:
-        return {"error": "port must be an integer in 1..65535"}
+        return None, "port must be an integer in 1..65535"
     localhost_only = data.get("localhost", True)
+    if not isinstance(localhost_only, bool):
+        return None, "localhost must be a boolean"
     host = "127.0.0.1" if localhost_only else "0.0.0.0"
+    terminal = data.get("terminal", False)
+    if not isinstance(terminal, bool):
+        return None, "terminal must be a boolean"
+    normalized = {}
+    for field in ("model", "effort", "dir", "api_key"):
+        value = data.get(field, "")
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            return None, "%s must be a string" % field
+        normalized[field] = value.strip()
+    for field in ("model", "effort", "dir", "api_key"):
+        text_error = _bridge_text_error(
+            field, normalized[field], option_operand=field in ("model", "effort", "dir"))
+        if text_error:
+            return None, text_error
+    launch_dir = to_git_bash_path(normalized["dir"])
+    if launch_dir:
+        try:
+            usable_dir = os.path.isdir(_bridge_native_dir(launch_dir))
+        except (OSError, ValueError, UnicodeError):
+            usable_dir = False
+        if not usable_dir:
+            return None, "dir must name an existing directory"
+    api_key = normalized["api_key"]
+    if not localhost_only and not api_key:
+        return None, "LAN bridge requires an API key"
+    cfg = BridgeLaunchConfig(
+        engine=engine, port=port, model=normalized["model"], effort=normalized["effort"],
+        dir=launch_dir, terminal=terminal, api_key=api_key,
+        localhost=localhost_only, lan=not localhost_only, host=host)
+    payload_error = _bridge_process_payload_error(cfg)
+    if payload_error:
+        return None, payload_error
+    refusal = _bridge_runtime.validate_network_config(cfg)
+    if refusal:
+        return None, refusal
+    return cfg, ""
+
+
+def _launch_bridge(cfg, allow_port_reassignment=True):
+    """Launch an already-preflighted config without reinterpreting untrusted form values."""
+    port = cfg.port
     # A busy/reserved port used to fail silently ("clicked start, nothing appeared"). Instead,
     # walk up to the next free port so the click always launches something; tell the client which
     # port was actually used (and whether it differs from what was asked).
     asked = port
     if not port_available(port):
+        if not allow_port_reassignment:
+            return {"error": "port %d is still in use -- no new bridge was started" % port,
+                    "port": port, "asked_port": asked}
         found = None
         for cand in range(port + 1, port + 50):
             if port_available(cand):
@@ -1105,22 +1421,44 @@ def start_bridge(data):
         if found is None:
             return {"error": "no free port near %d" % asked}
         port = found
-    args = ["openai-server", "-e", engine, "-p", str(port)]
-    if data.get("model"):  args += ["-m", str(data["model"]).strip()]
-    if data.get("effort"): args += ["-f", str(data["effort"]).strip()]
-    rdir = to_git_bash_path(data.get("dir") or "")
-    if rdir:               args += ["-C", rdir]
-    args += ["--localhost"] if localhost_only else ["--lan"]
-    # An empty key keeps the historic open bridge (fine on loopback); a LAN bridge without one is
-    # reported back so the panel can warn instead of quietly exposing the machine.
-    api_key = str(data.get("api_key") or "").strip()
-    if api_key:
-        args += ["--api-key", api_key]
-    spawn(args, terminal=bool(data.get("terminal")))
-    shown = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    # A free port proves any same-port registry is stale. Remove it before launch so readiness
+    # cannot accidentally accept an old record once the new child binds.
+    stale_registry = os.path.join(BRIDGES_DIR, "bridge-%d.json" % port)
+    try:
+        os.remove(stale_registry)
+    except OSError:
+        pass
+    args = _bridge_command_args(cfg, port)
+    # An empty key is permitted only for a loopback bridge.  LAN starts are rejected above unless
+    # authentication is configured, before any child process is created.
+    # Secrets never go in argv (visible to process listings and diagnostics). openai-server
+    # already supports AGENT_OPENAI_KEY, so give it only to the child environment.
+    child_env = {"AGENT_OPENAI_KEY": cfg.api_key} if cfg.api_key else None
+    try:
+        proc = spawn(args, terminal=cfg.terminal, extra_env=child_env)
+    except (OSError, ValueError) as error:
+        # Keep diagnostics useful without echoing argv or the environment (which may carry the
+        # API key). Predictable form failures should already have been refused by preflight.
+        LOG.warning("bridge launch failed before process creation (%s)", type(error).__name__)
+        return {"error": "could not launch bridge (%s)" % type(error).__name__,
+                "port": port, "asked_port": asked}
+    rec, ready_error = _await_bridge_ready(port, proc)
+    if rec is None:
+        if proc is not None and getattr(proc, "pid", None):
+            kill_pid(proc.pid)
+        return {"error": ready_error, "port": port, "asked_port": asked}
+    shown = "127.0.0.1" if cfg.host in ("0.0.0.0", "::") else cfg.host
     return {"ok": True, "base_url": "http://%s:%d" % (shown, port),
             "port": port, "asked_port": asked, "reassigned": port != asked,
-            "auth": bool(api_key), "unprotected_lan": (not localhost_only) and not api_key}
+            "auth": bool(cfg.api_key)}
+
+
+def start_bridge(data):
+    """Preflight and spawn `agent.sh openai-server` from the GUI bridge form."""
+    cfg, error = _bridge_preflight(data)
+    if cfg is None:
+        return {"error": error}
+    return _launch_bridge(cfg)
 
 def stop_bridge(port, expected_instance_id=None):
     """Stop the bridge on <port> and drop its registry file -- FAIL-CLOSED: kill_pid runs only
@@ -1200,9 +1538,15 @@ def restart_bridge(data):
     localhost/dir -- lets the GUI switch a running bridge's model (and local/LAN binding) in place
     without retyping the whole form. Aborts with the stop error when stopping failed (held or
     unverifiable bridge) and never silently launches on another port."""
-    port = coerce_port(data.get("port"))
-    if port is None:
-        return {"error": "port must be an integer in 1..65535"}
+    cfg, error = _bridge_preflight(data)
+    if cfg is None:
+        return {"ok": False, "error": error}
+    port = cfg.port
+    old = _read_bridge_registration(port)
+    if old and old.get("auth") and not cfg.api_key:
+        return {"ok": False, "error": "this bridge is authenticated; re-enter its API key "
+                                             "before restarting so protection is not dropped",
+                "port": port}
     stopped = stop_bridge(port, data.get("instance_id"))
     if not stopped.get("ok"):
         return {"ok": False, "error": stopped.get("error")
@@ -1218,12 +1562,9 @@ def restart_bridge(data):
         return {"ok": False, "error": "port %d is still in use -- the old bridge did not "
                                       "release it, no new bridge was started" % port,
                 "port": port}
-    data = dict(data)
-    data["port"] = port
-    return start_bridge(data)
+    return _launch_bridge(cfg, allow_port_reassignment=False)
 
-# Set by main(): the shared secret required from non-loopback clients ("" = loopback-only panel,
-# no token needed). See the module docstring for why this panel is stricter than the API bridge.
+# Set by main(): when non-empty, the shared secret required from every client, including loopback.
 GUI_TOKEN = ""
 TOKEN_COOKIE = "agent_gui_token"
 
@@ -1249,27 +1590,64 @@ def presented_token(headers, path):
     for part in cookie.split(";"):
         k, _, v = part.strip().partition("=")
         if k == TOKEN_COOKIE:
-            return v.strip()
+            return urllib.parse.unquote(v.strip())
     return ""
 
 
 def gui_authorized(client_addr, headers, path):
-    """Whether this request may touch the panel. No token configured -> open (the loopback-only
-    default, unchanged). Loopback clients -> always allowed (see the module docstring). Everyone
-    else must present the token; compared in constant time so the panel is not a guessing oracle."""
+    """Token authentication, independent of the peer address.
+
+    A reverse proxy normally makes every request appear to come from loopback, so a configured
+    token must never be bypassed just because ``client_addr`` is local.
+    """
     if not GUI_TOKEN:
-        return True
-    if is_loopback(client_addr):
         return True
     import hmac
     return hmac.compare_digest(presented_token(headers, path), GUI_TOKEN)
 
 
+def tokenless_post_is_same_origin(client_addr, headers):
+    """CSRF guard for the historic tokenless loopback mode.
+
+    Non-browser local clients remain usable with ``Host: 127.0.0.1:<port>`` and
+    ``Content-Type: application/json``. Browsers additionally send Origin and/or
+    Sec-Fetch-Site; if present those headers must prove a same-origin navigation.
+    """
+    if GUI_TOKEN or not is_loopback(client_addr):
+        return bool(GUI_TOKEN)
+    host = (headers.get("Host") or "").strip()
+    if not host or any(ch in host for ch in ("/", "\\", "@", ",")):
+        return False
+    try:
+        host_url = urllib.parse.urlsplit("//" + host)
+        hostname = (host_url.hostname or "").lower()
+    except ValueError:
+        return False
+    if hostname != "localhost" and not is_loopback(hostname):
+        return False
+    fetch_site = (headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if fetch_site and fetch_site not in ("same-origin", "none"):
+        return False
+    origin = (headers.get("Origin") or "").strip()
+    if origin:
+        try:
+            origin_url = urllib.parse.urlsplit(origin)
+        except ValueError:
+            return False
+        if origin_url.scheme not in ("http", "https") or origin_url.netloc.lower() != host.lower():
+            return False
+    return True
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a):  # request lines at DEBUG only (AGENT_LOG_LEVEL); token/key
-        # query params are redacted so a `?token=...` URL never lands in the log
-        LOG.debug("%s %s", self.address_string(),
-                  re.sub(r"((?:api[_-]?key|token)=)[^&\s\"']*", r"\1<redacted>", fmt % a))
+        # Omit the complete query string. Redaction by key is insufficient because names and
+        # separators can be percent-encoded, and unknown future secret parameters must be safe.
+        line = fmt % a if a else fmt
+        line = re.sub(r'("(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+)(\S+)(\s+HTTP/)',
+                      lambda m: m.group(1) + urllib.parse.urlsplit(m.group(2)).path + m.group(3),
+                      line, count=1)
+        LOG.debug("%s %s", self.address_string(), line)
 
     def _reject_unauthorized(self):
         """401 for a network client with no/!wrong token. Returns True when the caller must stop."""
@@ -1280,6 +1658,32 @@ class H(BaseHTTPRequestHandler):
                                              "http://<host>:<port>/?token=<secret>"}))
         return True
 
+    def _reject_mutation(self):
+        """Authenticate every POST, enforce JSON, and protect tokenless localhost from CSRF."""
+        if self._reject_unauthorized():
+            return True
+        content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            self._send(415, json.dumps({"error": "Content-Type application/json required"}))
+            return True
+        if not GUI_TOKEN and not tokenless_post_is_same_origin(
+                self.client_address[0] if self.client_address else "", self.headers):
+            self._send(403, json.dumps({"error": "tokenless POST requires a loopback Host and "
+                                                "same-origin browser headers"}))
+            return True
+        return False
+
+    def _task_from_query(self, q, must_exist=True):
+        raw = (q.get("task") or [""])[0]
+        name = safe_task_name(raw)
+        if name is None:
+            self._send(400, json.dumps({"error": "invalid task name"}))
+            return None
+        if must_exist and not task_exists(name):
+            self._send(404, json.dumps({"error": "task no longer exists"}))
+            return None
+        return name
+
     def _maybe_set_token_cookie(self):
         """After a successful ?token=... page load, remember it in a cookie so the page's own
         fetch() calls (which carry no query string) keep working without touching any JS."""
@@ -1287,12 +1691,36 @@ class H(BaseHTTPRequestHandler):
         tok = (q.get("token") or [""])[0].strip()
         if GUI_TOKEN and tok and tok == GUI_TOKEN:
             self.send_header("Set-Cookie",
-                             "%s=%s; Path=/; SameSite=Strict; Max-Age=604800" % (TOKEN_COOKIE, tok))
+                             "%s=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=604800"
+                             % (TOKEN_COOKIE, urllib.parse.quote(tok, safe="")))
+
+    def _redirect_without_token_query(self, parsed):
+        """Bootstrap the auth cookie, then immediately remove the secret from browser history."""
+        pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        if not any(key == "token" for key, _ in pairs):
+            return False
+        clean_query = urllib.parse.urlencode([(key, value) for key, value in pairs if key != "token"])
+        location = parsed.path or "/"
+        if clean_query:
+            location += "?" + clean_query
+        self.send_response(303)
+        self.send_header("Location", location)
+        self._maybe_set_token_cookie()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return True
 
     def _send(self, code, body, ctype="application/json"):
         b = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+            "frame-ancestors 'none'",
+        )
         self.send_header("Content-Length", str(len(b)))
         self._maybe_set_token_cookie()
         self.end_headers()
@@ -1302,6 +1730,8 @@ class H(BaseHTTPRequestHandler):
         if self._reject_unauthorized():
             return
         u = urllib.parse.urlparse(self.path)
+        if GUI_TOKEN and H._redirect_without_token_query(self, u):
+            return
         q = urllib.parse.parse_qs(u.query)
         if u.path in ("/", "/index.html"):
             try:
@@ -1318,12 +1748,14 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/api/browse":
             self._send(200, json.dumps(browse((q.get("path") or [""])[0])))
         elif u.path == "/api/thread":
-            name = (q.get("task") or [""])[0]
+            name = H._task_from_query(self, q)
+            if name is None:
+                return
             self._send(200, json.dumps({"name": name, "log": read_log(name)}))
         elif u.path == "/api/dialog":
-            name = (q.get("task") or [""])[0]
-            if not name:
-                return self._send(400, json.dumps({"error": "task required"}))
+            name = H._task_from_query(self, q)
+            if name is None:
+                return
             full = (q.get("full") or ["0"])[0] == "1"
             try:
                 self._send(200, json.dumps(dialog_payload(name, full=full)))
@@ -1353,20 +1785,24 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"limits": codex_limits(), "now": time.time()}))
         elif u.path == "/api/provider":
             eng = (q.get("engine") or ["codex"])[0]
+            if eng not in PROVIDERS:
+                return self._send(400, json.dumps({"error": "unknown provider"}))
             force = (q.get("force") or ["0"])[0] == "1"
             self._send(200, json.dumps(provider_info(eng, force)))
         elif u.path == "/api/bridges":
             self._send(200, json.dumps({"bridges": list_bridges(), "now": time.time()}))
         elif u.path == "/api/models":
             eng = (q.get("engine") or ["codex"])[0]
+            if eng not in PROVIDERS:
+                return self._send(400, json.dumps({"error": "unknown provider"}))
             force = (q.get("force") or ["0"])[0] == "1"
             self._send(200, json.dumps({"engine": eng, "models": engine_models(eng, force)}))
         elif u.path == "/api/locales":
             self._send(200, json.dumps({"locales": list_locales()}))
         elif u.path == "/api/wait":
-            name = (q.get("task") or [""])[0]
-            if not name:
-                return self._send(400, json.dumps({"error": "task required"}))
+            name = H._task_from_query(self, q)
+            if name is None:
+                return
             timeout = clamp_wait_timeout((q.get("timeout") or [""])[0])
             deadline = time.time() + timeout
             st, meta = task_state(name)
@@ -1376,9 +1812,9 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"name": name, "state": st, "model": meta.get("model", "?"),
                                         "log": read_log(name)}))
         elif u.path == "/api/stream":
-            name = (q.get("task") or [""])[0]
-            if not name:
-                return self._send(400, json.dumps({"error": "task required"}))
+            name = H._task_from_query(self, q)
+            if name is None:
+                return
             self._stream_log(name)
         elif u.path.startswith("/locales/") and u.path.endswith(".json"):
             self._serve_static(LOCALES_DIR, u.path[len("/locales/"):], "application/json")
@@ -1458,7 +1894,7 @@ class H(BaseHTTPRequestHandler):
         return data
 
     def do_POST(self):
-        if self._reject_unauthorized():
+        if H._reject_mutation(self):
             return
         u = urllib.parse.urlparse(self.path)
         data = self._read_json_object_body()
@@ -1469,25 +1905,36 @@ class H(BaseHTTPRequestHandler):
             if not prompt:
                 return self._send(400, json.dumps({"error": "empty prompt"}))
             rdir = to_git_bash_path(data.get("dir") or "")
-            args = ["run", "-e", data.get("engine") or "codex"]
+            task_name = data.get("name")
+            parent_name = data.get("parent")
+            if task_name not in (None, "") and safe_task_name(task_name) is None:
+                return self._send(400, json.dumps({"error": "invalid task name"}))
+            if parent_name not in (None, "") and safe_task_name(parent_name) is None:
+                return self._send(400, json.dumps({"error": "invalid parent task name"}))
+            engine = data.get("engine") or "codex"
+            if not isinstance(engine, str) or engine not in PROVIDERS:
+                return self._send(400, json.dumps({"error": "unknown provider"}))
+            args = ["run", "-e", engine]
             if data.get("model"):    args += ["-m", data["model"]]
             if data.get("effort"):   args += ["-f", data["effort"]]
             if rdir:                 args += ["-C", rdir]
-            if data.get("name"):     args += ["-t", data["name"]]
-            if data.get("parent"):   args += ["-P", data["parent"]]
+            if task_name:             args += ["-t", task_name]
+            if parent_name:           args += ["-P", parent_name]
             if data.get("progress"): args += ["-p"]
             args.append(prompt)
             spawn(args, terminal=bool(data.get("terminal")))
             if rdir:  # remember the project
-                pr = load_projects()
-                if rdir not in pr:
-                    pr.append(rdir); save_projects(pr)
+                register_project(rdir)
             self._send(200, json.dumps({"ok": True}))
         elif u.path == "/api/reply":
             task = (data.get("task") or "").strip()
             answer = (data.get("answer") or "").strip()
             if not task or not answer:
                 return self._send(400, json.dumps({"error": "task and answer required"}))
+            if safe_task_name(task) is None:
+                return self._send(400, json.dumps({"error": "invalid task name"}))
+            if not task_exists(task):
+                return self._send(404, json.dumps({"error": "task no longer exists"}))
             args = ["reply", task, answer]
             if data.get("progress"): args = ["reply", "-p", task, answer]
             spawn(args, terminal=bool(data.get("terminal")))
@@ -1496,9 +1943,7 @@ class H(BaseHTTPRequestHandler):
             d = to_git_bash_path((data.get("dir") or "").strip())
             if not d:
                 return self._send(400, json.dumps({"error": "dir required"}))
-            pr = load_projects()
-            if d not in pr:
-                pr.append(d); save_projects(pr)
+            pr = register_project(d)
             self._send(200, json.dumps({"ok": True, "projects": pr}))
         elif u.path == "/api/bridge/start":
             self._send(200, json.dumps(start_bridge(data)))
@@ -1524,14 +1969,17 @@ def prewarm_cache():
         doctor_cached_only(refresh=True)
     threading.Thread(target=run, daemon=True).start()
 
-def is_our_panel(port):
+def is_our_panel(port, token=None):
     """True only if whatever holds <port> answers like THIS panel. The default port is a popular
     one -- it was found occupied by an unrelated WebSocket server, and because the old code treated
     ANY bind failure as "already running", `agent.sh gui` printed a success line and opened a tab
     that could only fail with "invalid Connection header". Identity is checked by asking /api/tasks
     for its shape (works against older panel versions too, unlike a version header)."""
     try:
-        with urllib.request.urlopen("http://127.0.0.1:%d/api/tasks" % port, timeout=2) as r:
+        req = urllib.request.Request("http://127.0.0.1:%d/api/tasks" % port)
+        if token:
+            req.add_header("X-Agent-Token", token)
+        with urllib.request.urlopen(req, timeout=2) as r:
             o = json.loads(r.read().decode("utf-8", "replace") or "{}")
         return isinstance(o, dict) and "tasks" in o and "engines" in o
     except Exception:
@@ -1548,7 +1996,7 @@ def choose_port(asked):
     running", so `agent.sh gui` claimed success while the browser tab hit a foreign server."""
     if port_available(asked):
         return asked, "asked"
-    if is_our_panel(asked):
+    if is_our_panel(asked, GUI_TOKEN):
         return asked, "ours"
     for cand in range(asked + 1, asked + 50):
         if port_available(cand):
@@ -1560,7 +2008,7 @@ def parse_argv(argv, env):
     LAN/token rules are unit-testable without binding a socket.
       - a bare positional number is the port (explicit arg > $AGENT_GUI_PORT > 8765);
       - --lan / $AGENT_GUI_HOST=0.0.0.0 binds all interfaces, --localhost forces loopback back;
-      - --token SECRET / $AGENT_GUI_TOKEN is the shared secret for non-loopback clients.
+      - --token SECRET / $AGENT_GUI_TOKEN is the shared secret for every client.
     Raises SystemExit with an explanation when LAN is requested without a token -- an
     unauthenticated LAN panel is remote code execution, so it must not start (see the docstring)."""
     port = None
@@ -1637,7 +2085,7 @@ def main():
         for ip in lan_ips():
             print("[agent-gui] LAN: http://%s:%d/?token=<your token>  (other devices use THIS url)"
                   % (ip, port))
-        print("[agent-gui] the token is required for every non-loopback request; open the ?token= "
+        print("[agent-gui] the token is required for every request; open the ?token= "
               "url once and the panel stores it in a cookie.")
     prewarm_cache()
     try:

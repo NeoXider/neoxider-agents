@@ -59,28 +59,34 @@ async function goBrowse(path) {
   const d = await jget("/api/browse?path=" + encodeURIComponent(path || ""));
   $("#br-path").value = d.path;
   $("#br-shortcuts").innerHTML = (d.shortcuts || [])
-    .map(s => `<button class="mini" onclick="goBrowse('${esc(s).replace(/'/g, "\\'")}')">${esc(base(s))}</button>`)
+    .map(s => `<button class="mini" data-browse="${esc(s)}">${esc(base(s))}</button>`)
     .join("");
+  $("#br-shortcuts").querySelectorAll("[data-browse]").forEach(button =>
+    button.addEventListener("click", () => goBrowse(button.dataset.browse)));
   const parts = d.path.split("/").filter(Boolean);
   let acc = d.path.match(/^[A-Za-z]:/) ? "" : "/";
   $("#br-crumbs").innerHTML = parts
     .map((p, i) => {
       acc += i === 0 ? p : "/" + p;
       const full = acc;
-      return `<span onclick="goBrowse('${esc(full).replace(/'/g, "\\'")}')">${esc(p)}</span>${i < parts.length - 1 ? " / " : ""}`;
+      return `<span data-browse="${esc(full)}">${esc(p)}</span>${i < parts.length - 1 ? " / " : ""}`;
     })
     .join("");
-  const up = d.parent ? `<div class="direntry" onclick="goBrowse('${esc(d.parent).replace(/'/g, "\\'")}')">⬆ .. (${t("browse.up")})</div>` : "";
+  $("#br-crumbs").querySelectorAll("[data-browse]").forEach(part =>
+    part.addEventListener("click", () => goBrowse(part.dataset.browse)));
+  const up = d.parent ? `<div class="direntry" data-browse="${esc(d.parent)}">⬆ .. (${esc(t("browse.up"))})</div>` : "";
   $("#br-list").innerHTML =
     up +
     (d.dirs.length
       ? d.dirs
           .map(x => {
             const full = d.path.replace(/\/$/, "") + "/" + x;
-            return `<div class="direntry" onclick="goBrowse('${esc(full).replace(/'/g, "\\'")}')">📁 ${esc(x)}</div>`;
+            return `<div class="direntry" data-browse="${esc(full)}">📁 ${esc(x)}</div>`;
           })
           .join("")
       : `<div class="direntry" style="cursor:default;color:var(--dim)">${t("browse.no_subdirs")}</div>`);
+  $("#br-list").querySelectorAll("[data-browse]").forEach(entry =>
+    entry.addEventListener("click", () => goBrowse(entry.dataset.browse)));
 }
 async function chooseBrowsed() {
   const path = $("#br-path").value;
