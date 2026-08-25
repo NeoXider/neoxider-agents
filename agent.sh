@@ -412,11 +412,27 @@ render_md() {
     } > "$md"
 }
 
-# looks_waiting LINE — true if this final output line asks for input (-> state=waiting):
-# real (alphanumeric) text before a trailing '?' — bare '?'/'?!'/punctuation-only do NOT count —
-# or an explicit ask-phrase (English + Russian phrasings seen live). Trailing quotes/brackets and
-# a `(yes/no)` aside are stripped first.
+# looks_waiting CLOSING_WINDOW — true if the step's closing output asks for input (-> state=waiting).
+# CLOSING_WINDOW is the last few non-empty lines of the final output block (finish_step supplies
+# them): a genuine question followed by a bookkeeping footer ("PROGRESS.x.md updated.") used to
+# read as a clean done because only the very last line was classified — so EVERY line in this small
+# window goes through _looks_waiting_line.
+# Per line (after stripping trailing quotes/brackets and a `(yes/no)` aside):
+#   * real (alphanumeric) text before a trailing '?' — bare '?'/punctuation-only never counts;
+#   * an EXPLICIT ask: self-directed should/shall-I, do-you-want, please confirm/clarify/specify,
+#     Russian уточни/подтверд/как поступить — or a which-option phrase ONLY when it leads into a
+#     '?', so declarative prose stays declarative: "...documents which options the CLI supports"
+#     and soft sign-offs like "let me know if you need anything else." do NOT flip state=waiting.
 looks_waiting() {
+    local window="${1:-}" line
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        _looks_waiting_line "$line" && return 0
+    done <<< "$window"
+    return 1
+}
+
+_looks_waiting_line() {
     local body="${1:-}" last
     body="${body%$'\r'}"
     body="${body% \(*\)}"
@@ -434,7 +450,7 @@ looks_waiting() {
             ;;
     esac
     printf '%s' "$body" | grep -qiE \
-        'should i |do you want|which (one|option|approach|of)|please (confirm|clarify|specify)|let me know|shall i |уточни|подтверд|как (мне |)поступ|какой из' \
+        'should i |shall i |do you want|please (confirm|clarify|specify)|which (one|option|approach|of)[^.?!]*\?|уточни|подтверд|как (мне |)поступ|какой из[^.?!]*\?' \
         && return 0
     return 1
 }
@@ -453,12 +469,17 @@ looks_waiting() {
 AGENT_RETRIES="${AGENT_RETRIES:-2}"
 case "$AGENT_RETRIES" in ''|*[!0-9]*) AGENT_RETRIES=2 ;; esac
 AGENT_RETRY_DELAY="${AGENT_RETRY_DELAY:-8}"
+case "$AGENT_RETRY_DELAY" in ''|*[!0-9]*) AGENT_RETRY_DELAY=8 ;; esac
 
+# NB: the two patterns below deliberately spell word boundaries out as (^|[^...]) groups instead
+# of \b: an earlier revision carried LITERAL 0x08 backspace bytes where \b was meant (they survive
+# copy/paste and every editor, and silently broke the classifier). [[:<:]]/[[:>:]] would be the
+# tidy spelling but are GNU-only, so the explicit character-class form is the portable one.
 _is_transient_failure() {
     local log="$1" tailtxt
     tailtxt="$(tail -c 4000 "$log" 2>/dev/null)"
-    printf '%s' "$tailtxt" | grep -qiE 'unauthorized|invalid api key|authentication|forbidden|model .* (not found|unavailable|unknown)|insufficient (quota|credit)|quota exceeded|payment required' && return 1
-    printf '%s' "$tailtxt" | grep -qiE '"isretryable"[[:space:]]*:[[:space:]]*true|network_error|providerresponsestreamerror|stream (error|closed|interrupted)|econnreset|etimedout|enotfound|socket hang up|(429|500|502|503|504)|overloaded|temporarily unavailable|rate.?limit'
+    printf '%s' "$tailtxt" | grep -qiE 'unauthorized|invalid api key|authentication|forbidden|(^|[^_[:alnum:]])model .*(not found|unavailable|unknown)|insufficient (quota|credit)|quota exceeded|payment required' && return 1
+    printf '%s' "$tailtxt" | grep -qiE '"isretryable"[[:space:]]*:[[:space:]]*true|network_error|providerresponsestreamerror|stream (error|closed|interrupted)|econnreset|etimedout|enotfound|socket hang up|(^|[^_0-9a-zA-Z])(429|500|502|503|504)($|[^_0-9a-zA-Z])|overloaded|temporarily unavailable|rate.?limit'
 }
 
 # Совет по восстановлению зависит от движка: у opencode и gemini возобновления
@@ -476,14 +497,17 @@ _recovery_hint() {
 
 # after a step finishes: exit code, changed files, state, question detection
 finish_step() {
-    local n="$1" rc="$2" log tdir nfiles=0 last_line
+    local n="$1" rc="$2" log tdir nfiles=0 closing
     log="$LOGDIR/$n.log"; tdir="$(meta_get "$n" dir)"; [ -n "$tdir" ] || tdir="$dir"
     meta_set "$n" exit "$rc"
     if git -C "$tdir" rev-parse --git-dir >/dev/null 2>&1; then
         nfiles=$(git -C "$tdir" status --porcelain 2>/dev/null | grep -c .)
     fi
     meta_set "$n" files "$nfiles"
-    last_line="$(last_output "$log" | grep -v '^[[:space:]]*$' | tail -1)"
+    # Closing window, not just the last line: the last few non-empty lines of the final output
+    # block. A question followed by a footer ("PROGRESS.x.md updated.") used to read as done;
+    # looks_waiting classifies every line in this window so the question is still caught.
+    closing="$(last_output "$log" | grep -v '^[[:space:]]*$' | tail -6)"
     if [ "$rc" = 124 ]; then
         # killed by the step watchdog (_guarded_run). Recorded in meta so `status`/`list`/the GUI
         # can say WHY the task died instead of showing a bare exit code.
@@ -493,7 +517,7 @@ finish_step() {
     elif [ "$rc" -ne 0 ]; then
         meta_set "$n" state error
         echo "[agent.sh] ✖ error exit=$rc  task=$n  (log: agent.sh log $n | $(_recovery_hint "$n"))" >&2
-    elif looks_waiting "$last_line"; then
+    elif looks_waiting "$closing"; then
         meta_set "$n" state waiting
         echo "[agent.sh] ⏳ the agent appears to have ASKED a question — reply: agent.sh reply $n \"...\"  (question: agent.sh last $n)" >&2
     else
@@ -573,10 +597,21 @@ provider_dispatch_resume() {
     rc=${PIPESTATUS[0]}   # 124 = killed by the step watchdog (see _guarded_run / finish_step)
 }
 
+# _require_engine_run ENGINE — die if no provider implements this engine's run command. This MUST
+# happen before _do_run_dispatch touches the filesystem: provider_dispatch_run would die too, but
+# only after state=running and pid= were already written, leaving a ghost task that reads `stalled`
+# forever. Worse, under `fan` each dispatch runs in a background subshell with output discarded, so
+# `agent.sh fan -e typo ...` reported "launched N parallel task(s)" while starting nothing.
+_require_engine_run() {
+    declare -F "provider_${1}_run_cmd" >/dev/null 2>&1 \
+        || die "unknown engine: $1 (no providers/$1/provider.sh defines it) — see 'agent.sh doctor'"
+}
+
 # shared body for `run` and `test-api` (identical except test-api also tags kind=api-test via
 # $task_kind) -- creates the log/meta, dispatches to the provider, finishes the step.
 # Expects $name/$engine/$model/$dir/$parent/$prompt (and optionally $task_kind) already set.
 _do_run_dispatch() {
+    _require_engine_run "$engine"   # BEFORE the first .log/.meta write: no ghost tasks
     log="$LOGDIR/$name.log"; : > "$log"
     meta_set "$name" engine "$engine"; meta_set "$name" model "${model:-default}"
     meta_set "$name" dir "$dir"; meta_set "$name" state running
@@ -640,6 +675,7 @@ case "$cmd" in
         # / `status <name>`. Saves writing a bash loop of backgrounded `run &` calls by hand.
         parse_opts "$@"
         [ ${#REST[@]} -ge 1 ] || die "fan: needs >=1 prompt (agent.sh fan [opts] \"p1\" \"p2\" ...)"
+        _require_engine_run "$engine"   # synchronously + visibly; the backgrounded dispatches would swallow the error
         fan_base="$name"; fan_i=0
         for fan_p in "${REST[@]}"; do
             fan_i=$((fan_i+1))
@@ -669,8 +705,10 @@ case "$cmd" in
             # it in a markdown ```json fence or add a sentence before/after despite the
             # instruction not to) -- take from the first "{" to the last "}" in the last output
             # block, which tolerates both a bare JSON line and a fenced/annotated one.
-            if command -v python >/dev/null 2>&1; then
-                last_output "$log" | PYTHONIOENCODING=utf-8 python -c "
+            # JSON extraction needs a real interpreter: route it through the shared _agent_python
+            # (Windows' bare `python` can be an exit-nonzero stub) and fail clearly when none runs.
+            if _agent_python; then
+                last_output "$log" | PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c "
 import json, sys
 s = sys.stdin.read()
 i, j = s.find('{'), s.rfind('}')
@@ -683,7 +721,7 @@ except Exception:
     print(s, end='')
 " > "$out_file"
             else
-                last_output "$log" | grep -v '^[[:space:]]*$' | tail -1 > "$out_file"
+                die "test-api: --out needs python to validate the JSON (python3/python/py in PATH or \$AGENT_PYTHON) — none runnable"
             fi
             echo "[agent.sh] wrote $out_file" >&2
         fi
@@ -694,7 +732,15 @@ except Exception:
         [ -n "$answer" ] || die "reply: needs an answer text"
         if [ -z "$ref" ]; then tname="$(latest_task)"; [ -n "$tname" ] || die "reply: no tasks — specify name/session id"
         elif [[ "$ref" =~ ^[0-9a-f-]{36}$|^ses_[[:alnum:]_.-]+$|^session_[[:alnum:]_.-]+$ ]]; then tname="$(name_by_session "$ref")"
-        else tname="$ref"; fi
+        else
+            tname="$ref"
+            # An explicit NAME must point at a real task. Without this check a typo fell through
+            # every lookup empty-handed: engine stayed at the default claude, the session guard
+            # was bypassed by `[ "$engine" = claude ]`, a ghost .meta/.log got created, and
+            # `claude --continue` resumed WHATEVER conversation happened to be latest — an answer
+            # delivered into the wrong thread. Fail loudly instead.
+            [ -e "$(meta_file "$tname")" ] || die "reply: no such task '$ref' ($LOGDIR/$ref.meta missing) — see 'agent.sh list'"
+        fi
         if [ -n "${tname:-}" ]; then
             session="$(resolve_session "$tname")"
             mdir="$(meta_get "$tname" dir)"; [ -n "$mdir" ] && dir="$mdir"
@@ -816,7 +862,8 @@ except Exception:
 
         doctor_engine_csv="$(IFS=,; echo "${doctor_engines[*]}")"
         doctor_deep_csv="$(IFS=,; echo "${doctor_deep_engines[*]}")"
-        PYTHONIOENCODING=utf-8 python - "$doctor_tmp" "$doctor_json" "$doctor_engine_csv" "$doctor_deep_csv" "$deep" <<'PY'
+        _agent_python || die "doctor: needs python to render the report (python3/python/py in PATH or \$AGENT_PYTHON) — none runnable"
+        PYTHONIOENCODING=utf-8 "$_AGENT_PY" - "$doctor_tmp" "$doctor_json" "$doctor_engine_csv" "$doctor_deep_csv" "$deep" <<'PY'
 import datetime, json, os, sys, time
 root, as_json, engine_csv, deep_csv, deep = sys.argv[1:6]
 now = time.time()
@@ -961,15 +1008,16 @@ PY
         # gui.py owns the parsing -- with NO argument it still falls back to $AGENT_GUI_PORT or
         # its own stable 8765 default (an unconditional "${1:-8765}" here used to defeat
         # AGENT_GUI_PORT, because python always saw an argv).
+        _agent_python || die "gui: needs python to run gui.py (python3/python/py in PATH or \$AGENT_PYTHON) — none runnable"
         export AGENT_SH_BASH="$(cygpath -w "$BASH" 2>/dev/null || echo bash)"
-        exec python "$(dirname "$0")/gui.py" "$@"
+        exec "$_AGENT_PY" "$(dirname "$0")/gui.py" "$@"
         ;;
     openai-server)
-        # OpenAI-compatible /v1/chat/completions bridge over a CLI subagent -- one process =
-        # one fixed engine/model/effort; run several (different -e/-m/-f/-p) to compare
+        # One process = one fixed engine/model/effort; run several (different -e/-m/-f/-p) to compare
         # providers/models side by side. Foreground like `gui`, not backgrounded here.
+        _agent_python || die "openai-server: needs python to run openai_server.py (python3/python/py in PATH or \$AGENT_PYTHON) — none runnable"
         export AGENT_SH_BASH="$(cygpath -w "$BASH" 2>/dev/null || echo bash)"
-        exec python "$(dirname "$0")/openai_server.py" "$@"
+        exec "$_AGENT_PY" "$(dirname "$0")/openai_server.py" "$@"
         ;;
     clean|prune)
         # Remove md clutter left by STOPPED tasks: the generated <name>.md thread in LOGDIR and the

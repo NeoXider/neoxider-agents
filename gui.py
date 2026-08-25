@@ -1500,19 +1500,6 @@ class H(BaseHTTPRequestHandler):
             if d not in pr:
                 pr.append(d); save_projects(pr)
             self._send(200, json.dumps({"ok": True, "projects": pr}))
-        elif u.path == "/api/test-api":
-            base_url = (data.get("base_url") or "").strip()
-            goal = (data.get("goal") or "").strip()
-            if not base_url or not goal:
-                return self._send(400, json.dumps({"error": "base_url and goal are required"}))
-            rdir = to_git_bash_path(data.get("dir") or "") or HERE
-            name = data.get("name") or ("api-test-%d" % int(time.time()))
-            args = ["test-api", "--base-url", base_url, "--goal", goal, "-e", data.get("engine") or "codex",
-                    "-C", rdir, "-t", name]
-            if data.get("model"):  args += ["-m", data["model"]]
-            if data.get("effort"): args += ["-f", data["effort"]]
-            spawn(args, terminal=bool(data.get("terminal")))
-            self._send(200, json.dumps({"ok": True, "name": name}))
         elif u.path == "/api/bridge/start":
             self._send(200, json.dumps(start_bridge(data)))
         elif u.path == "/api/bridge/stop":

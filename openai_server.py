@@ -2167,7 +2167,18 @@ class H(BaseHTTPRequestHandler):
                          "action, respond with ONLY the fenced ```json {\"tool_calls\":[...]} block from the "
                          "instructions -- no prose before or after -- and nothing else.")
                 retry_messages = list(messages) + [{"role": "user", "content": nudge}]
-                r_text, r_calls, r_usage = H._run(self, retry_messages, tools, _retry_left=0)
+                retry_has_calls = False
+                try:
+                    r_text, r_calls, r_usage = H._run(self, retry_messages, tools, _retry_left=0)
+                    retry_has_calls = bool(r_calls)
+                finally:
+                    # The synthetic nudge is absent from every later client history.
+                    with SESSION_LOCK:
+                        SESSION["messages"] = list(messages)
+                        if not retry_has_calls:
+                            # The bridge returns the original prose, not the retry answer, so that
+                            # CLI session no longer matches the client-visible conversation.
+                            SESSION["task_name"] = None
                 if r_calls:
                     return r_text, r_calls, r_usage
 
@@ -2210,6 +2221,15 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+        self._sse_started = True  # a second HTTP status line is now impossible -- see do_POST
+
+    def _abort_stream_safely(self):
+        """Finish an already-started SSE response without writing another HTTP status."""
+        try:
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (OSError, ValueError):
+            pass
 
     def _stream_response(self, messages, tools):
         if ((CFG.engine in LIVE_STREAM_ENGINES or _use_opencode_native())
@@ -2319,7 +2339,10 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         if self._reject_unauthorized():
             return
-        p = urllib.parse.urlparse(self.path).path
+        # Preserve the raw route shape: urlparse("//v1/reset").path is "/reset".
+        p = self.path.partition("?")[0]
+        if len(p) > 1 and p.endswith("/"):
+            p = p[:-1]
         if p not in ("/chat/completions", "/v1/chat/completions", "/reset", "/v1/reset"):
             return self._send_json(404, {"error": {"message": "not found: " + p}})
         length, err = self._read_content_length()
@@ -2346,6 +2369,8 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             pass  # client went away -- nothing to answer
         except ProviderLimitError as e:
+            if getattr(self, "_sse_started", False):
+                return self._abort_stream_safely()  # 429 headers cannot follow an SSE body
             try:
                 self._send_json(429, {"error": {"message": str(e), "type": "rate_limit_error",
                                                  "code": "rate_limit_exceeded"}})
@@ -2353,8 +2378,9 @@ class H(BaseHTTPRequestHandler):
                 pass
         except Exception as e:  # noqa: BLE001 -- a bridge bug must surface as an OpenAI-style
             # error response, not a bare connection reset the client can't distinguish from a
-            # network failure. (_run finishes before any response bytes go out, including in the
-            # streaming path, so sending a 500 here is always still possible.)
+            # network failure. A second status line would corrupt an already-started SSE stream.
+            if getattr(self, "_sse_started", False):
+                return self._abort_stream_safely()
             try:
                 self._send_json(500, {"error": {"message": "bridge failure: %s" % e,
                                                  "type": "server_error"}})

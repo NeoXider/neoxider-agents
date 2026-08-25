@@ -145,14 +145,14 @@ entirely — just `--base-url` + `--goal`, let the agent introspect the API itse
 endpoints) and report back in the JSON shape above. Add spec-file support once that
 loop is proven out.
 
-The core of this (`test-api` subcommand + GUI API tab) has since shipped — see
-`TODO.md`'s "Local HTTP API test-driver" entry. The follow-up design questions below
-were resolved alongside it.
+The supported core is the `agent.sh test-api` subcommand. Its former dedicated GUI
+form and `/api/test-api` route were later retired; CLI-created `kind=api-test` tasks
+still appear in the shared task list. See `TODO.md`'s "Local HTTP API test-driver" entry.
 
 ### One shared API server, not one-per-provider
 
-Resolved design: a single `gui.py` server instance, where every request
-(`/api/run`, `/api/test-api`, etc.) carries its own `engine`/`model`/`effort` fields —
+Resolved design: a single `gui.py` server instance, where task-launch requests such as
+`/api/run` carry their own `engine`/`model`/`effort` fields —
 not a separate server process per provider/model combo. Rationale: simpler (one port,
 one process, one cache), and the CLI (`agent.sh test-api -e claude -m sonnet -f high
 --base-url ... --goal ...`) already gives full per-call provider/model control from
@@ -166,7 +166,7 @@ without adding capability.
 That's not an inconsistency, it follows from a real difference in the two protocols —
 and it's an entirely separate axis from the session model discussed below:
 
-- `/api/run`, `/api/test-api`, and every other `gui.py`-served endpoint are *this
+- `/api/run` and the other `gui.py`-served endpoints are *this
   project's own* wire format — every request already carries explicit `engine`/
   `model`/`effort` fields, so one shared server can dispatch per-call with no loss of
   capability.
@@ -210,15 +210,11 @@ expires and the next call starts fresh, rather than staying resumable (and growi
 forever.
 
 **A second thing worth being explicit about, since both sections use the word
-"streaming" for different things**: `/api/stream` (above) tails the *real*, live,
-in-progress CLI transcript as the wrapped agent produces it — genuine incremental
-output. `openai-server`'s `stream: true` is a *post-hoc replay*: the full answer is
-generated first (same blocking wait as non-streaming), then chopped into word-sized
-SSE chunks and sent out on a fixed cadence. Both are legitimately useful, but a reader
-skimming both sections could easily assume they're the same kind of "streaming" when
-they aren't — `/api/stream` gives you the agent's actual real-time work; the bridge's
-streaming only exists so OpenAI-compatible client libraries that expect an SSE
-response shape don't have to special-case this one backend.
+"streaming" for different things**: `/api/stream` (above) tails the task log itself.
+`openai-server`'s `stream: true` forwards real deltas for live-capable engines and
+falls back to replaying the completed answer for non-live engines. Both expose SSE,
+but only the bridge also translates tool-call deltas into the OpenAI wire format; see
+`README.md` and `openai_server.py` for the current capability matrix.
 
 ### "Does this feel like a real API?" — history, tool calls, streaming
 
@@ -241,8 +237,8 @@ response shape don't have to special-case this one backend.
   `running` or `timeout` seconds elapse (capped at 300s), then returns one JSON object
   `{"name":..., "state":..., "model":..., "log":...}`. This is what makes the API
   usable synchronously (e.g. from a test harness or a Unity/C# test) instead of a
-  manual polling loop: kick off with `/api/test-api` or `/api/run`, then one
-  `/api/wait` call gets the final result.
+  manual polling loop: kick off with `/api/run`, then one `/api/wait` call gets the
+  final result. API-test jobs are launched through `agent.sh test-api` instead.
 
 Not implemented yet: `--spec`/OpenAPI parsing (still the smallest-viable-first-version
 scope note above still applies).

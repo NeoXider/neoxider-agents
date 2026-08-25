@@ -762,7 +762,7 @@ ROWS
 rm -rf "$STAT_FAKE"
 
 # ============================================================================================
-section "looks_waiting classifier (final-line question detection)"
+section "looks_waiting classifier (closing-window question detection)"
 # ============================================================================================
 
 LOOKS_WAITING_POSITIVE=(
@@ -771,7 +771,6 @@ LOOKS_WAITING_POSITIVE=(
     "Which option do you prefer?"
     "which of these files should I edit?"
     "Please confirm before I delete anything."
-    "let me know if you need anything else."
     "Shall I apply the fix?"
     "уточни формат вывода"
     "подтверди продолжение."
@@ -793,6 +792,13 @@ LOOKS_WAITING_NEGATIVE=(
     "should"
     "Error: file not found."
     "TODO"
+    # soft follow-up prose / documentary prose: declarative, NOT a blocking ask (regression:
+    # bare "let me know" and "which options ..." used to flip finished tasks to waiting)
+    "let me know if you need anything else."
+    "I'll keep you posted and let you know the outcome."
+    "This section documents which options the CLI supports."
+    "Below we describe which of these approaches fits each case."
+    "Please see the README for the full option list."
 )
 for l in "${LOOKS_WAITING_POSITIVE[@]}"; do
     if looks_waiting "$l"; then
@@ -808,6 +814,169 @@ for l in "${LOOKS_WAITING_NEGATIVE[@]}"; do
         pass "not-waiting: $l"
     fi
 done
+
+# Closing WINDOW, not just the last line (finish_step feeds the last few non-empty lines):
+# a question followed by a bookkeeping footer must still be caught...
+assert_eq "waiting: question above a footer line is caught in the closing window" "0" \
+    "$(looks_waiting "$(printf 'Working on it...\nShould I proceed with the refactor?\nPROGRESS.t.md updated.')"; echo $?)"
+assert_eq "waiting: question two footer lines below is still caught" "0" \
+    "$(looks_waiting "$(printf 'Which option do you prefer?\nFiles changed.\nAll checks passed.')"; echo $?)"
+# ...while a clean window stays clean even when earlier blocks asked questions
+assert_eq "not-waiting: plain completion window" "1" \
+    "$(looks_waiting "$(printf 'Refactor applied.\nTests green.\nReport written.')"; echo $?)"
+
+# ============================================================================================
+section "finish_step end-to-end: closing window decides waiting vs done"
+# ============================================================================================
+# finish_step slices the LAST output block (last_output), takes its closing window and lets
+# looks_waiting decide state=waiting. A question followed by a footer line used to read as done
+# because only the very last line was classified.
+
+fs_write_log() { # fs_write_log NAME LINE... — a minimal one-block task log ending with $* lines
+    local n="$1"; shift
+    { printf '========== [run] 2026-01-01 00:00:00 | engine=test model=default ==========\n'
+      printf '> PROMPT:\nwork\n---------- output ----------\n'
+      printf '%s\n' "$@"
+    } > "$SCRATCH_LOGDIR/$n.log"
+}
+
+meta_set fs_wait state running; meta_set fs_wait dir ""
+fs_write_log fs_wait "Working on it..." "Should I proceed with the refactor?" "PROGRESS.fs_wait.md updated."
+finish_step fs_wait 0 2>/dev/null
+assert_eq "question above a footer -> state=waiting" "waiting" "$(meta_get fs_wait state)"
+
+meta_set fs_done state running; meta_set fs_done dir ""
+fs_write_log fs_done "Refactor applied." "Tests green." "Report written."
+finish_step fs_done 0 2>/dev/null
+assert_eq "plain completion -> state=done" "done" "$(meta_get fs_done state)"
+
+meta_set fs_oldq state running; meta_set fs_oldq dir ""
+{ printf '========== [run] t ==========\n> PROMPT:\nwork\n---------- output ----------\nShould I stop here?\n'
+  printf '========== [reply] t ==========\n> ANSWER:\nyes\n---------- output ----------\nDone.\n'
+} > "$SCRATCH_LOGDIR/fs_oldq.log"
+finish_step fs_oldq 0 2>/dev/null
+assert_eq "a question in an EARLIER output block does not leak into the final verdict" \
+    "done" "$(meta_get fs_oldq state)"
+rm -f "$SCRATCH_LOGDIR/fs_wait.md" "$SCRATCH_LOGDIR/fs_done.md" "$SCRATCH_LOGDIR/fs_oldq.md"
+
+# ============================================================================================
+section "_is_transient_failure (retry classifier)"
+# ============================================================================================
+# Positive/negative lock-in for the retry decision. The regex once carried LITERAL 0x08 backspace
+# bytes where \b word boundaries were intended, so numeric codes never matched; the portable
+# (^|[^...]) spelling must match standalone codes and reject digits glued to them.
+
+mk_tf_log() { printf '%s' "$2" > "$SCRATCH_LOGDIR/tf.log"; }
+TRANSIENT_POSITIVE=(
+    '{"error":{"isRetryable":true,"message":"Provider finish_reason: network_error"}}'
+    'stream error: ECONNRESET'
+    'ETIMEDOUT while reading upstream'
+    'socket hang up'
+    'HTTP 429 Too Many Requests'
+    'status: 503'
+    '(502)'
+    'provider is overloaded, try later'
+    'temporarily unavailable'
+    'rate limit exceeded'
+)
+TRANSIENT_NEGATIVE=(
+    '401 unauthorized'
+    'invalid api key sk-xxx'
+    'payment required'
+    'insufficient quota for this request'
+    'model gpt-9 not found'      # auth-class wins over the transient list (checked first)
+    'exit code 15002'            # digits glued around 500: boundary must reject
+    'reference x502y'            # word chars around 502: boundary must reject
+    'all 200 OK'
+    'supermodel unavailable'     # boundary before `model`: must NOT hit the auth class either
+    ''
+)
+for s in "${TRANSIENT_POSITIVE[@]}"; do
+    mk_tf_log tf "$s"
+    if _is_transient_failure "$SCRATCH_LOGDIR/tf.log"; then
+        pass "transient: $s"
+    else
+        fail "transient: '$s' classified as permanent"
+    fi
+done
+for s in "${TRANSIENT_NEGATIVE[@]}"; do
+    mk_tf_log tf "$s"
+    if _is_transient_failure "$SCRATCH_LOGDIR/tf.log"; then
+        fail "permanent: '$s' wrongly classified as transient"
+    else
+        pass "permanent: $s"
+    fi
+done
+
+# no literal backspace bytes anywhere in agent.sh (the original \b regression)
+if LC_ALL=C grep -q "$(printf '\010')" "$HERE/agent.sh"; then
+    fail "agent.sh contains literal 0x08 backspace bytes"
+else
+    pass "agent.sh contains no literal 0x08 bytes (portable boundaries instead)"
+fi
+
+# AGENT_RETRY_DELAY input validation mirrors AGENT_RETRIES/AGENT_TIMEOUT_SEC
+assert_eq "non-numeric AGENT_RETRY_DELAY falls back to the default" "8" \
+    "$(AGENT_RETRY_DELAY='soon' bash -c "export AGENT_CLI_LOGS='$SCRATCH_LOGDIR'; source '$HERE/agent.sh' list >/dev/null 2>&1; echo \"\$AGENT_RETRY_DELAY\"")"
+
+# ============================================================================================
+section "run/fan validate the engine BEFORE any task artifact exists"
+# ============================================================================================
+# An unknown engine used to die only inside provider_dispatch_run — after .log/.meta with
+# state=running + pid= were already written (ghost task reading `stalled` forever); under fan the
+# dying subshell's message was discarded entirely while "launched N parallel task(s)" still printed.
+
+run_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" run -e nosuchengine -t ghost_run "hi" 2>&1)"
+run_rc=$?
+assert_eq "run with an unknown engine exits non-zero" "1" "$run_rc"
+assert_match "run names the offending engine" 'unknown engine: nosuchengine' "$run_out"
+if [ -e "$SCRATCH_LOGDIR/ghost_run.meta" ] || [ -e "$SCRATCH_LOGDIR/ghost_run.log" ]; then
+    fail "run with an unknown engine created a ghost task record"
+else
+    pass "run with an unknown engine creates NO .meta/.log"
+fi
+
+fan_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" fan -e nosuchengine -t ghost_fan "p1" "p2" 2>&1)"
+fan_rc=$?
+assert_eq "fan with an unknown engine exits non-zero synchronously" "1" "$fan_rc"
+assert_match "fan reports the unknown engine visibly" 'unknown engine: nosuchengine' "$fan_out"
+if [ -n "$(ls "$SCRATCH_LOGDIR"/ghost_fan-* 2>/dev/null)" ]; then
+    fail "fan with an unknown engine created ghost task records"
+else
+    pass "fan with an unknown engine launches nothing and leaves no records"
+fi
+
+# ============================================================================================
+section "reply fails safely on a nonexistent task"
+# ============================================================================================
+# A typo'd name used to fall through every lookup empty-handed: engine stayed at default claude,
+# the session guard was bypassed, a ghost .meta was written and `claude --continue` resumed
+# whichever conversation happened to be LATEST. It must die before touching any file.
+
+reply_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" reply definitely_not_a_task "continue" 2>&1)"
+reply_rc=$?
+assert_eq "reply to a nonexistent task exits non-zero" "1" "$reply_rc"
+assert_match "reply names the missing task" 'no such task.*definitely_not_a_task' "$reply_out"
+if [ -e "$SCRATCH_LOGDIR/definitely_not_a_task.meta" ] || [ -e "$SCRATCH_LOGDIR/definitely_not_a_task.log" ]; then
+    fail "reply to a nonexistent task wrote ghost artifacts"
+else
+    pass "reply to a nonexistent task writes NO .meta/.log"
+fi
+
+# ============================================================================================
+section "python entrypoints fail clearly without an interpreter"
+# ============================================================================================
+# Resolve bash NOW — the stripped PATH below must not break launching the interpreter itself.
+TEST_BASH="$(command -v bash)"
+gui_out="$(PATH=/nonexistent AGENT_CLI_LOGS="$SCRATCH_LOGDIR" "$TEST_BASH" "$HERE/agent.sh" gui 2>&1)"
+gui_rc=$?
+assert_eq "gui without python exits non-zero" "1" "$gui_rc"
+assert_match "gui without python says so clearly" 'needs python' "$gui_out"
+
+bridge_out="$(PATH=/nonexistent AGENT_CLI_LOGS="$SCRATCH_LOGDIR" "$TEST_BASH" "$HERE/agent.sh" openai-server 2>&1)"
+bridge_rc=$?
+assert_eq "openai-server without python exits non-zero" "1" "$bridge_rc"
+assert_match "openai-server without python says so clearly" 'needs python' "$bridge_out"
 
 # ============================================================================================
 section "summary"

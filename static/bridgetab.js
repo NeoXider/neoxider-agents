@@ -280,11 +280,13 @@ async function restartBridge(port, btn) {
   btn.disabled = true;
   btn.innerHTML = spin();
   try {
-    const r = await jpost("/api/bridge/restart", {
+    const body = {
       port, model, localhost,
       engine: btn.dataset.engine, effort: btn.dataset.effort, dir: btn.dataset.dir,
-      instance_id: (row && row.dataset.instanceId) || "",
-    });
+    };
+    // Legacy rows omit identity so the backend can fail closed with the real verification error.
+    if (row && row.dataset.instanceId) body.instance_id = row.dataset.instanceId;
+    const r = await jpost("/api/bridge/restart", body);
     if (r.error) { toast("error", t("bridge.stop_failed"), r.error); return; }
     toast("success", t("bridge.switched"), (r.base_url || "") + " · " + (model || t("form.auto")));
     [700, 1500, 2600, 4000, 6000].forEach(ms => setTimeout(refreshBridgeTab, ms));

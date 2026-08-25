@@ -290,13 +290,10 @@ Roughly in priority order. PRs welcome.
   design in [`docs/IDEAS.md`](docs/IDEAS.md#local-http-api-test-driver-api-test-mode).
   The agent exercises the API via its own shell/curl capability (no MCP/new tool-use
   needed) and returns one strict JSON object; `--out` extracts it robustly (tolerates
-  a markdown-fenced or annotated answer despite the instruction not to). Also exposed
-  in the GUI as a new **API tab**: a form (base URL/goal/provider/model/effort), a
-  results list parsing each run's JSON into a pass/fail summary + per-endpoint detail,
-  and ready-made curl/C# (Unity `UnityWebRequest`) snippets for calling the same
-  `/api/test-api` GUI endpoint from your own test suite. Verified end-to-end twice
-  against a real local Python HTTP server (via the CLI directly and via the GUI form)
-  — real HTTP calls, real structured JSON, correctly rendered pass/fail in the tab.
+  a markdown-fenced or annotated answer despite the instruction not to). The former
+  dedicated GUI form and `/api/test-api` route were later removed as duplicate surface;
+  CLI-created `kind=api-test` runs remain visible in the common task list. The CLI path
+  was verified end-to-end against a real local Python HTTP server.
 - [ ] **`/plugin install` round-trip, unverified.** The plugin packaging (see
   Distribution above) hasn't been tested by an actual install on a second machine yet.
 - [x] **Test coverage.** Done — `tests/test_agent_sh.sh` (48 bash assertions: the
