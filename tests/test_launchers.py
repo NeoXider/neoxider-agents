@@ -38,6 +38,32 @@ BASH = find_bash()
 
 
 class WindowsLauncherTests(unittest.TestCase):
+    def test_gui_launcher_uses_repo_entrypoint(self):
+        data = (ROOT / "gui-launcher.bat").read_bytes()
+        data.decode("ascii")
+        self.assertIn(b'%~dp0bin\\neoxider.cmd', data)
+        self.assertNotIn(b".claude/skills", data.lower())
+        self.assertNotIn(b".claude\\skills", data.lower())
+
+    @unittest.skipUnless(os.name == "nt" and shutil.which("cmd"), "requires cmd.exe")
+    def test_gui_launcher_passes_gui_arguments_and_propagates_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "bin").mkdir()
+            shutil.copyfile(ROOT / "gui-launcher.bat", root / "gui-launcher.bat")
+            (root / "bin" / "neoxider.cmd").write_bytes(
+                b"@echo off\r\necho delegated:%*\r\nexit /b 37\r\n"
+            )
+            result = subprocess.run(
+                ["cmd", "/d", "/c", str(root / "gui-launcher.bat")],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
+        self.assertIn("delegated:gui 8765", result.stdout)
+
     def test_powershell_launcher_is_windows_powershell_safe_ascii(self):
         data = (ROOT / "bin" / "neoxider.ps1").read_bytes()
         data.decode("ascii")
