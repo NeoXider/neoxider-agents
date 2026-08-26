@@ -6,7 +6,7 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-08-26
+## [0.4.0] - 2026-08-25
 
 ### Security
 
