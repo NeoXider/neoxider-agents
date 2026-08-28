@@ -107,14 +107,20 @@ bash "$SK" gui 8765 --lan --token SECRET              # ...reachable from anothe
 - **Model ids with a provider prefix must be passed verbatim**: `-e opencode -m
   opencode/muse-spark-1.2-contributor-free` works; the bare id without the `opencode/` prefix
   errors. Short aliases (`-m free`, `-m ox`, …) resolve to the full id for you.
-- **OpenCode Zen free tier (live list 2026-08-24):** `big-pickle`, `hy3-free`, `mimo-v2.5-free`,
-  `muse-spark-1.2-contributor-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`,
-  `x-preview-f-free`. Aliases: `free`/`spark`/`muse`, `ox`/`alpha`, `pickle`, `hy3`, `mimo`,
-  `nemotron`/`ultra`, `lightning`. Re-check with `opencode models` — the tier moves.
+- **OpenCode Zen free tier (live list 2026-08-28):** `big-pickle`, `hy3-free`, `mimo-v2.5-free`,
+  `muse-spark-1.2-contributor-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`.
+  Aliases: `free`/`spark`/`muse`, `ox`/`alpha`, `pickle`, `hy3`, `mimo`, `nemotron`/`ultra`,
+  `lightning`. Re-check with `opencode models` — the tier moves, and it moved: **`x-preview-f-free`
+  is gone** as of 2026-08-28. Write the id exactly as `opencode models` prints it; near-misses like
+  `mimo-free` or `nemotron-ultra-free` are not aliases and fail as unknown models.
   **Unranked**: `free` points at Muse Spark by user preference, not measurement. In the one
   head-to-head actually run (2026-08-24, a 5-step PowerShell disk survey) *neither* Muse Spark nor
   Ox Alpha produced an answer — Ox hit the 1800s timeout, Muse never emitted a line. Treat the free
   tier as fine for one-shot Q&A and unproven for multi-step tool work.
+  Liveness varies inside the tier: on 2026-08-28 a one-line probe came back from `mimo-v2.5-free`,
+  `nemotron-3-ultra-free` and `hy3-free`, while `nemotron-3.5-lightning-free` sat past a 120s
+  deadline without a byte. A silent provider is a provider outage, not a slow model — give it its
+  own timeout rather than reading the silence as a result.
 - **DeepSeek is gone from opencode:** the Zen `deepseek-v4-flash-free` entry no longer appears in
   `opencode models`, and the Ollama route (`ollama/deepseek-v4-flash:cloud`) returns
   `403 this model requires a subscription`. The `ollama` and `zai` providers are therefore listed
