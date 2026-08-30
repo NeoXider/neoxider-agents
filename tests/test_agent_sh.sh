@@ -700,6 +700,22 @@ else
     pass "clean skips an idle task exactly like a running one"
 fi
 
+# `wait` must treat idle exactly like running, for the same reason clean must. A codex/claude step
+# flushes its log only when the step ENDS, so a working task goes quiet and reads as `idle`; wait
+# used to call that "settled" and return while the agent was still mid-turn, handing the orchestrator
+# an empty answer. It must keep blocking and time out instead.
+meta_set st_wait_idle state running
+meta_set st_wait_idle pid "$$"
+meta_set st_wait_idle dir ""
+: > "$SCRATCH_LOGDIR/st_wait_idle.log"
+touch -d "@$(( $(date +%s) - AGENT_STALE_SEC - 120 ))" "$SCRATCH_LOGDIR/st_wait_idle.log" 2>/dev/null     || touch -t "$(date -d '-1 hour' '+%Y%m%d%H%M' 2>/dev/null)" "$SCRATCH_LOGDIR/st_wait_idle.log" 2>/dev/null
+wait_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" wait st_wait_idle --timeout 1 --poll 1 2>&1)"; wait_rc=$?
+if [ "$wait_rc" = 2 ] && ! printf '%s' "$wait_out" | grep -q 'settled: st_wait_idle'; then
+    pass "wait keeps blocking on an idle task and times out instead of calling it settled"
+else
+    fail "wait must not settle an idle (alive but quiet) task (rc=$wait_rc)"
+fi
+
 # ============================================================================================
 section "task-name safety and option operand errors"
 # ============================================================================================

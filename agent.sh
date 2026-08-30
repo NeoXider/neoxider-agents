@@ -1058,7 +1058,7 @@ except Exception:
                 [ -e "$mf" ] || continue
                 n="${mf##*/}"; n="${n%.meta}"
                 valid_task_name "$n" || continue
-                [ "$(eff_state "$n")" = running ] && w_names+=("$n")
+                case "$(eff_state "$n")" in running|idle) w_names+=("$n") ;; esac
             done
         fi
         if [ ${#w_names[@]} -eq 0 ]; then echo "[agent.sh] wait: no tasks to watch — nothing to do"; exit 0; fi
@@ -1071,7 +1071,9 @@ except Exception:
             for n in "${w_names[@]}"; do
                 case "$settled" in *" $n "*) continue ;; esac
                 st="$(eff_state "$n")"
-                if [ "$st" = running ]; then still="$still $n"
+                # WHY: idle means alive but quiet — a codex/claude step flushes its log only when it
+                # ENDS, so treating idle as settled makes wait return while the task is still working.
+                if [ "$st" = running ] || [ "$st" = idle ]; then still="$still $n"
                 else
                     settled="${settled}${n} "
                     echo "[agent.sh] $(state_icon "$st") settled: $n -> $(state_label "$st" "$(log_idle_sec "$n")") (exit=$(meta_get "$n" exit), files=$(meta_get "$n" files))" >&2

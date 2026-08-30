@@ -6,6 +6,17 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **`wait` no longer calls a live-but-quiet task "settled".** It counted only `running` as still
+  going, so a task in the honest `idle` state — alive, but its log silent past `AGENT_STALE_SEC` —
+  was reported as settled and `wait` returned while the agent was still mid-turn, handing the
+  orchestrator an empty answer. That is the NORMAL case for codex and claude, whose steps flush the
+  log only when the step ends, so `wait` was unreliable exactly where it is most useful. Both places
+  now treat `idle` like `running`: the settle loop keeps blocking, and whole-wave mode (no names
+  given) also picks up idle tasks instead of ignoring them. `clean` already had this right; `wait`
+  did not. Regression test added with RED/GREEN evidence.
+
 ### Documentation
 
 - **How to handle a turn the PROVIDER killed, as opposed to one the model failed.** The orchestrator
