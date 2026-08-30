@@ -775,18 +775,36 @@ def dialog_payload(name, full=False, offset=None, limit=None):
             "has_more": off > 0, "steps": out, "now": now,
             "mtime": mtime, "log_size": size}
 
+def _hidden_windows_kwargs(new_process_group=False):
+    """Popen/run kwargs that prevent Windows' default terminal from creating a visible tab."""
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    flags = subprocess.CREATE_NO_WINDOW
+    if new_process_group:
+        flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+    return {"creationflags": flags, "startupinfo": startupinfo}
+
+
 def spawn(args, terminal=False, extra_env=None):
-    """Background launch of agent.sh. terminal=True -> a separate console window with a live chat view."""
+    """Launch agent.sh in the background.
+
+    Windows must be explicitly windowless by default: console applications launched through
+    Git Bash may otherwise be adopted by the configured default terminal and open a visible tab.
+    terminal=True is the sole opt-in to a separate live console.
+    """
     kw = dict(cwd=HERE)
     if extra_env:
         child_env = os.environ.copy()
         child_env.update(extra_env)
         kw["env"] = child_env
     if terminal and os.name == "nt":
-        kw["creationflags"] = 0x00000010  # CREATE_NEW_CONSOLE — chat visible live
+        kw["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # explicit live-chat opt-in
     elif os.name == "nt":
         kw.update(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        kw["creationflags"] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | NEW_PROCESS_GROUP
+        kw.update(_hidden_windows_kwargs(new_process_group=True))
     else:
         kw.update(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         kw["start_new_session"] = True
@@ -795,7 +813,8 @@ def spawn(args, terminal=False, extra_env=None):
 def run_sync(args, timeout=30):
     try:
         p = subprocess.run([BASH, SK] + args, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout, cwd=HERE)
+                           encoding="utf-8", errors="replace", timeout=timeout, cwd=HERE,
+                           **_hidden_windows_kwargs())
         return (p.stdout or "") + (p.stderr or "")
     except Exception as e:
         return "error: %s" % e
@@ -997,7 +1016,8 @@ def engine_models(engine, force=False):
         # subprocess can't resolve by bare name; the same git-bash agent.sh uses finds it on PATH.
         try:
             p = subprocess.run([BASH, "-lc", "opencode models"], capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=20, cwd=HERE)
+                               encoding="utf-8", errors="replace", timeout=20, cwd=HERE,
+                               **_hidden_windows_kwargs())
             got = [l.strip() for l in (p.stdout or "").splitlines()
                    if l.strip() and "/" in l and " " not in l.strip()]
             return got or static
@@ -1138,7 +1158,8 @@ def kill_pid(pid):
     try:
         if os.name == "nt":
             proc = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                                  capture_output=True, timeout=10)
+                                  capture_output=True, timeout=10,
+                                  **_hidden_windows_kwargs())
             if proc.returncode != 0:
                 LOG.warning("kill_pid: could not terminate pid %s (taskkill status=%s)",
                             pid, proc.returncode)
@@ -1914,6 +1935,9 @@ class H(BaseHTTPRequestHandler):
             engine = data.get("engine") or "codex"
             if not isinstance(engine, str) or engine not in PROVIDERS:
                 return self._send(400, json.dumps({"error": "unknown provider"}))
+            terminal = data.get("terminal", False)
+            if not isinstance(terminal, bool):
+                return self._send(400, json.dumps({"error": "terminal must be a boolean"}))
             args = ["run", "-e", engine]
             if data.get("model"):    args += ["-m", data["model"]]
             if data.get("effort"):   args += ["-f", data["effort"]]
@@ -1922,7 +1946,7 @@ class H(BaseHTTPRequestHandler):
             if parent_name:           args += ["-P", parent_name]
             if data.get("progress"): args += ["-p"]
             args.append(prompt)
-            spawn(args, terminal=bool(data.get("terminal")))
+            spawn(args, terminal=terminal)
             if rdir:  # remember the project
                 register_project(rdir)
             self._send(200, json.dumps({"ok": True}))
@@ -1935,9 +1959,12 @@ class H(BaseHTTPRequestHandler):
                 return self._send(400, json.dumps({"error": "invalid task name"}))
             if not task_exists(task):
                 return self._send(404, json.dumps({"error": "task no longer exists"}))
+            terminal = data.get("terminal", False)
+            if not isinstance(terminal, bool):
+                return self._send(400, json.dumps({"error": "terminal must be a boolean"}))
             args = ["reply", task, answer]
             if data.get("progress"): args = ["reply", "-p", task, answer]
-            spawn(args, terminal=bool(data.get("terminal")))
+            spawn(args, terminal=terminal)
             self._send(200, json.dumps({"ok": True}))
         elif u.path == "/api/project":
             d = to_git_bash_path((data.get("dir") or "").strip())

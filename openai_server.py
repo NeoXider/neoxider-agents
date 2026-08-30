@@ -222,10 +222,23 @@ def is_extension(prev, new):
     return len(new) > len(prev) and new[:len(prev)] == prev
 
 
+def _hidden_windows_kwargs():
+    """Prevent CLI subprocesses from opening tabs in the configured Windows terminal."""
+    if os.name != "nt":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            "startupinfo": startupinfo}
+
+
 def _process_group_kwargs():
-    """Start a subprocess in a group we can terminate as one process tree."""
+    """Start a hidden subprocess in a group we can terminate as one process tree."""
     if os.name == "nt":
-        return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+        kwargs = _hidden_windows_kwargs()
+        kwargs["creationflags"] |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return kwargs
     return {"start_new_session": True}
 
 
@@ -381,7 +394,7 @@ def _terminate_claimed_process_tree(proc):
                 # taskkill /T is the supported way to include grandchildren created by bash.
                 subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=10, check=False)
+                               timeout=10, check=False, **_hidden_windows_kwargs())
             if proc.poll() is None:
                 proc.kill()  # taskkill failure is reported by exit code, not an exception
         else:

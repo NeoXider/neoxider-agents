@@ -953,6 +953,90 @@ class WaitTimeoutAndPortTests(unittest.TestCase):
         self.assertFalse(spawned)
 
 
+@unittest.skipUnless(os.name == "nt", "Windows process-window contract")
+class SpawnVisibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.original_popen = gui.subprocess.Popen
+        self.calls = []
+
+        def fake_popen(argv, **kwargs):
+            self.calls.append((argv, kwargs))
+            return types.SimpleNamespace(pid=1234)
+
+        gui.subprocess.Popen = fake_popen
+
+    def tearDown(self):
+        gui.subprocess.Popen = self.original_popen
+
+    def test_background_spawn_is_windowless_by_default(self):
+        gui.spawn(["list"])
+        argv, kwargs = self.calls[-1]
+        self.assertEqual(argv[:2], [gui.BASH, gui.SK])
+        self.assertTrue(kwargs["creationflags"] & gui.subprocess.CREATE_NO_WINDOW)
+        self.assertTrue(kwargs["creationflags"] & gui.subprocess.CREATE_NEW_PROCESS_GROUP)
+        self.assertFalse(kwargs["creationflags"] & gui.subprocess.CREATE_NEW_CONSOLE)
+        self.assertEqual(kwargs["stdin"], gui.subprocess.DEVNULL)
+        self.assertEqual(kwargs["stdout"], gui.subprocess.DEVNULL)
+        self.assertEqual(kwargs["stderr"], gui.subprocess.DEVNULL)
+        self.assertTrue(kwargs["startupinfo"].dwFlags & gui.subprocess.STARTF_USESHOWWINDOW)
+        self.assertEqual(kwargs["startupinfo"].wShowWindow, gui.subprocess.SW_HIDE)
+
+    def test_terminal_true_is_the_only_visible_console_opt_in(self):
+        gui.spawn(["list"], terminal=True)
+        _, kwargs = self.calls[-1]
+        self.assertEqual(kwargs["creationflags"], gui.subprocess.CREATE_NEW_CONSOLE)
+        self.assertNotIn("startupinfo", kwargs)
+        self.assertNotIn("stdout", kwargs)
+
+
+class TerminalOptInRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.original_spawn = gui.spawn
+        self.original_task_exists = gui.task_exists
+        self.spawned = []
+        gui.spawn = lambda args, terminal=False, extra_env=None: self.spawned.append(terminal)
+        gui.task_exists = lambda _task: True
+
+    def tearDown(self):
+        gui.spawn = self.original_spawn
+        gui.task_exists = self.original_task_exists
+
+    @staticmethod
+    def _call(path, payload):
+        sent = []
+
+        class Fake:
+            client_address = ("127.0.0.1", 4242)
+            headers = {"Content-Type": "application/json", "Host": "127.0.0.1:8765"}
+
+            def __init__(self):
+                self.path = path
+
+            def _read_json_object_body(self):
+                return dict(payload)
+
+            def _send(self, code, body, ctype="application/json"):
+                sent.append((code, body))
+
+        Fake._reject_unauthorized = lambda self: False
+        gui.H.do_POST(Fake())
+        return sent
+
+    def test_run_terminal_is_hidden_by_default_and_visible_only_for_true(self):
+        self.assertEqual(self._call("/api/run", {"prompt": "one"})[0][0], 200)
+        self.assertEqual(self._call("/api/run", {"prompt": "two", "terminal": False})[0][0], 200)
+        self.assertEqual(self._call("/api/run", {"prompt": "three", "terminal": True})[0][0], 200)
+        self.assertEqual(self.spawned, [False, False, True])
+
+    def test_string_false_cannot_accidentally_open_run_or_reply_terminal(self):
+        run = self._call("/api/run", {"prompt": "one", "terminal": "false"})
+        reply = self._call("/api/reply", {"task": "task-1", "answer": "go",
+                                           "terminal": "false"})
+        self.assertEqual(run[0][0], 400)
+        self.assertEqual(reply[0][0], 400)
+        self.assertEqual(self.spawned, [])
+
+
 class StopBridgeTests(unittest.TestCase):
     """Fail-closed stopping: kill_pid runs only when the registry record and the live /health
     carry the same non-empty instance_id. Unreachable /health never kills: a held port means
