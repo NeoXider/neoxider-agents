@@ -989,6 +989,25 @@ ROWS
 
 PATH="$PATH_SAVE"; unset AGENT_PYTHON
 _AGENT_PY=""; _AGENT_PY_RESOLVED=""
+
+# ============================================================================================
+section "windowless python resolver (no-console servers on Windows)"
+# ============================================================================================
+case "$(uname -s 2>/dev/null || true)" in MINGW*|MSYS*)
+    make_py_stub pythonw 0
+    _WINDOWLESS_PY=""; _WINDOWLESS_PY_RESOLVED=""
+    got="<none>"
+    if PATH="$FAKE_BIN:$PATH_SAVE" _windowless_python; then got="$_WINDOWLESS_PY"; fi
+    assert_eq "pythonw on PATH -> windowless resolver picks it (gui/openai-server never own a console)" "pythonw" "$got"
+
+    make_py_stub pythonw 1   # broken stub shadows any host pythonw deterministically
+    _WINDOWLESS_PY=""; _WINDOWLESS_PY_RESOLVED=""
+    if PATH="$FAKE_BIN:$PATH_SAVE" _windowless_python; then got_found=1; else got_found=0; fi
+    assert_eq "broken/absent pythonw -> resolver fails so caller falls back to console python" "0" "$got_found"
+    ;;
+    *) pass "windowless resolver rows are Windows-only (skipped on this platform)" ;;
+esac
+
 rm -rf "$FAKE_BIN"
 
 # ============================================================================================

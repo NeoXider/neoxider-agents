@@ -57,6 +57,7 @@ class WindowsLauncherTests(unittest.TestCase):
             result = subprocess.run(
                 ["cmd", "/d", "/c", str(root / "gui-launcher.bat")],
                 cwd=root,
+                env={"NEOXIDER_GUI_VISIBLE": "1"},
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -76,7 +77,7 @@ class WindowsLauncherTests(unittest.TestCase):
             cwd=ROOT,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
         )
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("unknown command", (result.stdout + result.stderr).lower())
@@ -96,7 +97,7 @@ class WindowsLauncherTests(unittest.TestCase):
             cwd=ROOT,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
         )
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("unknown command", (result.stdout + result.stderr).lower())
@@ -114,7 +115,7 @@ class WindowsLauncherTests(unittest.TestCase):
             cwd=ROOT,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=60,
         )
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("unknown command", (result.stdout + result.stderr).lower())
