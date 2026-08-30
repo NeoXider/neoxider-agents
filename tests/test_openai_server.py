@@ -49,6 +49,18 @@ class ToGitBashPathTests(unittest.TestCase):
         self.assertEqual(srv.to_git_bash_path(""), "")
 
 
+@unittest.skipUnless(os.name == "nt", "Windows process-window contract")
+class ProcessVisibilityTests(unittest.TestCase):
+    def test_provider_process_groups_are_hidden_without_losing_killability(self):
+        kwargs = srv._process_group_kwargs()
+        flags = kwargs["creationflags"]
+        self.assertTrue(flags & subprocess.CREATE_NO_WINDOW)
+        self.assertTrue(flags & subprocess.CREATE_NEW_PROCESS_GROUP)
+        self.assertFalse(flags & subprocess.CREATE_NEW_CONSOLE)
+        self.assertTrue(kwargs["startupinfo"].dwFlags & subprocess.STARTF_USESHOWWINDOW)
+        self.assertEqual(kwargs["startupinfo"].wShowWindow, subprocess.SW_HIDE)
+
+
 class LastOutputTests(unittest.TestCase):
     def test_extracts_text_after_last_marker(self):
         log = (
@@ -850,7 +862,10 @@ class ProcessTreeTimeoutTests(unittest.TestCase):
                   "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
                   "open(sys.argv[1],'w').write(str(p.pid)); time.sleep(60)")
         try:
-            srv._run_agent_process([sys.executable, "-c", script, pid_file], 0.5,
+            # A cold Windows process launched without a console can need >500 ms before its
+            # first Python statement; still keep the deadline tiny relative to the 60 s sleeper.
+            timeout = 2.0 if os.name == "nt" else 0.5
+            srv._run_agent_process([sys.executable, "-c", script, pid_file], timeout,
                                    dict(os.environ))
             self.assertTrue(os.path.exists(pid_file))
             with open(pid_file, encoding="ascii") as f:
@@ -875,7 +890,8 @@ class ProcessTreeTimeoutTests(unittest.TestCase):
             "open(sys.argv[1],'w').write(str(p.pid))")
         orphan_pid = None
         try:
-            srv._run_agent_process([sys.executable, "-c", script, pid_file], 0.5,
+            timeout = 2.0 if os.name == "nt" else 0.5
+            srv._run_agent_process([sys.executable, "-c", script, pid_file], timeout,
                                    dict(os.environ))
             self.assertTrue(os.path.exists(pid_file))
             with open(pid_file, encoding="ascii") as f:

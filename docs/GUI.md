@@ -130,9 +130,13 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   providers with no `_resolve` at all (opencode's `--variant`, still empty for gemini which has no
   effort concept). Backward compatible: an alias like `sonnet-high` still works if you don't pass `-f`.
 - **Terminal**: an "open in terminal" checkbox (off by default) — when enabled, the GUI spawns `agent.sh`
-  in a separate console window (`CREATE_NEW_CONSOLE`) where you can see live output; without the checkbox — as usual, silently.
+  in a separate console window (`CREATE_NEW_CONSOLE`) where you can see live output. Without the
+  checkbox, Windows launches are explicitly hidden with `CREATE_NO_WINDOW`/`SW_HIDE`, so the default
+  terminal application cannot create stray command-line tabs.
 - **Toasts + history**: any completion/error/agent question — a popup notification for 3s, plus
-  history via 🔔 (persisted in localStorage). A universal CSS spinner (`.spinner`) — for doctor,
+  history via 🔔 (persisted in localStorage). Consecutive identical error toasts within a rolling
+  60-second window collapse into one history row with an `×N` count and do not repeatedly pop up;
+  success and user-action notifications remain distinct. A universal CSS spinner (`.spinner`) — for doctor,
   the limits panel, and the run/reply buttons while a request is in flight.
 - **Doctor/limits are cached** (30s TTL) server-side, so switching providers or an idle poll doesn't
   re-shell-out to `agent.sh` every few seconds; a ⟳ refresh button next to the limits panel and inside
