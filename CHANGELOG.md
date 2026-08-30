@@ -6,6 +6,21 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **`agent.sh wait <names>` completion primitive.** Blocks until the named tasks (or every
+  task currently running) leave `running`, prints each final state and the agent's last answer;
+  exit code 2 on timeout. Lets an orchestrator with its own background-job mechanism get a
+  completion notification — one background job per watched task.
+
+### Fixed
+
+- **GUI polling error spam.** Consecutive identical error toasts within 60 seconds now share one
+  bounded `×N` history record and only the first occurrence creates a visible popup.
+- **Windows background launches opened terminal tabs.** GUI run/reply/bridge subprocesses now use
+  `CREATE_NO_WINDOW` plus a hidden startup state by default; a visible console is created only when
+  the user explicitly enables the terminal checkbox.
+
 ## [0.4.0] - 2026-08-25
 
 ### Security
