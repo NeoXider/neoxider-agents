@@ -6,6 +6,21 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Documentation
+
+- **How to handle a turn the PROVIDER killed, as opposed to one the model failed.** The orchestrator
+  loop said an `error` task should have "its log read and the task re-scoped", which is wrong advice
+  for by far the most common cause: a transport failure (`403 Forbidden`, `tls handshake eof`,
+  `stream disconnected before completion`, `os error 10054`) that ends the turn in seconds while the
+  task itself was fine. Those sessions are still on disk and `agent.sh reply <name>` resumes them with
+  full context, so re-running a fresh `run` with a re-pasted prompt discards work and pays twice.
+  A new section documents this, plus the part that actually bites: a failed turn is NOT an atomic
+  rollback, so the working tree must be inspected before resuming — observed live, a task had written
+  its new failing tests but not the fix they existed to prove, leaving a deliberately red suite with
+  nothing recording why. Also records the practical adaptation during an outage: split the work into
+  several short `fan`-ed tasks, because short turns survive where one long turn keeps dying.
+  The liveness table gains the matching `error` row.
+
 ### Added
 
 - **`agent.sh wait <names>` completion primitive.** Blocks until the named tasks (or every
