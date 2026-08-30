@@ -227,7 +227,7 @@ done
 unset _p
 
 cmd="${1:-}"
-[ -n "$cmd" ] || die "usage: agent.sh run|fan|reply|log|last|status|list|clean|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
+[ -n "$cmd" ] || die "usage: agent.sh run|fan|reply|log|last|wait|status|list|clean|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
 shift
 
 engine="claude"; engine_explicit=0; model=""; model_explicit=0; effort_override=""; effort_explicit=0; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1; terse=1
@@ -1013,6 +1013,64 @@ except Exception:
         if [ -n "$f" ]; then require_task_name "$f"; log="$LOGDIR/$f.log"; else log="$(_latest_file log)"; fi
         [ -e "${log:-}" ] || die "log not found: ${f:-<latest>}"
         last_output "$log"
+        ;;
+    # wait [names...] — completion primitive for orchestrators that have their own background-job
+    # mechanism: blocks until every named task leaves `running` (the SAME eff_state machine as list/
+    # gui), prints a one-line settled note the moment each task settles, then prints each final state
+    # + the agent's last answer block to stdout. Launch ONE background job per task — that job's exit
+    # IS your completion notification and its output is the subagent's final answer (exit 0 = settled,
+    # exit 2 = --timeout hit while a task was still running). With no names it watches every task
+    # currently state=running — one call covers a whole fan-out wave.
+    wait)
+        w_timeout="${AGENT_WAIT_TIMEOUT:-0}"; w_poll="${AGENT_WAIT_POLL:-5}"; w_names=()
+        while [ $# -gt 0 ]; do case "$1" in
+            --timeout) [ $# -ge 2 ] || die "wait: option '--timeout' needs an operand (seconds, 0 = forever)"; w_timeout="$2"; shift 2 ;;
+            --poll)    [ $# -ge 2 ] || die "wait: option '--poll' needs an operand (seconds)"; w_poll="$2"; shift 2 ;;
+            *) w_names+=("$1"); shift ;;
+        esac; done
+        case "$w_timeout" in ''|*[!0-9]*) die "wait: --timeout must be a non-negative integer (0 = wait forever)" ;; esac
+        case "$w_poll"    in ''|*[!0-9]*) die "wait: --poll must be a positive integer" ;; esac
+        for a in "${w_names[@]}"; do require_task_name "$a"; done
+        if [ ${#w_names[@]} -eq 0 ]; then
+            # no names given -> watch every task currently running (whole-wave mode)
+            for mf in "$LOGDIR"/*.meta; do
+                [ -e "$mf" ] || continue
+                n="${mf##*/}"; n="${n%.meta}"
+                valid_task_name "$n" || continue
+                [ "$(eff_state "$n")" = running ] && w_names+=("$n")
+            done
+        fi
+        if [ ${#w_names[@]} -eq 0 ]; then echo "[agent.sh] wait: no tasks to watch — nothing to do"; exit 0; fi
+        for n in "${w_names[@]}"; do
+            [ -e "$(meta_file "$n")" ] || echo "[agent.sh] wait: warning: task '$n' not found ($LOGDIR/$n.meta missing) yet" >&2
+        done
+        w_start="$(date +%s)"; settled=" "; w_rc=0
+        while :; do
+            still=""
+            for n in "${w_names[@]}"; do
+                case "$settled" in *" $n "*) continue ;; esac
+                st="$(eff_state "$n")"
+                if [ "$st" = running ]; then still="$still $n"
+                else
+                    settled="${settled}${n} "
+                    echo "[agent.sh] $(state_icon "$st") settled: $n -> $(state_label "$st" "$(log_idle_sec "$n")") (exit=$(meta_get "$n" exit), files=$(meta_get "$n" files))" >&2
+                fi
+            done
+            [ -z "${still// /}" ] && break
+            if [ "$w_timeout" -gt 0 ] && [ $(( $(date +%s) - w_start )) -ge "$w_timeout" ]; then
+                echo "[agent.sh] wait: timeout after ${w_timeout}s; still running:${still}" >&2
+                w_rc=2; break
+            fi
+            sleep "$w_poll"
+        done
+        for n in "${w_names[@]}"; do
+            logf="$LOGDIR/$n.log"
+            echo ""
+            echo "========== wait | $n | $(eff_state "$n") =========="
+            if [ -e "$logf" ]; then last_output "$logf"; else echo "(no log for $n)"; fi
+        done
+        echo "WAIT_DONE tasks=${#w_names[@]} rc=$w_rc"
+        exit "$w_rc"
         ;;
     status)
         n="${1:-$(latest_task)}"; [ -n "$n" ] || die "no tasks"
