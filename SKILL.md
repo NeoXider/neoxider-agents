@@ -43,8 +43,10 @@ The loop:
    trivial → `-m haiku` (or `-e codex -m spark`), regular → `-m sonnet`, hard → the default `opus5`.
 4. **Delegate.** `run` for one task, `fan` for a parallel batch. Parallel workers only on
    NON-overlapping files. Each keeps its own `PROGRESS.<task>.md`.
-5. **Watch.** `list` / `status <name>`; a `waiting` task gets `reply <name> "..."`,
-   a `stalled`/`error` one gets its log read and the task re-scoped.
+5. **Watch.** `list` / `status <name>`; a `waiting` task gets `reply <name> "..."`.
+   A `stalled`/`error` one gets its log read FIRST — the tail says whether the model failed the task
+   (re-scope it) or the provider dropped the turn (just resume it, see
+   ["A turn that died on the provider"](#a-turn-that-died-on-the-provider-resume-it-dont-restart-it)).
 6. **Verify.** Read every finished task's diff yourself — never trust "done" blindly. Run
    builds/tests. Reject and re-delegate anything wrong.
 7. **Integrate & commit.** YOU own git: stage, review, commit. Workers must not commit.
@@ -359,6 +361,7 @@ panel run the SAME state machine (`eff_state` in `agent.sh` and in `gui.py`):
 | process dead, meta still says running | `stalled` | `⚠ stalled` → `agent.sh reply <name> "continue"` |
 | process alive, log growing | `running` | `▶ running (alive, pid N)` |
 | process alive, no output for > `AGENT_STALE_SEC` | `idle` | `▷ running (no output for Nm)` |
+| process exited after the provider dropped the turn | `error` | `✖ error` → read the log tail, then resume with `reply` (see below) |
 
 `idle` is an honest third state, not an error: a codex/claude step flushes its log only when the step
 ENDS, so silence alone never means dead. This is what used to make the CLI say *running* and the GUI say
@@ -414,6 +417,34 @@ tool-call round trip works, and the command itself only reads. Output is one lin
 It costs one cheap model call (~10–15s), so plain `doctor` stays instant and just prints a reminder
 that the deep check exists. Run `--deep` when an agent "answers but does nothing", after a codex-cli
 upgrade, or on a new machine.
+
+### A turn that died on the provider: resume it, don't restart it
+
+**Symptom:** a task ends `state=error` after only seconds or minutes, its log tail is full of
+`{"type":"error","message":"Reconnecting... n/5 ..."}` followed by `{"type":"turn.failed", ...}`, and
+the cause is transport, not the task — `unexpected status 403 Forbidden`, `tls handshake eof`,
+`stream disconnected before completion`, or `os error 10054`. Provider-side outages hit long turns
+hardest, so an xhigh/high-effort worker doing a big audit dies while a short one beside it survives.
+
+**The session is not lost.** The CLI session lives on disk, so `agent.sh reply <name> "..."` picks the
+task up with its full context — the same mechanism `stalled` uses. Do NOT start a fresh `run` with a
+re-pasted prompt: you throw away everything the agent already worked out, and you pay for it twice.
+
+**But check the working tree BEFORE you resume.** A failed turn is not an atomic rollback. The agent
+may have written some files and not others before the transport died, and it does not know which. Seen
+live: one task had added its new failing tests but not the fix they were meant to prove, leaving the
+repository in a state where the suite was red on purpose but nothing said so. So:
+
+1. `git status --short` / read the files and establish what actually landed.
+2. Resume with that state stated explicitly — "your turn died on a provider network error; I checked
+   the tree, X landed and Y did not, continue from there" — rather than letting the agent re-derive
+   it, which is where it will guess wrong.
+3. Prefer resuming over re-running even when little landed; the session context is the expensive part.
+
+**Adapt the shape of the work while an outage lasts.** Long single turns keep dying, so split the job
+into several short focused tasks and `fan` them: each turn is shorter, more of them survive, and the
+ones that die are cheap to resume. A four-part audit that completes beats one exhaustive audit that
+never finishes.
 
 ### Codex: every shell command hangs (environment issue)
 
