@@ -133,6 +133,10 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   in a separate console window (`CREATE_NEW_CONSOLE`) where you can see live output. Without the
   checkbox, Windows launches are explicitly hidden with `CREATE_NO_WINDOW`/`SW_HIDE`, so the default
   terminal application cannot create stray command-line tabs.
+- **Windowless long-lived servers**: on Windows, `gui` and `openai-server` prefer a no-console
+  interpreter (`pythonw.exe`; override with `$AGENT_PYTHON_W`) when one exists, so the server itself
+  never parks in a visible command window; `gui-launcher.bat` double-clicks into a hidden PowerShell
+  host instead of keeping a console — set `NEOXIDER_GUI_VISIBLE=1` to keep it (tests and debugging do).
 - **Toasts + history**: any completion/error/agent question — a popup notification for 3s, plus
   history via 🔔 (persisted in localStorage). Consecutive identical error toasts within a rolling
   60-second window collapse into one history row with an `×N` count and do not repeatedly pop up;

@@ -20,6 +20,10 @@ All notable changes to this project are documented here. Format follows
 - **Windows background launches opened terminal tabs.** GUI run/reply/bridge subprocesses now use
   `CREATE_NO_WINDOW` plus a hidden startup state by default; a visible console is created only when
   the user explicitly enables the terminal checkbox.
+- **Windowless long-lived servers on Windows.** `gui` and `openai-server` now prefer a no-console
+  interpreter (`pythonw.exe`, overridable via `$AGENT_PYTHON_W`) when one exists, so the server never
+  parks in a visible command window; `gui-launcher.bat` starts from a hidden PowerShell host unless you
+  set `NEOXIDER_GUI_VISIBLE=1`.
 
 ## [0.4.0] - 2026-08-25
 

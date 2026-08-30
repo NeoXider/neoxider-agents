@@ -216,6 +216,27 @@ _agent_python() {
     [ -n "$_AGENT_PY" ]
 }
 
+# _windowless_python -- Windows-only sibling of _agent_python: prefer an interpreter that owns no console
+# (pythonw.exe) so a long-lived server (`gui`, `openai-server`) never parks in a visible command-line window.
+# Sets $_WINDOWLESS_PY on success; fails silently elsewhere, letting callers fall back to _agent_python.
+_WINDOWLESS_PY=""
+_WINDOWLESS_PY_RESOLVED=""
+_windowless_python() {
+    if [ -z "$_WINDOWLESS_PY_RESOLVED" ]; then
+        _WINDOWLESS_PY_RESOLVED=1
+        case "$(uname -s 2>/dev/null || true)" in MINGW*|MSYS*) ;; *) return 1 ;; esac
+        local c
+        for c in "${AGENT_PYTHON_W:-}" pythonw; do
+            [ -n "$c" ] || continue
+            if command -v "$c" >/dev/null 2>&1 && "$c" -c "import sys" >/dev/null 2>&1; then
+                _WINDOWLESS_PY="$c"
+                break
+            fi
+        done
+    fi
+    [ -n "$_WINDOWLESS_PY" ]
+}
+
 # --- provider plugin loader ------------------------------------------------
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROVIDERS_DIR="$HERE/providers"
@@ -1308,6 +1329,8 @@ PY
         # AGENT_GUI_PORT, because python always saw an argv).
         _agent_python || die "gui: needs python to run gui.py (python3/python/py in PATH or \$AGENT_PYTHON) — none runnable"
         export AGENT_SH_BASH="$(cygpath -w "$BASH" 2>/dev/null || echo bash)"
+        # Long-lived server: on Windows prefer the windowless interpreter so no console window survives.
+        if _windowless_python; then exec "$_WINDOWLESS_PY" "$(dirname "$0")/gui.py" "$@"; fi
         exec "$_AGENT_PY" "$(dirname "$0")/gui.py" "$@"
         ;;
     openai-server)
@@ -1315,6 +1338,8 @@ PY
         # providers/models side by side. Foreground like `gui`, not backgrounded here.
         _agent_python || die "openai-server: needs python to run openai_server.py (python3/python/py in PATH or \$AGENT_PYTHON) — none runnable"
         export AGENT_SH_BASH="$(cygpath -w "$BASH" 2>/dev/null || echo bash)"
+        # Long-lived server: on Windows prefer the windowless interpreter so no console window survives.
+        if _windowless_python; then exec "$_WINDOWLESS_PY" "$(dirname "$0")/openai_server.py" "$@"; fi
         exec "$_AGENT_PY" "$(dirname "$0")/openai_server.py" "$@"
         ;;
     clean|prune)
