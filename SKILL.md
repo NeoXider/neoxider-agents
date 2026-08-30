@@ -77,6 +77,9 @@ bash "$SK" log  -f fix-readme                         # follow a live background
 bash "$SK" log  -l fix-readme                         # only the last step
 bash "$SK" last fix-readme                            # only the agent's last answer
 bash "$SK" status fix-readme                          # state: state/stage/changed files/whether a reply is needed
+bash "$SK" wait name-a name-b                         # BLOCK until named tasks settle, then print each final answer;
+                                                      # exit 0 = settled, exit 2 = --timeout hit while still running
+bash "$SK" wait --timeout 3600                        # no names = watch ALL currently-running tasks (whole wave); default poll 5s
 bash "$SK" list                                       # table: state / engine / model / age / files / session
 bash "$SK" clean                                      # delete md clutter (<name>.md + PROGRESS.<name>.md) of STOPPED
                                                      # tasks; live running/idle tasks are never touched;
@@ -104,6 +107,13 @@ bash "$SK" gui 8765 --lan --token SECRET              # ...reachable from anothe
   (powershell.exe ...)` message even when the command succeeded — verify with
   `agent.sh list` / `agent.sh status <name>` before assuming failure. `fan` returns immediately;
   the launched task keeps running in the background.
+- **Completion notifications for orchestrators with their own background-job mechanism**
+  (an agent runtime that notifies you when a shell command exits, e.g. DeepSeek Harness):
+  launch one `agent.sh wait <task-name>` per task as a separate BACKGROUND job — it blocks
+  until the subagent finishes and then prints its final answer to stdout, so your job-
+  completion notification arrives with everything you need to verify. For an entire fan-out
+  wave use ONE call without names (it watches every running task; exits when all settle,
+  or at --timeout with exit code 2).
 - **Model ids with a provider prefix must be passed verbatim**: `-e opencode -m
   opencode/muse-spark-1.2-contributor-free` works; the bare id without the `opencode/` prefix
   errors. Short aliases (`-m free`, `-m ox`, …) resolve to the full id for you.
