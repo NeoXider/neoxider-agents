@@ -579,7 +579,8 @@ last_output() { awk '/^---------- output ----------$/{buf=""; next}{buf=buf $0 O
 # durable md checkpoint of the task: header from meta + the whole thread in markdown.
 # Survives a shutdown; the task can be resumed from it (or from the codex/claude session).
 render_md() {
-    local n="$1" log="$LOGDIR/$1.log" md="$LOGDIR/$1.md" st; st="$(eff_state "$n")"
+    local n="$1" log="$LOGDIR/$1.log" md="$LOGDIR/$1.md" st reason; st="$(eff_state "$n")"
+    reason="$(meta_get "$n" reason)"
     {
         echo "# Subagent task: $n"
         echo
@@ -588,6 +589,7 @@ render_md() {
         echo "- **Dir:** \`$(meta_get "$n" dir)\`"
         echo "- **Session:** \`$(meta_get "$n" session)\`"
         echo "- **Exit:** $(meta_get "$n" exit)  **Changed files:** $(meta_get "$n" files)"
+        [ "$st" = error ] && echo "- **Failure:** Turn died; work may or may not have landed. Inspect the working tree. Reason: ${reason:-provider failure}"
         echo "- **Started:** $(meta_get "$n" started)  **Updated:** $(now)"
         echo "- **Resume:** \`agent.sh reply $n \"...\"\`  |  **Log:** \`agent.sh log $n\`"
         awk '
@@ -671,6 +673,13 @@ case "$AGENT_RETRIES" in ''|*[!0-9]*) AGENT_RETRIES=2 ;; esac
 AGENT_RETRY_DELAY="${AGENT_RETRY_DELAY:-8}"
 case "$AGENT_RETRY_DELAY" in ''|*[!0-9]*) AGENT_RETRY_DELAY=8 ;; esac
 
+# A Codex thread-writer conflict is not reliably reflected by process liveness: the process may
+# already be gone while the thread store still owns its lock. Keep this signature shared by
+# finish_step (last-resort detection) and the Codex provider's one automatic resume retry.
+_has_thread_writer_conflict() {
+    grep -qiE 'thread-store conflict|already has an active writer|code[[:space:]]+-32600'
+}
+
 # NB: the two patterns below deliberately spell word boundaries out as (^|[^...]) groups instead
 # of \b: an earlier revision carried LITERAL 0x08 backspace bytes where \b was meant (they survive
 # copy/paste and every editor, and silently broke the classifier). [[:<:]]/[[:>:]] would be the
@@ -697,9 +706,23 @@ _recovery_hint() {
 
 # after a step finishes: exit code, changed files, state, question detection
 finish_step() {
-    local n="$1" rc="$2" log tdir nfiles=0 closing
+    local n="$1" rc="$2" log tdir nfiles=0 closing output nonblank reason=""
     log="$LOGDIR/$n.log"; tdir="$(meta_get "$n" dir)"; [ -n "$tdir" ] || tdir="$dir"
+    output="$(last_output "$log")"
+    nonblank="$(printf '%s' "$output" | tr -d '[:space:]')"
+    if printf '%s' "$output" | _has_thread_writer_conflict; then
+        [ "$rc" -ne 0 ] || rc=3
+        reason="Codex thread writer conflict after bounded wait/retry; inspect the working tree (changes may have landed)"
+    elif [ -z "$nonblank" ]; then
+        [ "$rc" -ne 0 ] || rc=3
+        reason="provider returned an empty answer; inspect the working tree (changes may have landed)"
+    elif [ "$rc" = 124 ]; then
+        reason="step watchdog timeout; inspect the working tree (changes may have landed)"
+    elif [ "$rc" -ne 0 ]; then
+        reason="provider exited $rc; inspect the working tree (changes may have landed)"
+    fi
     meta_set "$n" exit "$rc"
+    meta_set "$n" reason "$reason"
     if git -C "$tdir" rev-parse --git-dir >/dev/null 2>&1; then
         nfiles=$(git -C "$tdir" status --porcelain 2>/dev/null | grep -c .)
     fi
@@ -707,7 +730,7 @@ finish_step() {
     # Closing window, not just the last line: the last few non-empty lines of the final output
     # block. A question followed by a footer ("PROGRESS.x.md updated.") used to read as done;
     # looks_waiting classifies every line in this window so the question is still caught.
-    closing="$(last_output "$log" | grep -v '^[[:space:]]*$' | tail -6)"
+    closing="$(printf '%s' "$output" | grep -v '^[[:space:]]*$' | tail -6)"
     if [ "$rc" = 124 ]; then
         # killed by the step watchdog (_guarded_run). Recorded in meta so `status`/`list`/the GUI
         # can say WHY the task died instead of showing a bare exit code.
@@ -716,7 +739,7 @@ finish_step() {
         echo "[agent.sh] ⏱ TIMEOUT after ${AGENT_TIMEOUT_SEC}s — task=$n killed (raise AGENT_TIMEOUT_SEC or $(_recovery_hint "$n"))" >&2
     elif [ "$rc" -ne 0 ]; then
         meta_set "$n" state error
-        echo "[agent.sh] ✖ error exit=$rc  task=$n  (log: agent.sh log $n | $(_recovery_hint "$n"))" >&2
+        echo "[agent.sh] ✖ error exit=$rc  task=$n  reason=$reason  (the turn died; work may have landed — inspect the working tree | log: agent.sh log $n | $(_recovery_hint "$n"))" >&2
     elif looks_waiting "$closing"; then
         meta_set "$n" state waiting
         echo "[agent.sh] ⏳ the agent appears to have ASKED a question — reply: agent.sh reply $n \"...\"  (question: agent.sh last $n)" >&2
@@ -725,6 +748,7 @@ finish_step() {
         echo "[agent.sh] ✔ done  task=$n  files=$nfiles  (log: agent.sh log $n | result: agent.sh last $n)" >&2
     fi
     render_md "$n"
+    return "$rc"
 }
 
 # --- generic provider dispatch ---------------------------------------------
@@ -859,7 +883,7 @@ _do_run_dispatch() {
     log="$LOGDIR/$name.log"; _secure_state_truncate "$log" || die "cannot create protected task log: $log"
     meta_set "$name" engine "$engine"; meta_set "$name" model "${model:-default}"
     meta_set "$name" resolved_model ""; meta_set "$name" effort ""; meta_set "$name" session ""
-    meta_set "$name" dir "$dir"; meta_set "$name" state running
+    meta_set "$name" dir "$dir"; meta_set "$name" state running; meta_set "$name" reason ""; meta_set "$name" exit ""
     # NB: capture the pid into a variable FIRST. $BASHPID inside a command substitution reports
     # the substitution's own throwaway subshell, so `winpid "$(_winpid "$BASHPID")"` would record
     # the winpid of a process that is already dead -- and gui.py would call the task stalled while
@@ -908,6 +932,7 @@ case "$cmd" in
         [ "$progress" = 1 ] && prompt="$prompt$(progress_proto "$name")"
         [ "$terse" = 1 ] && prompt="$prompt$TERSE_PROTO"
         _do_run_dispatch
+        dispatch_rc=$?
         ;;
     fan)
         # Launch N agents IN PARALLEL from one call: each positional prompt becomes its own
@@ -967,6 +992,7 @@ except Exception:
             fi
             echo "[agent.sh] wrote $out_file" >&2
         fi
+        exit "$dispatch_rc"
         ;;
     reply)
         parse_opts "$@"
@@ -1004,12 +1030,22 @@ except Exception:
         fi
         [ "$progress" = 1 ] && answer="$answer$(progress_proto_reply "$tname")"   # per-task reminder; needs resolved $tname
         [ -n "${session:-}" ] || [ "$engine" = claude ] || die "reply: could not find a session id (task '$tname'); specify uuid explicitly"
+        # Optional provider preflight happens BEFORE touching the shared log/meta. Codex uses this
+        # to wait on the actual thread-store file lock and for the prior wrapper to finish its final
+        # log/meta writes. Appending a reply header earlier interleaves both turns and lets the old
+        # turn overwrite the failed reply's state (the live defect this ordering fixes).
+        prepare_fn="provider_${engine}_prepare_resume"; PROVIDER_PREPARE_NOTE=""; prepare_rc=0
+        if declare -F "$prepare_fn" >/dev/null 2>&1; then
+            "$prepare_fn" "$session" "$tname" || prepare_rc=$?
+            [ "$prepare_rc" = 0 ] || die "reply: provider preflight failed for task '$tname' (exit=$prepare_rc): ${PROVIDER_PREPARE_NOTE:-session writer did not become available}"
+        fi
         _secure_state_file "$log" || die "cannot create protected task log: $log"
         meta_set "$tname" state running; meta_set "$tname" pid "$$"
         meta_set "$tname" winpid "$(_winpid "$$")"   # $$ is the SHELL's pid, safe inside $( ) — unlike $BASHPID
-        meta_set "$tname" timeout ""
+        meta_set "$tname" timeout ""; meta_set "$tname" reason ""; meta_set "$tname" exit ""
         echo "[agent.sh] ▶ reply task=$tname session=$session dir=$dir" >&2
         hdr reply "task=$tname session=$session" ANSWER "$answer" "$log"
+        [ -n "$PROVIDER_PREPARE_NOTE" ] && printf '%s\n' "$PROVIDER_PREPARE_NOTE" >> "$log"
         rc=0
         provider_dispatch_resume "$engine" "$dir" "$session" "$answer" "$tname"
         finish_step "$tname" "$rc"
@@ -1101,6 +1137,7 @@ except Exception:
         [ -e "$(meta_file "$n")" ] || die "no such task: $n"
         st="$(eff_state "$n")"; e="$(meta_get "$n" engine)"; mo="$(meta_get "$n" model)"
         ex="$(meta_get "$n" exit)"; nf="$(meta_get "$n" files)"; s="$(meta_get "$n" session)"; d="$(meta_get "$n" dir)"
+        reason="$(meta_get "$n" reason)"
         idle_s="$(log_idle_sec "$n")"
         live=""; [ "$st" = running ] || [ "$st" = idle ] && live=" (alive, pid $(meta_get "$n" pid))"
         echo "$(state_icon "$st") task=$n  state=$(state_label "$st" "${idle_s:-0}")${live}  engine=$e/${mo}  exit=${ex:-–}  files=${nf:-0}"
@@ -1112,6 +1149,7 @@ except Exception:
         # honest third state: the process IS alive, it just has not written anything for a while
         # (a codex/claude step only flushes its log when the step ends). Not an error by itself.
         [ "$st" = idle ]     && echo "   ⟳ process alive but SILENT for $(( ${idle_s:-0} / 60 ))m — it is still working unless AGENT_TIMEOUT_SEC(${AGENT_TIMEOUT_SEC}s) kills it; follow: agent.sh log -f $n"
+        [ "$st" = error ]    && echo "   ✖ TURN DIED — work may or may not have landed; inspect the working tree. reason=${reason:-provider failure}"
         [ -n "$(meta_get "$n" timeout)" ] && [ "$st" = error ] && \
             echo "   ⏱ killed by the step watchdog after $(meta_get "$n" timeout)s (AGENT_TIMEOUT_SEC) — raise it, or $(_recovery_hint "$n")"
         if [ -n "$d" ] && [ "${nf:-0}" != 0 ] && git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
@@ -1122,16 +1160,17 @@ except Exception:
         ;;
     list)
         list_limit="${1:-20}"; case "$list_limit" in ''|*[!0-9]*) die "list: limit must be a non-negative integer" ;; esac
-        printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %s\n' "" TASK STATE ENGINE MODEL AGE FILES SESSION
+        printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %-8s %s\n' "" TASK STATE ENGINE MODEL AGE FILES SESSION DETAIL
         _sorted_meta_files "$list_limit" || die "list: invalid limit '$list_limit'"
         for m in "${_SORTED_META_FILES[@]}"; do
             n="$(basename "$m" .meta)"
             valid_task_name "$n" || continue
             e="$(meta_get "$n" engine)"; mo="$(meta_get "$n" model)"; s="$(meta_get "$n" session)"
-            st="$(eff_state "$n")"; nf="$(meta_get "$n" files)"
+            st="$(eff_state "$n")"; nf="$(meta_get "$n" files)"; reason="$(meta_get "$n" reason)"; detail=""
+            [ "$st" = error ] && detail="turn died; inspect tree — ${reason:-provider failure}"
             fm="$(file_mtime "$m")"
             age="$(( ($(date +%s) - ${fm:-0}) / 60 ))m"
-            printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %s\n' "$(state_icon "$st")" "$n" "${st:-?}" "${e:-?}" "${mo:-?}" "$age" "${nf:-0}" "${s:0:8}"
+            printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %-8s %s\n' "$(state_icon "$st")" "$n" "${st:-?}" "${e:-?}" "${mo:-?}" "$age" "${nf:-0}" "${s:0:8}" "$detail"
         done
         ;;
     provider-info)

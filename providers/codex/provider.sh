@@ -200,6 +200,135 @@ _provider_codex_chatonly_args() {
     _provider_codex_isolation_args
 }
 
+# Codex keeps one persistent file per thread and owns an OS-level exclusive lock on it while a
+# writer is active. The files remain after release, so existence is not a liveness check. Probe the
+# same lock non-blockingly (LockFileEx-compatible msvcrt on Windows, flock on Unix); return 0 only
+# while held, 1 when free/missing, 2 when the probe is unavailable.
+_provider_codex_thread_lock_file() {
+    printf '%s/thread-writer-locks/%s.lock\n' "${CODEX_HOME:-$HOME/.codex}" "$1"
+}
+
+_provider_codex_thread_writer_held() {
+    local lock; lock="$(_provider_codex_thread_lock_file "$1")"
+    [ -e "$lock" ] || return 1
+    _agent_python || return 2
+    PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
+import errno, os, sys
+path = sys.argv[1]
+try:
+    f = open(path, "r+b", buffering=0)
+except FileNotFoundError:
+    raise SystemExit(1)
+except OSError:
+    raise SystemExit(2)
+try:
+    if os.name == "nt":
+        import msvcrt
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN, getattr(errno, "EDEADLK", -1)):
+                raise SystemExit(0)
+            raise SystemExit(2)
+        try:
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    else:
+        import fcntl
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN, getattr(errno, "EWOULDBLOCK", -1)):
+                raise SystemExit(0)
+            raise SystemExit(2)
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+finally:
+    f.close()
+raise SystemExit(1)
+' "$lock"
+}
+
+_provider_codex_writer_wait_limit() {
+    local max="${AGENT_CODEX_WRITER_WAIT_SEC:-${AGENT_TIMEOUT_SEC:-1800}}"
+    case "$max" in ''|*[!0-9]*) max=1800 ;; esac
+    printf '%s\n' "$max"
+}
+
+_provider_codex_wait_for_writer() {
+    local session="$1" max start deadline current remaining pause=1 probe_rc elapsed=0
+    max="$(_provider_codex_writer_wait_limit)"; start="$(date +%s)"; deadline=$((start + max))
+    PROVIDER_CODEX_WAITED_SEC=0; PROVIDER_CODEX_WAIT_NOTE=""
+    while :; do
+        _provider_codex_thread_writer_held "$session"; probe_rc=$?
+        case "$probe_rc" in
+            1)
+                PROVIDER_CODEX_WAITED_SEC=$(( $(date +%s) - start ))
+                if [ "$PROVIDER_CODEX_WAITED_SEC" -gt 0 ]; then
+                    PROVIDER_CODEX_WAIT_NOTE="Codex thread writer released after ${PROVIDER_CODEX_WAITED_SEC}s; resume continuing"
+                fi
+                return 0
+                ;;
+            2)
+                PROVIDER_CODEX_WAIT_NOTE="Codex thread-writer lock probe unavailable; relying on conflict detection/retry"
+                echo "[agent.sh] ! $PROVIDER_CODEX_WAIT_NOTE" >&2
+                return 0
+                ;;
+        esac
+        current="$(date +%s)"; elapsed=$((current - start))
+        if [ "$current" -ge "$deadline" ]; then
+            PROVIDER_CODEX_WAITED_SEC="$elapsed"
+            PROVIDER_CODEX_WAIT_NOTE="Codex thread writer still held after bounded ${max}s wait; no resume was started"
+            echo "[agent.sh] ✖ $PROVIDER_CODEX_WAIT_NOTE" >&2
+            return 75
+        fi
+        remaining=$((deadline - current)); [ "$pause" -le "$remaining" ] || pause="$remaining"
+        echo "[agent.sh] ⏳ Codex thread writer is held for $session — waiting ${pause}s (bounded ${max}s)" >&2
+        sleep "$pause"
+        [ "$pause" -ge 8 ] || pause=$((pause * 2))
+    done
+}
+
+# The Codex lock is released just before the old agent.sh process writes its final answer/state.
+# Give that already-recorded wrapper pid a short bounded settling window too, so the reply header
+# cannot interleave with the old answer or have its final state overwritten afterward.
+_provider_codex_wait_for_prior_wrapper() {
+    local task="${1:-}" pid state start deadline max current
+    [ -n "$task" ] || return 0
+    state="$(meta_get "$task" state)"; pid="$(meta_get "$task" pid)"
+    [ "$state" = running ] && [ -n "$pid" ] && is_alive "$pid" || return 0
+    max="$(_provider_codex_writer_wait_limit)"; [ "$max" -le 30 ] || max=30
+    start="$(date +%s)"; deadline=$((start + max))
+    while [ "$(meta_get "$task" state)" = running ] && is_alive "$pid"; do
+        current="$(date +%s)"
+        if [ "$current" -ge "$deadline" ]; then
+            PROVIDER_CODEX_WAIT_NOTE="prior wrapper still finalizing after bounded ${max}s wait; no resume was started"
+            echo "[agent.sh] ✖ $PROVIDER_CODEX_WAIT_NOTE" >&2
+            return 75
+        fi
+        sleep 0.2
+    done
+    current=$(( $(date +%s) - start ))
+    [ "$current" -gt 0 ] && PROVIDER_CODEX_WAIT_NOTE="${PROVIDER_CODEX_WAIT_NOTE:+$PROVIDER_CODEX_WAIT_NOTE; }prior wrapper settled after ${current}s"
+}
+
+# Optional agent.sh hook: critically, the dispatcher calls this before it writes the reply header
+# or replaces the prior turn's pid/state in .meta.
+provider_codex_prepare_resume() {
+    local session="$1" task="${2:-}" rc
+    PROVIDER_PREPARE_NOTE=""
+    _provider_codex_wait_for_writer "$session" || {
+        rc=$?; PROVIDER_PREPARE_NOTE="$PROVIDER_CODEX_WAIT_NOTE"; return "$rc"
+    }
+    _provider_codex_wait_for_prior_wrapper "$task" || {
+        rc=$?; PROVIDER_PREPARE_NOTE="$PROVIDER_CODEX_WAIT_NOTE"; return "$rc"
+    }
+    [ -n "$PROVIDER_CODEX_WAIT_NOTE" ] && PROVIDER_PREPARE_NOTE="[agent.sh] $PROVIDER_CODEX_WAIT_NOTE"
+    return 0
+}
+
 # provider_codex_run_cmd DIR MODEL EFFORT PROMPT — runs the CLI via `--json` and cleans the output.
 # codex's plaintext `exec` mixes its banner/session-id/ERROR-log/"tokens used" chrome (and Windows
 # cp866 mojibake) into the same stdout stream as the answer, which used to pollute `agent.sh last`,
@@ -221,8 +350,18 @@ provider_codex_run_cmd() {
 # provider_codex_resume_cmd DIR SESSION ANSWER — resumes an existing session. $P_MODEL/$P_EFFORT
 # are set by agent.sh's provider_dispatch_resume just before this runs (PROVIDER_CODEX_RESUME_NEEDS_MODEL=1
 # above opts into that) -- same pattern provider_claude_resume_cmd uses. Same `--json` cleanup.
+_provider_codex_resume_once() {
+    local raw="$1" dir="$2" session="$3" answer="$4"; shift 4
+    ( cd "$dir" && codex exec resume --skip-git-repo-check \
+        "$@" --json "$session" "$answer" </dev/null 2>&1 ) | tee "$raw" | _provider_codex_emit
+    local statuses=("${PIPESTATUS[@]}")
+    [ "${statuses[0]}" -ne 0 ] && return "${statuses[0]}"
+    [ "${statuses[1]}" -ne 0 ] && return "${statuses[1]}"
+    return "${statuses[2]}"
+}
+
 provider_codex_resume_cmd() {
-    local dir="$1" session="$2" answer="$3" cargs
+    local dir="$1" session="$2" answer="$3" cargs attempt_log rc
     local -a isoargs; mapfile -t isoargs < <(_provider_codex_isolation_args)
     # Same sandbox policy as a fresh run (see _provider_codex_chatonly_args): full auto by default,
     # read-only and unoverridable for the chat-only bridge.
@@ -236,11 +375,25 @@ provider_codex_resume_cmd() {
     [ ${#isoargs[@]} -gt 0 ] && cargs+=("${isoargs[@]}")
     [ -n "$P_MODEL" ] && cargs+=(-m "$P_MODEL")
     [ -n "$P_EFFORT" ] && cargs+=(-c "model_reasoning_effort=\"$P_EFFORT\"")
-    ( cd "$dir" && codex exec resume --skip-git-repo-check \
-        "${cargs[@]}" --json "$session" "$answer" </dev/null 2>&1 ) | _provider_codex_emit
-    local rc_codex=${PIPESTATUS[0]} rc_emit=${PIPESTATUS[1]}   # see provider_codex_run_cmd
-    [ "$rc_emit" -ne 0 ] && return "$rc_emit"
-    return "$rc_codex"
+    # Repeat the lock check immediately before exec to close most of the preflight/launch race.
+    # If Codex still wins that race and returns its explicit conflict, wait again and retry ONCE.
+    _provider_codex_wait_for_writer "$session" || return $?
+    attempt_log="$(mktemp "$LOGDIR/.codex-resume-attempt.XXXXXX" 2>/dev/null)"
+    [ -n "$attempt_log" ] && [ -f "$attempt_log" ] || {
+        echo "agent.sh: cannot create Codex resume attempt log in $LOGDIR" >&2
+        return 1
+    }
+    _provider_codex_resume_once "$attempt_log" "$dir" "$session" "$answer" "${cargs[@]}"; rc=$?
+    if _has_thread_writer_conflict < "$attempt_log"; then
+        echo "[agent.sh] ↻ Codex thread-writer conflict detected (exit=$rc) — bounded wait, then retry 1/1" >&2
+        if _provider_codex_wait_for_writer "$session"; then
+            _provider_codex_resume_once "$attempt_log" "$dir" "$session" "$answer" "${cargs[@]}"; rc=$?
+        else
+            rc=$?
+        fi
+    fi
+    rm -f -- "$attempt_log"
+    return "$rc"
 }
 
 # provider_codex_doctor_deep — the "does a shell command actually RUN" check for `agent.sh doctor
