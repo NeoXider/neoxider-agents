@@ -68,6 +68,19 @@ for line in sys.stdin:
     t = o.get("type")
     if t == "thread.started" and o.get("thread_id"):
         sid = o["thread_id"]
+        # Emit IMMEDIATELY, not after the stream ends. agent.sh greps the live log to fill
+        # meta `session=`, and `reply` needs it while the task is still running - that is the
+        # whole point of replying to a live agent. Printing it at EOF made `reply <name>` fail
+        # with "could not find a session id" on every running codex task (observed 31.08.2026),
+        # and the id only appeared once the answer was already delivered, when it is useless.
+        # The opencode provider already emitted its id inline; codex now matches.
+        # NO APOSTROPHES ANYWHERE IN THIS PARSER, INCLUDING COMMENTS. The whole thing is passed to
+        # python -c inside a SINGLE-QUOTED bash string, so a single apostrophe closes that string
+        # early and bash parses the rest of the python as shell. The symptom is a syntax error on a
+        # line far below the real cause, and it broke agent.sh reply for every codex task. The
+        # offending word was the possessive form of opencode. Writing that word again while
+        # documenting the fix reintroduced the same break one line lower, so: no apostrophes.
+        print("session id: %s" % sid, flush=True)
     elif t == "item.completed":
         it = o.get("item") or {}
         if it.get("type") == "agent_message" and it.get("text") is not None:
@@ -78,8 +91,7 @@ if msg is None:
 # Defuse the (pathological) case where the answer itself contains a line exactly equal to MARK:
 # a trailing space stops last_output from treating it as the answer-boundary and truncating there.
 msg = "\n".join((ln + " ") if ln == MARK else ln for ln in msg.split("\n"))
-if sid:
-    print("session id: %s" % sid)           # captured by agent.sh grep for resume
+# The id was already printed inline when thread.started arrived; do not print it twice.
 print(MARK)                                  # last_output slices to AFTER this -> clean answer only
 sys.stdout.write(msg)
 if not msg.endswith("\n"):
