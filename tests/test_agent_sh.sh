@@ -448,6 +448,79 @@ assert_match "opencode provider preserves exact DeepSeek model, variant and prom
 assert_match "opencode provider emits clean final answer" 'OPENCODE_WRAPPER_OK' "$opencode_run_output"
 assert_match "opencode provider keeps prefixed stderr diagnostics" \
     '^\[opencode\] provider diagnostic' "$(cat "$opencode_stderr")"
+
+# ============================================================================================
+section "long prompts (--prompt-file / stdin handover)"
+# ============================================================================================
+# Windows caps a whole command line near 32767 characters and the spawn fails before the CLI ever
+# starts ("Argument list too long"; a Python caller sees WinError 206 as FileNotFoundError). A long
+# prompt therefore has to reach the CLI out-of-band, and an engine that cannot take one must say so.
+printf -v long_prompt '%*s' 20000 ''
+long_prompt="${long_prompt// /x}"
+
+if prompt_needs_stdin "$long_prompt"; then
+    pass "a 20000-character prompt is routed off argv"
+else
+    fail "a 20000-character prompt was left on argv"
+fi
+if prompt_needs_stdin "short prompt"; then
+    fail "a short prompt was needlessly routed off argv"
+else
+    pass "a short prompt still goes on argv"
+fi
+
+# --prompt-file is how a caller hands over text too long to pass as an argument.
+PROMPT_FILE_PATH="$SCRATCH_LOGDIR/handover-prompt.txt"
+printf 'handed over via file' > "$PROMPT_FILE_PATH"
+cmd="run"; prompt_file="$PROMPT_FILE_PATH"
+assert_eq "--prompt-file supplies the prompt text" "handed over via file" "$(read_prompt_file)"
+prompt_file=""
+
+# Only engines whose CLI reads stdin may carry an over-long prompt; the rest refuse with a reason.
+fits_err="$SCRATCH_LOGDIR/fits-err"
+if prompt_fits_engine claude "$long_prompt" 2>"$fits_err"; then
+    pass "claude accepts a prompt over the argv ceiling"
+else
+    fail "claude rejected a prompt it can take on stdin"
+fi
+if prompt_fits_engine opencode "$long_prompt" 2>>"$fits_err"; then
+    pass "opencode accepts a prompt over the argv ceiling"
+else
+    fail "opencode rejected a prompt it can take on stdin"
+fi
+if prompt_fits_engine codex "$long_prompt" 2>"$fits_err"; then
+    fail "codex silently accepted a prompt its CLI cannot receive"
+else
+    pass "codex refuses a prompt over the argv ceiling"
+fi
+assert_match "the refusal names the size and the way out" \
+    'prompt is 20000 characters.*-e claude or -e opencode' "$(cat "$fits_err")"
+if prompt_fits_engine codex "short prompt" 2>/dev/null; then
+    pass "codex still takes a normal prompt"
+else
+    fail "codex refused a normal prompt"
+fi
+
+# The opencode CLI must receive the long prompt on stdin, with no prompt left in argv.
+OPENCODE_STDIN_FILE="$SCRATCH_LOGDIR/opencode-stdin"
+opencode() {
+    printf '%s\n' "$*" > "$OPENCODE_ARGS_FILE"
+    cat > "$OPENCODE_STDIN_FILE"
+    printf '%s\n' '{"type":"text","sessionID":"ses_fake","part":{"id":"p1","text":"LONG_PROMPT_OK"}}'
+}
+opencode_long_output="$(provider_opencode_run_cmd "$SCRATCH_LOGDIR" "some/model" "" "$long_prompt" 2>/dev/null)"
+assert_match "opencode long-prompt run still answers" 'LONG_PROMPT_OK' "$opencode_long_output"
+assert_eq "opencode argv carries no prompt when it is too long" \
+    "run --auto --format json -m some/model" "$(cat "$OPENCODE_ARGS_FILE")"
+assert_eq "opencode receives the whole long prompt on stdin" \
+    "20000" "$(wc -c < "$OPENCODE_STDIN_FILE" | tr -d ' ')"
+# A normal prompt must keep the old argv path, so nothing arrives on stdin.
+: > "$OPENCODE_STDIN_FILE"
+provider_opencode_run_cmd "$SCRATCH_LOGDIR" "some/model" "" "inspect this" >/dev/null 2>&1
+assert_match "a normal prompt stays in opencode's argv" 'inspect this' "$(cat "$OPENCODE_ARGS_FILE")"
+assert_eq "a normal prompt sends nothing on opencode's stdin" "0" \
+    "$(wc -c < "$OPENCODE_STDIN_FILE" | tr -d ' ')"
+unset -f opencode
 unset -f opencode
 unset AGENT_OPENCODE_TIMEOUT_SEC
 

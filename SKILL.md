@@ -64,6 +64,9 @@ bash "$SK" fan  -t audit -C dir "prompt A" "prompt B" # N parallel background ta
                                                      # Use instead of a hand-written `run ... &` loop
 bash "$SK" run  -t big-job -C dir "prompt"            # agent keeps PROGRESS.<task>.md by default (per-task, resumable + orchestrator-readable); --no-progress opts out
 bash "$SK" run  --no-terse -C dir "prompt"            # terse (concision) directive is ON by default to save output/turn tokens; --no-terse for exploratory/ambiguous work
+bash "$SK" run  --prompt-file p.txt -C dir            # prompt from a FILE, for text too long to pass as an argument
+                                                     # (the platform caps a command line near 32000 chars); works for `reply` too,
+                                                     # where the positional argument is then the task name
 bash "$SK" run  -m spark -C /c/Git/Proj "prompt"      # trivial task -> spark
 bash "$SK" run  -e claude -m haiku -C dir "prompt"    # a different CLI: claude/opencode/gemini
 bash "$SK" run  -m sonnet -f low -e claude -C dir "prompt"  # -f <effort>, separate from -m <model>
@@ -316,6 +319,11 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   the final agent message (`_provider_codex_emit`) — this also cleaned up `agent.sh last`
   and the GUI chat view for codex. Kimi's stream-json provider performs the same clean extraction;
   `claude`/`opencode`/`gemini` were already clean.
+- **A very long conversation is handed over as a file, not as an argument.** The bridge
+  stages any prompt over ~16000 characters in a temp file and passes `--prompt-file`,
+  because a command line is capped near 32000 characters and the spawn fails outright
+  above it. From there only `claude` and `opencode` can carry it (their CLIs read a
+  prompt from stdin); `codex` and `gemini` refuse with a message naming the size.
 - One process = one fixed engine/model/effort for its whole lifetime. To compare
   models, run the command again with different `-e/-m/-f/-p` on another port.
 

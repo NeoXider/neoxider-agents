@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -50,6 +51,58 @@ class ToGitBashPathTests(unittest.TestCase):
 
 
 @unittest.skipUnless(os.name == "nt", "Windows process-window contract")
+class PromptArgumentTests(unittest.TestCase):
+    """A prompt too long for a command line is handed to agent.sh as a file instead.
+
+    WHY: Windows caps a whole command line at 32767 characters. Passing a long conversation as an
+    argument failed the spawn itself (WinError 206, surfacing as FileNotFoundError), which the
+    bridge could only report as an opaque 500 -- the model was never asked.
+    """
+
+    def test_short_prompt_is_passed_directly(self):
+        with srv._prompt_argument("build a castle") as args:
+            self.assertEqual(args, ["build a castle"])
+
+    @staticmethod
+    def _capture_staged_path():
+        """agent.sh is handed a git-bash path, so keep the OS path the file was actually written to."""
+        seen = []
+        real_mkstemp = srv.tempfile.mkstemp
+
+        def spy(*args, **kwargs):
+            fd, path = real_mkstemp(*args, **kwargs)
+            seen.append(path)
+            return fd, path
+
+        return seen, spy
+
+    def test_long_prompt_is_staged_in_a_file(self):
+        text = "x" * (srv.ARGV_PROMPT_MAX + 1)
+        seen, spy = self._capture_staged_path()
+        with mock.patch.object(srv.tempfile, "mkstemp", spy):
+            with srv._prompt_argument(text) as args:
+                self.assertEqual(args[0], "--prompt-file")
+                self.assertEqual(args[1], srv.to_git_bash_path(seen[0]))
+                self.assertTrue(os.path.exists(seen[0]), "staged file should exist while in scope")
+                with open(seen[0], encoding="utf-8") as f:
+                    self.assertEqual(f.read(), text)
+        self.assertFalse(os.path.exists(seen[0]), "staged file should be removed on exit")
+
+    def test_boundary_length_still_goes_on_argv(self):
+        text = "x" * srv.ARGV_PROMPT_MAX
+        with srv._prompt_argument(text) as args:
+            self.assertEqual(args, [text])
+
+    def test_staged_file_is_removed_even_when_the_body_raises(self):
+        text = "x" * (srv.ARGV_PROMPT_MAX + 1)
+        seen, spy = self._capture_staged_path()
+        with mock.patch.object(srv.tempfile, "mkstemp", spy):
+            with self.assertRaises(RuntimeError):
+                with srv._prompt_argument(text):
+                    raise RuntimeError("agent died mid-run")
+        self.assertFalse(os.path.exists(seen[0]))
+
+
 class ProcessVisibilityTests(unittest.TestCase):
     def test_provider_process_groups_are_hidden_without_losing_killability(self):
         kwargs = srv._process_group_kwargs()

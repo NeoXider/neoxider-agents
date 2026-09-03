@@ -151,19 +151,31 @@ provider_opencode_run_cmd() {
     # process tree of exactly {bash, tee, tail, orphaned reader} and NO opencode process — the
     # `timeout` below had already done its job and killed the CLI. A temp file has no reader to
     # deadlock on.
-    local -a command=(opencode run "${args[@]}" "$prompt")
+    # A prompt too long for argv goes in on stdin instead. `opencode run` with no positional
+    # message reads the message from stdin, and a file redirect hits EOF immediately, so this
+    # keeps the "never wait on an interactive stdin" property the redirect below is there for.
+    local -a command=(opencode run "${args[@]}")
+    local promptfile=""
+    if prompt_needs_stdin "$prompt"; then
+        promptfile="$(prompt_stdin_file "$prompt")" \
+            || { printf '[opencode] cannot stage a long prompt for stdin\n' >&2; return 1; }
+    else
+        command+=("$prompt")
+    fi
     local -a statuses
     local errfile; errfile="$(mktemp -t opencode-stderr-XXXXXX 2>/dev/null)" \
         || { printf '[opencode] cannot create temporary stderr file\n' >&2; return 1; }
     [ -n "$errfile" ] && [ -f "$errfile" ] \
         || { printf '[opencode] mktemp returned an invalid stderr file\n' >&2; return 1; }
+    local stdin_src="/dev/null"; [ -n "$promptfile" ] && stdin_src="$promptfile"
     if [ "$timeout_sec" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
-        ( cd "$dir" && timeout --foreground --kill-after=10s "${timeout_sec}s" "${command[@]}" </dev/null 2>"$errfile" ) \
+        ( cd "$dir" && timeout --foreground --kill-after=10s "${timeout_sec}s" "${command[@]}" <"$stdin_src" 2>"$errfile" ) \
             | _provider_opencode_emit
     else
-        ( cd "$dir" && "${command[@]}" </dev/null 2>"$errfile" ) | _provider_opencode_emit
+        ( cd "$dir" && "${command[@]}" <"$stdin_src" 2>"$errfile" ) | _provider_opencode_emit
     fi
     statuses=("${PIPESTATUS[@]}")
+    [ -n "$promptfile" ] && rm -f "$promptfile"
     if [ -s "$errfile" ]; then
         while IFS= read -r line; do printf '[opencode] %s\n' "$line" >&2; done <"$errfile"
     fi

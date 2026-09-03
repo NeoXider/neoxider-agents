@@ -7,7 +7,8 @@
 # (engine/model/dir/session/state/exit/files). All replies are APPENDED to the same <name>.log,
 # so the whole conversation with the subagent reads as one file.
 #
-#   agent.sh run    [-e engine] [-m model] [-f effort] [-C dir] [-t name] [--no-progress] [--no-terse] "prompt"
+#   agent.sh run    [-e engine] [-m model] [-f effort] [-C dir] [-t name] [--no-progress] [--no-terse]
+#                      [--prompt-file PATH] "prompt"
 #                      — new task. By default the agent keeps a PROGRESS.md checkpoint in its working
 #                      dir (resumable after a crash; orchestrator-readable summary) and gets a concision
 #                      directive to save output/turn tokens. --no-progress / --no-terse opt out of each.
@@ -251,7 +252,7 @@ cmd="${1:-}"
 [ -n "$cmd" ] || die "usage: agent.sh run|fan|reply|log|last|wait|status|list|clean|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
 shift
 
-engine="claude"; engine_explicit=0; model=""; model_explicit=0; effort_override=""; effort_explicit=0; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1; terse=1
+engine="claude"; engine_explicit=0; model=""; model_explicit=0; effort_override=""; effort_explicit=0; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1; terse=1; prompt_file=""
 # ^ engine=claude by default -> Opus 5 (see providers/claude). Pass -e codex for the gpt-5.6 family.
 # ^ progress=1 by default: every task keeps a PROGRESS.md checkpoint (resumable after a crash,
 # and an orchestrator can read the summary without re-running the agent). Disable with --no-progress.
@@ -267,7 +268,7 @@ task_kind=""; base_url=""; test_goal=""; out_file=""   # test-api only (see that
 parse_opts() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            -e|-m|-f|-C|-t|-P|--base-url|--goal|--out)
+            -e|-m|-f|-C|-t|-P|--base-url|--goal|--out|--prompt-file)
                 [ $# -ge 2 ] || die "$cmd: option '$1' needs an operand"
                 case "$2" in -*) die "$cmd: option '$1' needs an operand (got option '$2')" ;; esac
                 case "$1" in
@@ -280,6 +281,7 @@ parse_opts() {
                     --base-url) base_url="$2" ;;
                     --goal) test_goal="$2" ;;
                     --out) out_file="$2" ;;
+                    --prompt-file) prompt_file="$2" ;;
                 esac
                 shift 2 ;;
             -p) progress=1; shift ;;                 # kept for compat; progress is on by default
@@ -289,6 +291,52 @@ parse_opts() {
         esac
     done
     REST=("$@")
+}
+
+# Reads the prompt/answer text handed over as a file instead of an argument.
+#
+# WHY: Windows caps an entire command line at 32767 characters, so a long prompt passed as an
+# argument never reaches the CLI -- the spawn itself fails ("Argument list too long", or
+# WinError 206 surfacing in a Python caller as FileNotFoundError). Anything that composes a big
+# prompt (the OpenAI bridge stuffing a whole conversation plus tool schemas into one turn) has to
+# hand it over out-of-band.
+read_prompt_file() {
+    [ -n "$prompt_file" ] || die "$cmd: --prompt-file needs a path"
+    [ -r "$prompt_file" ] || die "$cmd: --prompt-file '$prompt_file' is not readable"
+    cat -- "$prompt_file"
+}
+
+# Longest prompt still safe to pass to a provider CLI as an argument. Windows' real ceiling is the
+# whole command line, so this leaves ample room for the executable path, flags and quoting.
+AGENT_ARGV_PROMPT_MAX="${AGENT_ARGV_PROMPT_MAX:-16000}"
+
+# Whether $1 must be handed to the CLI through stdin rather than argv.
+prompt_needs_stdin() {
+    [ "${#1}" -gt "$AGENT_ARGV_PROMPT_MAX" ]
+}
+
+# Writes $1 to a private temp file and echoes its path; the caller removes it.
+prompt_stdin_file() {
+    local f
+    f="$(mktemp -t agent-prompt-XXXXXX 2>/dev/null)" || return 1
+    [ -n "$f" ] && [ -f "$f" ] || return 1
+    printf '%s' "$1" > "$f" || { rm -f "$f"; return 1; }
+    printf '%s' "$f"
+}
+
+# Engines whose CLI can take the prompt on stdin, so a prompt over the argv ceiling still works.
+# codex and gemini pass it as an argument only, and their `</dev/null` guard exists to keep a
+# headless run from blocking on an interactive stdin -- so they refuse instead of failing opaquely.
+PROMPT_STDIN_ENGINES=" claude opencode "
+
+# Refuses, with the reason, when this engine cannot carry a prompt of this size.
+prompt_fits_engine() {
+    local eng="$1" text="$2"
+    prompt_needs_stdin "$text" || return 0
+    case "$PROMPT_STDIN_ENGINES" in *" $eng "*) return 0 ;; esac
+    printf 'agent.sh: prompt is %s characters and -e %s hands it to the CLI as a command-line argument, which the platform caps near 32000. Use -e claude or -e opencode for a prompt this size.\n' \
+        "${#text}" "$eng" >&2
+    return 1
 }
 
 # PROGRESS checkpoint protocol: each task keeps its OWN file, NAMED BY TASK (PROGRESS.<task>.md), so
@@ -756,6 +804,7 @@ finish_step() {
 provider_dispatch_run() {
     local eng="$1" alias="$2" d="$3" prompt="$4" n="$5" fn="provider_${1}_run_cmd"
     declare -F "$fn" >/dev/null 2>&1 || die "unknown engine: $eng"
+    prompt_fits_engine "$eng" "$prompt" || { rc=1; return 1; }
     local resolve_fn="provider_${eng}_resolve"
     P_MODEL=""; P_EFFORT=""
     if declare -F "$resolve_fn" >/dev/null 2>&1; then
@@ -928,7 +977,8 @@ PROMPT
 case "$cmd" in
     run)
         parse_opts "$@"
-        prompt="${REST[0]:-}"; [ -n "$prompt" ] || die "run: needs a prompt"
+        if [ -n "$prompt_file" ]; then prompt="$(read_prompt_file)"; else prompt="${REST[0]:-}"; fi
+        [ -n "$prompt" ] || die "run: needs a prompt"
         [ "$progress" = 1 ] && prompt="$prompt$(progress_proto "$name")"
         [ "$terse" = 1 ] && prompt="$prompt$TERSE_PROTO"
         _do_run_dispatch
@@ -996,7 +1046,9 @@ except Exception:
         ;;
     reply)
         parse_opts "$@"
-        if [ ${#REST[@]} -ge 2 ]; then ref="${REST[0]}"; answer="${REST[1]}"; else ref=""; answer="${REST[0]:-}"; fi
+        if [ -n "$prompt_file" ]; then ref="${REST[0]:-}"; answer="$(read_prompt_file)"
+        elif [ ${#REST[@]} -ge 2 ]; then ref="${REST[0]}"; answer="${REST[1]}"
+        else ref=""; answer="${REST[0]:-}"; fi
         [ -n "$answer" ] || die "reply: needs an answer text"
         if [ -z "$ref" ]; then tname="$(latest_task)"; [ -n "$tname" ] || die "reply: no tasks — specify name/session id"
         elif valid_task_name "$ref" && [ -e "$(meta_file "$ref")" ]; then tname="$ref"
