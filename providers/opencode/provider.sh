@@ -22,7 +22,9 @@
 provider_opencode_resolve() {
     local alias="${1:-}"; P_EFFORT=""
     case "$alias" in
-        free|spark|muse|muse-spark) P_MODEL="opencode/muse-spark-1.2-contributor-free" ;;
+        # 03.09.2026: вышел 1.3. Комментарий держим ПОСЛЕ ;; — иначе он съедает
+        # закрытие ветки и весь case ломается синтаксической ошибкой.
+        free|spark|muse|muse-spark) P_MODEL="opencode/muse-spark-1.3-contributor-free" ;;
         ox|ox-alpha|alpha)          P_MODEL="opencode/x-preview-f-free" ;;
         pickle|big-pickle)          P_MODEL="opencode/big-pickle" ;;
         hy3)                        P_MODEL="opencode/hy3-free" ;;
