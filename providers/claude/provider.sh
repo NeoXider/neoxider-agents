@@ -88,14 +88,30 @@ _provider_claude_perm_args() {
 _provider_claude_invoke() {
     local dir="$1" prompt="$2"; shift 2
     local -a perm; mapfile -t perm < <(_provider_claude_perm_args)
+    # A prompt too long for argv goes in on stdin: `claude -p` with no positional prompt reads it
+    # from there, and a file redirect hits EOF at once, so the headless "never block on an
+    # interactive stdin" guarantee of the </dev/null below is preserved.
+    local -a text=("$prompt")
+    local promptfile=""
+    if prompt_needs_stdin "$prompt"; then
+        promptfile="$(prompt_stdin_file "$prompt")" \
+            || { printf '[claude] cannot stage a long prompt for stdin\n' >&2; return 1; }
+        text=()
+    fi
+    local stdin_src="/dev/null"; [ -n "$promptfile" ] && stdin_src="$promptfile"
+    local rc=0
     if [ "${AGENT_STREAM_TEXT:-0}" = 1 ]; then
         _agent_python || { printf 'agent.sh: claude streaming needs a runnable python interpreter\n' >&2; return 1; }
         ( cd "$dir" && claude -p "$@" "${perm[@]}" \
-            --output-format stream-json --include-partial-messages --verbose "$prompt" </dev/null 2>&1 \
+            --output-format stream-json --include-partial-messages --verbose "${text[@]}" <"$stdin_src" 2>&1 \
           | PYTHONIOENCODING=utf-8 "$_AGENT_PY" -u "$HERE/stream_text_filter.py" )
+        rc=$?
     else
-        ( cd "$dir" && claude -p "$@" "${perm[@]}" "$prompt" </dev/null 2>&1 )
+        ( cd "$dir" && claude -p "$@" "${perm[@]}" "${text[@]}" <"$stdin_src" 2>&1 )
+        rc=$?
     fi
+    [ -n "$promptfile" ] && rm -f "$promptfile"
+    return "$rc"
 }
 
 # provider_claude_run_cmd DIR MODEL EFFORT PROMPT — runs the CLI, streams to stdout/stderr.

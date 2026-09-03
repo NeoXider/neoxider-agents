@@ -8,6 +8,21 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- **A long prompt no longer fails the spawn before the model is ever asked.** Windows caps an entire
+  command line at 32767 characters, and every path here handed the prompt to the CLI as an argument,
+  so a big conversation died in `CreateProcess` — as `Argument list too long` from bash, or as
+  WinError 206 that Python raises as `FileNotFoundError`, which the OpenAI bridge could only report
+  as an opaque `500 bridge_failure`. Reproduced live: an 18.5 KB payload worked, a 43 KB one did not,
+  and the boundary sits at ~32 KB for a native CLI whether it is spawned from Python or from bash.
+  Three parts to the fix. `agent.sh run` and `agent.sh reply` take `--prompt-file PATH`, so a caller
+  can hand over text too long to pass as an argument. `claude` and `opencode` — the two CLIs that
+  read a prompt from stdin — now receive an over-long prompt that way (from a file, so the headless
+  "never block on an interactive stdin" guarantee is kept), with no prompt left in argv. `codex` and
+  `gemini` take it only as an argument, so instead of failing opaquely they refuse up front, naming
+  the size and pointing at the two engines that can. The threshold is `AGENT_ARGV_PROMPT_MAX`
+  (default 16000), well under the platform ceiling to leave room for flags and quoting.
+- **The OpenAI bridge stages a long prompt in a file** rather than in argv, using the new
+  `--prompt-file`, and removes it afterwards even when the run raises.
 - **`wait` no longer calls a live-but-quiet task "settled".** It counted only `running` as still
   going, so a task in the honest `idle` state — alive, but its log silent past `AGENT_STALE_SEC` —
   was reported as settled and `wait` returned while the agent was still mid-turn, handing the
@@ -16,6 +31,13 @@ All notable changes to this project are documented here. Format follows
   now treat `idle` like `running`: the settle loop keeps blocking, and whole-wave mode (no names
   given) also picks up idle tasks instead of ignoring them. `clean` already had this right; `wait`
   did not. Regression test added with RED/GREEN evidence.
+
+### Changed
+
+- **A bridge bug is diagnosable again.** The catch-all logged only the exception's type
+  (`exception=FileNotFoundError`), which is what made the failure above a dead end — the message
+  naming the real cause was thrown away. It now logs the message too, and the traceback at debug
+  level.
 
 ### Documentation
 

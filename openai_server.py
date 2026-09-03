@@ -76,7 +76,7 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
 (does not import gui.py) so the two servers can run/fail independently.
 """
-import argparse, atexit, glob, ipaddress, json, logging, os, queue, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
+import argparse, atexit, contextlib, glob, ipaddress, json, logging, os, queue, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -498,14 +498,40 @@ def _chatonly_env():
     return env
 
 
+# Longest prompt still safe as a command-line argument. Windows caps a whole command line at
+# 32767 characters and the spawn fails outright above it -- as WinError 206, which Python raises as
+# FileNotFoundError, so the bridge answered a long conversation with an opaque 500. agent.sh takes
+# anything longer through --prompt-file instead. Keep in step with AGENT_ARGV_PROMPT_MAX in agent.sh.
+ARGV_PROMPT_MAX = 16000
+
+
+@contextlib.contextmanager
+def _prompt_argument(text):
+    """Yields the extra argv for `text`, staging it in a file when it is too long to pass directly."""
+    if len(text) <= ARGV_PROMPT_MAX:
+        yield [text]
+        return
+    fd, path = tempfile.mkstemp(prefix="bridge-prompt-", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        LOG.info("prompt of %d chars staged for --prompt-file", len(text))
+        yield ["--prompt-file", to_git_bash_path(path)]
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def run_agent(engine, model, effort, workdir, prompt, name, timeout):
     args = [BASH, SK, "run", "--no-progress", "-e", engine, "-C", to_git_bash_path(workdir), "-t", name]
     if model:
         args += ["-m", model]
     if effort:
         args += ["-f", effort]
-    args.append(prompt)
-    _run_agent_process(args, timeout, _chatonly_env())
+    with _prompt_argument(prompt) as prompt_args:
+        _run_agent_process(args + prompt_args, timeout, _chatonly_env())
     return last_output(read_log(name))
 
 
@@ -524,9 +550,10 @@ def reply_agent(engine, model, effort, workdir, name, answer, timeout):
         args += ["-m", model]
     if effort:
         args += ["-f", effort]
-    args += ["-C", to_git_bash_path(workdir), name, answer]
+    args += ["-C", to_git_bash_path(workdir), name]
     before = len(read_log(name))
-    _run_agent_process(args, timeout, _chatonly_env())
+    with _prompt_argument(answer) as answer_args:
+        _run_agent_process(args + answer_args, timeout, _chatonly_env())
     after = read_log(name)
     if len(after) == before:
         return None  # nothing was appended -> the resume died before its block; don't echo stale
@@ -2960,7 +2987,11 @@ class H(BaseHTTPRequestHandler):
             # error response, not a bare connection reset the client can't distinguish from a
             # network failure. A second status line would corrupt an already-started SSE stream.
             incident = uuid.uuid4().hex[:12]
-            LOG.warning("bridge incident %s exception=%s", incident, type(e).__name__)
+            # WHY: the type alone sent one real bug (a FileNotFoundError that was really Windows
+            # refusing an over-long command line) to a dead end. The message names the failure and
+            # the traceback names the line.
+            LOG.warning("bridge incident %s exception=%s: %s", incident, type(e).__name__, e)
+            LOG.debug("bridge incident %s traceback", incident, exc_info=True)
             if getattr(self, "_sse_started", False):
                 return self._abort_stream_safely()
             try:
