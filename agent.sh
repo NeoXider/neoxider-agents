@@ -82,10 +82,15 @@ set -uo pipefail
 LOGDIR="${AGENT_CLI_LOGS:-$HOME/.claude/agent-cli-logs}"
 ( umask 077; mkdir -p "$LOGDIR" )
 chmod 700 "$LOGDIR" 2>/dev/null || true
+# БАГФИКС list-вис: этот цикл раньше вызывал `chmod` отдельным процессом на КАЖДЫЙ
+# .log/.meta (~270 форков ≈ 13с в git-bash) при КАЖДОМ запуске agent.sh, включая
+# read-only `list`/`status`. Теперь один batched-вызов chmod на все файлы сразу.
+_agent_chmod_batch=()
 for _agent_state_file in "$LOGDIR"/*.log "$LOGDIR"/*.meta; do
-    [ -f "$_agent_state_file" ] && chmod 600 "$_agent_state_file" 2>/dev/null || true
+    [ -f "$_agent_state_file" ] && _agent_chmod_batch+=("$_agent_state_file")
 done
-unset _agent_state_file
+[ "${#_agent_chmod_batch[@]}" -gt 0 ] && chmod 600 "${_agent_chmod_batch[@]}" 2>/dev/null || true
+unset _agent_state_file _agent_chmod_batch
 
 # State contains prompts, source and provider diagnostics, so create it owner-only without changing
 # the umask inherited by provider processes (their working-tree files must keep the caller's umask).
@@ -548,19 +553,43 @@ _latest_file() {
     printf '%s' "$best"
 }
 _sorted_meta_files() {
-    local limit="${1:-20}" f i j best_idx best_mt mt
+    local limit="${1:-20}" f mt line out=""
     case "$limit" in ''|*[!0-9]*) return 1 ;; esac
-    _SORTED_META_FILES=("$LOGDIR"/*.meta)
-    [ -e "${_SORTED_META_FILES[0]}" ] || { _SORTED_META_FILES=(); return 0; }
-    for ((i=0; i<${#_SORTED_META_FILES[@]}; i++)); do
-        best_idx=$i; best_mt=-1
-        for ((j=i; j<${#_SORTED_META_FILES[@]}; j++)); do
-            mt="$(file_mtime "${_SORTED_META_FILES[j]}")"; case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
-            if [ "$mt" -gt "$best_mt" ]; then best_idx=$j; best_mt=$mt; fi
+    _SORTED_META_FILES=()
+    # БАГФИКС list-вис: раньше здесь была сортировка выбором O(n²), где КАЖДОЕ
+    # сравнение спавнило 1-2 процесса `stat` (file_mtime). При ~135 задачах это
+    # ~9к итераций × форки в git-bash = минуты виса, и `list` показывал пустую
+    # таблицу (строки не успевали посчитаться до таймаута), хотя `status` одной
+    # задачи отвечал мгновенно. Теперь ОДИН вызов stat на все файлы + sort.
+    # Элемент массива — "mtime<TAB>path" (mtime нужен вызывающему для age без
+    # повторного stat). Разделитель — таб: в именах задач табов не бывает
+    # (valid_task_name); режем по ПЕРВОМУ табу, т.к. в $LOGDIR пробелы возможны.
+    for f in "$LOGDIR"/*.meta; do [ -e "$f" ] || continue; out="x"; break; done
+    [ -n "$out" ] || return 0
+    out=""
+    # GNU stat понимает много файлов за раз; BSD/macOS — свой формат. Один форк
+    # вместо N. Без grob-несовпадений сюда не доходим (проверка выше), так что
+    # литеральный "*.meta" в stat не попадёт.
+    # NOTE: `stat -c` в старых coreutils (8.32 в git-bash) НЕ раскрывает \t в
+    # формате (печатает буквально), поэтому только --printf; проверка на таб
+    # ниже отбрасывает неверный вывод в пофайловый fallback.
+    out="$(stat --printf '%Y\t%n\n' "$LOGDIR"/*.meta 2>/dev/null)" \
+        || out="$(stat -f '%m\t%N' "$LOGDIR"/*.meta 2>/dev/null)" || out=""
+    # BSD stat не раскрывает \t в формате (печатает буквально) — такой вывод
+    # отбрасываем: ниже есть пофайловый fallback (на macOS/Linux форки дешёвые).
+    case "$out" in *$'\t'*) ;; *) out="" ;; esac
+    if [ -z "$out" ]; then
+        for f in "$LOGDIR"/*.meta; do
+            [ -e "$f" ] || continue
+            mt="$(file_mtime "$f")"; case "$mt" in ''|*[!0-9]*) mt=0 ;; esac
+            out="$out$mt	$f
+"
         done
-        f="${_SORTED_META_FILES[i]}"; _SORTED_META_FILES[i]="${_SORTED_META_FILES[best_idx]}"; _SORTED_META_FILES[best_idx]="$f"
-        [ "$((i + 1))" -ge "$limit" ] && { _SORTED_META_FILES=("${_SORTED_META_FILES[@]:0:limit}"); break; }
-    done
+    fi
+    [ -n "$out" ] || return 0
+    while IFS= read -r line; do
+        [ -n "$line" ] && _SORTED_META_FILES+=("$line")
+    done < <(printf '%s\n' "$out" | sort -rn | head -n "$limit")
     return 0
 }
 latest_task() { local f; f="$(_latest_file meta)"; [ -n "$f" ] && basename "$f" .meta; }
@@ -1214,15 +1243,60 @@ except Exception:
         list_limit="${1:-20}"; case "$list_limit" in ''|*[!0-9]*) die "list: limit must be a non-negative integer" ;; esac
         printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %-8s %s\n' "" TASK STATE ENGINE MODEL AGE FILES SESSION DETAIL
         _sorted_meta_files "$list_limit" || die "list: invalid limit '$list_limit'"
-        for m in "${_SORTED_META_FILES[@]}"; do
-            n="$(basename "$m" .meta)"
+        # БАГФИКС list-вис: раньше каждая строка делала ~10 форков (meta_get ×6 —
+        # это grep+cut+subshell на поле, eff_state, file_mtime, date, basename,
+        # state_icon). 20 строк × ~30 форков в git-bash ≈ десятки секунд сверх
+        # сортировки. Теперь .meta парсится один раз чистым bash (0 форков),
+        # mtime переиспользуется из сортировки, date вызывается один раз.
+        list_now="$(date +%s)"; case "$list_now" in ''|*[!0-9]*) list_now=0 ;; esac
+        for list_mline in "${_SORTED_META_FILES[@]}"; do
+            m="${list_mline#*$'\t'}"; fm="${list_mline%%$'\t'*}"
+            case "$fm" in ''|*[!0-9]*) fm=0 ;; esac
+            n="${m##*/}"; n="${n%.meta}"
             valid_task_name "$n" || continue
-            e="$(meta_get "$n" engine)"; mo="$(meta_get "$n" model)"; s="$(meta_get "$n" session)"
-            st="$(eff_state "$n")"; nf="$(meta_get "$n" files)"; reason="$(meta_get "$n" reason)"; detail=""
-            [ "$st" = error ] && detail="turn died; inspect tree — ${reason:-provider failure}"
-            fm="$(file_mtime "$m")"
-            age="$(( ($(date +%s) - ${fm:-0}) / 60 ))m"
-            printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %-8s %s\n' "$(state_icon "$st")" "$n" "${st:-?}" "${e:-?}" "${mo:-?}" "$age" "${nf:-0}" "${s:0:8}" "$detail"
+            e=""; mo=""; s=""; st=""; nf=""; reason=""; pid=""
+            # 2>/dev/null на случай каталога/битого файла вместо .meta: поля
+            # останутся пустыми, ниже напечатается строка с пометкой, не вис.
+            # (ввод цикла — редирект из файла, stdin скрипта не трогаем).
+            while IFS= read -r list_kv || [ -n "$list_kv" ]; do
+                case "$list_kv" in
+                    engine=*) e="${list_kv#engine=}" ;;
+                    model=*) mo="${list_kv#model=}" ;;
+                    session=*) s="${list_kv#session=}" ;;
+                    state=*) st="${list_kv#state=}" ;;
+                    files=*) nf="${list_kv#files=}" ;;
+                    reason=*) reason="${list_kv#reason=}" ;;
+                    pid=*) pid="${list_kv#pid=}" ;;
+                esac
+            done < "$m" 2>/dev/null
+            if [ ! -f "$m" ] || [ ! -r "$m" ] || { [ -z "$e" ] && [ -z "$st" ] && [ -z "$mo" ]; }; then
+                detail=""
+                [ "$st" = error ] && detail="turn died; inspect tree — ${reason:-provider failure}"
+                [ -n "$detail" ] || detail="unreadable .meta"
+                printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %-8s %s\n' "•" "$n" "${st:-?}" "${e:-?}" "${mo:-?}" "?" "${nf:-0}" "${s:0:8}" "$detail"
+                detail=""; continue
+            fi
+            # Тот же автомат, что eff_state(): running+pid мёртв -> stalled;
+            # running+жив+лог молчит дольше AGENT_STALE_SEC -> idle/stalled.
+            # Дублируется здесь ради скорости (без форков); при правке eff_state
+            # править и тут.
+            est="$st"
+            if [ "$est" = running ]; then
+                if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then est="stalled";
+                else
+                    list_lm=""
+                    [ -f "$LOGDIR/$n.log" ] && list_lm="$(file_mtime "$LOGDIR/$n.log")"
+                    case "$list_lm" in ''|*[!0-9]*) list_lm="" ;; esac
+                    if [ -n "$list_lm" ] && [ "$(( list_now - list_lm ))" -gt "$AGENT_STALE_SEC" ]; then
+                        if [ -z "$pid" ]; then est="stalled"; else est="idle"; fi
+                    else est="running"; fi
+                fi
+            fi
+            detail=""
+            [ "$est" = error ] && detail="turn died; inspect tree — ${reason:-provider failure}"
+            case "$est" in running) ic="▶";; idle) ic="▷";; done) ic="✔";; waiting) ic="⏳";; error) ic="✖";; stalled) ic="⚠";; *) ic="•";; esac
+            age="$(( (list_now - fm) / 60 ))m"
+            printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %-8s %s\n' "$ic" "$n" "${est:-?}" "${e:-?}" "${mo:-?}" "$age" "${nf:-0}" "${s:0:8}" "$detail"
         done
         ;;
     provider-info)
