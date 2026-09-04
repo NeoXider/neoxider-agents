@@ -8,6 +8,17 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- **An opencode rate limit no longer masquerades as a 30-minute hang.** The free tier answered
+  `AI_APICallError: Rate limit exceeded` **one second** into the request; opencode did not exit on the
+  stream error, so the step sat until the watchdog killed it. Observed live 2026-09-04 on five tasks
+  in a row: each was reported as `turn died — step watchdog timeout` with an empty log, while the
+  reason had been available from the first second — nobody asked for it. `opencode run` now gets
+  `--print-logs --log-level ERROR`, so provider errors reach the task log through the existing
+  `[opencode]` stderr channel (logs go to stderr; the JSONL on stdout stays clean). A rate-limit
+  signature is additionally called out by name on the timeout path, because an orchestrator must not
+  mistake it for a broken task and retry straight into another watchdog window. The two argv-pinning
+  tests were updated for the new flags; `tests/test_agent_sh.sh` is 310/310.
+
 - **A long prompt no longer fails the spawn before the model is ever asked.** Windows caps an entire
   command line at 32767 characters, and every path here handed the prompt to the CLI as an argument,
   so a big conversation died in `CreateProcess` — as `Argument list too long` from bash, or as
