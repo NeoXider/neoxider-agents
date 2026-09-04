@@ -77,6 +77,9 @@ bash "$SK" test-api --base-url http://127.0.0.1:8080 --goal "check /health, then
                                                      # HTTP API via its own curl/shell, returns strict JSON
 bash "$SK" reply fix-readme "answer"                  # continue the task by name (session/dir taken from meta)
 bash "$SK" reply SESSION_UUID "answer"                 # or by uuid; with no argument — the last task
+                                                     # reply works on claude/codex/kimi/opencode. Use it to
+                                                     # CORRECT a task in flight instead of killing it: the
+                                                     # agent keeps everything it has already read and done.
 bash "$SK" log  fix-readme                            # the entire task thread (run + all replies in one file)
 bash "$SK" log  -f fix-readme                         # follow a live background agent (tail -f)
 bash "$SK" log  -l fix-readme                         # only the last step
@@ -254,8 +257,8 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   the new tail, instead of resending the whole growing history via a brand-new
   `agent.sh run`. Any mismatch (edited history, an unrelated conversation, the first
   call, or a dead/errored session) falls back safely to a fresh `agent.sh run` with the
-  full history. `claude`/`codex`/`kimi` support this (`provider.json`'s
-  `supports_resume`); `opencode`/`gemini` always take the fresh-run path.
+  full history. `claude`/`codex`/`kimi`/`opencode` support this (`provider.json`'s
+  `supports_resume`); `gemini` always takes the fresh-run path.
 - **Trade-off: one bridge process serves one conversation at a time** — a lock
   serializes every request, so don't point multiple unrelated tasks at the same bridge
   port expecting them to stay independent (start one process per port per conversation

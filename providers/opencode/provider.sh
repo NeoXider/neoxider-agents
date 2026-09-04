@@ -1,6 +1,12 @@
 # opencode provider plugin for agent.sh.
-# Contract: provider_opencode_resolve, provider_opencode_run_cmd, provider_opencode_doctor.
-# No provider_opencode_resume_cmd: reply was never supported for opencode (matches today).
+# Contract: provider_opencode_resolve, provider_opencode_run_cmd, provider_opencode_resume_cmd,
+# provider_opencode_doctor.
+#
+# Resume IS supported. `opencode run` takes `-s/--session <id>` (and `-c/--continue`), and the JSON
+# event stream already carries `sessionID`, which _provider_opencode_emit prints as the `session id:`
+# line agent.sh records in the task meta. The old `supports_resume:false` predated those flags and
+# cost real work: a running agent could not be corrected mid-task, so a task given a wrong spec had
+# to be killed and relaunched from zero.
 
 # alias -> real model id. Sets P_MODEL; P_EFFORT stays empty (opencode takes effort only via the
 # separate --variant flag, i.e. agent.sh's -f, never as an alias suffix).
@@ -117,16 +123,11 @@ _provider_opencode_chatonly_args() {
     return 0
 }
 
-# provider_opencode_run_cmd DIR MODEL EFFORT PROMPT — runs the CLI and emits clean final text.
-# MODEL is the raw -m value (may be empty). EFFORT maps to opencode's --variant flag (its
-# reasoning-effort equivalent: high/max/minimal/...), if given.
-# --format json: machine-readable event stream we parse for the final assistant message (see emit).
-# --auto: auto-approve permissions that are not explicitly denied -- without it opencode can block on
-# a permission prompt, which would hang forever since stdin is closed (</dev/null). Fully unattended
-# runs need it. NOTE: opencode renamed this from --dangerously-skip-permissions to --auto; the old
-# flag now fails `opencode run` with "Unexpected server error".
-provider_opencode_run_cmd() {
-    local dir="$1" model="$2" effort="$3" prompt="$4"
+# _provider_opencode_invoke DIR PROMPT EXTRA... — the single CLI invocation both run and resume use.
+# EXTRA are session flags (`-s <id>`) or nothing. Kept as one function on purpose: run and resume
+# must share the stdin/stderr/timeout handling below, or a fix to one silently skips the other.
+_provider_opencode_invoke() {
+    local dir="$1" prompt="$2"; shift 2
     local timeout_sec="${AGENT_OPENCODE_TIMEOUT_SEC:-${AGENT_TIMEOUT_SEC:-1800}}"
     # --print-logs --log-level ERROR: without them opencode keeps provider failures to itself and the
     # task looks like an unexplained hang. Observed live 2026-09-04: the free tier answered
@@ -134,9 +135,7 @@ provider_opencode_run_cmd() {
     # and the step sat until the watchdog killed it 30 minutes later — five tasks in a row, each
     # reported as "turn died" with an empty log. The reason existed the whole time; nobody asked for
     # it. Logs go to stderr, so the JSONL on stdout stays clean.
-    local args=(--auto --format json --print-logs --log-level ERROR)
-    [ -n "$model" ] && args+=(-m "$model")
-    [ -n "$effort" ] && args+=(--variant "$effort")
+    local args=(--auto --format json --print-logs --log-level ERROR "$@")
     mapfile -t -O ${#args[@]} args < <(_provider_opencode_chatonly_args)
     if _provider_opencode_chatonly; then
         local chat_config
@@ -207,6 +206,40 @@ provider_opencode_run_cmd() {
     fi
     [ "${statuses[0]}" -ne 0 ] && return "${statuses[0]}"
     return "${statuses[1]}"
+}
+
+# provider_opencode_run_cmd DIR MODEL EFFORT PROMPT — runs the CLI and emits clean final text.
+# MODEL is the raw -m value (may be empty). EFFORT maps to opencode's --variant flag (its
+# reasoning-effort equivalent: high/max/minimal/...), if given.
+# --format json: machine-readable event stream we parse for the final assistant message (see emit).
+# --auto: auto-approve permissions that are not explicitly denied -- without it opencode can block on
+# a permission prompt, which would hang forever since stdin is closed (</dev/null). Fully unattended
+# runs need it. NOTE: opencode renamed this from --dangerously-skip-permissions to --auto; the old
+# flag now fails `opencode run` with "Unexpected server error".
+provider_opencode_run_cmd() {
+    local dir="$1" model="$2" effort="$3" prompt="$4"
+    local -a extra=()
+    [ -n "$model" ] && extra+=(-m "$model")
+    [ -n "$effort" ] && extra+=(--variant "$effort")
+    _provider_opencode_invoke "$dir" "$prompt" "${extra[@]}"
+}
+
+# agent.sh resolves the alias into $P_MODEL/$P_EFFORT before calling resume when this is 1. opencode
+# remembers neither across `run -s`, so a resumed turn without them would silently switch model.
+PROVIDER_OPENCODE_RESUME_NEEDS_MODEL=1
+
+# provider_opencode_resume_cmd DIR SESSION ANSWER — continues an existing session.
+# `-s <id>` continues that exact session; with no id `--continue` takes the last one in this
+# directory, which is why agent.sh records the session from the `session id:` line at run time.
+# WHY this matters: without resume a task given a wrong or incomplete spec could only be killed and
+# restarted from zero, throwing away everything it had already read and done.
+provider_opencode_resume_cmd() {
+    local dir="$1" session="$2" answer="$3"
+    local -a extra=()
+    [ -n "$P_MODEL" ] && extra+=(-m "$P_MODEL")
+    [ -n "$P_EFFORT" ] && extra+=(--variant "$P_EFFORT")
+    if [ -n "$session" ]; then extra+=(-s "$session"); else extra+=(--continue); fi
+    _provider_opencode_invoke "$dir" "$answer" "${extra[@]}"
 }
 
 # provider_opencode_doctor — prints a single-line JSON object to stdout.
