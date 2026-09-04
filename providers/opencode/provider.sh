@@ -128,7 +128,13 @@ _provider_opencode_chatonly_args() {
 provider_opencode_run_cmd() {
     local dir="$1" model="$2" effort="$3" prompt="$4"
     local timeout_sec="${AGENT_OPENCODE_TIMEOUT_SEC:-${AGENT_TIMEOUT_SEC:-1800}}"
-    local args=(--auto --format json)
+    # --print-logs --log-level ERROR: without them opencode keeps provider failures to itself and the
+    # task looks like an unexplained hang. Observed live 2026-09-04: the free tier answered
+    # `AI_APICallError: Rate limit exceeded` ONE SECOND into the request, opencode did not exit on it,
+    # and the step sat until the watchdog killed it 30 minutes later — five tasks in a row, each
+    # reported as "turn died" with an empty log. The reason existed the whole time; nobody asked for
+    # it. Logs go to stderr, so the JSONL on stdout stays clean.
+    local args=(--auto --format json --print-logs --log-level ERROR)
     [ -n "$model" ] && args+=(-m "$model")
     [ -n "$effort" ] && args+=(--variant "$effort")
     mapfile -t -O ${#args[@]} args < <(_provider_opencode_chatonly_args)
@@ -178,13 +184,26 @@ provider_opencode_run_cmd() {
     fi
     statuses=("${PIPESTATUS[@]}")
     [ -n "$promptfile" ] && rm -f "$promptfile"
+    local rate_limited=""
     if [ -s "$errfile" ]; then
+        # Read the reason BEFORE the file is removed: on a timeout the exit code alone says nothing
+        # about why, and "rate limit" is the one cause an orchestrator must not mistake for a broken
+        # task — retrying it immediately just burns another watchdog window.
+        grep -qiE 'rate limit|429|quota' "$errfile" && rate_limited=1
         while IFS= read -r line; do printf '[opencode] %s\n' "$line" >&2; done <"$errfile"
     fi
     rm -f "$errfile"
     if [ "${statuses[0]}" -eq 124 ]; then
-        printf '[opencode] timed out after %ss\n' "$timeout_sec" >&2
+        if [ -n "$rate_limited" ]; then
+            printf '[opencode] provider rate limit hit; opencode did not exit on it and the step ran out its %ss budget. Wait for the limit to reset or switch engine/model — this is NOT a task failure.\n' \
+                "$timeout_sec" >&2
+        else
+            printf '[opencode] timed out after %ss\n' "$timeout_sec" >&2
+        fi
         return 124
+    fi
+    if [ -n "$rate_limited" ]; then
+        printf '[opencode] provider reported a rate limit — the answer may be missing or truncated.\n' >&2
     fi
     [ "${statuses[0]}" -ne 0 ] && return "${statuses[0]}"
     return "${statuses[1]}"
