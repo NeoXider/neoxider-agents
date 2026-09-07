@@ -155,6 +155,71 @@ else
 fi
 
 # ============================================================================================
+section "metadata batches: validation, atomic publication, mixed writers"
+# ============================================================================================
+if ! declare -F meta_set_many >/dev/null; then
+    fail "metadata batching API is available"
+else
+    meta_set_many batch_values empty "" spaced "two words" equals "a=b=c" literal 'C:\folder\$value'
+    assert_eq "batch preserves empty values" "" "$(meta_get batch_values empty)"
+    assert_eq "batch preserves spaces" "two words" "$(meta_get batch_values spaced)"
+    assert_eq "batch preserves equals signs" "a=b=c" "$(meta_get batch_values equals)"
+    assert_eq "batch preserves literal backslashes and dollar signs" 'C:\folder\$value' "$(meta_get batch_values literal)"
+    batch_before="$(cat "$SCRATCH_LOGDIR/batch_values.meta")"
+    invalid_batches=0
+    meta_set_many batch_values spaced changed dangling >/dev/null 2>&1 || invalid_batches=$((invalid_batches + 1))
+    meta_set_many batch_values spaced changed 'bad=key' value >/dev/null 2>&1 || invalid_batches=$((invalid_batches + 1))
+    meta_set_many batch_values spaced changed injected $'value\nstate=done' >/dev/null 2>&1 || invalid_batches=$((invalid_batches + 1))
+    meta_set_many batch_values spaced changed injected $'value\rstate=done' >/dev/null 2>&1 || invalid_batches=$((invalid_batches + 1))
+    meta_set_many batch_values spaced first spaced second >/dev/null 2>&1 || invalid_batches=$((invalid_batches + 1))
+    assert_eq "malformed, duplicate, and injected batch inputs are rejected" "5" "$invalid_batches"
+    assert_eq "invalid batches change none of the existing fields" "$batch_before" "$(cat "$SCRATCH_LOGDIR/batch_values.meta")"
+    meta_set batch_values injected $'value\nstate=done' >/dev/null 2>&1
+    assert_eq "single-key compatibility API also rejects line injection" "1" "$?"
+    assert_eq "rejected single-key injection leaves metadata intact" "$batch_before" "$(cat "$SCRATCH_LOGDIR/batch_values.meta")"
+
+    mixed_pids=()
+    for ((i=1; i<=4; i++)); do
+        ( _guarded_run 45 meta_set_many batch_mixed "left$i" "$i" "right$i" "$i" ) &
+        mixed_pids+=("$!")
+        ( _guarded_run 45 meta_set batch_mixed "single$i" "$i" ) &
+        mixed_pids+=("$!")
+    done
+    mixed_rc=0
+    for p in "${mixed_pids[@]}"; do wait "$p" || mixed_rc=1; done
+    assert_eq "mixed batch and single writers finish successfully" "0" "$mixed_rc"
+    mixed_survived=0
+    for ((i=1; i<=4; i++)); do
+        for prefix in left right single; do
+            [ "$(meta_get batch_mixed "$prefix$i")" = "$i" ] && mixed_survived=$((mixed_survived + 1))
+        done
+    done
+    assert_eq "mixed writers retain all independent committed fields" "12" "$mixed_survived"
+
+    meta_set_many batch_snapshot left 0 right 0
+    _batch_snapshot_writer() {
+      local generation
+      for ((generation=1; generation<=8; generation++)); do
+          meta_set_many batch_snapshot left "$generation" right "$generation" || exit 1
+      done
+    }
+    ( _guarded_run 45 _batch_snapshot_writer ) &
+    batch_writer=$!
+    torn_snapshot=0
+    # One open/read observes one published file generation. Reading each key with a separate
+    # meta_get would legitimately cross commits and would not test atomic publication.
+    while kill -0 "$batch_writer" 2>/dev/null; do
+        awk -F= '$1=="left"{left=$2} $1=="right"{right=$2} END{exit(left!=right)}' \
+            "$SCRATCH_LOGDIR/batch_snapshot.meta" || torn_snapshot=1
+    done
+    wait "$batch_writer"; batch_writer_rc=$?
+    unset -f _batch_snapshot_writer
+    assert_eq "batch snapshot writer completes" "0" "$batch_writer_rc"
+    assert_eq "readers never observe half of a metadata batch" "0" "$torn_snapshot"
+    assert_eq "last batch is visible after publication" "8" "$(meta_get batch_snapshot right)"
+fi
+
+# ============================================================================================
 section "provider_codex_resolve"
 # ============================================================================================
 
@@ -816,8 +881,15 @@ done
 printf 'engine=opencode\nmodel=exact-model\ndir=%s\nstate=done\n' "$SCRATCH_LOGDIR" > "$SCRATCH_LOGDIR/ses_exact.meta"
 printf 'engine=gemini\nsession=ses_exact\ndir=%s\nstate=done\n' "$SCRATCH_LOGDIR" > "$SCRATCH_LOGDIR/session_decoy.meta"
 exact_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" reply ses_exact continue 2>&1)"
+exact_rc=$?
+assert_eq "exact task without a usable session fails before invoking a provider" "1" "$exact_rc"
 assert_match "session-looking exact task name is resolved before session lookup" \
-    "engine 'opencode'.*task 'ses_exact'" "$exact_out"
+    "task 'ses_exact'" "$exact_out"
+if [[ "$exact_out" == *session_decoy* ]]; then
+    fail "exact task resolution selected the session-id decoy"
+else
+    pass "exact task resolution never selects the session-id decoy"
+fi
 
 # No `ls` parsing: a LOGDIR containing spaces still supports latest/list correctly.
 SPACE_LOGDIR="$SCRATCH_LOGDIR/log dir with spaces"

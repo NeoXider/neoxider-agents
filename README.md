@@ -266,11 +266,25 @@ check, not a model guessing), only the new tail goes to the *same* CLI session v
 reply`, instead of re-serializing the whole growing history into a brand-new `agent.sh run`. That
 saves the resend cost and lets the provider's own prompt caching actually apply.
 
+API-вызовы отключают инструкции вести `PROGRESS.<task>.md` как при запуске, так и при
+продолжении: текстовый endpoint не должен просить модель менять файлы. Служебные `.log`,
+`.meta` и `.md` самого wrapper сохраняются. Повторное использование сессии само по себе
+не доказывает попадание в кеш: это проверяется по данным провайдера, а `usage` этого API
+остаётся оценкой.
+
+Служебные поля одной фазы (`run`, выбор модели, завершение) записываются одним атомарным
+обновлением metadata. Это сокращает запуск вспомогательных процессов на Windows и позволяет
+панели прочитать согласованные `state`, `exit` и `reason`. Конкурентные одиночные и групповые
+записи используют общую блокировку; новое состояние публикуется только после подготовки всей
+группы. Многострочные значения и повторяющиеся ключи отклоняются до записи.
+
 Any mismatch — edited/rolled-back history, a genuinely different conversation, the first call, or
 a previous session that ended `error`/`stalled` — falls back safely to a fresh run with the full
-history; it never resumes onto a session that might disagree with the caller. `claude`, `codex`
-and `kimi` support continuation (`provider.json`'s `supports_resume`); `opencode`/`gemini` are
-`false` and always take the fresh-run path. Verified live: Claude's task log showed one `[run]`
+history; it never resumes onto a session that might disagree with the caller. `claude`, `codex`,
+`kimi`, and `opencode` support continuation (`provider.json`'s `supports_resume`); `gemini` remains
+`false` and always takes the fresh-run path. opencode resumes the recorded session with `-s`
+and preserves the selected model and effort via `-m` and `--variant`.
+Verified live: Claude's task log showed one `[run]`
 block followed by a `[reply]` block containing only the new tail, the task count stayed at 1
 across 4 sequential calls, and an unrelated conversation sent next correctly started a new session.
 
@@ -294,7 +308,8 @@ conversation can't grow forever. `GET /health` reports `session_active`, `sessio
 `claude -p` process (stream-json), so the ~7–11 s agent-environment boot is paid once and each
 turn afterwards costs only inference (~3.5 s measured on Opus), keeping the provider prompt cache
 warm across turns (`CLAUDE_NO_NATIVE=1` opts out). The other engines spawn a fresh CLI subprocess
-per completion, so their first token waits a few seconds for that boot — even when streaming.
+per completion; both process startup and wrapper bookkeeping add latency before the response.
+For Codex, `stream: true` replays the completed answer as SSE; it does not expose live model tokens.
 
 **`stream: true` is REAL token streaming on `claude`:** the CLI runs with `--output-format
 stream-json --include-partial-messages` piped through `stream_text_filter.py`, so the task log

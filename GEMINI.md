@@ -62,8 +62,8 @@ agent every call — when a new call's `messages` is a deterministic extension o
 it saw last time (exact prefix match, not a guess), it resumes the *same* underlying
 CLI session via `agent.sh reply` with only the new tail; any mismatch (edited history,
 an unrelated conversation, the first call, or a dead/errored session) falls back safely
-to a brand-new `agent.sh run` with the full history. `claude`/`codex`/`kimi` support this
-resume (`opencode`/`gemini` always take the fresh-run path). Consequence: **one bridge
+to a brand-new `agent.sh run` with the full history. `claude`/`codex`/`kimi`/`opencode` support
+resume (`gemini` always takes the fresh-run path). Consequence: **one bridge
 process serves one conversation at a time** — a lock serializes every request, so don't
 point multiple unrelated tasks at the same port expecting independence (run one process
 per port per conversation instead); `POST .../reset` clears the remembered session,

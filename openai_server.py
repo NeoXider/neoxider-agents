@@ -545,7 +545,7 @@ def reply_agent(engine, model, effort, workdir, name, answer, timeout):
     Without this guard `last_output(read_log(name))` would echo the PREVIOUS successful answer as
     if it were the reply's -- a silent stale-answer bug. The caller (_run) falls back to a fresh
     run when it sees None."""
-    args = [BASH, SK, "reply", "-e", engine]
+    args = [BASH, SK, "reply", "--no-progress", "-e", engine]
     if model:
         args += ["-m", model]
     if effort:
@@ -677,7 +677,7 @@ def reply_agent_live(engine, model, effort, workdir, name, answer, timeout, on_d
     """reply_agent with a live log tail. Same None contract as reply_agent: None when the reply
     appended nothing or ended in a bad state (the caller decides whether a fresh-run fallback
     is still invisible to the client or the stream must be finalized as-is)."""
-    args = [BASH, SK, "reply", "-e", engine]
+    args = [BASH, SK, "reply", "--no-progress", "-e", engine]
     if model:
         args += ["-m", model]
     if effort:

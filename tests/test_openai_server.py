@@ -684,8 +684,8 @@ class SessionDirTests(unittest.TestCase):
         self.assertFalse(os.path.exists(stray))
 
     def test_wipe_false_keeps_the_same_conversation_files(self):
-        """A no-resume engine (opencode/gemini) takes the fresh-run path on EVERY turn of one
-        conversation; wiping the project root under a live `opencode serve` each time is both
+        """A no-resume engine (gemini) takes the fresh-run path on EVERY turn of one
+        conversation; wiping the scratch dir each time is both
         pointless and destabilising, so a continuation keeps the directory intact."""
         d = srv.fresh_session_dir()
         keep = os.path.join(d, "turn1.txt")
@@ -892,6 +892,39 @@ class ReplyAgentStaleGuardTests(unittest.TestCase):
         srv.read_meta = lambda name: {"state": "waiting"}
         self.assertEqual(srv.reply_agent("codex", "spark", "medium", "/tmp/x", "t", "hi", 60),
                          "NEW ANSWER\n")
+
+
+class ChatOnlyResumePromptTests(unittest.TestCase):
+    """Resuming an API conversation must not ask the provider to write task checkpoints."""
+
+    def _assert_no_progress(self, live):
+        before = "---------- output ----------\nOLD\n"
+        after = before + "---------- output ----------\nNEW\n"
+        with mock.patch.object(srv, "read_log", side_effect=[before, after]), \
+                mock.patch.object(srv, "read_meta", return_value={"state": "done"}), \
+                mock.patch.object(srv, "_log_size", return_value=len(before)), \
+                mock.patch.object(srv, "_run_agent_process") as run, \
+                mock.patch.object(srv, "_popen_process_tree") as launch, \
+                mock.patch.object(srv, "_tail_task_log"), \
+                mock.patch.object(srv, "_release_process_tree"):
+            if live:
+                result = srv.reply_agent_live(
+                    "claude", "sonnet", "medium", "/tmp/api", "api-task", "continue", 60,
+                    lambda delta: None)
+                arguments = launch.call_args.args[0]
+            else:
+                result = srv.reply_agent(
+                    "codex", "spark", "medium", "/tmp/api", "api-task", "continue", 60)
+                arguments = run.call_args.args[0]
+        self.assertEqual(result, "NEW\n")
+        self.assertIn("--no-progress", arguments,
+                      "The public agent.sh resume boundary must disable checkpoint instructions.")
+
+    def test_buffered_api_resume_disables_checkpoint_instructions(self):
+        self._assert_no_progress(live=False)
+
+    def test_live_api_resume_disables_checkpoint_instructions(self):
+        self._assert_no_progress(live=True)
 
 
 class ProcessTreeTimeoutTests(unittest.TestCase):

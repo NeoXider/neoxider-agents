@@ -512,13 +512,35 @@ _meta_unlock() {
     rm -f -- "$state"
     rmdir "$lock" 2>/dev/null
 }
-meta_set()  { local f tmp key="${2:-}"; f="$(meta_file "${1:-}")" || return 1
-    case "$key" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+meta_set_many() {
+    # Validate the entire batch before locking/writing. Metadata is a line-based format;
+    # CR/LF cannot be represented as values without injecting a different field.
+    [ "$#" -ge 3 ] && [ $(( ($# - 1) % 2 )) -eq 0 ] || return 1
+    local f tmp key value read_rc
+    local -a exclusions=() records=()
+    local -A seen=()
+    f="$(meta_file "$1")" || return 1
+    shift
+    while [ "$#" -gt 0 ]; do
+        key="$1"; value="$2"; shift 2
+        case "$key" in ''|*[!A-Za-z0-9_-]*) return 1 ;; esac
+        case "$value" in *$'\n'*|*$'\r'*) return 1 ;; esac
+        [ -z "${seen[$key]+present}" ] || return 1
+        seen[$key]=1
+        exclusions+=(-e "^$key=")
+        records+=("$key=$value")
+    done
     _meta_lock "$f" || return 1
     tmp="$f.tmp.$BASHPID.${RANDOM:-0}"
     if ( umask 077
-         { [ ! -e "$f" ] || grep -v "^$key=" "$f" || true; } > "$tmp" 2>/dev/null \
-             && printf '%s=%s\n' "$key" "${3:-}" >> "$tmp"
+         if [ -e "$f" ]; then
+             grep -v "${exclusions[@]}" "$f" > "$tmp" 2>/dev/null
+             read_rc=$?
+             [ "$read_rc" -le 1 ] || exit 1
+         else
+             : > "$tmp" || exit 1
+         fi
+         printf '%s\n' "${records[@]}" >> "$tmp"
        ) \
         && mv "$tmp" "$f"; then
         chmod 600 "$f" 2>/dev/null || true
@@ -528,6 +550,10 @@ meta_set()  { local f tmp key="${2:-}"; f="$(meta_file "${1:-}")" || return 1
     rm -f -- "$tmp"
     _meta_unlock "$f"
     return 1
+}
+meta_set() {
+    [ "$#" -ge 2 ] && [ "$#" -le 3 ] || return 1
+    meta_set_many "$1" "$2" "${3:-}"
 }
 meta_get()  { local f; f="$(meta_file "${1:-}")" || return 1; grep -m1 "^${2:-}=" "$f" 2>/dev/null | cut -d= -f2- ; }
 
@@ -768,9 +794,10 @@ _is_transient_failure() {
     printf '%s' "$tailtxt" | grep -qiE '"isretryable"[[:space:]]*:[[:space:]]*true|network_error|providerresponsestreamerror|stream (error|closed|interrupted)|econnreset|etimedout|enotfound|socket hang up|(^|[^_0-9a-zA-Z])(429|500|502|503|504)($|[^_0-9a-zA-Z])|overloaded|temporarily unavailable|rate.?limit'
 }
 
-# Совет по восстановлению зависит от движка: у opencode и gemini возобновления
-# сессии нет (supports_resume=false), и предлагать им `reply` — значит посылать
-# человека в тупик. Обёртка так и делала после таймаута opencode-задачи.
+# Совет по восстановлению зависит от движка: у gemini возобновления
+# сессии нет (supports_resume=false), и предлагать ему `reply` — значит посылать
+# человека в тупик. Обёртка так и делала после таймаута opencode-задачи
+# до появления provider_opencode_resume_cmd.
 _recovery_hint() {
     local n="$1" eng
     eng="$(meta_get "$n" engine)"
@@ -798,12 +825,9 @@ finish_step() {
     elif [ "$rc" -ne 0 ]; then
         reason="provider exited $rc; inspect the working tree (changes may have landed)"
     fi
-    meta_set "$n" exit "$rc"
-    meta_set "$n" reason "$reason"
     if git -C "$tdir" rev-parse --git-dir >/dev/null 2>&1; then
         nfiles=$(git -C "$tdir" status --porcelain 2>/dev/null | grep -c .)
     fi
-    meta_set "$n" files "$nfiles"
     # Closing window, not just the last line: the last few non-empty lines of the final output
     # block. A question followed by a footer ("PROGRESS.x.md updated.") used to read as done;
     # looks_waiting classifies every line in this window so the question is still caught.
@@ -811,17 +835,16 @@ finish_step() {
     if [ "$rc" = 124 ]; then
         # killed by the step watchdog (_guarded_run). Recorded in meta so `status`/`list`/the GUI
         # can say WHY the task died instead of showing a bare exit code.
-        meta_set "$n" state error
-        meta_set "$n" timeout "$AGENT_TIMEOUT_SEC"
+        meta_set_many "$n" exit "$rc" reason "$reason" files "$nfiles" state error timeout "$AGENT_TIMEOUT_SEC"
         echo "[agent.sh] ⏱ TIMEOUT after ${AGENT_TIMEOUT_SEC}s — task=$n killed (raise AGENT_TIMEOUT_SEC or $(_recovery_hint "$n"))" >&2
     elif [ "$rc" -ne 0 ]; then
-        meta_set "$n" state error
+        meta_set_many "$n" exit "$rc" reason "$reason" files "$nfiles" state error
         echo "[agent.sh] ✖ error exit=$rc  task=$n  reason=$reason  (the turn died; work may have landed — inspect the working tree | log: agent.sh log $n | $(_recovery_hint "$n"))" >&2
     elif looks_waiting "$closing"; then
-        meta_set "$n" state waiting
+        meta_set_many "$n" exit "$rc" reason "$reason" files "$nfiles" state waiting
         echo "[agent.sh] ⏳ the agent appears to have ASKED a question — reply: agent.sh reply $n \"...\"  (question: agent.sh last $n)" >&2
     else
-        meta_set "$n" state done
+        meta_set_many "$n" exit "$rc" reason "$reason" files "$nfiles" state done
         echo "[agent.sh] ✔ done  task=$n  files=$nfiles  (log: agent.sh log $n | result: agent.sh last $n)" >&2
     fi
     render_md "$n"
@@ -848,9 +871,7 @@ provider_dispatch_run() {
     # verbatim above with P_EFFORT always empty, since there's no suffix parsing to find it in.
     [ -n "$effort_override" ] && P_EFFORT="$effort_override"
     if [ -n "$P_MODEL" ]; then
-        meta_set "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}"  # resolved model, not the raw alias
-        meta_set "$n" resolved_model "$P_MODEL"
-        meta_set "$n" effort "$P_EFFORT"
+        meta_set_many "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}" resolved_model "$P_MODEL" effort "$P_EFFORT"
     fi
     local _try=0 attempt_log attempt_sid="" worktree_before="" worktree_after=""
     if git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
@@ -898,7 +919,7 @@ provider_dispatch_run() {
 provider_dispatch_resume() {
     local eng="$1" d="$2" session="$3" answer="$4" n="$5" fn="provider_${1}_resume_cmd"
     # Distinguish the two failures the old single message conflated: an engine nobody implements vs
-    # an engine that exists but has no resume path (supports_resume=false, e.g. opencode/gemini).
+    # an engine that exists but has no resume path (supports_resume=false, e.g. gemini).
     if ! declare -F "$fn" >/dev/null 2>&1; then
         declare -F "provider_${eng}_run_cmd" >/dev/null 2>&1 \
             && die "engine '$eng' does not support resuming a session (supports_resume=false) — use 'run' to start a new task"
@@ -933,9 +954,7 @@ provider_dispatch_resume() {
         fi
         [ "$effort_explicit" = 1 ] && P_EFFORT="$effort_override"
         if [ -n "$P_MODEL" ]; then
-            meta_set "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}"  # resolved model, not the raw alias
-            meta_set "$n" resolved_model "$P_MODEL"
-            meta_set "$n" effort "$P_EFFORT"
+            meta_set_many "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}" resolved_model "$P_MODEL" effort "$P_EFFORT"
         fi
     fi
     _guarded_run "$AGENT_TIMEOUT_SEC" "$fn" "$d" "$session" "$answer" 2>&1 | tee -a "$log" | tail -40
@@ -959,18 +978,17 @@ _do_run_dispatch() {
     _require_engine_run "$engine"   # BEFORE the first .log/.meta write: no ghost tasks
     require_task_name "$name"
     log="$LOGDIR/$name.log"; _secure_state_truncate "$log" || die "cannot create protected task log: $log"
-    meta_set "$name" engine "$engine"; meta_set "$name" model "${model:-default}"
-    meta_set "$name" resolved_model ""; meta_set "$name" effort ""; meta_set "$name" session ""
-    meta_set "$name" dir "$dir"; meta_set "$name" state running; meta_set "$name" reason ""; meta_set "$name" exit ""
     # NB: capture the pid into a variable FIRST. $BASHPID inside a command substitution reports
     # the substitution's own throwaway subshell, so `winpid "$(_winpid "$BASHPID")"` would record
     # the winpid of a process that is already dead -- and gui.py would call the task stalled while
     # the CLI called it running (exactly the bug this pairing is meant to end).
     step_pid="$BASHPID"
-    meta_set "$name" pid "$step_pid"; meta_set "$name" winpid "$(_winpid "$step_pid")"
-    meta_set "$name" started "$(now)"; meta_set "$name" timeout ""   # clear a previous run's marker
-    [ -n "$parent" ] && meta_set "$name" parent "$parent"
-    [ -n "$task_kind" ] && meta_set "$name" kind "$task_kind"
+    local -a initial_meta=(engine "$engine" model "${model:-default}" resolved_model "" effort "" session ""
+        dir "$dir" state running reason "" exit "" pid "$step_pid" winpid "$(_winpid "$step_pid")"
+        started "$(now)" timeout "")
+    [ -n "$parent" ] && initial_meta+=(parent "$parent")
+    [ -n "$task_kind" ] && initial_meta+=(kind "$task_kind")
+    meta_set_many "$name" "${initial_meta[@]}" || die "cannot initialize task metadata: $name"
     echo "[agent.sh] ▶ run task=$name engine=$engine model=${model:-default} dir=$dir" >&2
     hdr run "engine=$engine model=${model:-default} dir=$dir" PROMPT "$prompt" "$log"
     rc=0
@@ -1101,8 +1119,9 @@ except Exception:
         # Validate the engine BEFORE touching .meta. provider_dispatch_resume dies further down, but
         # by then state=running and pid= have already been written, so the dead task shows up as
         # `⚠ stalled` and status helpfully advises re-running the very reply that cannot work. Seen
-        # on opencode: provider.json says supports_resume=false, so there is no
-        # provider_opencode_resume_cmd, and the generic dispatcher blamed it on an "unknown engine".
+        # historically on engines without a resume command (provider.json says supports_resume=false,
+        # e.g. gemini has no provider_gemini_resume_cmd), where the generic dispatcher blamed it
+        # on an "unknown engine".
         declare -F "provider_${engine}_run_cmd" >/dev/null 2>&1 \
             || die "reply: unknown engine '$engine' (task '$tname') — no providers/$engine/provider.sh defines it"
         if ! declare -F "provider_${engine}_resume_cmd" >/dev/null 2>&1; then
@@ -1121,9 +1140,9 @@ except Exception:
             [ "$prepare_rc" = 0 ] || die "reply: provider preflight failed for task '$tname' (exit=$prepare_rc): ${PROVIDER_PREPARE_NOTE:-session writer did not become available}"
         fi
         _secure_state_file "$log" || die "cannot create protected task log: $log"
-        meta_set "$tname" state running; meta_set "$tname" pid "$$"
-        meta_set "$tname" winpid "$(_winpid "$$")"   # $$ is the SHELL's pid, safe inside $( ) — unlike $BASHPID
-        meta_set "$tname" timeout ""; meta_set "$tname" reason ""; meta_set "$tname" exit ""
+        # $$ is the SHELL's pid, safe inside $( ) — unlike $BASHPID.
+        meta_set_many "$tname" state running pid "$$" winpid "$(_winpid "$$")" timeout "" reason "" exit "" \
+            || die "cannot initialize reply metadata: $tname"
         echo "[agent.sh] ▶ reply task=$tname session=$session dir=$dir" >&2
         hdr reply "task=$tname session=$session" ANSWER "$answer" "$log"
         [ -n "$PROVIDER_PREPARE_NOTE" ] && printf '%s\n' "$PROVIDER_PREPARE_NOTE" >> "$log"

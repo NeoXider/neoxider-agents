@@ -8,6 +8,22 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- **Combined gate is green again after the opencode-resume upstream.** `provider.json`
+  now declares `supports_resume: true` and `provider_opencode_resume_cmd` continues
+  sessions with `-s/--session`, so the shell expectation that an opencode reply dies
+  with "cannot resume" is obsolete: the same exact-task-name probe now fails later
+  with "could not find a session id", which still proves exact-name resolution wins
+  over session-id lookup. The assertion was relaxed to `task 'ses_exact'` plus an
+  explicit decoy check; stale `supports_resume=false` comments naming opencode in
+  `agent.sh` and the `test_wipe_false` docstring now name gemini only.
+  Evidence: `tests/test_agent_sh.sh` **325/325** via Git bash,
+  `python -m unittest discover tests` **445 tests OK (3 skipped)**.
+- **Windows installer test no longer runs under WSL bash.** `find_bash()` preferred
+  whatever `bash` was first on PATH, which on these machines is WSL's
+  `system32\bash.exe` — it mangles Windows paths (`C:UsersUser...`) and failed with
+  exit 127. On Windows it now prefers Git bash (`ProgramFiles/Git/bin/bash.exe`)
+  and skips the WSL binary when Git bash exists.
+
 - **An opencode rate limit no longer masquerades as a 30-minute hang.** The free tier answered
   `AI_APICallError: Rate limit exceeded` **one second** into the request; opencode did not exit on the
   stream error, so the step sat until the watchdog killed it. Observed live 2026-09-04 on five tasks
