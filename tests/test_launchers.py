@@ -13,8 +13,40 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def find_bash():
+    # On Windows prefer Git bash over WSL's bash.exe: WSL bash mangles
+    # Windows paths (C:UsersUser...) and cannot run install.sh from a
+    # Windows checkout. shutil.which("bash") finds WSL first on PATH.
+    if os.name == "nt":
+        for base in (
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ):
+            if not base:
+                continue
+            suffix = (
+                Path("Programs/Git/bin/bash.exe")
+                if base == os.environ.get("LOCALAPPDATA")
+                else Path("Git/bin/bash.exe")
+            )
+            candidate = Path(base) / suffix
+            if candidate.is_file():
+                return str(candidate)
     found = shutil.which("bash")
     if found:
+        # Still skip WSL's bash.exe when Git bash exists elsewhere.
+        if os.name == "nt" and found.lower().endswith(
+            ("system32\\bash.exe", "system32/bash.exe")
+        ):
+            for base in (
+                os.environ.get("ProgramFiles"),
+                os.environ.get("ProgramFiles(x86)"),
+            ):
+                if not base:
+                    continue
+                candidate = Path(base) / Path("Git/bin/bash.exe")
+                if candidate.is_file():
+                    return str(candidate)
         return found
     for base in (
         os.environ.get("ProgramFiles"),
