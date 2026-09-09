@@ -6,6 +6,30 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Claude tasks stream by default, so a working agent stops looking like a stuck one.**
+  `claude -p` prints nothing at all until the turn ends, so a worker that spent twenty minutes
+  reading and editing files was byte-for-byte indistinguishable from a hung one — and two healthy
+  workers were killed as `silent` on 2026-09-09 with their edits already on disk and their answer
+  lost. The provider now runs `--output-format stream-json --include-partial-messages` and pipes it
+  through `stream_text_filter.py`, so the log grows with the answer as it is generated and a partial
+  answer survives any ending. Because a long stretch of tool work produces no assistant text either,
+  the filter writes one `[agent-activity] tool <Name>` line per tool call when
+  `AGENT_STREAM_ACTIVITY=1` (set for every background task; the `openai-server` bridge leaves it
+  off). Those lines are progress, not answer: `log` shows them, `last` and `status` strip them.
+  `AGENT_STREAM_TEXT=0` restores the old buffered path.
+- **Claude tasks resume by session id, not by `--continue`.** The stream carries the real
+  `session_id`, so `reply` targets the exact session instead of whatever was last touched in that
+  directory — the failure mode the skill has warned about for parallel workers.
+
+### Fixed
+
+- **The activity heartbeat no longer fires on a run's first event.** The clock started at zero, so
+  the first stream event of every codex/kimi run was more than ten seconds "since the last
+  heartbeat" and printed one — even a one-second answer opened with a progress line the caller then
+  had to strip, and the emitter's own session-id line stopped being the first thing in the output.
+
 ### Fixed
 
 - **Combined gate is green again after the opencode-resume upstream.** `provider.json`

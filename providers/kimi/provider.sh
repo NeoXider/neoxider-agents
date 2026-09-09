@@ -35,7 +35,10 @@ except Exception:
 MARK = "---------- output ----------"
 RAW_LIMIT = 262144
 raw, answers, sid, raw_size = [], [], None, 0
-last_activity = 0.0
+# WHY the clock starts NOW and not at zero: a heartbeat is only meaningful once a turn has
+# been quiet for a while. Starting at zero made the FIRST event of every run print one, so
+# even a one-second answer opened with a progress line the caller then had to strip.
+last_activity = time.monotonic()
 for line in sys.stdin:
     raw.append(line)
     raw_size += len(line.encode("utf-8", "ignore"))
