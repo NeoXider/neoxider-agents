@@ -27,7 +27,7 @@ _provider_kimi_emit() {
         return 0
     fi
     PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
-import json, sys
+import json, sys, time
 try:
     sys.stdin.reconfigure(errors="ignore")
 except Exception:
@@ -35,6 +35,7 @@ except Exception:
 MARK = "---------- output ----------"
 RAW_LIMIT = 262144
 raw, answers, sid, raw_size = [], [], None, 0
+last_activity = 0.0
 for line in sys.stdin:
     raw.append(line)
     raw_size += len(line.encode("utf-8", "ignore"))
@@ -47,12 +48,28 @@ for line in sys.stdin:
         obj = json.loads(s)
     except Exception:
         continue
+    # Throttled activity heartbeat -- see the same block in the codex provider for why: without it
+    # a genuinely long, healthy turn looks identical (zero log growth) to a stuck one to agent.sh
+    # SILENCE_SEC watchdog.
+    tag = obj.get("type") or obj.get("role")
+    now = time.monotonic()
+    if tag and now - last_activity >= 10.0:
+        print("[kimi] activity: %s" % tag, flush=True)
+        last_activity = now
     if obj.get("role") == "assistant" and not obj.get("tool_calls"):
         content = obj.get("content")
         if isinstance(content, str) and content:
             answers.append(content)
     elif obj.get("role") == "meta" and obj.get("type") == "session.resume_hint":
         sid = obj.get("session_id") or sid
+    elif obj.get("type") == "error" or "error" in obj:
+        # Best-effort: exact Kimi Code error-event shape is not documented here, so accept either a
+        # top-level "error" field or type=="error", and unwrap a nested {"message": "..."} if given.
+        err_val = obj.get("error", obj.get("message"))
+        if isinstance(err_val, dict):
+            err_val = err_val.get("message") or json.dumps(err_val, ensure_ascii=False)
+        if err_val:
+            print("AGENT_PROVIDER_ERROR: %s" % " ".join(str(err_val).split()), flush=True)
 if not answers:
     sys.stdout.write("".join(raw))
     raise SystemExit(3)

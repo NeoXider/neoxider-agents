@@ -100,11 +100,28 @@ _provider_claude_invoke() {
     fi
     local stdin_src="/dev/null"; [ -n "$promptfile" ] && stdin_src="$promptfile"
     local rc=0
-    if [ "${AGENT_STREAM_TEXT:-0}" = 1 ]; then
+    # WHY streaming is the DEFAULT here, not only for the bridge: `claude -p` in plain mode prints
+    # NOTHING until the whole turn ends, so a task log stays byte-identical for as long as the model
+    # works -- the no-output watchdog then kills healthy workers as "stuck", and a task that dies for
+    # any reason leaves no partial answer behind to recover. Streaming makes the log grow with the
+    # real answer, and AGENT_STREAM_ACTIVITY adds one marker line per tool call so a long tool-only
+    # stretch (reading and editing files, no assistant text at all) also counts as activity.
+    # The bridge keeps markers OFF: it forwards this stdout verbatim as answer text.
+    # AGENT_STREAM_TEXT=0 forces the old buffered path back.
+    local stream="${AGENT_STREAM_TEXT:-}"
+    if [ -z "$stream" ]; then
+        if [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; then stream=0
+        elif _agent_python; then stream=1
+        else stream=0; fi
+    fi
+    if [ "$stream" = 1 ]; then
         _agent_python || { printf 'agent.sh: claude streaming needs a runnable python interpreter\n' >&2; return 1; }
+        local activity=1
+        [ "${AGENT_STREAM_TEXT:-0}" = 1 ] && activity=0
         ( cd "$dir" && claude -p "$@" "${perm[@]}" \
             --output-format stream-json --include-partial-messages --verbose "${text[@]}" <"$stdin_src" 2>&1 \
-          | PYTHONIOENCODING=utf-8 "$_AGENT_PY" -u "$HERE/stream_text_filter.py" )
+          | PYTHONIOENCODING=utf-8 AGENT_STREAM_ACTIVITY="$activity" \
+            "$_AGENT_PY" -u "$HERE/stream_text_filter.py" )
         rc=$?
     else
         ( cd "$dir" && claude -p "$@" "${perm[@]}" "${text[@]}" <"$stdin_src" 2>&1 )

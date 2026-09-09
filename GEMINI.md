@@ -29,9 +29,23 @@ bash $SK gui                                      # web GUI (stable default port
 
 **Never a silent hang.** Every step runs under `AGENT_TIMEOUT_SEC` (default 1800s): on
 expiry the whole process tree is killed, the log gets a `!! TIMEOUT …` line and the task
-ends `state=error exit=124`. A task that is alive but quiet longer than `AGENT_STALE_SEC`
-(300s) is reported as `running (no output for Nm)` — the same wording in the CLI and the
-GUI, which share one liveness rule. Codex runs are isolated from `~/.codex/config.toml`
+ends `state=error exit=124`. A SEPARATE no-output watchdog, `AGENT_SILENCE_SEC` (default
+600s), kills the tree and ends the task as the distinct `state=silent` if no NEW log
+activity appears for that long — "stuck", as opposed to `error exit=124`'s "took too long
+overall". Claude tasks stream by default (`--output-format stream-json` piped through
+`stream_text_filter.py`) so the log grows while the model works and a partial answer
+survives a killed turn: plain `claude -p` prints nothing until the turn ends, which made
+healthy workers look stuck. That filter also writes one `[agent-activity] tool <Name>`
+line per tool call, so a long tool-only stretch counts as activity; those lines show in
+`log` and are stripped from `last`/`status`. `AGENT_STREAM_TEXT=0` restores the buffered
+path.
+A task that is alive but quiet longer than `AGENT_STALE_SEC` (300s, reporting
+only) is reported as `running (no output for Nm)` — the same wording in the CLI and the
+GUI, which share one liveness rule (the CLI additionally checks for a live ENGINE
+descendant under the wrapper pid before calling a quiet task `idle`, not just `stalled`).
+A provider-level failure (usage/rate limit, quota, auth expiry, unavailable model) ends
+the task immediately as `state=limited`, with the provider's own message in meta
+`reason=`. Codex runs are isolated from `~/.codex/config.toml`
 (`--ignore-user-config`), because the ChatGPT desktop app's config there hangs codex's
 tool router on the first shell command; re-add a specific MCP server with
 `AGENT_CODEX_MCP="name=url"`, or opt out entirely with `AGENT_CODEX_USER_CONFIG=1`.

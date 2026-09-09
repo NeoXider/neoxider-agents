@@ -39,7 +39,7 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   never a silent no-op). Parallel workers each write to their own `<name>.meta/.log`, so a shared
   overview is safe (and concurrency-safe at the file level too — `meta_set`'s read-modify-write is
   wrapped in a portable `mkdir`-based lock).
-- **Task liveness is NOT computed here anymore** — `gui.py`'s `eff_state()` is a literal mirror of
+- **Task liveness is NOT computed here anymore** — `gui.py`'s `eff_state()` is a mirror of
   `agent.sh`'s. It used to have its own rule ("running + log quiet for 5 min = stalled"), which
   contradicted the CLI's ("pid alive = running") on every long task: a codex step buffers its output
   and flushes the log only when it ends, so an honest 10-minute task read as *stalled* in the panel
@@ -53,6 +53,16 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   meaningless to native python). **Never probe with `os.kill(pid, 0)` on Windows** — there it is not a
   probe, it calls `TerminateProcess` and would kill the very task being asked about; `pid_alive()`
   uses `OpenProcess` + `GetExitCodeProcess` instead.
+  **One known divergence:** the CLI's `eff_state` additionally checks for a live ENGINE descendant
+  (not just the wrapper pid) before calling a quiet task `idle` — a wrapper stuck on a blocked read
+  can stay alive long after the real engine process under it has died (see SKILL.md, "Liveness means
+  the ENGINE, not the wrapper"). `gui.py` does not yet do this (no cheap process-tree enumeration on
+  Windows without an extra dependency), so a task the CLI now correctly calls `stalled` may still show
+  as `idle` here until this is ported. Two new terminal states, `limited` (a provider-level failure —
+  usage/rate limit, quota, auth, unavailable model) and `silent` (the no-output watchdog fired), pass
+  through `eff_state`'s `st != "running"` branch unchanged and render with the generic `•` bullet
+  (`activity_emoji`'s fallback) — functional, just without a dedicated icon or the `reason=` text
+  shown inline yet.
 - **Watchdog kills are surfaced, not hidden**: a task killed by `AGENT_TIMEOUT_SEC` carries
   `timeout=<secs>` in its `.meta`, which the chat header shows as a `⏱ killed after Ns` pill and the
   toast reports instead of a bare exit code.
