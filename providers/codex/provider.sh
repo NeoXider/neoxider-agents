@@ -45,14 +45,32 @@ _provider_codex_emit() {
         return 0
     fi
     PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
-import sys, json
+import sys, json, time
 try:
     sys.stdin.reconfigure(errors="ignore")   # codex prints a cp866 OS-notification line that is not UTF-8
 except Exception:
     pass
 MARK = "---------- output ----------"
 RAW_LIMIT = 262144
-sid = None; msg = None; raw = []; raw_size = 0
+sid = None; msg = None; err = None; raw = []; raw_size = 0
+last_activity = 0.0
+def _unwrap_error_message(text):
+    # Some codex error events wrap an upstream error body as a JSON-encoded STRING inside the
+    # outer "message" field -- observed live for a rejected model name, a nested {"error":
+    # {"message": "the real human-readable text"}} one level down. Unwrap that extra layer so
+    # meta reason= carries the human-readable text, not redundant JSON scaffolding. Plain
+    # messages (e.g. a usage-limit string) do not start with "{" and pass through unchanged.
+    # NO APOSTROPHES IN THIS FUNCTION OR ITS COMMENTS -- see the file-level warning above.
+    if isinstance(text, str) and text.strip().startswith("{"):
+        try:
+            inner = json.loads(text)
+        except Exception:
+            return text
+        if isinstance(inner, dict):
+            inner_err = inner.get("error")
+            nested = inner_err.get("message") if isinstance(inner_err, dict) else None
+            return nested or inner.get("message") or text
+    return text
 for line in sys.stdin:
     raw.append(line)
     raw_size += len(line.encode("utf-8", "ignore"))
@@ -66,6 +84,15 @@ for line in sys.stdin:
     except Exception:
         continue
     t = o.get("type")
+    # Throttled activity heartbeat (same pattern as opencode/kimi): codex otherwise writes NOTHING
+    # to the log between the thread.started line and the final answer, even on a genuinely long,
+    # healthy turn -- agent.sh SILENCE_SEC watchdog would misread that quiet stretch as a stuck
+    # engine. A heartbeat every >=10s of real stream activity keeps the log growing for as long as
+    # codex is actually doing something, so silence keeps meaning silence.
+    now = time.monotonic()
+    if t and now - last_activity >= 10.0:
+        print("[codex] activity: %s" % t, flush=True)
+        last_activity = now
     if t == "thread.started" and o.get("thread_id"):
         sid = o["thread_id"]
         # Emit IMMEDIATELY, not after the stream ends. agent.sh greps the live log to fill
@@ -81,12 +108,37 @@ for line in sys.stdin:
         # offending word was the possessive form of opencode. Writing that word again while
         # documenting the fix reintroduced the same break one line lower, so: no apostrophes.
         print("session id: %s" % sid, flush=True)
-    elif t == "item.completed":
+    elif t in ("item.completed", "item.updated", "item.started"):
+        # item.updated/started (not just completed): a turn that fails BEFORE an agent_message ever
+        # reaches "completed" status must not lose the partial text that was already generated --
+        # the last agent.sh reason for adding this: an audit that hit a usage limit mid-turn had
+        # already found a real regression, and that finding was only recoverable before this by
+        # hand-parsing the raw JSON stream.
         it = o.get("item") or {}
         if it.get("type") == "agent_message" and it.get("text") is not None:
             msg = it["text"]
+    elif t == "error":
+        # A provider-level failure (usage limit, quota, auth, unavailable model, ...) arrives as its
+        # own event, distinct from a normal agent_message. Tag it INLINE the moment it is seen (not
+        # only at EOF) so agent.sh watchdog can end the task immediately instead of waiting for codex
+        # itself to exit -- observed live: codex kept running for a while after emitting this.
+        text = o.get("message")
+        if text:
+            err = " ".join(str(_unwrap_error_message(text)).split())   # one line: reason= is a single meta field
+            print("AGENT_PROVIDER_ERROR: %s" % err, flush=True)
+    elif t == "turn.failed":
+        eo = o.get("error") or {}
+        text = eo.get("message") or o.get("message")
+        if text:
+            err = " ".join(str(_unwrap_error_message(text)).split())
+            print("AGENT_PROVIDER_ERROR: %s" % err, flush=True)
 if msg is None:
-    sys.stdout.write("".join(raw))          # surface the raw error stream, nothing clean to show
+    if err:
+        # A clean, short marker beats a raw JSON dump when we already know WHY there is no answer --
+        # agent.sh last/status can show this directly instead of nothing.
+        sys.stdout.write("[no agent message before the provider ended the turn: %s]\n" % err)
+    else:
+        sys.stdout.write("".join(raw))          # surface the raw error stream, nothing clean to show
     raise SystemExit(3)                      # non-zero -> PIPESTATUS[1] guard marks the task failed
 # Defuse the (pathological) case where the answer itself contains a line exactly equal to MARK:
 # a trailing space stops last_output from treating it as the answer-boundary and truncating there.

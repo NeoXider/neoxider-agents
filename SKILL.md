@@ -158,11 +158,14 @@ bash "$SK" gui 8765 --lan --token SECRET              # ...reachable from anothe
 | `AGENT_TIMEOUT_SEC` | `1800` | Wall-clock deadline for ONE step (`run`/`reply`). On expiry the whole process tree is killed, `!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=<N>s and was killed` is appended to the log, and the task ends as `state=error exit=124`. `0` disables it (only for genuinely long jobs). |
 | `AGENT_RETRIES` | `2` | Additional provider attempts after a transient failure. Set `0` when an outer caller (such as the API bridge) owns retries. Attempts stop when retrying could repeat autonomous side effects. |
 | `AGENT_RETRY_DELAY` | `8` | Seconds between safe transient retries. |
-| `AGENT_STALE_SEC` | `300` | Silence after which a still-alive task is reported as `running (no output for Nm)` instead of plain `running` — same wording in the CLI and in the GUI. |
+| `AGENT_STALE_SEC` | `300` | Silence after which a still-alive task is reported as `running (no output for Nm)` instead of plain `running` — same wording in the CLI and in the GUI. Reporting only; does not end the task. |
+| `AGENT_SILENCE_SEC` | `600` | No-output **watchdog**: if a step produces no NEW log activity for this long, the process tree is killed and the task ends as `state=silent` — distinct from `state=error exit=124` (`AGENT_TIMEOUT_SEC`, "took too long overall"): this means "stuck", that means "slow". Measured from the last real stream activity (codex/kimi now emit throttled heartbeats for exactly this reason — see below), not from step start, so a genuinely long-thinking turn is not killed. `0` disables it. |
 | `AGENT_CODEX_USER_CONFIG` | unset | `1` = let codex load `~/.codex/config.toml` again. Off by default **on purpose** — see ["Codex: every shell command hangs"](#codex-every-shell-command-hangs-environment-issue) below. |
 | `AGENT_CODEX_MCP` | unset | Re-add specific MCP servers to the isolated codex config: `AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp,other=http://…"` → repeated `-c mcp_servers.<name>.url="<url>"`. |
 | `AGENT_CODEX_SANDBOX` | `danger-full-access` | Sandbox for normal Codex `run`/`reply` tasks. Set `workspace-write` or `read-only` to opt down. `AGENT_CHAT_ONLY=1` always forces `read-only` and ignores this variable. |
 | `AGENT_CLAUDE_PERMISSION` | `--dangerously-skip-permissions` | Permission arguments for normal Claude `run`/`reply` tasks; for example, set `--permission-mode acceptEdits` to opt down. `AGENT_CHAT_ONLY=1` always uses `--permission-mode acceptEdits` and ignores this variable. |
+| `AGENT_STREAM_TEXT` | unset (= on for claude tasks) | Claude only. Unset means the provider streams (`--output-format stream-json`) so the log grows while the model works; `0` forces the old buffered `claude -p`, which prints nothing until the turn ends and therefore looks silent to the watchdog. `1` is the bridge's mode: stream, but no activity markers. |
+| `AGENT_STREAM_ACTIVITY` | set to `1` by agent.sh for background claude tasks | Adds one `[agent-activity] tool <Name>` line per tool call to the log, so a long tool-only stretch counts as activity for `AGENT_SILENCE_SEC`. Marker lines are stripped from `agent.sh last`/`status`; `agent.sh log` keeps them. |
 | `AGENT_CODEX_DOCTOR_MODEL` / `AGENT_CODEX_DOCTOR_TIMEOUT` | `spark` / `60` | Model and hard deadline for `doctor --deep`'s codex shell check. |
 | `AGENT_GUI_PORT` | `8765` | GUI port (an explicit `gui <port>` argument still wins). |
 | `AGENT_GUI_HOST` | `127.0.0.1` | GUI bind address. Anything but loopback also requires `AGENT_GUI_TOKEN`, or the panel refuses to start. `--lan` / `--localhost` override it. |
@@ -359,10 +362,11 @@ CLI is one new directory, zero edits to `agent.sh`/`gui.py`. Implementation deta
 (tree/i18n/toasts/splitters/caching/path normalization): [docs/GUI.md](docs/GUI.md).
 
 **Task state.** After every step the wrapper sets in `.meta`:
-`state` (`running`/`done`/`waiting`/`error`), the `exit` code, `files` (how many files the agent changed
-per `git status`), `pid` + `winpid`, `started`, and `timeout` (set only when the step watchdog killed the
-task). Icons in `list`/`status`: `▶` running, `▷` running-but-silent, `✔` done, `⏳` waiting,
-`✖` error, `⚠` stalled.
+`state` (`running`/`done`/`waiting`/`error`/`limited`/`silent`), the `exit` code, `files` (how many
+files the agent changed per `git status`), `pid` + `winpid`, `started`, `reason` (human-readable —
+see below), and `timeout`/`silence` (set only when the matching watchdog killed the task). Icons in
+`list`/`status`: `▶` running, `▷` running-but-silent, `✔` done, `⏳` waiting, `✖` error, `⚠` stalled,
+`⛔` limited (provider said no), `◌` silent (no-output watchdog fired).
 
 **Working or stuck (liveness) — one truth for CLI and GUI.** Both `agent.sh status`/`list` and the web
 panel run the SAME state machine (`eff_state` in `agent.sh` and in `gui.py`):
@@ -370,9 +374,12 @@ panel run the SAME state machine (`eff_state` in `agent.sh` and in `gui.py`):
 | Situation | State | Shown as |
 |---|---|---|
 | process dead, meta still says running | `stalled` | `⚠ stalled` → `agent.sh reply <name> "continue"` |
-| process alive, log growing | `running` | `▶ running (alive, pid N)` |
-| process alive, no output for > `AGENT_STALE_SEC` | `idle` | `▷ running (no output for Nm)` |
-| process exited after the provider dropped the turn | `error` | `✖ error` → read the log tail, then resume with `reply` (see below) |
+| wrapper process alive, but no live engine descendant AND log stale | `stalled` | `⚠ stalled` |
+| process alive, engine descendant alive, log growing | `running` | `▶ running (alive, pid N)` |
+| process alive, engine descendant alive, no output for > `AGENT_STALE_SEC` | `idle` | `▷ running (no output for Nm)` |
+| no output for > `AGENT_SILENCE_SEC` — watchdog killed the tree | `silent` | `◌ silent` → read the log, then `reply` or re-run |
+| provider itself ended the turn (usage/rate limit, quota, auth expiry, unavailable model) | `limited` | `⛔ limited` → `reason=` shows the provider's own message verbatim |
+| process exited after the provider dropped the turn for another reason | `error` | `✖ error` → read the log tail, then resume with `reply` (see below) |
 
 `idle` is an honest third state, not an error: a codex/claude step flushes its log only when the step
 ENDS, so silence alone never means dead. This is what used to make the CLI say *running* and the GUI say
@@ -381,17 +388,62 @@ ENDS, so silence alone never means dead. This is what used to make the CLI say *
 `agent.sh clean`, including `clean --purge`, skips `idle` exactly like `running`; otherwise it could
 delete a live quiet process's `.log`/`.meta` while that process was still writing to them.
 
-**No silent forever-hangs.** Every step runs under `AGENT_TIMEOUT_SEC` (default 30 min). On expiry the
-whole process tree is killed — including the native Windows grandchild (`codex.exe` and whatever it
-spawned), which plain `timeout`/`kill` leaves orphaned — the log gets an explicit
-`!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=<N>s and was killed` line, and the task ends as
-`state=error exit=124`. `agent.sh status` then says `⏱ killed by the step watchdog after <N>s` instead of
-pretending the task is still working.
+**Liveness means the ENGINE, not the wrapper.** A wrapper shell can stay `kill -0`-alive forever after
+the real engine process under it has died — stuck on a blocked read (a broken pipe whose write end an
+orphaned grandchild still holds open, or a hung `wait`). Seen live: `agent.sh status` reported
+`running (alive, pid N)` for a wrapper burning 0% CPU with a dead codex process underneath it, and the
+only way to tell was measuring the log's byte growth by hand. `eff_state` now checks for a live engine
+**descendant** (not just the wrapper pid) before calling a quiet task `idle`; with none, it reports
+`stalled` instead. This check is cached to one process-table snapshot per `agent.sh` invocation, so a
+`list`/`clean`/`wait` sweep over many tasks still costs one `ps` fork total, not one per task.
 
-opencode emits throttled activity heartbeats into that log while preserving a clean final-answer block.
-Its unattended run has a 30-minute hard deadline by default; override it with
-`AGENT_OPENCODE_TIMEOUT_SEC=<seconds>` (`0` disables the deadline). opencode stderr is retained with an
-`[opencode]` prefix, so auth/network/plugin failures are diagnosable instead of looking like silent hangs.
+**No silent forever-hangs — two watchdogs, two diagnoses.** Every step runs under `AGENT_TIMEOUT_SEC`
+(default 30 min, "took too long overall") AND `AGENT_SILENCE_SEC` (default 10 min, "produced nothing
+for too long"). Either expiring kills the whole process tree — including the native Windows grandchild
+(`codex.exe` and whatever it spawned), which plain `timeout`/`kill` leaves orphaned. `AGENT_TIMEOUT_SEC`
+ends the task as `state=error exit=124` with a `!! TIMEOUT` log line; `AGENT_SILENCE_SEC` ends it as the
+**distinct** `state=silent exit=125` with a `!! SILENT` log line — `agent.sh status` names which one
+fired (`⏱ killed by the step watchdog after <N>s` vs `… SILENT — no output for <N>s`), because an
+orchestrator should react differently to "stuck" than to "slow". Silence is measured from the last real
+stream activity, never from step start: codex and kimi now emit throttled `[codex]`/`[kimi] activity: …`
+heartbeats into the log for exactly this reason (previously codex wrote nothing at all between the
+`session id:` line and the final answer, which would have made every honest multi-minute turn look
+identical to a stuck one). opencode already emitted these; its own heartbeats are unchanged.
+**claude was the worst offender and is now fixed at the source:** `claude -p` in plain mode prints
+nothing at all until the turn ends, so a worker that spent twenty minutes reading and editing files
+was byte-for-byte indistinguishable from a hung one — and two healthy workers were killed as `silent`
+on 2026-09-09 while their edits were already on disk. The claude provider therefore runs
+`--output-format stream-json --include-partial-messages` by DEFAULT now (not only for the
+`openai-server` bridge) and pipes it through `stream_text_filter.py`, so the log grows with the answer
+as it is generated. Because a long stretch of tool work produces no assistant text either, that filter
+also writes one `[agent-activity] tool <Name>` line per tool call when `AGENT_STREAM_ACTIVITY=1`
+(agent.sh sets it for every background task; the bridge leaves it off). Those marker lines are
+progress, not answer: `agent.sh log` shows them, `agent.sh last` and `status` strip them. Set
+`AGENT_STREAM_TEXT=0` to force the old buffered path back. A side benefit: the stream carries the real
+`session_id`, so claude tasks now resume with `--resume <id>` instead of falling back to `--continue`,
+which picked the wrong session whenever several tasks shared a directory.
+
+**Provider-level failures end the task immediately, not eventually.** A usage/rate limit, quota
+exhaustion, auth expiry, or an unavailable model (`The 'gpt-6-astra' model requires a newer version of
+Codex`) is the PROVIDER talking, not a crash — and used to sit invisible: the task kept showing
+`running` while codex's `--json` stream had already emitted `{"type":"error","message":"..."}` followed
+by `turn.failed`, and the only way to find out was grepping the raw log. Every bundled provider now
+surfaces this the moment it appears in its own stream (codex/kimi tag it inline from their JSON events;
+opencode tags its errfile's rate-limit line; claude/gemini's raw CLI error text is caught by a generic
+fallback) and the task ends at once as `state=limited`, with the provider's own message — verbatim,
+including any reset time — in meta `reason=`, shown inline by `list` and `status` with no log to open.
+opencode's own stderr is retained with an `[opencode]` prefix regardless, so auth/network/plugin
+failures stay diagnosable instead of looking like silent hangs. Known gap: if opencode itself hangs
+AFTER printing a rate-limit error without exiting (its own historical failure mode), that specific
+message is only visible once the run ends — `AGENT_SILENCE_SEC` still ends the task promptly, just as
+`silent` rather than the more specific `limited` in that one sub-case.
+
+**A partial answer survives a failed turn.** When a run ends for ANY reason — success, provider
+limit/failure, the silence watchdog, the timeout, or a crash — `agent.sh last <name>` still returns the
+last real agent output it can find, not emptiness and not a failure banner. codex's stream parser now
+tracks the agent's message from `item.updated`/`item.started` as well as `item.completed`, so text the
+model had already produced before a mid-turn provider failure is not lost; a turn that failed before any
+agent message ever appeared gets a short, clean marker instead of a raw JSON dump.
 
 **Durable checkpoint (survives shutdown).** After every step a `<name>.md` is generated — a
 human-readable markdown file: a header (state/engine/session/dir/changed files/resume command) + the

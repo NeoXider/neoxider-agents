@@ -15,9 +15,24 @@ Event handling (defensive -- unknown event types are simply ignored):
                                                   (older CLI without partial messages)
   result                                       -> print ONLY if nothing was printed at all
                                                   (error/limit banners surface here)
+
+AGENT_STREAM_ACTIVITY=1 additionally emits one compact ACTIVITY MARKER line per tool call,
+prefixed with ACTIVITY_PREFIX. agent.sh sets it for background run/reply tasks and strips those
+lines back out when it reports the agent's answer. WHY it exists: a `claude -p` turn that spends
+twenty minutes reading and editing files emits no assistant TEXT at all, so a log carrying only
+text deltas stays byte-identical while the engine is working hard -- and the no-output watchdog
+then kills a healthy worker as "stuck". The markers make the log grow in step with what the
+engine is actually doing. The bridge (AGENT_STREAM_TEXT=1) leaves them off: its consumer
+forwards the log verbatim as answer text.
 """
 import json
+import os
 import sys
+
+# Opens every activity line. ASCII on purpose: this is written to a console whose encoding
+# is whatever Windows picked, and no real answer text starts a line with it, letting
+# agent.sh strip these by prefix without eating output.
+ACTIVITY_PREFIX = "[agent-activity] "
 
 
 def iter_text_blocks(message):
@@ -26,11 +41,28 @@ def iter_text_blocks(message):
             yield block.get("text") or ""
 
 
-def main(stdin=None, stdout=None):
+def iter_tool_names(message):
+    for block in (message or {}).get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            yield block.get("name") or "tool"
+
+
+def main(stdin=None, stdout=None, activity=None):
     inp = stdin if stdin is not None else sys.stdin
     out = stdout if stdout is not None else sys.stdout
+    if activity is None:
+        activity = os.environ.get("AGENT_STREAM_ACTIVITY") == "1"
     printed_total = 0   # chars printed over the whole run
     printed_msg = 0     # chars printed via deltas for the CURRENT message
+    state = {"at_line_start": True}  # a marker must never land mid-sentence in streamed text
+    seen_session = False
+
+    def mark(note):
+        if not activity:
+            return
+        out.write(("" if state["at_line_start"] else "\n") + ACTIVITY_PREFIX + note + "\n")
+        out.flush()
+        state["at_line_start"] = True
     for raw in inp:
         line = raw.rstrip("\n")
         if not line.strip():
@@ -47,6 +79,15 @@ def main(stdin=None, stdout=None):
         if not isinstance(ev, dict):
             continue
         etype = ev.get("type")
+        if etype == "system" and ev.get("subtype") == "init" and not seen_session:
+            sid = ev.get("session_id") or ""
+            if sid:
+                seen_session = True
+                # WHY this exact spelling: agent.sh sniffs the resumable session out of the
+                # step log with `session id: <id>`. Plain `claude -p` prints no session id at
+                # all, so resume fell back to --continue, which picks the wrong session when
+                # several tasks share a directory. The stream carries the real one.
+                mark("session id: " + sid)
         if etype == "stream_event":
             event = ev.get("event") or {}
             if event.get("type") == "message_start":
@@ -58,6 +99,7 @@ def main(stdin=None, stdout=None):
                     if text:
                         out.write(text)
                         out.flush()
+                        state["at_line_start"] = text.endswith("\n")
                         printed_total += len(text)
                         printed_msg += len(text)
         elif etype == "assistant":
@@ -67,7 +109,10 @@ def main(stdin=None, stdout=None):
             if text and printed_msg == 0:
                 out.write(text)
                 out.flush()
+                state["at_line_start"] = text.endswith("\n")
                 printed_total += len(text)
+            for name in iter_tool_names(ev.get("message")):
+                mark("tool " + name)
             printed_msg = 0
         elif etype == "result":
             # Final aggregate. Normally everything is already printed; error subtypes (limit
@@ -77,7 +122,7 @@ def main(stdin=None, stdout=None):
                 out.write(text)
                 out.flush()
                 printed_total += len(text)
-    if printed_total:
+    if printed_total and not state["at_line_start"]:
         out.write("\n")
         out.flush()
 

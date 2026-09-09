@@ -26,7 +26,7 @@
 #   agent.sh status [name]                                               — state: state/step/changed files/needs reply?
 #   agent.sh list                                                        — task table (state/engine/model/age/files)
 #   agent.sh clean  [--all] [--purge] [-n]                               — delete md clutter (<name>.md +
-#                      PROGRESS.<name>.md) of STOPPED tasks (done/error/stalled). --all also cleans
+#                      PROGRESS.<name>.md) of STOPPED tasks (done/error/stalled/limited/silent). --all also cleans
 #                      waiting tasks; --purge also drops .log/.meta; -n dry-run. Live tasks
 #                      (running AND idle) are never touched.
 #   agent.sh doctor [--deep]                                             — pre-flight: engines + codex limits + claude usage (before fan-out).
@@ -61,8 +61,20 @@
 #                               process tree is killed, the log gets a "!! TIMEOUT" line and the
 #                               task ends as state=error exit=124 — never a silent forever-hang.
 #                               0 disables the watchdog (use for genuinely long jobs).
-#   AGENT_STALE_SEC=300         after this much silence a still-alive task is reported as
+#   AGENT_STALE_SEC=300         after this much silence a still-alive task is REPORTED as
 #                               "running (no output for Nm)" instead of plain running (CLI + GUI).
+#                               Reporting only — does not end the task; see AGENT_SILENCE_SEC below
+#                               for the watchdog that does.
+#   AGENT_SILENCE_SEC=600       no-output watchdog: if a step produces no NEW log activity for this
+#                               long, the process tree is KILLED, the log gets a "!! SILENT" line and
+#                               the task ends as state=silent (distinct from state=error/exit=124,
+#                               which means "hit AGENT_TIMEOUT_SEC" — "stuck" and "took too long" are
+#                               different diagnoses). Measured from the last real activity in the
+#                               stream, not from step start, so a genuinely long-thinking model is not
+#                               mistaken for a stuck one. 0 disables it.
+#   A provider-level failure (usage/rate limit, quota exhaustion, auth expiry, an unavailable model)
+#   ends the task immediately as state=limited, with the provider's own message (verbatim, including
+#   any reset time) in meta reason= — visible in `list`/`status` without opening the log.
 #   AGENT_CODEX_USER_CONFIG=1   let codex load ~/.codex/config.toml again (default: NOT loaded —
 #                               it hangs codex's tool router on machines with the ChatGPT desktop
 #                               app; see providers/codex/provider.sh for the live repro).
@@ -104,6 +116,15 @@ AGENT_TIMEOUT_SEC="${AGENT_TIMEOUT_SEC:-1800}"
 AGENT_STALE_SEC="${AGENT_STALE_SEC:-300}"
 case "$AGENT_TIMEOUT_SEC" in ''|*[!0-9]*) AGENT_TIMEOUT_SEC=1800 ;; esac
 case "$AGENT_STALE_SEC"   in ''|*[!0-9]*) AGENT_STALE_SEC=300   ;; esac
+
+# No-output watchdog (see the header comment above): a step that produces no NEW log activity for
+# this long is KILLED and ends as state=silent, distinct from state=error/exit=124 (AGENT_TIMEOUT_SEC
+# — "took too long overall"). 600s is deliberately well under the 1800s default AGENT_TIMEOUT_SEC, so
+# a truly stuck engine (session id then nothing, ever -- observed live after a codex CLI upgrade)
+# does not sit at state=running for the full half hour, while staying generous enough not to fire on
+# a single long-thinking turn. 0 disables it.
+AGENT_SILENCE_SEC="${AGENT_SILENCE_SEC:-600}"
+case "$AGENT_SILENCE_SEC" in ''|*[!0-9]*) AGENT_SILENCE_SEC=600 ;; esac
 
 die() { echo "agent.sh: $*" >&2; exit 1; }
 now() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -184,6 +205,67 @@ _guarded_run() {
             sleep 1
         done
     fi
+    wait "$child"; rc=$?
+    return "$rc"
+}
+
+# _guarded_run_watched SECS LOG SILENCE_SECS CMD... — same wall-clock deadline/process-tree-kill
+# contract as _guarded_run (used unchanged by callers that have no log to watch, e.g. doctor --deep),
+# PLUS two more reasons to end CMD early, checked on the SAME 1s tick as the deadline:
+#   * a provider-level failure signature appears in LOG (usage/rate limit, quota exhaustion, auth
+#     expiry, model-not-available -- see _extract_provider_reason) -> kill the tree AT ONCE and
+#     return 126. WHY: codex's --json stream can emit {"type":"error","message":"...usage limit...
+#     try again at 6:29 PM."} followed by turn.failed and then keep the process alive for a while
+#     (observed live) -- without this, the task sits at state=running until AGENT_TIMEOUT_SEC finally
+#     expires, and the orchestrator only learns why by grepping the raw log.
+#   * LOG has not grown for SILENCE_SECS -> kill the tree, return 125 ("silent", distinct from 124
+#     "took too long"). SILENCE_SECS=0 disables this check.
+# LOG is being written concurrently by the `tee` downstream of this function in the SAME pipeline
+# (provider_dispatch_run/resume: `_guarded_run_watched ... | tee -a "$log" | tail -40`), so by the
+# time this loop's tick runs, tee has already flushed whatever CMD produced -- no extra plumbing
+# needed to observe it from here.
+_guarded_run_watched() {
+    local secs="${1:-0}" log="${2:-}" silence="${3:-0}"; shift 3
+    case "$secs" in ''|*[!0-9]*) secs=0 ;; esac
+    case "$silence" in ''|*[!0-9]*) silence=0 ;; esac
+    local child rc=0 deadline=0 nowt lm reason
+    ( "$@" ) 2>&1 &
+    child=$!
+    if [ "$secs" -le 0 ] && { [ "$silence" -le 0 ] || [ -z "$log" ]; }; then
+        wait "$child"; rc=$?
+        return "$rc"
+    fi
+    [ "$secs" -gt 0 ] && deadline=$(( $(date +%s) + secs ))
+    while kill -0 "$child" 2>/dev/null; do
+        nowt=$(date +%s)
+        if [ "$deadline" -gt 0 ] && [ "$nowt" -ge "$deadline" ]; then
+            _kill_tree "$child"
+            wait "$child" 2>/dev/null
+            printf '\n!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=%ss and was killed (process tree terminated)\n' "$secs"
+            return 124
+        fi
+        if [ -n "$log" ]; then
+            reason="$(_extract_provider_reason "$log")"
+            if [ -n "$reason" ]; then
+                _kill_tree "$child"
+                wait "$child" 2>/dev/null
+                printf '\n!! PROVIDER FAILURE: %s (process tree terminated)\n' "$reason"
+                return 126
+            fi
+            if [ "$silence" -gt 0 ]; then
+                lm="$(file_mtime "$log")"
+                case "$lm" in ''|*[!0-9]*) lm="" ;; esac
+                if [ -n "$lm" ] && [ $(( nowt - lm )) -ge "$silence" ]; then
+                    _kill_tree "$child"
+                    wait "$child" 2>/dev/null
+                    printf '\n!! SILENT: no output for %ss (AGENT_SILENCE_SEC=%ss) — engine appears stuck, process tree terminated\n' \
+                        "$(( nowt - lm ))" "$silence"
+                    return 125
+                fi
+            fi
+        fi
+        sleep 1
+    done
     wait "$child"; rc=$?
     return "$rc"
 }
@@ -622,6 +704,50 @@ latest_task() { local f; f="$(_latest_file meta)"; [ -n "$f" ] && basename "$f" 
 
 is_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
+# --- cached process table, for BULK liveness sweeps only ------------------
+# _child_pids (above) forks `ps` (+ awk on the git-bash fallback path) on EVERY call -- fine for a
+# single lookup (e.g. _kill_tree acting on one task) but ruinous for `list`/`clean`/`wait` sweeping
+# dozens-to-hundreds of tasks: this file's own history (see the "БАГФИКС list-вис" comments earlier)
+# already got bitten twice by exactly this per-row-fork trap. _load_proc_table forks `ps` ONCE per
+# agent.sh invocation and builds a PID -> children map in pure bash; _has_live_descendant then does
+# zero-fork array lookups (is_alive/`kill -0` is a bash builtin) no matter how many tasks it checks.
+# Never used by _kill_tree, which needs a FRESH table at the moment it kills, not a cached one.
+declare -A _PROC_CHILDREN
+_PROC_TABLE_LOADED=0
+_load_proc_table() {
+    [ "$_PROC_TABLE_LOADED" = 1 ] && return 0
+    _PROC_TABLE_LOADED=1
+    local raw p pp
+    if ps -eo pid=,ppid= >/dev/null 2>&1; then
+        raw="$(ps -eo pid=,ppid= 2>/dev/null)"
+    else
+        raw="$(ps 2>/dev/null | awk 'NR>1{print $1, $2}')"
+    fi
+    while read -r p pp; do
+        case "$p" in ''|*[!0-9]*) continue ;; esac
+        case "$pp" in ''|*[!0-9]*) continue ;; esac
+        _PROC_CHILDREN["$pp"]="${_PROC_CHILDREN[$pp]:-}$p "
+    done <<< "$raw"
+}
+
+# _has_live_descendant PID -> true if PID has any live descendant process (recursively), from the
+# cached table above. Liveness of the WRAPPER shell is not liveness of the ENGINE it launched: a
+# wrapper stuck on a blocked read (a broken pipe whose write end an orphaned grandchild still holds
+# open, or a hung `wait`) stays `kill -0`-alive forever even after the real codex.exe/node.exe/etc.
+# child has died -- observed live as `agent.sh status` printing "running (alive, pid N)" for a
+# wrapper burning 0% CPU with a dead engine underneath it. Used by eff_state()/`list`'s inline copy
+# to tell the two apart.
+_has_live_descendant() {
+    local pid="${1:-}" c
+    [ -n "$pid" ] || return 1
+    _load_proc_table
+    for c in ${_PROC_CHILDREN[$pid]:-}; do
+        is_alive "$c" && return 0
+        _has_live_descendant "$c" && return 0
+    done
+    return 1
+}
+
 # file_mtime PATH -> mtime as epoch seconds (empty if missing/unreadable).
 # GNU stat (-c %Y) first, BSD/macOS stat (-f %m) as fallback.
 file_mtime() {
@@ -658,7 +784,12 @@ eff_state() {
     if [ -n "$pid" ] && ! is_alive "$pid"; then echo stalled; return; fi
     idle="$(log_idle_sec "$n")"
     if [ -n "$idle" ] && [ "$idle" -gt "$AGENT_STALE_SEC" ]; then
-        if [ -z "$pid" ]; then echo stalled; else echo idle; fi
+        # Wrapper alive is not enough once it has gone quiet this long: without a live engine
+        # descendant underneath it, it is not "idle" (still working, just quiet) but dead weight
+        # that outlived the process that mattered (see _has_live_descendant).
+        if [ -z "$pid" ]; then echo stalled;
+        elif _has_live_descendant "$pid"; then echo idle;
+        else echo stalled; fi
     else
         echo running
     fi
@@ -670,14 +801,20 @@ state_label() {
         *)    printf '%s' "$1" ;;
     esac
 }
-state_icon() { case "$1" in running) echo "▶";; idle) echo "▷";; done) echo "✔";; waiting) echo "⏳";; error) echo "✖";; stalled) echo "⚠";; *) echo "•";; esac; }
+state_icon() { case "$1" in running) echo "▶";; idle) echo "▷";; done) echo "✔";; waiting) echo "⏳";; error) echo "✖";; stalled) echo "⚠";; limited) echo "⛔";; silent) echo "◌";; *) echo "•";; esac; }
 
 hdr() { # kind "info" LABEL "text" logfile
     { echo; echo "========== [$1] $(now) | $2 =========="; echo "> $3:"; echo "$4";
       echo "---------- output ----------"; } >> "$5"; }
 
-# last output block (after the last separator)
-last_output() { awk '/^---------- output ----------$/{buf=""; next}{buf=buf $0 ORS} END{printf "%s", buf}' "$1"; }
+# last output block (after the last separator), with the streaming ACTIVITY markers dropped:
+# they exist so a tool-only stretch still grows the log for the liveness watchdog, and they are
+# progress, not answer. `agent.sh log` still shows them — that is where progress belongs.
+last_output() {
+    awk '/^---------- output ----------$/{buf=""; next}
+         /^\[agent-activity\] /{next}
+         {buf=buf $0 ORS} END{printf "%s", buf}' "$1"
+}
 
 # durable md checkpoint of the task: header from meta + the whole thread in markdown.
 # Survives a shutdown; the task can be resumed from it (or from the codex/claude session).
@@ -693,6 +830,8 @@ render_md() {
         echo "- **Session:** \`$(meta_get "$n" session)\`"
         echo "- **Exit:** $(meta_get "$n" exit)  **Changed files:** $(meta_get "$n" files)"
         [ "$st" = error ] && echo "- **Failure:** Turn died; work may or may not have landed. Inspect the working tree. Reason: ${reason:-provider failure}"
+        [ "$st" = limited ] && echo "- **Provider limit/failure:** The provider itself ended the turn (usage limit, quota, auth, or an unavailable model) — not a crash. Reason: ${reason:-see log}"
+        [ "$st" = silent ] && echo "- **Silent watchdog:** No output for ${AGENT_SILENCE_SEC}s (AGENT_SILENCE_SEC) — the engine looked stuck and was killed. Inspect the working tree."
         echo "- **Started:** $(meta_get "$n" started)  **Updated:** $(now)"
         echo "- **Resume:** \`agent.sh reply $n \"...\"\`  |  **Log:** \`agent.sh log $n\`"
         awk '
@@ -794,6 +933,35 @@ _is_transient_failure() {
     printf '%s' "$tailtxt" | grep -qiE '"isretryable"[[:space:]]*:[[:space:]]*true|network_error|providerresponsestreamerror|stream (error|closed|interrupted)|econnreset|etimedout|enotfound|socket hang up|(^|[^_0-9a-zA-Z])(429|500|502|503|504)($|[^_0-9a-zA-Z])|overloaded|temporarily unavailable|rate.?limit'
 }
 
+# --- provider-level failure detection (usage/rate limit, quota, auth expiry, model unavailable) ---
+# Every engine spells its own death differently (see providers/*/provider.sh):
+#   * codex's --json stream and kimi's --output-format stream-json are parsed by their own
+#     _provider_*_emit filters, which -- the moment they see the provider's own error/turn.failed
+#     event -- print it INLINE as "AGENT_PROVIDER_ERROR: <message>" (flush=True), so the exact text,
+#     including any reset time, reaches the log without this function re-parsing JSON.
+#   * opencode tags its errfile's rate-limit line the same way (see _provider_opencode_invoke).
+#   * claude/gemini print their own CLI error text straight into the log (no JSON layer) -- the
+#     generic regex below catches those directly.
+# Only consulted when a step has already failed (rc != 0): running it on a SUCCESSFUL step would
+# misclassify a clean answer that merely discusses one of these words (e.g. an audit finding that
+# quotes "rate limit" from the code it reviewed) as a provider failure.
+_PROVIDER_FAILURE_TAG='AGENT_PROVIDER_ERROR: '
+_PROVIDER_FAILURE_RE='usage limit|rate.?limit|quota exceeded|insufficient (quota|credit)|payment required|requires a newer version of|model[^.?!]*(not found|unavailable|unknown)|unauthoriz|invalid api key|authentication (failed|error)|token expired|session expired|not logged in|please (run|log ?in)'
+
+# _extract_provider_reason LOG -> the provider's own failure message (verbatim, one line, reset
+# time intact if it gave one), or empty if the tail of LOG shows no such signature.
+_extract_provider_reason() {
+    local log="${1:-}" chunk line
+    [ -n "$log" ] && [ -f "$log" ] || return 0
+    chunk="$(tail -c 8000 "$log" 2>/dev/null)"
+    line="$(printf '%s\n' "$chunk" | grep -aF "$_PROVIDER_FAILURE_TAG" | tail -1)"
+    if [ -n "$line" ]; then
+        printf '%s\n' "${line#*"$_PROVIDER_FAILURE_TAG"}"
+        return 0
+    fi
+    printf '%s\n' "$chunk" | grep -aiE "$_PROVIDER_FAILURE_RE" | tail -1
+}
+
 # Совет по восстановлению зависит от движка: у gemini возобновления
 # сессии нет (supports_resume=false), и предлагать ему `reply` — значит посылать
 # человека в тупик. Обёртка так и делала после таймаута opencode-задачи
@@ -810,18 +978,26 @@ _recovery_hint() {
 
 # after a step finishes: exit code, changed files, state, question detection
 finish_step() {
-    local n="$1" rc="$2" log tdir nfiles=0 closing output nonblank reason=""
+    local n="$1" rc="$2" log tdir nfiles=0 closing output nonblank reason="" provider_reason="" is_conflict=0
     log="$LOGDIR/$n.log"; tdir="$(meta_get "$n" dir)"; [ -n "$tdir" ] || tdir="$dir"
     output="$(last_output "$log")"
     nonblank="$(printf '%s' "$output" | tr -d '[:space:]')"
-    if printf '%s' "$output" | _has_thread_writer_conflict; then
+    printf '%s' "$output" | _has_thread_writer_conflict && is_conflict=1
+    # A provider-level failure is only meaningful once the step has actually failed (see
+    # _extract_provider_reason's own comment on why rc=0 is never checked here).
+    [ "$rc" -ne 0 ] && provider_reason="$(_extract_provider_reason "$log")"
+    if [ "$is_conflict" = 1 ]; then
         [ "$rc" -ne 0 ] || rc=3
         reason="Codex thread writer conflict after bounded wait/retry; inspect the working tree (changes may have landed)"
+    elif [ -n "$provider_reason" ]; then
+        reason="$provider_reason"
     elif [ -z "$nonblank" ]; then
         [ "$rc" -ne 0 ] || rc=3
         reason="provider returned an empty answer; inspect the working tree (changes may have landed)"
     elif [ "$rc" = 124 ]; then
         reason="step watchdog timeout; inspect the working tree (changes may have landed)"
+    elif [ "$rc" = 125 ]; then
+        reason="no output for ${AGENT_SILENCE_SEC}s (AGENT_SILENCE_SEC) — the engine appears to be stuck; inspect the working tree (changes may have landed)"
     elif [ "$rc" -ne 0 ]; then
         reason="provider exited $rc; inspect the working tree (changes may have landed)"
     fi
@@ -832,11 +1008,24 @@ finish_step() {
     # block. A question followed by a footer ("PROGRESS.x.md updated.") used to read as done;
     # looks_waiting classifies every line in this window so the question is still caught.
     closing="$(printf '%s' "$output" | grep -v '^[[:space:]]*$' | tail -6)"
-    if [ "$rc" = 124 ]; then
-        # killed by the step watchdog (_guarded_run). Recorded in meta so `status`/`list`/the GUI
-        # can say WHY the task died instead of showing a bare exit code.
+    if [ "$is_conflict" = 1 ]; then
+        meta_set_many "$n" exit "$rc" reason "$reason" files "$nfiles" state error
+        echo "[agent.sh] ✖ error exit=$rc  task=$n  reason=$reason  (the turn died; work may have landed — inspect the working tree | log: agent.sh log $n | $(_recovery_hint "$n"))" >&2
+    elif [ -n "$provider_reason" ]; then
+        # The PROVIDER ended the turn (not a crash, not our watchdog) -- a distinct state so this
+        # is impossible to mistake for a healthy run or for an ordinary crash at a glance.
+        meta_set_many "$n" exit "$rc" reason "$reason" files "$nfiles" state limited
+        echo "[agent.sh] ⛔ PROVIDER LIMIT/FAILURE  task=$n  reason=$reason  (log: agent.sh log $n | last answer: agent.sh last $n | $(_recovery_hint "$n"))" >&2
+    elif [ "$rc" = 124 ]; then
+        # killed by the step watchdog (_guarded_run/_guarded_run_watched). Recorded in meta so
+        # `status`/`list`/the GUI can say WHY the task died instead of showing a bare exit code.
         meta_set_many "$n" exit "$rc" reason "$reason" files "$nfiles" state error timeout "$AGENT_TIMEOUT_SEC"
         echo "[agent.sh] ⏱ TIMEOUT after ${AGENT_TIMEOUT_SEC}s — task=$n killed (raise AGENT_TIMEOUT_SEC or $(_recovery_hint "$n"))" >&2
+    elif [ "$rc" = 125 ]; then
+        # killed by the no-output watchdog -- distinct from 124 ("took too long overall"): this
+        # means "stuck", 124 means "slow". The orchestrator acts differently on each.
+        meta_set_many "$n" exit "$rc" reason "$reason" files "$nfiles" state silent silence "$AGENT_SILENCE_SEC"
+        echo "[agent.sh] … SILENT after ${AGENT_SILENCE_SEC}s of no output — task=$n killed (raise AGENT_SILENCE_SEC, or $(_recovery_hint "$n"))" >&2
     elif [ "$rc" -ne 0 ]; then
         meta_set_many "$n" exit "$rc" reason "$reason" files "$nfiles" state error
         echo "[agent.sh] ✖ error exit=$rc  task=$n  reason=$reason  (the turn died; work may have landed — inspect the working tree | log: agent.sh log $n | $(_recovery_hint "$n"))" >&2
@@ -884,14 +1073,17 @@ provider_dispatch_run() {
             rc=1
             break
         fi
-        _guarded_run "$AGENT_TIMEOUT_SEC" "$fn" "$d" "$P_MODEL" "$P_EFFORT" "$prompt" 2>&1 \
+        _guarded_run_watched "$AGENT_TIMEOUT_SEC" "$log" "$AGENT_SILENCE_SEC" "$fn" "$d" "$P_MODEL" "$P_EFFORT" "$prompt" 2>&1 \
             | tee -a "$log" "$attempt_log" | tail -40
         rc=${PIPESTATUS[0]}
         attempt_sid="$(grep -m1 -oE 'session id: [[:alnum:]_.-]+' "$attempt_log" 2>/dev/null | cut -d' ' -f3)"
         if [ "$rc" = 0 ] && [ -n "$attempt_sid" ]; then
             meta_set "$n" session "$attempt_sid"
         fi
-        { [ "$rc" = 0 ] || [ "$rc" = 124 ]; } && break
+        # 124/125/126 are all OUR OWN watchdogs ending the step for a reason already recorded in the
+        # log (took too long / silent / provider said no) -- never retry those, only the provider's
+        # own transient failures (network blips etc.), which _is_transient_failure classifies below.
+        { [ "$rc" = 0 ] || [ "$rc" = 124 ] || [ "$rc" = 125 ] || [ "$rc" = 126 ]; } && break
         [ "$_try" -ge "$AGENT_RETRIES" ] && break
         _is_transient_failure "$attempt_log" || break
         # A provider session means the failed attempt may already have executed tools. Starting a
@@ -957,8 +1149,8 @@ provider_dispatch_resume() {
             meta_set_many "$n" model "$P_MODEL${P_EFFORT:+-$P_EFFORT}" resolved_model "$P_MODEL" effort "$P_EFFORT"
         fi
     fi
-    _guarded_run "$AGENT_TIMEOUT_SEC" "$fn" "$d" "$session" "$answer" 2>&1 | tee -a "$log" | tail -40
-    rc=${PIPESTATUS[0]}   # 124 = killed by the step watchdog (see _guarded_run / finish_step)
+    _guarded_run_watched "$AGENT_TIMEOUT_SEC" "$log" "$AGENT_SILENCE_SEC" "$fn" "$d" "$session" "$answer" 2>&1 | tee -a "$log" | tail -40
+    rc=${PIPESTATUS[0]}   # 124=timeout 125=silent 126=provider failure (see _guarded_run_watched / finish_step)
 }
 
 # _require_engine_run ENGINE — die if no provider implements this engine's run command. This MUST
@@ -1248,8 +1440,10 @@ except Exception:
         [ "$st" = running ]  && echo "   ⟳ still working — follow: agent.sh log -f $n"
         # honest third state: the process IS alive, it just has not written anything for a while
         # (a codex/claude step only flushes its log when the step ends). Not an error by itself.
-        [ "$st" = idle ]     && echo "   ⟳ process alive but SILENT for $(( ${idle_s:-0} / 60 ))m — it is still working unless AGENT_TIMEOUT_SEC(${AGENT_TIMEOUT_SEC}s) kills it; follow: agent.sh log -f $n"
+        [ "$st" = idle ]     && echo "   ⟳ process alive but SILENT for $(( ${idle_s:-0} / 60 ))m — it is still working unless AGENT_SILENCE_SEC(${AGENT_SILENCE_SEC}s) or AGENT_TIMEOUT_SEC(${AGENT_TIMEOUT_SEC}s) kills it; follow: agent.sh log -f $n"
         [ "$st" = error ]    && echo "   ✖ TURN DIED — work may or may not have landed; inspect the working tree. reason=${reason:-provider failure}"
+        [ "$st" = limited ]  && echo "   ⛔ PROVIDER LIMIT/FAILURE — the provider itself ended the turn (not a crash). reason=${reason:-see log}"
+        [ "$st" = silent ]   && echo "   … SILENT — no output for $(meta_get "$n" silence)s (AGENT_SILENCE_SEC) killed it; the engine may be stuck. reason=${reason:-–}"
         [ -n "$(meta_get "$n" timeout)" ] && [ "$st" = error ] && \
             echo "   ⏱ killed by the step watchdog after $(meta_get "$n" timeout)s (AGENT_TIMEOUT_SEC) — raise it, or $(_recovery_hint "$n")"
         if [ -n "$d" ] && [ "${nf:-0}" != 0 ] && git -C "$d" rev-parse --git-dir >/dev/null 2>&1; then
@@ -1290,15 +1484,21 @@ except Exception:
             done < "$m" 2>/dev/null
             if [ ! -f "$m" ] || [ ! -r "$m" ] || { [ -z "$e" ] && [ -z "$st" ] && [ -z "$mo" ]; }; then
                 detail=""
-                [ "$st" = error ] && detail="turn died; inspect tree — ${reason:-provider failure}"
+                case "$st" in
+                    error)   detail="turn died; inspect tree — ${reason:-provider failure}" ;;
+                    limited) detail="provider limit/failure — ${reason:-see log}" ;;
+                    silent)  detail="no output — ${reason:-silence watchdog fired}" ;;
+                esac
                 [ -n "$detail" ] || detail="unreadable .meta"
                 printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %-8s %s\n' "•" "$n" "${st:-?}" "${e:-?}" "${mo:-?}" "?" "${nf:-0}" "${s:0:8}" "$detail"
                 detail=""; continue
             fi
             # Тот же автомат, что eff_state(): running+pid мёртв -> stalled;
-            # running+жив+лог молчит дольше AGENT_STALE_SEC -> idle/stalled.
-            # Дублируется здесь ради скорости (без форков); при правке eff_state
-            # править и тут.
+            # running+жив+лог молчит дольше AGENT_STALE_SEC -> idle, НО только если
+            # у обёртки есть живой потомок-движок (_has_live_descendant) — иначе
+            # stalled: обёртка жива, а движок под ней уже мёртв.
+            # Дублируется здесь ради скорости (без форков в общем случае); при
+            # правке eff_state править и тут.
             est="$st"
             if [ "$est" = running ]; then
                 if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then est="stalled";
@@ -1307,13 +1507,19 @@ except Exception:
                     [ -f "$LOGDIR/$n.log" ] && list_lm="$(file_mtime "$LOGDIR/$n.log")"
                     case "$list_lm" in ''|*[!0-9]*) list_lm="" ;; esac
                     if [ -n "$list_lm" ] && [ "$(( list_now - list_lm ))" -gt "$AGENT_STALE_SEC" ]; then
-                        if [ -z "$pid" ]; then est="stalled"; else est="idle"; fi
+                        if [ -z "$pid" ]; then est="stalled";
+                        elif _has_live_descendant "$pid"; then est="idle";
+                        else est="stalled"; fi
                     else est="running"; fi
                 fi
             fi
             detail=""
-            [ "$est" = error ] && detail="turn died; inspect tree — ${reason:-provider failure}"
-            case "$est" in running) ic="▶";; idle) ic="▷";; done) ic="✔";; waiting) ic="⏳";; error) ic="✖";; stalled) ic="⚠";; *) ic="•";; esac
+            case "$est" in
+                error)   detail="turn died; inspect tree — ${reason:-provider failure}" ;;
+                limited) detail="provider limit/failure — ${reason:-see log}" ;;
+                silent)  detail="no output — ${reason:-silence watchdog fired}" ;;
+            esac
+            case "$est" in running) ic="▶";; idle) ic="▷";; done) ic="✔";; waiting) ic="⏳";; error) ic="✖";; stalled) ic="⚠";; limited) ic="⛔";; silent) ic="◌";; *) ic="•";; esac
             age="$(( (list_now - fm) / 60 ))m"
             printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %-8s %s\n' "$ic" "$n" "${est:-?}" "${e:-?}" "${mo:-?}" "$age" "${nf:-0}" "${s:0:8}" "$detail"
         done
@@ -1531,7 +1737,10 @@ PY
     clean|prune)
         # Remove md clutter left by STOPPED tasks: the generated <name>.md thread in LOGDIR and the
         # agent's per-task PROGRESS.<name>.md in its working dir. Only stopped tasks (done/error/
-        # stalled) are touched; live (running/idle) and waiting (needs-reply) tasks are left intact. Only the
+        # stalled/limited/silent) are touched; live (running/idle) and waiting (needs-reply) tasks are
+        # left intact -- there is no explicit case for limited/silent below because the switch only
+        # EXCLUDES running/idle/waiting, so every other state (including these two) already falls
+        # through to "clean it". Only the
         # unambiguously agent-generated PROGRESS.<name>.md is removed -- a generic PROGRESS.md is
         # never touched.
         #   --all     also clean waiting (needs-reply) tasks

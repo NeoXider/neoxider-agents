@@ -183,15 +183,20 @@ _provider_opencode_invoke() {
     fi
     statuses=("${PIPESTATUS[@]}")
     [ -n "$promptfile" ] && rm -f "$promptfile"
-    local rate_limited=""
+    local rate_limited="" rate_line=""
     if [ -s "$errfile" ]; then
         # Read the reason BEFORE the file is removed: on a timeout the exit code alone says nothing
         # about why, and "rate limit" is the one cause an orchestrator must not mistake for a broken
         # task — retrying it immediately just burns another watchdog window.
-        grep -qiE 'rate limit|429|quota' "$errfile" && rate_limited=1
+        rate_line="$(grep -aiE 'rate limit|429|quota' "$errfile" | tail -1)"
+        [ -n "$rate_line" ] && rate_limited=1
         while IFS= read -r line; do printf '[opencode] %s\n' "$line" >&2; done <"$errfile"
     fi
     rm -f "$errfile"
+    # Tagged the same way codex/kimi tag their own provider errors (see agent.sh's
+    # _extract_provider_reason): this is what turns a generic error/timeout into agent.sh's distinct
+    # state=limited, with the CLI's own message in meta reason= instead of just this stderr line.
+    [ -n "$rate_limited" ] && printf 'AGENT_PROVIDER_ERROR: %s\n' "$rate_line" >&2
     if [ "${statuses[0]}" -eq 124 ]; then
         if [ -n "$rate_limited" ]; then
             printf '[opencode] provider rate limit hit; opencode did not exit on it and the step ran out its %ss budget. Wait for the limit to reset or switch engine/model — this is NOT a task failure.\n' \
