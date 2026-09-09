@@ -53,7 +53,10 @@ except Exception:
 MARK = "---------- output ----------"
 RAW_LIMIT = 262144
 sid = None; msg = None; err = None; raw = []; raw_size = 0
-last_activity = 0.0
+# WHY the clock starts NOW and not at zero: a heartbeat is only meaningful once a turn has
+# been quiet for a while. Starting at zero made the FIRST event of every run print one, so
+# even a one-second answer opened with a progress line the caller then had to strip.
+last_activity = time.monotonic()
 def _unwrap_error_message(text):
     # Some codex error events wrap an upstream error body as a JSON-encoded STRING inside the
     # outer "message" field -- observed live for a rejected model name, a nested {"error":
