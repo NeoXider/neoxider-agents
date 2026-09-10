@@ -428,15 +428,27 @@ exhaustion, auth expiry, or an unavailable model (`The 'gpt-6-astra' model requi
 Codex`) is the PROVIDER talking, not a crash — and used to sit invisible: the task kept showing
 `running` while codex's `--json` stream had already emitted `{"type":"error","message":"..."}` followed
 by `turn.failed`, and the only way to find out was grepping the raw log. Every bundled provider now
-surfaces this the moment it appears in its own stream (codex/kimi tag it inline from their JSON events;
-opencode tags its errfile's rate-limit line; claude/gemini's raw CLI error text is caught by a generic
-fallback) and the task ends at once as `state=limited`, with the provider's own message — verbatim,
-including any reset time — in meta `reason=`, shown inline by `list` and `status` with no log to open.
-opencode's own stderr is retained with an `[opencode]` prefix regardless, so auth/network/plugin
-failures stay diagnosable instead of looking like silent hangs. Known gap: if opencode itself hangs
-AFTER printing a rate-limit error without exiting (its own historical failure mode), that specific
-message is only visible once the run ends — `AGENT_SILENCE_SEC` still ends the task promptly, just as
-`silent` rather than the more specific `limited` in that one sub-case.
+surfaces this from its own stream and the task ends as `state=limited`, with the provider's own message
+— verbatim, including any reset time — in meta `reason=`, shown inline by `list` and `status` with no
+log to open. **What is scanned, and when.** Only the ENGINE's output: the part of the log after the last
+`---------- output ----------` line — never the run header or the echoed `> PROMPT:`/`> ANSWER:` text
+above it (an echoed line that happens to equal the marker is written with a trailing space, so a prompt
+cannot forge that boundary; `reply` appends its own echo + marker, so it is cut off by the same rule).
+While the step is still RUNNING, the 1-second watchdog trusts only the explicit `AGENT_PROVIDER_ERROR:`
+tag that the codex and kimi stream filters print the moment they see the provider's own error event
+(opencode tags its stderr rate-limit line the same way, but only once its CLI has exited); wording alone
+never ends a live step, because live there is no way to tell a provider banner from the model's own
+words — the previous behaviour scanned the log's tail from the first tick, prompt echo included, and on
+2026-09-10 a code-review prompt that mentioned "a rate limiter disabled in a place that also serves
+other groups" was killed two seconds in as `limited`, with that sentence reported as the provider's
+message. Once the step has FAILED (rc ≠ 0), a generic regex over the same engine-output window also
+recognises plain CLI error text — claude/gemini print theirs without a tag (`There's an issue with the
+selected model (...)`, `Not logged in`), kimi's `403 You've reached your monthly usage limit` — and
+labels the task `limited` instead of a bare `error`. opencode's own stderr is retained with an
+`[opencode]` prefix regardless, so auth/network/plugin failures stay diagnosable instead of looking
+like silent hangs. Known gap: an engine that prints a limit error WITHOUT the tag and then hangs
+instead of exiting (opencode's historical failure mode; never observed for claude/gemini) is ended by
+`AGENT_SILENCE_SEC` as `silent`, not `limited` — the message is in the log.
 
 **A partial answer survives a failed turn.** When a run ends for ANY reason — success, provider
 limit/failure, the silence watchdog, the timeout, or a crash — `agent.sh last <name>` still returns the

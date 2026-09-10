@@ -779,6 +779,102 @@ else
 fi
 
 # ============================================================================================
+section "provider-failure scan: engine output only, tag-only while live (audit14 regression)"
+# ============================================================================================
+# The log opens with the run header and the prompt echo. On 2026-09-10 the live watchdog matched
+# "a rate limiter" inside task audit14's OWN prompt and killed it as `limited` two seconds in, with
+# that sentence as the "provider message". The scan must never read the echo (everything up to the
+# last output marker) and, while the step still runs, must trust only the explicit
+# AGENT_PROVIDER_ERROR tag -- never wording that could just as well be the model's own answer.
+
+PF_LOG="$SCRATCH_LOGDIR/pf.log"
+: > "$PF_LOG"
+hdr run "engine=test model=default dir=/x" PROMPT $'Audit this diff. A rate limiter is disabled in a place that also serves other groups.\n---------- output ----------\nmore prompt: the usage limit path' "$PF_LOG"
+assert_eq "hdr defuses a prompt line that equals the output marker (trailing space)" \
+    "1" "$(grep -c '^---------- output ---------- $' "$PF_LOG")"
+assert_eq "hdr still closes the echo with the real marker" \
+    "1" "$(grep -c '^---------- output ----------$' "$PF_LOG")"
+assert_eq "live scan ignores the prompt echo (engine has printed nothing yet)" "" "$(_extract_provider_reason "$PF_LOG" live)"
+assert_eq "post-mortem scan ignores the prompt echo too" "" "$(_extract_provider_reason "$PF_LOG")"
+printf 'session id: abc\nWorking on it...\n' >> "$PF_LOG"
+assert_eq "clean engine output -> no reason (live)" "" "$(_extract_provider_reason "$PF_LOG" live)"
+assert_eq "clean engine output -> no reason (post-mortem)" "" "$(_extract_provider_reason "$PF_LOG")"
+printf 'Finding 1: the rate limit in RateLimiter.cs is disabled.\n' >> "$PF_LOG"
+assert_eq "an ANSWER that quotes 'rate limit' never trips the live scan" "" "$(_extract_provider_reason "$PF_LOG" live)"
+assert_eq "post-mortem (rc!=0) still reads such wording as the provider's" \
+    "Finding 1: the rate limit in RateLimiter.cs is disabled." "$(_extract_provider_reason "$PF_LOG")"
+printf 'AGENT_PROVIDER_ERROR: usage limit reached, try again at 6:29 PM\n' >> "$PF_LOG"
+assert_eq "the explicit tag is trusted live, message verbatim" \
+    "usage limit reached, try again at 6:29 PM" "$(_extract_provider_reason "$PF_LOG" live)"
+hdr reply "task=pf session=abc" ANSWER "continue; that rate limit note was about the code under review" "$PF_LOG"
+assert_eq "a reply's ANSWER echo is cut off by the same marker (live)" "" "$(_extract_provider_reason "$PF_LOG" live)"
+assert_eq "an earlier block's tag does not leak past a reply (post-mortem)" "" "$(_extract_provider_reason "$PF_LOG")"
+printf "The 'gpt-6-astra' model requires a newer version of Codex. Please upgrade.\n" >> "$PF_LOG"
+assert_eq "generic wording alone is NOT a live verdict" "" "$(_extract_provider_reason "$PF_LOG" live)"
+assert_eq "generic wording is a post-mortem verdict" \
+    "The 'gpt-6-astra' model requires a newer version of Codex. Please upgrade." "$(_extract_provider_reason "$PF_LOG")"
+# Marker older than the scan window: everything in the window is engine output by construction.
+: > "$PF_LOG"; hdr run "engine=test" PROMPT "rate limit in the prompt" "$PF_LOG"
+yes 'engine output line' | head -c "$(( _PROVIDER_SCAN_BYTES + 1000 ))" >> "$PF_LOG"
+printf '\nAGENT_PROVIDER_ERROR: quota exceeded\n' >> "$PF_LOG"
+assert_eq "tag found when the marker has scrolled out of the scan window" "quota exceeded" "$(_extract_provider_reason "$PF_LOG" live)"
+# The spellings seen live on 2026-09-10: codex tag, kimi plain text, claude's unrecognized model.
+for pf_s in \
+    "AGENT_PROVIDER_ERROR: The 'gpt-99-nonexistent' model is not supported when using Codex with a ChatGPT account." \
+    "error: failed to run prompt: provider.auth_error: 403 You've reached your monthly usage limit for this billing cycle." \
+    "There's an issue with the selected model (claude-nonexistent-9). It may not exist or you may not have access to it."; do
+    : > "$PF_LOG"; hdr run "engine=test" PROMPT "plain" "$PF_LOG"; printf '%s\n' "$pf_s" >> "$PF_LOG"
+    assert_eq "post-mortem catches: ${pf_s:0:58}..." "${pf_s#AGENT_PROVIDER_ERROR: }" "$(_extract_provider_reason "$PF_LOG")"
+done
+
+# finish_step: a FAILED step whose prompt talks about rate limits is an error, not `limited`.
+meta_set pf_err state running; meta_set pf_err dir ""
+: > "$SCRATCH_LOGDIR/pf_err.log"
+hdr run "engine=test" PROMPT "Review the rate limit code" "$SCRATCH_LOGDIR/pf_err.log"
+printf 'segfault, no provider text here\n' >> "$SCRATCH_LOGDIR/pf_err.log"
+finish_step pf_err 3 2>/dev/null
+assert_eq "failed step + rate-limit PROMPT + plain crash output -> state=error, not limited" "error" "$(meta_get pf_err state)"
+meta_set pf_lim state running; meta_set pf_lim dir ""
+: > "$SCRATCH_LOGDIR/pf_lim.log"
+hdr run "engine=test" PROMPT "Review the rate limit code" "$SCRATCH_LOGDIR/pf_lim.log"
+printf 'AGENT_PROVIDER_ERROR: usage limit reached\n' >> "$SCRATCH_LOGDIR/pf_lim.log"
+finish_step pf_lim 3 2>/dev/null
+assert_eq "failed step + provider tag -> state=limited" "limited" "$(meta_get pf_lim state)"
+assert_eq "reason= is the provider's line, not the prompt" "usage limit reached" "$(meta_get pf_lim reason)"
+rm -f "$SCRATCH_LOGDIR/pf_err.md" "$SCRATCH_LOGDIR/pf_lim.md"
+
+# Live watchdog end-to-end, same pipeline shape as dispatch (_guarded_run_watched ... | tee -a LOG).
+PF_LIVE="$SCRATCH_LOGDIR/pf_live.log"
+: > "$PF_LIVE"; hdr run "engine=test" PROMPT 'Reply with: "the rate limit test passed"' "$PF_LIVE"
+_guarded_run_watched 30 "$PF_LIVE" 0 bash -c 'echo "the rate limit test passed"; sleep 3; echo done' 2>&1 | tee -a "$PF_LIVE" >/dev/null
+pf_rc="${PIPESTATUS[0]}"
+assert_eq "live: prompt AND answer say 'rate limit' -> the step completes (rc 0, not 126)" "0" "$pf_rc"
+: > "$PF_LIVE"; hdr run "engine=test" PROMPT 'plain' "$PF_LIVE"
+pf_t0=$(date +%s)
+_guarded_run_watched 60 "$PF_LIVE" 0 bash -c 'echo "AGENT_PROVIDER_ERROR: usage limit reached"; sleep 60' 2>&1 | tee -a "$PF_LIVE" >/dev/null
+pf_rc="${PIPESTATUS[0]}"; pf_el=$(( $(date +%s) - pf_t0 ))
+assert_eq "live: the provider tag ends a step that sits alive after it (rc 126)" "126" "$pf_rc"
+if [ "$pf_el" -lt 20 ]; then
+    pass "live: the tag was acted on promptly (${pf_el}s, not the 60s the engine wanted)"
+else
+    fail "live: reacting to the tag took ${pf_el}s"
+fi
+assert_match "live: the log carries the PROVIDER FAILURE line with the provider's text" \
+    'PROVIDER FAILURE: usage limit reached' "$(tail -3 "$PF_LIVE")"
+# Silence watchdog vs the prompt echo: hdr writes the echo BEFORE the engine starts, so a long
+# prompt neither masks nor delays a genuinely silent start -- the clock runs from that write.
+: > "$PF_LIVE"; hdr run "engine=test" PROMPT "$(yes 'a very long prompt line' | head -c 15000)" "$PF_LIVE"
+pf_t0=$(date +%s)
+_guarded_run_watched 60 "$PF_LIVE" 3 bash -c 'sleep 60' 2>&1 | tee -a "$PF_LIVE" >/dev/null
+pf_rc="${PIPESTATUS[0]}"; pf_el=$(( $(date +%s) - pf_t0 ))
+assert_eq "silence: 15KB prompt echo + an engine that never writes -> rc 125" "125" "$pf_rc"
+if [ "$pf_el" -lt 20 ]; then
+    pass "silence: fired about SILENCE_SECS after start (${pf_el}s), not delayed by the echo"
+else
+    fail "silence: took ${pf_el}s"
+fi
+
+# ============================================================================================
 section "eff_state / state_label (one liveness truth, shared with gui.py)"
 # ============================================================================================
 # The CLI used to call a task "running (alive)" while the GUI called the same task "stalled":

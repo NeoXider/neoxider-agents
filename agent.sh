@@ -218,6 +218,14 @@ _guarded_run() {
 #     try again at 6:29 PM."} followed by turn.failed and then keep the process alive for a while
 #     (observed live) -- without this, the task sits at state=running until AGENT_TIMEOUT_SEC finally
 #     expires, and the orchestrator only learns why by grepping the raw log.
+#     LIVE, only the explicit AGENT_PROVIDER_ERROR tag counts (`_extract_provider_reason LOG live`);
+#     the generic wording regex is a post-mortem tool. While the step is still running nothing can
+#     tell a provider banner from the model's own words, and the words are everywhere: the log opens
+#     with the prompt echo (an audit prompt that mentioned "a rate limiter" killed task audit14 as
+#     `limited` two seconds in on 2026-09-10, with its own sentence as the "provider message"), and
+#     claude streams its answer as it is generated (an audit FINDING that quotes "rate limit" from
+#     the code under review would die the same way). The tag is written only by the provider
+#     filters, only from the provider's own error event.
 #   * LOG has not grown for SILENCE_SECS -> kill the tree, return 125 ("silent", distinct from 124
 #     "took too long"). SILENCE_SECS=0 disables this check.
 # LOG is being written concurrently by the `tee` downstream of this function in the SAME pipeline
@@ -245,7 +253,7 @@ _guarded_run_watched() {
             return 124
         fi
         if [ -n "$log" ]; then
-            reason="$(_extract_provider_reason "$log")"
+            reason="$(_extract_provider_reason "$log" live)"
             if [ -n "$reason" ]; then
                 _kill_tree "$child"
                 wait "$child" 2>/dev/null
@@ -803,9 +811,17 @@ state_label() {
 }
 state_icon() { case "$1" in running) echo "▶";; idle) echo "▷";; done) echo "✔";; waiting) echo "⏳";; error) echo "✖";; stalled) echo "⚠";; limited) echo "⛔";; silent) echo "◌";; *) echo "•";; esac; }
 
+# The line that separates what agent.sh ECHOED (run header, prompt, reply answer) from what the
+# ENGINE printed. hdr writes it after every echo, the provider filters print a fresh one before the
+# final answer, and everything that reads a task log slices on it: last_output, render_md, `log -l`,
+# gui.py's parse_output_blocks and _extract_provider_reason (which must never scan the echo -- see
+# there). An echoed line that IS the marker gets a trailing space, the same defusal the filters apply
+# to answers, so a prompt cannot forge the boundary; `agent.sh log` reads the same.
+_OUTPUT_MARK='---------- output ----------'
 hdr() { # kind "info" LABEL "text" logfile
-    { echo; echo "========== [$1] $(now) | $2 =========="; echo "> $3:"; echo "$4";
-      echo "---------- output ----------"; } >> "$5"; }
+    { echo; echo "========== [$1] $(now) | $2 =========="; echo "> $3:"
+      printf '%s\n' "$4" | sed 's/^---------- output ----------$/& /'
+      echo "$_OUTPUT_MARK"; } >> "$5"; }
 
 # last output block (after the last separator), with the streaming ACTIVITY markers dropped:
 # they exist so a tool-only stretch still grows the log for the liveness watchdog, and they are
@@ -939,26 +955,50 @@ _is_transient_failure() {
 #     _provider_*_emit filters, which -- the moment they see the provider's own error/turn.failed
 #     event -- print it INLINE as "AGENT_PROVIDER_ERROR: <message>" (flush=True), so the exact text,
 #     including any reset time, reaches the log without this function re-parsing JSON.
-#   * opencode tags its errfile's rate-limit line the same way (see _provider_opencode_invoke).
-#   * claude/gemini print their own CLI error text straight into the log (no JSON layer) -- the
-#     generic regex below catches those directly.
-# Only consulted when a step has already failed (rc != 0): running it on a SUCCESSFUL step would
-# misclassify a clean answer that merely discusses one of these words (e.g. an audit finding that
-# quotes "rate limit" from the code it reviewed) as a provider failure.
+#   * opencode tags its errfile's rate-limit line the same way, but only once the CLI has exited
+#     (its stderr is a temp file read back at the end -- see _provider_opencode_invoke).
+#   * claude/gemini print their own CLI error text straight into the log (stream_text_filter passes
+#     claude's banners through verbatim; gemini has no JSON layer) -- the generic regex below catches
+#     those, and ONLY post-mortem (a step that has already failed, rc != 0): running it on a
+#     SUCCESSFUL step would misclassify a clean answer that merely discusses one of these words
+#     (e.g. an audit finding that quotes "rate limit" from the code it reviewed) as a provider
+#     failure, and running it on a still-RUNNING step is the same mistake one tick earlier.
+# WHAT IS SCANNED: the tail of the log AFTER its last _OUTPUT_MARK line -- engine output only. The
+# log opens with the run header and the prompt echo (`> PROMPT:`, or `> ANSWER:` after a reply), so
+# a window that included it matched the orchestrator's own words: on 2026-09-10 task audit14, a
+# code review whose prompt mentioned "a rate limiter disabled in a place that also serves other
+# groups", was killed by the live watchdog as `limited` two seconds in, with that sentence as the
+# "provider message"; the same prompt with "call throttle" in place of "rate limiter" ran normally.
+# hdr writes the marker after every echo, so a reply's `> ANSWER:` block is cut off by the same rule.
 _PROVIDER_FAILURE_TAG='AGENT_PROVIDER_ERROR: '
-_PROVIDER_FAILURE_RE='usage limit|rate.?limit|quota exceeded|insufficient (quota|credit)|payment required|requires a newer version of|model[^.?!]*(not found|unavailable|unknown)|unauthoriz|invalid api key|authentication (failed|error)|token expired|session expired|not logged in|please (run|log ?in)'
+_PROVIDER_FAILURE_RE='usage limit|rate.?limit|quota exceeded|insufficient (quota|credit)|payment required|requires a newer version of|unrecognized_model|issue with the selected model|model[^.?!]*(not found|unavailable|unknown)|unauthoriz|invalid api key|authentication (failed|error)|token expired|session expired|not logged in|please (run|log ?in)'
 
-# _extract_provider_reason LOG -> the provider's own failure message (verbatim, one line, reset
-# time intact if it gave one), or empty if the tail of LOG shows no such signature.
+_PROVIDER_SCAN_BYTES=8000
+
+# _engine_output_tail LOG -> the last _PROVIDER_SCAN_BYTES of LOG minus everything up to and
+# including the last _OUTPUT_MARK line inside that window. A window with no marker at all is engine
+# output through and through: hdr writes the marker before any provider starts, so the only way it
+# is missing from the tail is that the engine has printed more than the window since.
+_engine_output_tail() {
+    tail -c "$_PROVIDER_SCAN_BYTES" "$1" 2>/dev/null \
+        | awk -v mark="$_OUTPUT_MARK" '$0 == mark { buf = ""; next } { buf = buf $0 ORS } END { printf "%s", buf }'
+}
+
+# _extract_provider_reason LOG [live] -> the provider's own failure message (verbatim, one line,
+# reset time intact if it gave one), or empty if the engine output at the tail of LOG shows none.
+# `live` (the watchdog tick, step still running) trusts the explicit tag ONLY; the default
+# (post-mortem, rc != 0) also tries the generic regex -- see the block comment above for why.
 _extract_provider_reason() {
-    local log="${1:-}" chunk line
+    local log="${1:-}" mode="${2:-final}" chunk line
     [ -n "$log" ] && [ -f "$log" ] || return 0
-    chunk="$(tail -c 8000 "$log" 2>/dev/null)"
+    chunk="$(_engine_output_tail "$log")"
+    [ -n "$chunk" ] || return 0
     line="$(printf '%s\n' "$chunk" | grep -aF "$_PROVIDER_FAILURE_TAG" | tail -1)"
     if [ -n "$line" ]; then
         printf '%s\n' "${line#*"$_PROVIDER_FAILURE_TAG"}"
         return 0
     fi
+    [ "$mode" = live ] && return 0
     printf '%s\n' "$chunk" | grep -aiE "$_PROVIDER_FAILURE_RE" | tail -1
 }
 
