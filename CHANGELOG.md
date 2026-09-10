@@ -25,6 +25,22 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- **A prompt that mentions a rate limit no longer kills its own task as `limited`.** The live
+  provider-failure watchdog scanned the last 8000 bytes of the log from its first tick, and the log
+  opens with the run header and the prompt echo — so on 2026-09-10 task `audit14`, a code review whose
+  prompt discussed "a rate limiter disabled in a place that also serves other groups", was killed two
+  seconds in with that sentence reported as the provider's message; the same prompt with "call
+  throttle" in place of "rate limiter" ran normally. `_extract_provider_reason` now reads only ENGINE
+  output — everything after the last `---------- output ----------` marker, which `hdr` writes after
+  every `> PROMPT:`/`> ANSWER:` echo, so `reply` is covered too; an echoed line that equals the marker
+  gets a trailing space so it cannot forge the boundary — and the live tick trusts only the explicit
+  `AGENT_PROVIDER_ERROR:` tag. The generic wording regex is consulted post-mortem (rc ≠ 0) only, as
+  its own comment always said it should be, so a claude answer that streams the words "rate limit"
+  survives as well. Genuine failures still end the task at once: a rejected codex model was caught
+  live 7s in via the tag, a real codex usage limit and kimi's monthly quota came back as `limited`
+  with the provider's text, and claude's `There's an issue with the selected model (...)` wording was
+  added to the post-mortem regex (it ended as a bare `error` before). `tests/test_agent_sh.sh` locks
+  all of it in, including the silence watchdog's independence from the size of the prompt echo.
 - **The activity heartbeat no longer fires on a run's first event.** The clock started at zero, so
   the first stream event of every codex/kimi run was more than ten seconds "since the last
   heartbeat" and printed one — even a one-second answer opened with a progress line the caller then

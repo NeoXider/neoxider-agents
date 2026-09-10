@@ -45,7 +45,12 @@ GUI, which share one liveness rule (the CLI additionally checks for a live ENGIN
 descendant under the wrapper pid before calling a quiet task `idle`, not just `stalled`).
 A provider-level failure (usage/rate limit, quota, auth expiry, unavailable model) ends
 the task immediately as `state=limited`, with the provider's own message in meta
-`reason=`. Codex runs are isolated from `~/.codex/config.toml`
+`reason=`. Only ENGINE output is scanned for it — the log after the last
+`---------- output ----------` marker, never the echoed prompt/reply above it — and while
+the step is still running only the explicit `AGENT_PROVIDER_ERROR:` tag from the
+codex/kimi/opencode filters counts; the generic wording regex runs post-mortem (rc != 0)
+only, so a prompt or an answer that merely discusses a "rate limit" does not kill the
+task. Codex runs are isolated from `~/.codex/config.toml`
 (`--ignore-user-config`), because the ChatGPT desktop app's config there hangs codex's
 tool router on the first shell command; re-add a specific MCP server with
 `AGENT_CODEX_MCP="name=url"`, or opt out entirely with `AGENT_CODEX_USER_CONFIG=1`.
