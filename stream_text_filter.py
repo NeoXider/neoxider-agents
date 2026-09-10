@@ -121,6 +121,11 @@ def main(stdin=None, stdout=None, activity=None):
             if text and printed_total == 0:
                 out.write(text)
                 out.flush()
+                # WHY at_line_start is tracked here too, like the two branches above: without it
+                # the final newline below was skipped for a result-only run, so a limit banner
+                # reached the log with no line of its own and ran into whatever was appended next
+                # -- and the provider-failure scan that reads those logs matches line by line.
+                state["at_line_start"] = text.endswith("\n")
                 printed_total += len(text)
     if printed_total and not state["at_line_start"]:
         out.write("\n")
