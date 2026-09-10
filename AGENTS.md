@@ -126,6 +126,38 @@ REFUSES to bind the network without that token because it launches full-auto sub
 which machine does the work: the agent always runs on the host, so the caller's own files are
 never touched.
 
+### Recipe: standing in for a local model server
+
+A test suite that needs a live OpenAI-compatible model does not need LM Studio or a
+provider key. Bring the bridge up and point the suite at it:
+
+```bash
+SK=~/.claude/skills/neoxider-agents/agent.sh
+nohup bash $SK openai-server -e opencode -m muse -p 8801 > /tmp/bridge.log 2>&1 &
+curl -s http://127.0.0.1:8801/health     # {"ok": true, "engine": "opencode", ...}
+curl -s http://127.0.0.1:8801/v1/models  # the id the client must ask for
+```
+
+Verified end to end on 2026-09-10 against CoreAI's PlayMode suite, which until then
+failed with "No models loaded" from LM Studio:
+
+```bash
+export COREAI_PLAYMODE_LLM_BACKEND=http
+export COREAI_TEST_BASE_URL="http://127.0.0.1:8801/v1"
+export COREAI_TEST_MODEL="opencode/muse"
+```
+
+`RuntimeBackendSwitchLivePlayModeTests` went from failing to passing in 55 s.
+
+Know what this proves and what it does not. It proves the code path works against a real
+OpenAI-compatible endpoint. It is NOT a substitute for a run against the real backend:
+every call spawns a CLI subprocess and a lock serializes them, so a fixture that makes
+nine role calls or builds a whole scene takes many minutes and can hit its own timeouts;
+and tool calling is emulated through prompting rather than native, so a test whose subject
+IS the tool-call protocol may behave differently than it would on a real provider. Check
+`/health` for `session_active` and `POST /v1/reset` between unrelated suites — one process
+serves one conversation at a time.
+
 ## Rules for using this tool as a subagent orchestrator
 
 - Give every task a meaningful name via `-t` — the auto-generated default
