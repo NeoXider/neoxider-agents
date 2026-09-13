@@ -43,8 +43,11 @@ Copy the block above as the system/first message when you want a model to run an
 
 ## Model matrix — which model for what
 
-Pick the **cheapest model that will succeed**. Reasoning tokens dominate cost, so effort/model choice
-matters more than prompt wording.
+Pick the **cheapest model that will succeed among the engines that are actually available**.
+Reasoning tokens dominate cost, so effort/model choice matters more than prompt wording.
+The table below is a verified snapshot, not a prescription — check `agent.sh doctor` /
+`opencode models` / the DSH model picker first, and never invent model ids. A user-named model
+always wins.
 
 > Claude-model entries below are for NON-Claude orchestrators (e.g. Codex driving the wrapper);
 > from Claude Code spawn those tiers via the native Agent tool instead (NATIVE-FIRST rule above).
@@ -90,3 +93,14 @@ The CLI and the web panel compute this identically, so the two never contradict 
 big fan-out on a new machine (or after a codex-cli upgrade) run `agent.sh doctor --deep`: it makes each
 engine actually execute a shell command, which is the only way to catch an engine that answers happily
 while every command it runs hangs.
+
+---
+
+## Ledger mode (single hard task, not a fan-out)
+
+`fan` is for splittable work. For ONE hard problem (tricky algorithm, multi-cycle bugfix — where a
+single-shot answer drowns in reasoning), use ledger mode instead: `.ledger/<task>/` with
+`task.md` (read-only) + `plan.md` + `tasks.json` + append-only `notes.md` + `solution.py`.
+You are the manager: brainstorm worker → up to 10 single-task fresh-context rounds → YOU run the
+public sample tests each round (`test: input/expected/got` into `notes.md`) → `verdict.md` or stop
+after 2 stagnant rounds. Stubs in `ledger/`, full protocol in `SKILL.md` ("Ledger mode").

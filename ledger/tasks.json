@@ -1,0 +1,5 @@
+[
+  { "id": "t1", "title": "Write first working solution for the sample tests", "status": "todo" },
+  { "id": "t2", "title": "Fix failures reported in notes.md", "status": "todo" },
+  { "id": "t3", "title": "Harden edge cases + final review", "status": "todo" }
+]

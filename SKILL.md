@@ -1,6 +1,6 @@
 ---
 name: neoxider-agents
-description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (Claude Code / Opus 5 by default; also Kimi Code / Kimi K3, Codex, opencode, and Gemini) through the agent.sh wrapper, then verify and integrate their results. Covers run/fan, model selection, resume/reply, logs, and verification. Use whenever work can be parallelized or offloaded to CLI agents instead of doing everything in one session.
+description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (Claude Code / Opus 5 by default; also Kimi Code / Kimi K3, Codex, opencode, and Gemini) through the agent.sh wrapper, then verify and integrate their results. Covers run/fan, model selection, resume/reply, logs, and verification. Also covers ledger mode for single hard tasks (plan/tasks.json/notes/solution loop with test verifier, up to 10 rounds). Use whenever work can be parallelized or offloaded to CLI agents instead of doing everything in one session.
 ---
 
 # CLI Subagents (Codex Orchestration)
@@ -39,8 +39,10 @@ The loop:
    wastes a subagent; a precise one almost always succeeds.
 2. **Pre-flight.** `agent.sh doctor` before any fan-out (engines up? codex limits OK?).
    Near the limit → route to `-e claude -m sonnet` or `-e opencode`.
-3. **Route.** Cheapest model that will succeed (matrix in [ORCHESTRATOR.md](ORCHESTRATOR.md)):
-   trivial → `-m haiku` (or `-e codex -m spark`), regular → `-m sonnet`, hard → the default `opus5`.
+3. **Route.** Discover, don't assume: pick the cheapest capable model among the engines that
+   are actually up (`agent.sh doctor`, `opencode models`, `kimi provider list`; in DSH — the
+   model picker). Alias tables in [ORCHESTRATOR.md](ORCHESTRATOR.md) are snapshots — verify live,
+   the tier moves. A model the user named explicitly always wins. Never invent model ids.
 4. **Delegate.** `run` for one task, `fan` for a parallel batch. Parallel workers only on
    NON-overlapping files. Each keeps its own `PROGRESS.<task>.md`.
 5. **Watch.** `list` / `status <name>`; a `waiting` task gets `reply <name> "..."`.
@@ -53,6 +55,46 @@ The loop:
 
 > Paste-ready orchestrator system prompt + full which-model-for-what matrix:
 > [ORCHESTRATOR.md](ORCHESTRATOR.md).
+
+**Fan vs ledger.** `fan` is for work that splits into independent pieces (non-overlapping
+files). When the task is ONE hard problem that does not split — a tricky algorithm, a bug
+that needs several fix cycles, anything where a single-shot answer drowns in its own
+reasoning — use **ledger mode** below instead: one manager (you) + fresh worker contexts +
+shared filesystem ledger + test verifier, up to 10 rounds. Same model throughout, no
+training, no extra plugin. Which model: you choose it yourself from what is available (rule
+in step 3 above) — no pinned defaults; keep one model for the whole ledger unless it proves
+incapable.
+
+## Ledger mode (single hard task, GVS5H-style)
+
+1. **Init.** `mkdir -p .ledger/<task>` and seed it (stubs in `ledger/` at the skill root —
+   copy them, don't hand-write the schema):
+   - `task.md` — problem statement, READ ONLY afterwards, never rewritten.
+   - `plan.md` — your overarching plan (approach, edge cases, verification idea).
+   - `tasks.json` — `[{"id":"t1","title":"...","status":"todo"}]`; you curate it, workers
+     never reorder it.
+   - `notes.md` — append-only log. Every entry prefixed with role: `manager:` / `worker(t3):`.
+   - `solution.py` — current best attempt (empty stub first).
+2. **Brainstorm (1 worker).** Fresh worker, prompt = `task.md` + `plan.md` only: "list
+   algorithmic traps and edge cases, append them to `notes.md`, do NOT write code." Keeps the
+   first solution from anchoring on a flawed approach.
+3. **Loop (up to 10 rounds).** Each round YOU pick exactly one `todo` task, then spawn ONE
+   fresh worker with ONLY: the task text + current `solution.py` + the relevant `notes.md`
+   excerpt (never the whole history). Worker prompt ends with: "update `solution.py` and
+   append one `worker(<id>):` note, touch nothing else." Fresh context per worker is the
+   point — it prevents reasoning bloat and truncation, the main failure mode of long
+   single-shot answers.
+4. **Verify (you, every round that produced code).** Run the PUBLIC sample tests yourself,
+   never ask the worker to self-grade. On failure append to `notes.md`:
+   `test: input=... expected=... got=...` and queue the fix as the next `todo`. Hidden tests
+   are never shown to workers — same rule as any coding benchmark.
+5. **Stop.** Solved (public tests green + you reviewed the diff) → mark `done`, write
+   `verdict.md`. No progress in 2 consecutive rounds → stop, keep the best attempt, say so.
+   Never exceed 10 rounds. Never let a worker rewrite `plan.md` or anyone else's task status.
+
+In DeepSeek Harness the same protocol runs on NATIVE subagents/workflows (NATIVE-FIRST rule
+above); `agent.sh run/reply` is only for foreign CLI engines. The ledger directory is the
+coordination channel either way — no extra DSH plugin required.
 
 ## Commands
 
@@ -570,6 +612,10 @@ Gotchas (verified):
 - Give the task a meaningful name via `-t` — otherwise the name will be `task-<timestamp>`.
 
 ## Model selection
+
+> Discovery-first: the tables below are verified snapshots of `-m` aliases, not prescriptions.
+> Before routing, check what is actually available and pick the cheapest capable option among
+> those. An explicitly user-named model always wins. Never invent model ids.
 
 **Codex** (`-e codex`; no longer the default engine):
 
