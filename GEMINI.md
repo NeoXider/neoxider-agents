@@ -22,7 +22,7 @@ bash $SK fan  -t <base> -C <dir> "p1" "p2" ...   # N parallel background tasks (
 bash $SK reply <name> "<answer>"                 # continue a task by name
 bash $SK log  -f <name>                          # follow a task live
 bash $SK status <name>                           # state / current step / needs a reply?
-bash $SK doctor                                   # engines + codex rate limits, before a batch
+bash $SK doctor                                   # foreign CLI availability + limits, when needed
 bash $SK doctor --deep                            # + one REAL run per engine that must EXECUTE a shell command
 bash $SK gui                                      # web GUI (stable default port 8765; or: ./bin/neoxider gui)
 ```
@@ -127,6 +127,11 @@ which machine does the work: the agent always runs on the host, so the caller's 
 never touched.
 
 ## Rules for using this tool as a subagent orchestrator
+
+Follow the ownership, routing and verification loop in [SKILL.md](SKILL.md). Delegate only
+useful bounded work, honor explicit model choices, and serialize shared runtime mutations.
+For Windows launches or shared-service changes, read [runtime discipline](docs/RUNTIME-DISCIPLINE.md).
+Native workers do not require CLI `doctor`; a worker report alone is not acceptance.
 
 - Give every task a meaningful name via `-t` — the auto-generated default
   (`task-<timestamp>-<pid>`) is collision-safe but not descriptive.

@@ -10,32 +10,24 @@ For a plugin install use `SK="$CLAUDE_PLUGIN_ROOT/agent.sh"`; for a manual skill
 
 ## Paste-ready orchestrator prompt
 
-> You are the **orchestrator**. You do NOT write the implementation yourself — you decompose the
-> work, delegate each piece to a CLI subagent via `agent.sh`, then review and integrate the results.
-> Your value is planning, routing, verification, and integration — not typing code.
+> Own the requested outcome. Delegate independent, bounded tasks while doing useful work
+> locally; implement small or tightly coupled changes yourself. Use native workers for your own
+> engine and `agent.sh` only for foreign engines. Honor explicit model/effort/endpoint choices;
+> do not silently substitute them. Check foreign CLI availability only when that route is needed.
 >
-> **Loop:**
-> 1. **Plan.** Break the request into small, independent, precisely-scoped tasks (exact file paths,
->    signatures, "change nothing else", "Do NOT run git commit").
-> 2. **Pre-flight.** Run `agent.sh doctor` before any fan-out to check engine availability and Codex
->    usage limits. If Codex is near its limit, route to `-e claude -m sonnet` or `-e opencode`.
-> 3. **Route.** Pick the engine/model per task using the matrix below. Trivial → cheap model.
-> 4. **Delegate.** `agent.sh run -e <engine> -m <model> -t <name> -C <dir> "<scoped prompt>"`.
->    For a batch of parallel workers use one `agent.sh fan -t <base> -C <dir> "p1" "p2" ...`
->    (spawns `<base>-01`, `<base>-02`, ... in the background) instead of hand-looping `run`.
->    Give parallel workers only NON-overlapping files. Each keeps its own `PROGRESS.<task>.md`.
-> 5. **Watch.** `agent.sh list` / `agent.sh status <name>`. If a task is `waiting`, answer it with
->    `agent.sh reply <name> "<answer>"`. If `stalled`/`error`, read its log and re-scope.
-> 6. **Verify.** For every finished task, read the diff yourself — never trust "done" blindly. Run
->    tests where relevant. Reject and re-delegate anything wrong.
-> 7. **Integrate & commit.** YOU own git. Workers must not commit. You stage, review, and commit.
+> Give each worker an objective, owned files/resources, relevant context, acceptance checks and
+> permitted side effects. Serialize shared files, installs, configuration, ports and restarts.
+> Workers return changes, verification evidence, failed/unrun checks, blockers and active work;
+> they do not commit, publish or restart shared services unless assigned that responsibility.
 >
-> **Rules:** NATIVE-FIRST — spawn your OWN engine's subagents natively, agent.sh is only for
-> foreign engines (from Claude Code: claude models → native Agent tool, never `agent.sh -e claude`;
-> from Codex: codex models → native codex subagents; the wrapper bridges the rest);
-> small tasks over big ones; exact scope over open-ended "figure it out"; keep the hardest
-> reasoning (architecture, security, tricky bugs) either for yourself or a top-tier model; never let
-> two parallel workers touch the same file; clean up finished tasks with `agent.sh clean` when done.
+> Reuse exact task IDs, read logs before retrying and inspect partial side effects. Silence is
+> not proof of a hang. Review every diff and verify the integrated result with required checks
+> and the user's actual runtime path where applicable. Do not equate configured with working.
+> Complete authorized integration/restart/release steps, preserve unrelated work and report
+> remaining gaps honestly. Do not repeat passing checks without a reason or manufacture commits.
+>
+> On Windows keep background launches hidden at every relevant child/fallback boundary. Follow
+> [runtime discipline](docs/RUNTIME-DISCIPLINE.md) for launch verification and shared-state changes.
 
 Copy the block above as the system/first message when you want a model to run an orchestration session.
 
@@ -45,8 +37,8 @@ Copy the block above as the system/first message when you want a model to run an
 
 Pick the **cheapest model that will succeed among the engines that are actually available**.
 Reasoning tokens dominate cost, so effort/model choice matters more than prompt wording.
-The table below is a verified snapshot, not a prescription — check `agent.sh doctor` /
-`opencode models` / the DSH model picker first, and never invent model ids. A user-named model
+The table below is a verified snapshot, not a prescription — check the relevant catalog only when needed (`agent.sh doctor`,
+`opencode models`, or the DSH model picker), and never invent model ids. A user-named model
 always wins.
 
 > Claude-model entries below are for NON-Claude orchestrators (e.g. Codex driving the wrapper);
@@ -60,7 +52,8 @@ always wins.
 | Long-horizon coding / multimodal agent work | `-e kimi` (default Kimi K3) | Use Kimi Code after `kimi login`; `-m highspeed` selects the managed fast coding route. |
 | Deepest / architecture / security review | `-e claude -m opus5`, or keep it yourself | Reserve current Opus 5 for genuinely hard work; bare `opus` is the legacy 4.8 alias. |
 | 5.6 variant A/B or if `terra` is rate-limited | `-m sol` (`gpt-5.6-sol`) / `-m luna` (`gpt-5.6-luna`) | Alternative 5.6 models. **Observed speed (n=1): luna 41s < sol 56s < terra 105s.** In that same run only `sol` produced code whose own tests passed (luna/terra picked non-palindrome examples) — `terra` is the default per user preference, so still verify its output. |
-| Local / offline / free | `-e opencode -m free` (Muse Spark 1.3, с 03.09.2026), or `-m lmstudio/<model>` | `free`/`spark`/`muse`, `ox`/`alpha`, `pickle`, `hy3`, `mimo`, `nemotron`/`ultra`, `lightning` alias the OpenCode Zen free tier. Unranked — `free` is a user preference, not a measurement. `opencode models` shows the live list. |
+| Remote free tier | `-e opencode -m free` (Muse Spark 1.3, с 03.09.2026) | `free`/`spark`/`muse`, `ox`/`alpha`, `pickle`, `hy3`, `mimo`, `nemotron`/`ultra`, `lightning` alias the OpenCode Zen free tier. Unranked — `free` is a user preference, not a measurement. `opencode models` shows the live list. |
+| Local / offline | A configured local provider/model on the requested endpoint | Verify the exact route is local; a free remote tier is not an offline substitute. Serialize access to a shared model slot. |
 
 **Engine quick facts (verified 2026-07-09):**
 - **codex** — opt in with `-e codex`; the 5.6 family needs **codex-cli >= 0.144**. Watch usage limits (`agent.sh doctor`). Runs are launched with `--ignore-user-config`: `~/.codex/config.toml` (owned by the ChatGPT desktop app) hangs codex's tool router on the very first shell command. Need one of its MCP servers back → `AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp"`.
@@ -89,8 +82,8 @@ poll `agent.sh list` / `status <name>`:
 | `stalled` (`⚠`) | the process is gone (reboot/kill) | `agent.sh reply <name> "continue"` |
 | `error` + `⏱ killed by the step watchdog` | it hit the deadline | re-scope the task, or re-run with a bigger `AGENT_TIMEOUT_SEC` |
 
-The CLI and the web panel compute this identically, so the two never contradict each other. Before a
-big fan-out on a new machine (or after a codex-cli upgrade) run `agent.sh doctor --deep`: it makes each
+The CLI and the web panel compute this identically, so the two never contradict each other. When diagnosing foreign CLI execution on a new machine or after an upgrade, use
+`agent.sh doctor --deep`: it makes each
 engine actually execute a shell command, which is the only way to catch an engine that answers happily
 while every command it runs hangs.
 
