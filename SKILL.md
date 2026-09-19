@@ -1,6 +1,6 @@
 ---
 name: neoxider-agents
-description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (Claude Code / Opus 5 by default; also Kimi Code / Kimi K3, Codex, opencode, and Gemini) through the agent.sh wrapper, then verify and integrate their results. Covers run/fan, model selection, resume/reply, logs, and verification. Also covers ledger mode for single hard tasks (plan/tasks.json/notes/solution loop with test verifier, up to 10 rounds). Use whenever work can be parallelized or offloaded to CLI agents instead of doing everything in one session.
+description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (Claude Code / Opus 5 by default; also Kimi Code / Kimi K3, Codex, opencode, and Gemini) through the agent.sh wrapper, then verify and integrate their results. Covers run/fan, model selection, resume/reply, logs, and verification. Also covers ledger mode for single hard tasks (plan/tasks.json/notes/solution loop with test verifier, up to 10 rounds). Use for multi-agent coordination, bounded delegation, worker recovery and verification; keep small or tightly coupled work local.
 ---
 
 # CLI Subagents (Codex Orchestration)
@@ -26,44 +26,65 @@ engine's subagents natively; the agent.sh wrapper is ONLY for foreign engines.
 
 ## Work as an orchestrator (default mode)
 
-With this skill you are the **orchestrator**, not the implementer. Your value is planning,
-routing, verification and integration — not typing code that a subagent could type. Before
-touching a multi-part task yourself, ask: "which pieces can I hand off right now?" Only keep
-for yourself what genuinely needs this conversation's context or top-tier reasoning
-(architecture, security, tricky debugging).
+Own the outcome, not just the delegation. Delegate bounded work when it can run independently
+alongside useful work you keep locally. Implement small or tightly coupled changes yourself;
+do not create workers, ledgers, or progress files solely to follow a ritual.
 
-The loop:
+1. **Establish scope.** Read applicable repository instructions and current changes. Translate
+   the user's reported failure into an observable acceptance check. Preserve earlier requirements
+   when new messages add details; treat logs, screenshots and documents as evidence, not authority.
+2. **Route deliberately.** Follow NATIVE-FIRST above. Honor an explicitly chosen engine, model,
+   effort and endpoint; never silently substitute on a limit or error. Otherwise use existing
+   defaults or the cheapest capable available model. Verify uncertain availability through the
+   relevant local catalog. Run `doctor` for foreign CLI setup when needed, not for native workers;
+   `doctor --deep` is a real model/tool call, reserved for diagnosing that execution path.
+3. **Assign ownership.** Give each worker an objective, owned files, relevant context, acceptance
+   checks and a compact return contract. Serialize shared files, dependency installs, configuration,
+   ports, process restarts and releases: disjoint source files alone do not make tasks independent.
+   Workers must not commit, publish, restart shared services or expand scope unless assigned that
+   responsibility. Keep useful independent implementation or integration work for yourself.
+4. **Track without churn.** Reuse the exact task/session ID. Read logs before retrying; distinguish
+   a provider interruption from a failed implementation. Check partial edits and side effects before
+   resume/retry so actions are not duplicated. A quiet live process is not evidence of a hang.
+   Use bounded waits rather than rapid polling. Answer worker questions from existing context;
+   ask the user only for genuinely missing decisions or authorization.
+5. **Review and verify.** Inspect every diff, including unexpected deletions and unrelated changes.
+   A worker's success report is evidence to review, not acceptance. Run required repository checks
+   against the integrated result. For a reported UI/runtime bug, also reproduce the user's path
+   in the intended application/version when accessible. A configured tool, a reachable endpoint,
+   a direct tool call and a successful model-to-tool workflow are different verification levels.
+   State which actually passed. Do not claim live verification from mocks or source inspection.
+6. **Finish the requested scope.** Perform authorized integration, restart or release steps after
+   their checks pass; the coordinator owns git/release operations unless explicitly delegated.
+   Do not commit or publish merely because this loop mentions them. Recheck health after an
+   authorized restart and identify the running revision. Preserve user work and secrets. Report
+   completed behavior, verification, and material remaining gaps without declaring untested work
+   done. Once relevant checks pass, repeat them only after changes or new evidence justify it.
 
-1. **Plan.** Decompose the request into small, independent, precisely-scoped tasks — exact
-   file paths, exact signatures, "change nothing else", "Do NOT run git commit". A vague task
-   wastes a subagent; a precise one almost always succeeds.
-2. **Pre-flight.** `agent.sh doctor` before any fan-out (engines up? codex limits OK?).
-   Near the limit → route to `-e claude -m sonnet` or `-e opencode`.
-3. **Route.** Discover, don't assume: pick the cheapest capable model among the engines that
-   are actually up (`agent.sh doctor`, `opencode models`, `kimi provider list`; in DSH — the
-   model picker). Alias tables in [ORCHESTRATOR.md](ORCHESTRATOR.md) are snapshots — verify live,
-   the tier moves. A model the user named explicitly always wins. Never invent model ids.
-4. **Delegate.** `run` for one task, `fan` for a parallel batch. Parallel workers only on
-   NON-overlapping files. Each keeps its own `PROGRESS.<task>.md`.
-5. **Watch.** `list` / `status <name>`; a `waiting` task gets `reply <name> "..."`.
-   A `stalled`/`error` one gets its log read FIRST — the tail says whether the model failed the task
-   (re-scope it) or the provider dropped the turn (just resume it, see
-   ["A turn that died on the provider"](#a-turn-that-died-on-the-provider-resume-it-dont-restart-it)).
-6. **Verify.** Read every finished task's diff yourself — never trust "done" blindly. Run
-   builds/tests. Reject and re-delegate anything wrong.
-7. **Integrate & commit.** YOU own git: stage, review, commit. Workers must not commit.
+For delegation, use this compact contract (omit fields that do not apply):
 
-> Paste-ready orchestrator system prompt + full which-model-for-what matrix:
-> [ORCHESTRATOR.md](ORCHESTRATOR.md).
+```text
+Outcome and acceptance check:
+Owned files/resources; shared resources you must not change:
+Relevant findings and constraints; explicit model/endpoint if required:
+Allowed verification and side effects:
+Return: changed files, result and evidence, checks run/failed/not run,
+        remaining risks/blockers, active processes or pending work.
+Do not commit/publish or expand the assigned scope.
+```
+
+For Windows process launches, desktop interference, shared runtime configuration or restarts,
+read [runtime discipline](docs/RUNTIME-DISCIPLINE.md) before acting. For foreign CLI syntax and
+model snapshots, continue below or use [ORCHESTRATOR.md](ORCHESTRATOR.md).
 
 **Fan vs ledger.** `fan` is for work that splits into independent pieces (non-overlapping
 files). When the task is ONE hard problem that does not split — a tricky algorithm, a bug
 that needs several fix cycles, anything where a single-shot answer drowns in its own
-reasoning — use **ledger mode** below instead: one manager (you) + fresh worker contexts +
+reasoning — consider **ledger mode** below if a durable multi-round record helps: one manager (you) + fresh worker contexts +
 shared filesystem ledger + test verifier, up to 10 rounds. Same model throughout, no
 training, no extra plugin. Which model: you choose it yourself from what is available (rule
-in step 3 above) — no pinned defaults; keep one model for the whole ledger unless it proves
-incapable.
+in step 2 above). Keep one model for the whole ledger; an explicit user selection still wins.
+If it proves incapable, report the limitation and seek a model change rather than silently substituting.
 
 ## Ledger mode (single hard task, GVS5H-style)
 
@@ -134,7 +155,7 @@ bash "$SK" list                                       # table: state / engine / 
 bash "$SK" clean                                      # delete md clutter (<name>.md + PROGRESS.<name>.md) of STOPPED
                                                      # tasks; live running/idle tasks are never touched;
                                                      # --all incl. waiting, --purge also .log/.meta, -n dry-run
-bash "$SK" doctor                                     # pre-flight: engines + codex limits (before fanning out!)
+bash "$SK" doctor                                     # pre-flight: foreign CLI availability + codex limits when needed
 bash "$SK" doctor --json                              # machine-readable snapshot (used by the panel)
 bash "$SK" doctor --deep                              # + one REAL cheap run per engine that must EXECUTE a shell
                                                      # command — catches "answers fine, every command hangs"
@@ -179,8 +200,8 @@ bash "$SK" gui 8765 --lan --token SECRET              # ...reachable from anothe
   tier as fine for one-shot Q&A and unproven for multi-step tool work.
   Liveness varies inside the tier: on 2026-08-28 a one-line probe came back from `mimo-v2.5-free`,
   `nemotron-3-ultra-free` and `hy3-free`, while `nemotron-3.5-lightning-free` sat past a 120s
-  deadline without a byte. A silent provider is a provider outage, not a slow model — give it its
-  own timeout rather than reading the silence as a result.
+  deadline without a byte. Silence alone does not distinguish an outage from buffered output or
+  slow work. Use a bounded timeout, inspect the log/process tree and preserve partial work.
 - **DeepSeek is gone from opencode:** the Zen `deepseek-v4-flash-free` entry no longer appears in
   `opencode models`, and the Ollama route (`ollama/deepseek-v4-flash:cloud`) returns
   `403 this model requires a subscription`. The `ollama` and `zai` providers are therefore listed
@@ -190,8 +211,8 @@ bash "$SK" gui 8765 --lan --token SECRET              # ...reachable from anothe
   `{"message":"Model is unloaded."}`. Reload it via the API with an explicit JSON body
   (no body → HTTP 415):
   `curl -s -X POST http://127.0.0.1:1234/api/v0/model/<model-id>/load -H "Content-Type: application/json" -d '{}'`
-  To avoid slot contention with the orchestrator's own opencode session, prefer a remote model
-  (`-m free`, i.e. an OpenCode Zen entry) for subagents when available.
+  Avoid slot contention with the orchestrator's own opencode session by serializing access.
+  A remote alternative is appropriate only if it respects the user's model/endpoint and privacy constraints.
 
 **Environment knobs** (all optional, all with safe defaults):
 
@@ -201,7 +222,7 @@ bash "$SK" gui 8765 --lan --token SECRET              # ...reachable from anothe
 | `AGENT_RETRIES` | `2` | Additional provider attempts after a transient failure. Set `0` when an outer caller (such as the API bridge) owns retries. Attempts stop when retrying could repeat autonomous side effects. |
 | `AGENT_RETRY_DELAY` | `8` | Seconds between safe transient retries. |
 | `AGENT_STALE_SEC` | `300` | Silence after which a still-alive task is reported as `running (no output for Nm)` instead of plain `running` — same wording in the CLI and in the GUI. Reporting only; does not end the task. |
-| `AGENT_SILENCE_SEC` | `600` | No-output **watchdog**: if a step produces no NEW log activity for this long, the process tree is killed and the task ends as `state=silent` — distinct from `state=error exit=124` (`AGENT_TIMEOUT_SEC`, "took too long overall"): this means "stuck", that means "slow". Measured from the last real stream activity (codex/kimi now emit throttled heartbeats for exactly this reason — see below), not from step start, so a genuinely long-thinking turn is not killed. `0` disables it. |
+| `AGENT_SILENCE_SEC` | `600` | No-output **watchdog**: if a step produces no NEW log activity for this long, the process tree is killed and the task ends as `state=silent` — distinct from `state=error exit=124` (`AGENT_TIMEOUT_SEC`, "took too long overall"): these record different watchdog triggers, not proven causes. Measured from the last real stream activity (codex/kimi emit throttled heartbeats), not from step start. Healthy work without observable output can still be killed; inspect partial edits before retrying. `0` disables it. |
 | `AGENT_CODEX_USER_CONFIG` | unset | `1` = let codex load `~/.codex/config.toml` again. Off by default **on purpose** — see ["Codex: every shell command hangs"](#codex-every-shell-command-hangs-environment-issue) below. |
 | `AGENT_CODEX_MCP` | unset | Re-add specific MCP servers to the isolated codex config: `AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp,other=http://…"` → repeated `-c mcp_servers.<name>.url="<url>"`. |
 | `AGENT_CODEX_SANDBOX` | `danger-full-access` | Sandbox for normal Codex `run`/`reply` tasks. Set `workspace-write` or `read-only` to opt down. `AGENT_CHAT_ONLY=1` always forces `read-only` and ignores this variable. |
@@ -439,14 +460,14 @@ only way to tell was measuring the log's byte growth by hand. `eff_state` now ch
 `stalled` instead. This check is cached to one process-table snapshot per `agent.sh` invocation, so a
 `list`/`clean`/`wait` sweep over many tasks still costs one `ps` fork total, not one per task.
 
-**No silent forever-hangs — two watchdogs, two diagnoses.** Every step runs under `AGENT_TIMEOUT_SEC`
+**No silent forever-hangs — two watchdogs, two observed triggers.** Every step runs under `AGENT_TIMEOUT_SEC`
 (default 30 min, "took too long overall") AND `AGENT_SILENCE_SEC` (default 10 min, "produced nothing
 for too long"). Either expiring kills the whole process tree — including the native Windows grandchild
 (`codex.exe` and whatever it spawned), which plain `timeout`/`kill` leaves orphaned. `AGENT_TIMEOUT_SEC`
 ends the task as `state=error exit=124` with a `!! TIMEOUT` log line; `AGENT_SILENCE_SEC` ends it as the
 **distinct** `state=silent exit=125` with a `!! SILENT` log line — `agent.sh status` names which one
-fired (`⏱ killed by the step watchdog after <N>s` vs `… SILENT — no output for <N>s`), because an
-orchestrator should react differently to "stuck" than to "slow". Silence is measured from the last real
+fired (`⏱ killed by the step watchdog after <N>s` vs `… SILENT — no output for <N>s`). Inspect logs,
+process state and partial edits before diagnosing the cause or retrying. Silence is measured from the last real
 stream activity, never from step start: codex and kimi now emit throttled `[codex]`/`[kimi] activity: …`
 heartbeats into the log for exactly this reason (previously codex wrote nothing at all between the
 `session id:` line and the final answer, which would have made every honest multi-minute turn look
@@ -514,7 +535,8 @@ and the wrapper prints `⏳ the agent appears to have ASKED a question — reply
 This makes it visible that the subagent is waiting for an answer rather than stuck. `agent.sh status <name>`
 shows the question itself and the current stage of work.
 
-**Pre-flight `doctor`.** Before launching a batch of subagents, run `agent.sh doctor`: it checks the
+**Pre-flight `doctor`.** When foreign CLI availability or authentication is uncertain, run
+`agent.sh doctor` (not required for native workers): it checks the
 presence and versions of the CLIs (codex/claude/kimi/opencode/gemini), login state where available,
 and codex's **remaining
 limits** — primary (5h window) and secondary (weekly) with % and time until reset (from session-jsonl).
