@@ -10,6 +10,7 @@ Run:
     python -m unittest tests.test_openai_server   (from the repo root)
 """
 import argparse
+import base64
 import importlib.util
 import io
 import json
@@ -130,6 +131,35 @@ class LastOutputTests(unittest.TestCase):
     def test_empty_text(self):
         self.assertEqual(srv.last_output(""), "")
 
+    # Live 2026-09-29: `Red` + ~80 opencode schema warnings shipped as one completion because the
+    # provider wrote its CLI stderr AFTER the output marker and stdout+stderr share one task log.
+    SCHEMA_NOISE = ('[opencode] unknown format "uint32" ignored in schema at path '
+                    '"#/anyOf/0/properties/apps/items/properties/pid"')
+
+    def test_trailing_provider_diagnostics_are_dropped(self):
+        block = "Red\n" + "\n".join([self.SCHEMA_NOISE] * 80) + "\n"
+        log = "========== [run] ... ==========\n---------- output ----------\n" + block
+        self.assertEqual(srv.last_output(log), "Red")
+
+    def test_diagnostics_before_the_marker_were_never_returned(self):
+        log = ("[opencode] unknown format \"uint64\" ignored in schema\n"
+               "---------- output ----------\nRed\n")
+        self.assertEqual(srv.last_output(log), "Red\n")
+
+    def test_answer_without_noise_is_returned_byte_for_byte(self):
+        self.assertEqual(srv.last_output("answer\n"), "answer\n")
+        self.assertEqual(srv.last_output("answer"), "answer")
+
+    def test_noise_quoted_inside_the_answer_survives(self):
+        block = "The CLI logged:\n%s\nend.\n" % self.SCHEMA_NOISE
+        self.assertEqual(srv.last_output("---------- output ----------\n" + block), block)
+
+    def test_agent_bookkeeping_lines_are_dropped_too(self):
+        block = ("pong\n[agent-activity] tool Read\n"
+                 "AGENT_PROVIDER_ERROR: Rate limit exceeded\n"
+                 "!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=1800s and was killed\n")
+        self.assertEqual(srv.last_output("---------- output ----------\n" + block), "pong")
+
 
 class ModelLabelTests(unittest.TestCase):
     """model_label must show a versioned, human-readable name (e.g. "Sonnet 5", "Opus 4.8"),
@@ -186,11 +216,41 @@ class ModelLabelRealProviderDataTests(unittest.TestCase):
     def test_codex_default_model_shows_version_number(self):
         self.assertEqual(srv.model_label("codex", "sol", "medium"), "codex/GPT-5.6 Sol (medium)")
 
+    def test_codex_gpt6_labels(self):
+        self.assertEqual(srv.model_label("codex", "6-luna", "medium"), "codex/GPT-6 Luna (medium)")
+        self.assertEqual(srv.model_label("codex", "6-sol", "medium"), "codex/GPT-6 Sol (medium)")
+
     def test_kimi_default_model_shows_k3(self):
         self.assertEqual(srv.model_label("kimi", "", ""), "kimi/Kimi K3")
 
 
 class ContentTextTests(unittest.TestCase):
+    def test_camera_tool_json_is_lifted_to_cli_image_part(self):
+        image = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Yl6hdwAAAAASUVORK5CYII=")
+        url = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+        camera = {"ok": True, "camera": "Preview", "summary": "Captured scene", "dataUrl": url}
+        body = {"messages": [
+            {"role": "user", "content": "Inspect the scene"},
+            {"role": "tool", "tool_call_id": "camera_1", "content": json.dumps(camera)},
+        ]}
+        with mock.patch.object(srv, "CFG", argparse.Namespace(engine="codex")):
+            messages, _, _, _ = srv.validate_chat_request(body)
+        self.assertIsInstance(body["messages"][1]["content"], str,
+                              "normalization must not mutate the caller's transcript")
+        lifted = messages[1]["content"]
+        self.assertEqual("image_url", lifted[1]["type"])
+        self.assertEqual(url, lifted[1]["image_url"]["url"])
+        self.assertNotIn("dataUrl", lifted[0]["text"])
+        with mock.patch.object(srv, "CFG", argparse.Namespace(engine="codex")):
+            self.assertIn("image attached to Codex CLI", srv.render_messages(messages))
+            with srv._bridge_images(messages):
+                self.assertEqual(1, len(srv._chatonly_env()["AGENT_CODEX_IMAGE_PATHS"].splitlines()))
+
+        with mock.patch.object(srv, "CFG", argparse.Namespace(engine="claude")):
+            plain, _, _, _ = srv.validate_chat_request(body)
+        self.assertEqual(camera, json.loads(plain[1]["content"]))
+
     def test_plain_string(self):
         self.assertEqual(srv._content_text("hello"), "hello")
 
@@ -204,6 +264,152 @@ class ContentTextTests(unittest.TestCase):
     def test_image_part_is_noted_not_rendered(self):
         parts = [{"type": "image_url", "image_url": {"url": "http://x/y.png"}}]
         self.assertIn("image omitted", srv._content_text(parts))
+
+    def test_codex_data_url_image_is_staged_only_for_the_request(self):
+        image = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Yl6hdwAAAAASUVORK5CYII=")
+        url = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+        message = {"role": "user", "content": [
+            {"type": "text", "text": "Inspect this image"},
+            {"type": "image_url", "image_url": {"url": url}},
+        ]}
+        with mock.patch.object(srv, "CFG", argparse.Namespace(engine="codex")):
+            self.assertIn("image attached to Codex CLI", srv._content_text(message["content"]))
+            with srv._bridge_images([message]):
+                paths = srv._chatonly_env()["AGENT_CODEX_IMAGE_PATHS"].splitlines()
+                self.assertEqual(1, len(paths))
+                native_path = paths[0]
+                if os.name == "nt":
+                    native_path = native_path[1].upper() + ":" + native_path[2:]
+                with open(native_path, "rb") as image_file:
+                    self.assertEqual(image, image_file.read())
+            self.assertFalse(os.path.exists(native_path))
+
+    def test_opencode_data_url_image_is_staged_with_native_path(self):
+        image = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Yl6hdwAAAAASUVORK5CYII=")
+        url = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+        message = {"role": "user", "content": [
+            {"type": "text", "text": "Inspect this image"},
+            {"type": "image_url", "image_url": {"url": url}},
+        ]}
+        with mock.patch.object(srv, "CFG", argparse.Namespace(engine="opencode")), \
+                mock.patch.object(srv, "OPENCODE_NATIVE", False):
+            self.assertIn("image attached to OpenCode CLI", srv._content_text(message["content"]))
+            with srv._bridge_images([message]):
+                env = srv._chatonly_env()
+                self.assertNotIn("AGENT_CODEX_IMAGE_PATHS", env)
+                path = env["AGENT_OPENCODE_IMAGE_PATHS"]
+                with open(path, "rb") as image_file:
+                    self.assertEqual(image, image_file.read())
+            self.assertFalse(os.path.exists(path))
+
+    def test_codex_rejects_malformed_unsupported_and_oversized_images(self):
+        urls_and_statuses = [
+            ("data:image/png;base64,not-base64!", 400),
+            ("https://example.com/picture.png", 400),
+            ("data:image/png;base64," + base64.b64encode(b"not-a-png").decode("ascii"), 400),
+            ("data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n"
+                + b"x" * (4 * 1024 * 1024)).decode("ascii"), 413),
+        ]
+        with mock.patch.object(srv, "CFG", argparse.Namespace(engine="codex")):
+            for url, status in urls_and_statuses:
+                with self.subTest(url_prefix=url[:32]):
+                    message = {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": url}}]}
+                    with self.assertRaises(srv.RequestValidationError) as caught:
+                        with srv._bridge_images([message]):
+                            self.fail("invalid image must not reach the provider")
+                    self.assertEqual(status, caught.exception.status)
+                    self.assertNotIn("AGENT_CODEX_IMAGE_PATHS", srv._chatonly_env())
+
+    def test_codex_rejects_ninth_image_and_preserves_duplicate_image_order(self):
+        image = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Yl6hdwAAAAASUVORK5CYII=")
+        url = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+        message = {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": url}} for _ in range(8)]}
+        with mock.patch.object(srv, "CFG", argparse.Namespace(engine="codex")):
+            with srv._bridge_images([message]):
+                self.assertEqual(8, len(srv._chatonly_env()["AGENT_CODEX_IMAGE_PATHS"].splitlines()))
+            message["content"].append({"type": "image_url", "image_url": {"url": url}})
+            with self.assertRaises(srv.RequestValidationError) as caught:
+                with srv._bridge_images([message]):
+                    self.fail("ninth image must not reach the provider")
+            self.assertEqual(413, caught.exception.status)
+
+    def test_codex_image_validation_stops_before_provider_invocation(self):
+        message = {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,invalid!"}}]}
+        cfg = argparse.Namespace(engine="codex", model="6-luna", effort="medium",
+                                 dir="/tmp/pinned", retries=0, timeout=60, session_ttl=1800)
+        empty = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
+        with mock.patch.object(srv, "CFG", cfg), mock.patch.object(srv, "SESSION", empty), \
+                mock.patch.object(srv, "run_agent", side_effect=AssertionError("provider ran")):
+            with self.assertRaises(srv.RequestValidationError):
+                srv.H._raw_completion(object(), [message], None)
+
+    def test_codex_image_reaches_sync_and_live_provider_branches(self):
+        image = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Yl6hdwAAAAASUVORK5CYII=")
+        url = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+        message = {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": url}}]}
+        cfg = argparse.Namespace(engine="codex", model="6-sol", effort="medium",
+                                 dir="/tmp/pinned", port=8990, retries=0, timeout=60,
+                                 session_ttl=1800)
+        for live in (False, True):
+            with self.subTest(live=live):
+                seen = []
+
+                def provider(*args):
+                    path = srv._chatonly_env()["AGENT_CODEX_IMAGE_PATHS"]
+                    native_path = path[1].upper() + ":" + path[2:] if os.name == "nt" else path
+                    with open(native_path, "rb") as image_file:
+                        self.assertEqual(image, image_file.read())
+                    seen.append(native_path)
+                    return "image seen"
+
+                empty = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
+                with mock.patch.object(srv, "CFG", cfg), mock.patch.object(srv, "SESSION", empty), \
+                        mock.patch.object(srv, "read_meta", return_value={"state": "done"}), \
+                        mock.patch.object(srv, "LIVE_STREAM_ENGINES", {"codex"} if live else set()), \
+                        mock.patch.object(srv, "run_agent", side_effect=provider), \
+                        mock.patch.object(srv, "run_agent_live", side_effect=provider):
+                    answer = srv.H._raw_completion(
+                        object(), [message], None, on_delta=(lambda text: None) if live else None)
+                self.assertEqual("image seen", answer)
+                self.assertEqual(1, len(seen))
+                self.assertFalse(os.path.exists(seen[0]))
+
+    def test_codex_image_rejection_returns_http_400_or_413(self):
+        image = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Yl6hdwAAAAASUVORK5CYII=")
+        url = "data:image/png;base64," + base64.b64encode(image).decode("ascii")
+        cases = [("https://example.com/picture.png", 400), ([url] * 9, 413)]
+        for case, expected_status in cases:
+            with self.subTest(status=expected_status):
+                urls = case if isinstance(case, list) else [case]
+                body = json.dumps({"messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": item}} for item in urls]}]}).encode()
+                sent = []
+
+                class Fake:
+                    _reject_unauthorized = srv.H._reject_unauthorized
+                    _read_content_length = srv.H._read_content_length
+                    _send_json = staticmethod(lambda code, payload: sent.append((code, payload)))
+                    _sync_response = staticmethod(
+                        lambda messages, tools, choice: srv._validated_bridge_images(messages))
+
+                    def __init__(self):
+                        self.path = "/v1/chat/completions"
+                        self.headers = {"Content-Length": str(len(body))}
+                        self.rfile = io.BytesIO(body)
+
+                with mock.patch.object(srv, "CFG", argparse.Namespace(engine="codex", api_key="")):
+                    srv.H.do_POST(Fake())
+                self.assertEqual(expected_status, sent[0][0])
+                self.assertEqual("invalid_request_error", sent[0][1]["error"]["type"])
 
 
 class RenderMessagesTests(unittest.TestCase):
@@ -948,9 +1154,9 @@ class ProcessTreeTimeoutTests(unittest.TestCase):
                   "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
                   "open(sys.argv[1],'w').write(str(p.pid)); time.sleep(60)")
         try:
-            # A cold Windows process launched without a console can need >500 ms before its
-            # first Python statement; still keep the deadline tiny relative to the 60 s sleeper.
-            timeout = 2.0 if os.name == "nt" else 0.5
+            # Windows process startup under a concurrent Unity benchmark can exceed two seconds;
+            # ten seconds still distinguishes cleanup from the 60-second sleeper.
+            timeout = 10.0 if os.name == "nt" else 0.5
             srv._run_agent_process([sys.executable, "-c", script, pid_file], timeout,
                                    dict(os.environ))
             self.assertTrue(os.path.exists(pid_file))
@@ -976,7 +1182,7 @@ class ProcessTreeTimeoutTests(unittest.TestCase):
             "open(sys.argv[1],'w').write(str(p.pid))")
         orphan_pid = None
         try:
-            timeout = 2.0 if os.name == "nt" else 0.5
+            timeout = 10.0 if os.name == "nt" else 0.5
             srv._run_agent_process([sys.executable, "-c", script, pid_file], timeout,
                                    dict(os.environ))
             self.assertTrue(os.path.exists(pid_file))
@@ -2627,6 +2833,31 @@ class TailTaskLogTests(unittest.TestCase):
         self.assertGreaterEqual(len(got), 2)  # arrived in pieces, not one blob
 
 
+class ProviderNoiseStreamFilterTests(unittest.TestCase):
+    def test_filters_split_diagnostic_lines_without_delaying_tool_json(self):
+        chunks = []
+        filtered = srv.ProviderNoiseStreamFilter(chunks.append)
+        source = ('```json\n{"tool_calls":[{"name":"spawn_object","arguments":{}}]}\n```\n'
+                  '[codex] activity: item.completed\n'
+                  '[opencode] unknown format "uint32"\n'
+                  'Done')
+        for i in range(0, len(source), 3):
+            filtered.feed(source[i:i + 3])
+        filtered.finish()
+        self.assertEqual('```json\n{"tool_calls":[{"name":"spawn_object","arguments":{}}]}\n```\nDone',
+                         ''.join(chunks))
+        self.assertGreater(len(chunks), 1)
+
+    def test_reset_discards_partial_prefix_from_failed_retry(self):
+        chunks = []
+        filtered = srv.ProviderNoiseStreamFilter(chunks.append)
+        filtered.feed('[cod')
+        filtered.reset()
+        filtered.feed('answer')
+        filtered.finish()
+        self.assertEqual('answer', ''.join(chunks))
+
+
 class ApiKeyAuthTests(unittest.TestCase):
     """`--api-key` / $AGENT_OPENAI_KEY -- the gate that makes a LAN/public bridge safe to expose.
     An open bridge (no key) must keep behaving exactly as it always did on loopback."""
@@ -3126,6 +3357,19 @@ class StreamErrorSafetyTests(unittest.TestCase):
         self.assertEqual(sent, [])
         self.assertIn(b"event: error", wfile)
         self.assertNotIn(b"[DONE]", wfile)
+
+    def test_image_validation_after_sse_started_closes_without_second_status(self):
+        exc = srv.RequestValidationError("messages[1].content[0].image_url", "too many images", 413)
+        sent, wfile = self._drive(True, exc)
+        self.assertEqual(sent, [])
+        self.assertIn(b"event: error", wfile)
+        self.assertNotIn(b"[DONE]", wfile)
+
+    def test_image_validation_before_stream_returns_http_413(self):
+        exc = srv.RequestValidationError("messages[1].content[0].image_url", "too many images", 413)
+        sent, wfile = self._drive(False, exc)
+        self.assertEqual(sent[0][0], 413)
+        self.assertEqual(wfile, b"")
 
     def test_exception_before_any_byte_still_gets_openai_style_500(self):
         sent, wfile = self._drive(False, RuntimeError("boom"))

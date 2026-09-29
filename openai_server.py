@@ -76,7 +76,7 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
 (does not import gui.py) so the two servers can run/fail independently.
 """
-import argparse, atexit, contextlib, glob, ipaddress, json, logging, os, queue, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
+import argparse, atexit, base64, binascii, contextlib, glob, hashlib, ipaddress, json, logging, os, queue, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -149,6 +149,79 @@ def read_log(name):
         return ""
 
 
+_PROVIDER_NOISE_RE = re.compile(r"^(?:\[(?:agent-activity|opencode|codex|kimi|gemini|claude)\] "
+                                r"|AGENT_PROVIDER_ERROR: |!! TIMEOUT: )")
+
+
+def _strip_provider_noise(text):
+    """Drop a TRAILING run of the provider's own bookkeeping lines from an answer.
+
+    Providers write those to stderr — `[opencode] ...` CLI diagnostics, `[agent-activity] ...`
+    heartbeats, `AGENT_PROVIDER_ERROR: ...` provider failures, agent.sh's `!! TIMEOUT:` kill notice —
+    and generic dispatch merges stderr into the same task log the answer is sliced from. The opencode
+    provider now prints its answer LAST so they land before the marker, but a log written under any
+    other ordering would still hand them back as completion content: that is exactly how a one-word
+    vision answer ("Red") once shipped with ~80 `[opencode] unknown format "uint32" ignored in
+    schema` lines glued to it. Only a trailing run is removed, and text that ends in anything else is
+    returned byte-for-byte, so a diagnostic quoted inside the answer survives untouched."""
+    lines = text.split("\n")
+    end = len(lines)
+    while end and not lines[end - 1].strip():
+        end -= 1
+    if not end or not _PROVIDER_NOISE_RE.match(lines[end - 1]):
+        return text
+    while end and (_PROVIDER_NOISE_RE.match(lines[end - 1]) or not lines[end - 1].strip()):
+        end -= 1
+    return "\n".join(lines[:end])
+
+
+class ProviderNoiseStreamFilter:
+    """Keep provider diagnostics out of SSE content before bytes reach the client."""
+
+    _PREFIXES = ("[agent-activity] ", "[opencode] ", "[codex] ", "[kimi] ",
+                 "[gemini] ", "[claude] ", "AGENT_PROVIDER_ERROR: ", "!! TIMEOUT: ")
+
+    def __init__(self, sink):
+        self.sink = sink
+        self.reset()
+
+    def reset(self):
+        self.at_line_start = True
+        self.pending = ""
+        self.dropping = False
+
+    def feed(self, piece):
+        output = []
+        for char in piece:
+            if self.dropping:
+                if char == "\n":
+                    self.dropping = False
+                    self.at_line_start = True
+                continue
+            if self.at_line_start:
+                self.pending += char
+                if self.pending in self._PREFIXES:
+                    self.pending = ""
+                    self.dropping = True
+                    continue
+                if any(prefix.startswith(self.pending) for prefix in self._PREFIXES):
+                    continue
+                output.append(self.pending)
+                self.pending = ""
+                self.at_line_start = char == "\n"
+            else:
+                output.append(char)
+                if char == "\n":
+                    self.at_line_start = True
+        if output:
+            self.sink("".join(output))
+
+    def finish(self):
+        if self.pending:
+            self.sink(self.pending)
+            self.pending = ""
+
+
 def last_output(text):
     """Same block agent.sh's own `last_output` awk one-liner extracts: everything after the
     LAST "---------- output ----------" marker (a run may append a reply's marker too).
@@ -161,8 +234,8 @@ def last_output(text):
         if ln == marker:
             last = i
     if last == -1:
-        return text
-    return "\n".join(lines[last + 1:]).lstrip("\n")
+        return _strip_provider_noise(text)
+    return _strip_provider_noise("\n".join(lines[last + 1:]).lstrip("\n"))
 
 
 def read_meta(name):
@@ -481,6 +554,14 @@ def _chatonly_env():
     """
     env = dict(os.environ)
     env["AGENT_CHAT_ONLY"] = "1"
+    env.pop("AGENT_CODEX_IMAGE_PATHS", None)
+    env.pop("AGENT_OPENCODE_IMAGE_PATHS", None)
+    image_paths = getattr(_REQUEST_IMAGES, "paths", ())
+    if image_paths and CFG is not None:
+        if CFG.engine == "codex":
+            env["AGENT_CODEX_IMAGE_PATHS"] = "\n".join(image_paths)
+        elif CFG.engine == "opencode" and not _use_opencode_native():
+            env["AGENT_OPENCODE_IMAGE_PATHS"] = "\n".join(image_paths)
     # The bridge owns request-level retries. Disable agent.sh's nested retry layer so one
     # configured retry cannot multiply into several provider invocations.
     env["AGENT_RETRIES"] = "0"
@@ -1134,8 +1215,8 @@ def model_label(engine, model, effort):
 
 def _content_text(content):
     """OpenAI message content is either a plain string or a list of content-part dicts
-    ({"type":"text","text":...} / {"type":"image_url",...}). This bridge is text-only -- an
-    image part is noted, not rendered, since the wrapped CLI agent can't see it either way."""
+    ({"type":"text","text":...} / {"type":"image_url",...}). Codex and the safe OpenCode
+    CLI bridge receive bounded data-URL images as attachments."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -1147,13 +1228,137 @@ def _content_text(content):
                 if p.get("type") == "text":
                     parts.append(p.get("text", ""))
                 elif p.get("type") in ("image_url", "image"):
-                    parts.append("[image omitted -- this bridge is text-only]")
+                    source = p.get("image_url") or p.get("image")
+                    url = source.get("url", "") if isinstance(source, dict) else source
+                    image_engine = (CFG.engine if CFG is not None else "")
+                    if image_engine in ("codex", "opencode") and not _use_opencode_native() \
+                            and isinstance(url, str) \
+                            and url.lower().startswith("data:image/"):
+                        parts.append("[image attached to %s CLI]" %
+                                     ("Codex" if image_engine == "codex" else "OpenCode"))
+                    else:
+                        parts.append("[image omitted -- this bridge is text-only]")
                 else:
                     parts.append(json.dumps(p, ensure_ascii=False))
             else:
                 parts.append(str(p))
         return "\n".join(parts)
     return str(content)
+
+
+_REQUEST_IMAGES = threading.local()
+_BRIDGE_IMAGE_RE = re.compile(r"^data:image/(jpeg|png|webp);base64,(.+)$", re.I | re.S)
+_BRIDGE_IMAGE_MAX_BYTES = 4 * 1024 * 1024
+_BRIDGE_IMAGE_MAX_COUNT = 8
+
+
+def _validated_bridge_images(messages):
+    """Decode every image the CLI turn would receive, rejecting unsupported inputs."""
+    images = []
+    for message_index, message in enumerate(messages):
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for part_index, part in enumerate(content):
+            if not isinstance(part, dict) or part.get("type") not in ("image_url", "image"):
+                continue
+            param = "messages[%d].content[%d].image_url" % (message_index, part_index)
+            if len(images) >= _BRIDGE_IMAGE_MAX_COUNT:
+                raise RequestValidationError(param, "at most 8 images are supported per CLI turn", 413)
+            source = part.get("image_url") or part.get("image")
+            url = source.get("url", "") if isinstance(source, dict) else source
+            match = _BRIDGE_IMAGE_RE.fullmatch(url) if isinstance(url, str) else None
+            if not match:
+                raise RequestValidationError(
+                    param, "requires a base64 PNG, JPEG, or WebP data URL; remote URLs are unsupported")
+            encoded = match.group(2)
+            if len(encoded) > (_BRIDGE_IMAGE_MAX_BYTES + 2) // 3 * 4:
+                raise RequestValidationError(param, "image exceeds the 4 MiB limit", 413)
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error):
+                raise RequestValidationError(param, "invalid base64 image data") from None
+            if not raw:
+                raise RequestValidationError(param, "image data is empty")
+            if len(raw) > _BRIDGE_IMAGE_MAX_BYTES:
+                raise RequestValidationError(param, "image exceeds the 4 MiB limit", 413)
+            extension = "jpg" if match.group(1).lower() == "jpeg" else match.group(1).lower()
+            signature_ok = (
+                (extension == "png" and raw.startswith(b"\x89PNG\r\n\x1a\n"))
+                or (extension == "jpg" and raw.startswith(b"\xff\xd8") and raw.endswith(b"\xff\xd9"))
+                or (extension == "webp" and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP")
+            )
+            if not signature_ok:
+                raise RequestValidationError(param, "image bytes do not match the declared format")
+            images.append((raw, extension))
+    return images
+
+
+def _lift_camera_tool_images(messages):
+    """Turn a camera tool's JSON dataUrl into a real OpenAI image part.
+
+    Some OpenAI clients serialize function results as plain JSON strings even when
+    their own image-lifting step ran. Keep a bounded image attachment for the CLI
+    instead of letting the model receive an unreadable base64 paragraph.
+    """
+    if CFG is None or getattr(CFG, "engine", None) not in ("codex", "opencode") \
+            or _use_opencode_native():
+        return messages
+    converted = []
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") not in ("tool", "function") or not isinstance(content, str):
+            converted.append(message)
+            continue
+        if '"dataUrl"' not in content or '"camera"' not in content:
+            converted.append(message)
+            continue
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            converted.append(message)
+            continue
+        if not isinstance(payload, dict) or payload.get("ok") is not True \
+                or not isinstance(payload.get("dataUrl"), str) \
+                or not isinstance(payload.get("camera"), str):
+            converted.append(message)
+            continue
+        image_url = payload.pop("dataUrl")
+        payload["imageAttached"] = True
+        lifted = dict(message)
+        lifted["content"] = [
+            {"type": "text", "text": json.dumps(payload, ensure_ascii=False)},
+            {"type": "image_url", "image_url": {"url": image_url}},
+        ]
+        converted.append(lifted)
+    return converted
+
+
+@contextlib.contextmanager
+def _bridge_images(messages):
+    """Attach bounded request images to one CLI step and remove files afterwards."""
+    if CFG is None or CFG.engine not in ("codex", "opencode") or _use_opencode_native():
+        yield
+        return
+    images = _validated_bridge_images(messages)
+    if not images:
+        yield
+        return
+    previous = getattr(_REQUEST_IMAGES, "paths", ())
+    with tempfile.TemporaryDirectory(prefix="neoxider-bridge-images-") as directory:
+        paths = []
+        for index, (raw, extension) in enumerate(images):
+            digest = hashlib.sha256(raw).hexdigest()
+            path = os.path.join(directory, "%02d-%s.%s" % (index, digest, extension))
+            with open(path, "wb") as image_file:
+                image_file.write(raw)
+            paths.append(to_git_bash_path(path) if CFG.engine == "codex"
+                         else path.replace("\\", "/"))
+        _REQUEST_IMAGES.paths = paths
+        try:
+            yield
+        finally:
+            _REQUEST_IMAGES.paths = previous
 
 
 def render_messages(messages):
@@ -2258,9 +2463,10 @@ ACTIVE_REQUESTS = 0
 
 
 class RequestValidationError(ValueError):
-    def __init__(self, param, message):
+    def __init__(self, param, message, status=400):
         super().__init__(message)
         self.param = param
+        self.status = status
 
 
 def _validate_content(content, param, allow_none=False):
@@ -2375,7 +2581,7 @@ def validate_chat_request(body):
     stream = body.get("stream", False)
     if not isinstance(stream, bool):
         raise RequestValidationError("stream", "must be a boolean")
-    return messages, tools, choice, stream
+    return _lift_camera_tool_images(messages), tools, choice, stream
 
 
 def _canonical_assistant_message(text, tool_calls):
@@ -2587,13 +2793,17 @@ class H(BaseHTTPRequestHandler):
             raw_text = None
             if supports_resume and healthy and is_extension(SESSION["messages"], messages):
                 new_turns = messages[len(SESSION["messages"]):]
+                if CFG.engine in ("codex", "opencode") and not _use_opencode_native():
+                    _validated_bridge_images(new_turns)
                 answer = build_prompt(new_turns, tools, tool_choice)
                 if live:
-                    raw_text = reply_agent_live(CFG.engine, CFG.model, CFG.effort, SESSION["dir"],
-                                                prev_name, answer, CFG.timeout, on_delta)
+                    with _bridge_images(new_turns):
+                        raw_text = reply_agent_live(CFG.engine, CFG.model, CFG.effort, SESSION["dir"],
+                                                    prev_name, answer, CFG.timeout, on_delta)
                 else:
-                    raw_text = reply_agent(CFG.engine, CFG.model, CFG.effort, SESSION["dir"],
-                                           prev_name, answer, CFG.timeout)
+                    with _bridge_images(new_turns):
+                        raw_text = reply_agent(CFG.engine, CFG.model, CFG.effort, SESSION["dir"],
+                                               prev_name, answer, CFG.timeout)
                 if raw_text is not None and not raw_text.strip():
                     # A resume that "succeeded" but produced an EMPTY answer is as useless to the
                     # caller as one that died -- fall back to a fresh run rather than returning "".
@@ -2614,6 +2824,8 @@ class H(BaseHTTPRequestHandler):
                 # runs are retried (--retries, default 1): a real OpenAI endpoint effectively
                 # never returns an empty 200, and a transient CLI hiccup (rate-limit blip, session
                 # startup race) should not zero a whole benchmark scenario.
+                if CFG.engine in ("codex", "opencode") and not _use_opencode_native():
+                    _validated_bridge_images(messages)
                 prompt = build_prompt(messages, tools, tool_choice)
                 # Keep the directory only when this really is the same conversation carrying on
                 # (the normal case for a no-resume engine, where every turn lands here anyway).
@@ -2637,12 +2849,14 @@ class H(BaseHTTPRequestHandler):
                                         incident, type(_oce).__name__)
                             raw_text, state = "", "error"
                     elif live:
-                        raw_text = run_agent_live(CFG.engine, CFG.model, CFG.effort, workdir,
-                                                  prompt, name, CFG.timeout, on_delta)
+                        with _bridge_images(messages):
+                            raw_text = run_agent_live(CFG.engine, CFG.model, CFG.effort, workdir,
+                                                      prompt, name, CFG.timeout, on_delta)
                         state = read_meta(name).get("state")
                     else:
-                        raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt,
-                                             name, CFG.timeout)
+                        with _bridge_images(messages):
+                            raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt,
+                                                 name, CFG.timeout)
                         state = read_meta(name).get("state")
                     if raw_text.strip() and state != "error":
                         completed = True
@@ -2897,9 +3111,16 @@ class H(BaseHTTPRequestHandler):
             on_call=lambda call, idx: emit({"tool_calls": [
                 {"index": idx, "id": call["id"], "type": "function", "function": call["function"]}]}),
         )
-        raw = self._raw_completion(messages, tools, tool_choice, on_delta=emitter.feed,
+        noise_filter = ProviderNoiseStreamFilter(emitter.feed)
+
+        def reset_stream():
+            noise_filter.reset()
+            emitter.reset()
+
+        raw = self._raw_completion(messages, tools, tool_choice, on_delta=noise_filter.feed,
                                    can_retry=lambda: not emitter.wire_started,
-                                   on_retry=emitter.reset)
+                                   on_retry=reset_stream)
+        noise_filter.finish()
         if not emitter.wire_started and looks_like_limit_banner(raw):
             raise ProviderLimitError((raw or "").strip())  # -> 429, headers not sent yet
         fallback_text = emitter.finish()
@@ -2970,6 +3191,10 @@ class H(BaseHTTPRequestHandler):
                     self._stream_response(messages, tools, tool_choice)
                 else:
                     self._sync_response(messages, tools, tool_choice)
+        except RequestValidationError as e:
+            if getattr(self, "_sse_started", False):
+                return self._abort_stream_safely()
+            return self._send_json(e.status, _parameter_error(e))
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
             _invalidate_resume_session(messages)
         except ProviderLimitError:

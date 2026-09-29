@@ -1,12 +1,14 @@
 {
   "label": "Codex",
-  "models": ["sol", "luna", "terra", "spark"],
+  "models": ["6-sol", "6-luna", "sol", "luna", "terra", "spark"],
   "efforts": ["medium", "high"],
   "default_model": "terra",
   "default_effort": "medium",
   "limits": "codex",
   "resolved_label": "GPT-5.6 Terra (medium)",
   "model_labels": {
+    "6-sol": "GPT-6 Sol",
+    "6-luna": "GPT-6 Luna",
     "sol": "GPT-5.6 Sol",
     "luna": "GPT-5.6 Luna",
     "terra": "GPT-5.6 Terra",

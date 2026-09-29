@@ -103,7 +103,7 @@ otherwise mix its banner/session-id/error-log/"tokens used" chrome into the answ
 provider runs `codex exec --json` and extracts only the final agent message — this also
 cleaned up `agent.sh last`/the GUI for codex). One process = one fixed engine/model/effort
 — run it again on another port to compare models. **The wrapped CLI is locked to
-text-only completion for bridge calls**: `AGENT_CHAT_ONLY=1` makes codex run
+chat-only execution for bridge calls**: `AGENT_CHAT_ONLY=1` makes codex run
 `--sandbox read-only --ignore-user-config`, claude keeps `--permission-mode acceptEdits`
 and runs `--strict-mcp-config --disallowedTools
 Bash,Edit,Write,NotebookEdit,Task,WebFetch,WebSearch`, Kimi uses a

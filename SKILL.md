@@ -194,6 +194,20 @@ bash "$SK" gui 8765 --lan --token SECRET              # ...reachable from anothe
   `lightning`. Re-check with `opencode models` — the tier moves, and it moved: **`x-preview-f-free`
   is gone** as of 2026-08-28. Write the id exactly as `opencode models` prints it; near-misses like
   `mimo-free` or `nemotron-ultra-free` are not aliases and fail as unknown models.
+- **`opencode/space-bunny-free` is a current free Zen model (verified 2026-09-29)** and is the id
+  the picker now labels Space Bunny Free. It has **no short alias** — pass the full id, and pass it
+  verbatim *with* the `opencode/` prefix (a bare `space-bunny-free` is an unknown model):
+
+  ```bash
+  bash "$SK" run -e opencode -m opencode/space-bunny-free -t bunny-check \
+    -C "$PWD" "List the three largest files under ./Assets and report their sizes"
+  ```
+
+  Any unknown `-m` value falls through unchanged, so a new/free-tier id works the day it appears
+  without touching `providers/opencode/provider.sh` — that is why raw ids keep working here, and
+  why a missing alias is a convenience loss, not a failure. Prefer it over the pinned aliases when
+  the user just wants a free one-shot answer; the aliases stay stable ids, this one tracks the
+  vendor's current free lineup.
   **Unranked**: `free` points at Muse Spark by user preference, not measurement. In the one
   head-to-head actually run (2026-08-24, a 5-step PowerShell disk survey) *neither* Muse Spark nor
   Ox Alpha produced an answer — Ox hit the 1800s timeout, Muse never emitted a line. Treat the free
@@ -268,6 +282,37 @@ a real provider API key:
 bash "$SK" openai-server -e claude -m sonnet -f low -p 8801
 # then point any OpenAI-compatible client's base_url at http://127.0.0.1:8801/v1
 ```
+
+For GPT-6 Sol or Luna through a ChatGPT-backed Codex CLI, use `-e codex -m 6-sol` or
+`-m 6-luna` with Codex CLI 0.156.1 or newer. The desktop app may bundle an older CLI on
+`PATH`; point the bridge process at a newer standalone CLI if those models return 400.
+**Image attachments (Codex and OpenCode only).** The bridge is not blind to images: on `-e codex`
+and on the safe `-e opencode` CLI path it accepts OpenAI `image_url` parts carrying a base64
+**data URL** and hands the real file to the CLI turn — `-i <path>` for `codex exec`, `-f <path>` for
+`opencode run` — so the model actually sees the picture. Rules, all enforced before the CLI starts:
+
+- **Formats:** `data:image/png`, `data:image/jpeg`, `data:image/webp` only. `image/jpg` is *not*
+  accepted — spell it `jpeg`.
+- **Limits:** at most **8 images per CLI turn** and **4 MiB of decoded image data per image**.
+  Exceeding either is an HTTP **413**; an unsupported format, a remote `http(s)://` URL, broken
+  base64, empty data, or bytes that don't match the declared format is an HTTP **400** naming the
+  exact `messages[i].content[j].image_url` field at fault.
+- **Remote URLs are unsupported** on purpose — the CLI runs locally and a data URL needs no
+  outbound fetch of an untrusted link. Pass the bytes inline.
+- **Cleaned up after normal completion or handled timeout.** Images are written to a per-turn temp dir and deleted in a
+  `finally`; abrupt process termination may leave a temp file. The prompt text
+  gets an `[image attached to Codex CLI]` / `[image attached to OpenCode CLI]` marker in place of
+  the image, so the textual transcript stays honest about what was passed.
+- **Chat-only gate:** attachments are wired through the same `AGENT_CHAT_ONLY=1` path that strips
+  tools, and they cover **both** the fresh-run and the resumed-session turn (on resume only the new
+  message tail is validated). Opencode's opt-in `AGENT_OPENCODE_NATIVE_UNSAFE=1` HTTP path is
+  excluded — it does not receive attachments. `claude`, `kimi`, and `gemini` bridges stay
+  text-only and substitute the plain `[image omitted -- this bridge is text-only]` note.
+
+So: send `{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0…"}}` on a
+Codex- or OpenCode-backed bridge and it is a real multimodal turn; expect a 400/413 (not a silent
+drop) when a limit is hit.
+
 
 **Reaching the bridge from a phone/APK or another computer (LAN).** The bridge is loopback-only
 by default. Pass `--lan` together with an API key; non-loopback startup without a key is refused:
@@ -358,7 +403,7 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   exception returns `{"error": {...}}` HTTP 500 instead of a bare connection reset; a
   provider usage-limit banner becomes an HTTP 429 `rate_limit_error`, never a normal
   completion.
-- **The wrapped CLI is locked to text-only completion — real CLI flags, not just a
+- **The wrapped CLI is locked to chat-only execution — real CLI flags, not just a
   prompt ask.** Every subprocess gets `AGENT_CHAT_ONLY=1`, which makes codex run with
   `--sandbox read-only --ignore-user-config` (no writes, and skips
   `~/.codex/config.toml` so real configured MCP servers like a live `unityMCP` aren't
@@ -391,8 +436,8 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
 - **A very long conversation is handed over as a file, not as an argument.** The bridge
   stages any prompt over ~16000 characters in a temp file and passes `--prompt-file`,
   because a command line is capped near 32000 characters and the spawn fails outright
-  above it. From there only `claude` and `opencode` can carry it (their CLIs read a
-  prompt from stdin); `codex` and `gemini` refuse with a message naming the size.
+  above it. `claude`, `opencode`, and `codex` read staged prompts from stdin for both
+  new runs and replies; `gemini` refuses with a message naming the size.
 - One process = one fixed engine/model/effort for its whole lifetime. To compare
   models, run the command again with different `-e/-m/-f/-p` on another port.
 
@@ -644,6 +689,8 @@ Gotchas (verified):
 | Alias | Model | When |
 |---|---|---|
 | `5.6-terra` / `terra` (default) | `gpt-5.6-terra`, effort medium | regular tasks |
+| `6-sol` / `sol6` | `gpt-6-sol`, effort medium | GPT-6 Sol; requires Codex CLI 0.156.1+ |
+| `6-luna` / `luna6` | `gpt-6-luna`, effort medium | GPT-6 Luna; requires Codex CLI 0.156.1+ |
 | `5.6-sol` / `sol` | `gpt-5.6-sol`, effort medium | 5.6 variant / explicit Sol request |
 | `high` | `gpt-5.6-sol`, effort high | harder than usual (rare; big stuff is better done yourself) |
 | `luna` | `gpt-5.6-luna` | 5.6 variant |
@@ -678,6 +725,28 @@ e.g. `opus-high`. Implementation — `provider_claude_resolve()` in `providers/c
 Kimi has no CLI effort flag, so `-f` is ignored. Authenticate once with `kimi login`; then verify
 the provisioned aliases with `kimi provider list`. Do not invent K2.5/K2.7 aliases: they are not
 present in the live managed catalog verified on 2026-08-09. Raw configured aliases pass through.
+
+**opencode** (`-e opencode`) — the cheapest lane, and the only one where the vendor's free lineup
+changes without notice. No default model: pick one explicitly.
+
+| `-m` value | Resolves to | When |
+|---|---|---|
+| `opencode/space-bunny-free` | itself (raw id, **no alias**) | **default choice for free work**; verified 2026-09-29 |
+| `free` / `spark` / `muse` / `muse-spark` | `opencode/muse-spark-1.3-contributor-free` | the user's standing free pick |
+| `ox` / `alpha` / `ox-alpha` | `opencode/x-preview-f-free` | second free lane — **re-verify, it has vanished before** |
+| `pickle` / `big-pickle` | `opencode/big-pickle` | long-context free option |
+| `hy3`, `mimo`, `nemotron`/`ultra`, `lightning` | `…-free` ids | alternates, same caveats |
+
+```bash
+bash "$SK" run -e opencode -m opencode/space-bunny-free -t spot-check -C "$PWD" \
+  "Summarize what changed in the last commit"
+```
+
+Two rules that decide everything here: **ids with a provider prefix must be verbatim**
+(`opencode/space-bunny-free` works, `space-bunny-free` does not), and **an unknown `-m` is passed
+through unchanged rather than rejected** — so a brand-new Zen id works immediately, without a code
+change. The tier is free but liveness inside it is uneven; bound your timeout and treat silence as
+unknown, not as a verdict. Full trade-offs in the gotchas list above.
 
 ## Rules for setting tasks
 

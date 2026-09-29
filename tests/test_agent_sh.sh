@@ -514,6 +514,30 @@ assert_match "opencode provider emits clean final answer" 'OPENCODE_WRAPPER_OK' 
 assert_match "opencode provider keeps prefixed stderr diagnostics" \
     '^\[opencode\] provider diagnostic' "$(cat "$opencode_stderr")"
 
+# REGRESSION (live 2026-09-29, bridge content = "Red" + ~80 opencode schema warnings): stdout and
+# stderr share ONE log, so a provider that prints the answer BEFORE re-emitting its CLI stderr puts
+# every `[opencode] ...` line INSIDE the answer block, and last_output/openai_server then return them
+# as the completion content. With a chatty CLI the answer must be the LAST thing written.
+opencode() {
+    printf 'provider diagnostic\n' >&2
+    local i
+    for ((i=0; i<80; i++)); do
+        printf '[opencode] unknown format "uint32" ignored in schema at path "#/anyOf/0/properties/pid"\n' >&2
+    done
+    printf '%s\n' '{"type":"text","sessionID":"ses_fake","part":{"id":"p1","text":"Red"}}'
+}
+opencode_merged="$SCRATCH_LOGDIR/opencode-merged"
+provider_opencode_run_cmd "$SCRATCH_LOGDIR" "opencode/space-bunny-free" "" "dominant color?" \
+    >"$opencode_merged" 2>&1
+assert_eq "opencode provider fake chatty run still exits cleanly" "0" "$?"
+opencode_last_block="$(last_output "$opencode_merged")"
+assert_eq "opencode last output drops trailing stderr diagnostics" "Red" "$opencode_last_block"
+if grep -q '\[opencode\] unknown format' "$opencode_merged"; then
+    pass "opencode diagnostics still reach the log"
+else
+    fail "opencode diagnostics were dropped instead of just moved before the marker"
+fi
+
 # ============================================================================================
 section "long prompts (--prompt-file / stdin handover)"
 # ============================================================================================
@@ -554,17 +578,41 @@ else
     fail "opencode rejected a prompt it can take on stdin"
 fi
 if prompt_fits_engine codex "$long_prompt" 2>"$fits_err"; then
-    fail "codex silently accepted a prompt its CLI cannot receive"
+    pass "codex accepts a prompt over the argv ceiling"
 else
-    pass "codex refuses a prompt over the argv ceiling"
+    fail "codex rejected a prompt it can take on stdin"
+fi
+if prompt_fits_engine gemini "$long_prompt" 2>"$fits_err"; then
+    fail "gemini silently accepted a prompt its CLI cannot receive"
+else
+    pass "gemini refuses a prompt over the argv ceiling"
 fi
 assert_match "the refusal names the size and the way out" \
-    'prompt is 20000 characters.*-e claude or -e opencode' "$(cat "$fits_err")"
+    'prompt is 20000 characters.*stdin prompts' "$(cat "$fits_err")"
 if prompt_fits_engine codex "short prompt" 2>/dev/null; then
     pass "codex still takes a normal prompt"
 else
     fail "codex refused a normal prompt"
 fi
+
+# Codex CLI reads `-` from stdin for both a fresh exec and a resumed turn.
+CODEX_ARGS_FILE="$SCRATCH_LOGDIR/codex-stdin-args"
+CODEX_STDIN_FILE="$SCRATCH_LOGDIR/codex-stdin-content"
+codex() {
+    printf '%s' "$*" > "$CODEX_ARGS_FILE"
+    cat > "$CODEX_STDIN_FILE"
+    printf '%s\n' '{"type":"thread.started","thread_id":"12345678-1234-1234-1234-123456789abc"}' \
+        '{"type":"item.completed","item":{"type":"agent_message","text":"codex-ok"}}'
+}
+provider_codex_run_cmd "$SCRATCH_LOGDIR" "gpt-6-luna" "medium" "$long_prompt" >/dev/null 2>&1
+assert_match "codex long run passes stdin marker instead of argv prompt" '--json -$' "$(cat "$CODEX_ARGS_FILE")"
+assert_eq "codex long run forwards complete prompt on stdin" "$long_prompt" "$(cat "$CODEX_STDIN_FILE")"
+_provider_codex_resume_once "$SCRATCH_LOGDIR/codex-resume-raw" "$SCRATCH_LOGDIR" \
+    "12345678-1234-1234-1234-123456789abc" "$long_prompt" -m gpt-6-luna >/dev/null 2>&1
+assert_match "codex long reply passes stdin marker after session" \
+    '12345678-1234-1234-1234-123456789abc -$' "$(cat "$CODEX_ARGS_FILE")"
+assert_eq "codex long reply forwards complete prompt on stdin" "$long_prompt" "$(cat "$CODEX_STDIN_FILE")"
+unset -f codex
 
 # The opencode CLI must receive the long prompt on stdin, with no prompt left in argv.
 OPENCODE_STDIN_FILE="$SCRATCH_LOGDIR/opencode-stdin"
@@ -585,7 +633,18 @@ provider_opencode_run_cmd "$SCRATCH_LOGDIR" "some/model" "" "inspect this" >/dev
 assert_match "a normal prompt stays in opencode's argv" 'inspect this' "$(cat "$OPENCODE_ARGS_FILE")"
 assert_eq "a normal prompt sends nothing on opencode's stdin" "0" \
     "$(wc -c < "$OPENCODE_STDIN_FILE" | tr -d ' ')"
-unset -f opencode
+touch "$SCRATCH_LOGDIR/opencode-image.png"
+opencode_image_path="$SCRATCH_LOGDIR/opencode-image.png"
+command -v cygpath >/dev/null 2>&1 && opencode_image_path="$(cygpath -m "$opencode_image_path")"
+AGENT_CHAT_ONLY=1
+AGENT_OPENCODE_IMAGE_PATHS="$opencode_image_path"
+provider_opencode_run_cmd "$SCRATCH_LOGDIR" "some/model" "" "inspect the attached image" >/dev/null 2>&1
+assert_eq "opencode image argv ends with --file and never treats prompt as another file" \
+    "run --auto --format json --print-logs --log-level ERROR -m some/model --agent neoxider-chat-only -f $opencode_image_path" \
+    "$(cat "$OPENCODE_ARGS_FILE")"
+assert_eq "opencode image prompt is sent on stdin" \
+    "inspect the attached image" "$(cat "$OPENCODE_STDIN_FILE")"
+unset AGENT_CHAT_ONLY AGENT_OPENCODE_IMAGE_PATHS OPENCODE_CONFIG
 unset -f opencode
 unset AGENT_OPENCODE_TIMEOUT_SEC
 
@@ -653,6 +712,17 @@ AGENT_CHAT_ONLY=1
 mapfile -t codex_chatonly < <(_provider_codex_chatonly_args)
 assert_eq "codex chat-only: switches to read-only sandbox + ignore-user-config" \
     "--sandbox read-only --ignore-user-config" "${codex_chatonly[*]}"
+
+touch "$SCRATCH_LOGDIR/image-one.png" "$SCRATCH_LOGDIR/image-two.jpg"
+AGENT_CODEX_IMAGE_PATHS="$SCRATCH_LOGDIR/image-one.png"$'\n'"$SCRATCH_LOGDIR/image-two.jpg"
+mapfile -t codex_images < <(_provider_codex_image_args)
+assert_eq "codex chat-only: attaches request images" \
+    "-i $SCRATCH_LOGDIR/image-one.png -i $SCRATCH_LOGDIR/image-two.jpg" "${codex_images[*]}"
+unset AGENT_CODEX_IMAGE_PATHS
+provider_codex_resolve 6-luna
+assert_eq "codex GPT-6 Luna alias" "gpt-6-luna" "$P_MODEL"
+provider_codex_resolve 6-sol
+assert_eq "codex GPT-6 Sol alias" "gpt-6-sol" "$P_MODEL"
 
 # The bridge turns arbitrary HTTP callers into CLI invocations, so it must stay read-only no matter
 # what the environment says -- otherwise AGENT_CODEX_SANDBOX in a shell profile would silently hand
@@ -1150,7 +1220,11 @@ run_stale_lock_stress() {
     done
     [ "$failures" = 0 ]
 }
-_guarded_run 30 run_stale_lock_stress >/dev/null 2>&1
+stress_watchdog=30
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) stress_watchdog=180 ;;
+esac
+_guarded_run "$stress_watchdog" run_stale_lock_stress >/dev/null 2>&1
 stale_stress_rc=$?
 unset -f run_stale_lock_stress
 assert_eq "20 concurrent atomic-publication writers finish within the bounded watchdog" "0" "$stale_stress_rc"
