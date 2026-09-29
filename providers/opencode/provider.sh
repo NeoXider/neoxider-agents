@@ -46,17 +46,24 @@ provider_opencode_resolve() {
 # the tool loop is running, then a fresh `---------- output ----------` marker followed by ONLY the
 # assistant's final text (the concatenated `text` parts). Heartbeats deliberately precede the final
 # marker, so agent.sh last/openai_server still see a clean answer while status/log -f no longer look
-# frozen for the whole run. No usable python -> raw passthrough.
+# frozen for the whole run. When AGENT_OPENCODE_ANSWER_FILE is set the marker+answer go to that file
+# instead of stdout so the caller can order the stderr diagnostics before the answer (below).
+# No usable python -> raw passthrough.
 _provider_opencode_emit() {
     if ! _agent_python; then cat; return 0; fi
     PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
-import sys, json, time
+import sys, json, time, os
 try:
     sys.stdin.reconfigure(errors="ignore")
 except Exception:
     pass
 MARK = "---------- output ----------"
 RAW_LIMIT = 262144
+# When set, the final MARK+answer block goes to this file instead of stdout, so the caller can
+# print the CLI stderr diagnostics FIRST and only then let the answer be the last thing written
+# (see _provider_opencode_invoke). Without this, agent.sh merged stdout+stderr put every
+# "[opencode] ..." diagnostic INSIDE the answer block and last_output returned them as the answer.
+ANSWER_FILE = os.environ.get("AGENT_OPENCODE_ANSWER_FILE") or ""
 sid = None; parts = {}; order = []; raw = []; raw_size = 0
 last_activity = 0.0
 for line in sys.stdin:
@@ -92,10 +99,12 @@ if not msg:
     sys.stdout.write("".join(raw))   # nothing clean -> surface raw for debugging
     raise SystemExit(3)              # non-zero -> agent.sh marks the task failed
 msg = "\n".join((ln + " ") if ln == MARK else ln for ln in msg.split("\n"))
-print(MARK)
-sys.stdout.write(msg)
-if not msg.endswith("\n"):
-    sys.stdout.write("\n")
+block = MARK + "\n" + msg + ("" if msg.endswith("\n") else "\n")
+if ANSWER_FILE:
+    with open(ANSWER_FILE, "w", encoding="utf-8") as handle:
+        handle.write(block)
+else:
+    sys.stdout.write(block)
 '
 }
 
@@ -123,6 +132,18 @@ _provider_opencode_chatonly_args() {
     return 0
 }
 
+_provider_opencode_image_args() {
+    _provider_opencode_chatonly || return 0
+    [ -n "${AGENT_OPENCODE_IMAGE_PATHS:-}" ] || return 0
+    local path check
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        check="$path"
+        command -v cygpath >/dev/null 2>&1 && check="$(cygpath -u "$path" 2>/dev/null || printf '%s' "$path")"
+        [ -f "$check" ] && printf '%s\n' -f "$path"
+    done <<< "$AGENT_OPENCODE_IMAGE_PATHS"
+}
+
 # _provider_opencode_invoke DIR PROMPT EXTRA... — the single CLI invocation both run and resume use.
 # EXTRA are session flags (`-s <id>`) or nothing. Kept as one function on purpose: run and resume
 # must share the stdin/stderr/timeout handling below, or a fix to one silently skips the other.
@@ -137,6 +158,8 @@ _provider_opencode_invoke() {
     # it. Logs go to stderr, so the JSONL on stdout stays clean.
     local args=(--auto --format json --print-logs --log-level ERROR "$@")
     mapfile -t -O ${#args[@]} args < <(_provider_opencode_chatonly_args)
+    local -a image_args; mapfile -t image_args < <(_provider_opencode_image_args)
+    [ ${#image_args[@]} -gt 0 ] && args+=("${image_args[@]}")
     if _provider_opencode_chatonly; then
         local chat_config
         chat_config="$(_provider_opencode_chatonly_config)" \
@@ -163,7 +186,9 @@ _provider_opencode_invoke() {
     # keeps the "never wait on an interactive stdin" property the redirect below is there for.
     local -a command=(opencode run "${args[@]}")
     local promptfile=""
-    if prompt_needs_stdin "$prompt"; then
+    # OpenCode's repeatable -f consumes following positional words as more file paths. With an
+    # attachment, send the prompt on stdin so it can never be parsed as a filename.
+    if [ ${#image_args[@]} -gt 0 ] || prompt_needs_stdin "$prompt"; then
         promptfile="$(prompt_stdin_file "$prompt")" \
             || { printf '[opencode] cannot stage a long prompt for stdin\n' >&2; return 1; }
     else
@@ -175,6 +200,19 @@ _provider_opencode_invoke() {
     [ -n "$errfile" ] && [ -f "$errfile" ] \
         || { printf '[opencode] mktemp returned an invalid stderr file\n' >&2; return 1; }
     local stdin_src="/dev/null"; [ -n "$promptfile" ] && stdin_src="$promptfile"
+    # The final answer is parked in a file and printed AFTER the stderr diagnostics below. Without
+    # this, everything agent.sh merges into one log made the CLI's own diagnostics part of the
+    # answer: `--print-logs --log-level ERROR` makes this model emit ~80
+    # `[opencode] unknown format "uint32" ignored in schema ...` lines per turn, and since they were
+    # written after the marker, last_output/openai_server returned them as the completion content
+    # (verified live on the `Red` + 81-lines case, task state=done exit=0). Heartbeats keep
+    # streaming to stdout during the run, so the silence watchdog is unaffected.
+    local answerfile; answerfile="$(mktemp -t opencode-answer-XXXXXX 2>/dev/null)"
+    if [ -z "$answerfile" ] || [ ! -f "$answerfile" ]; then
+        printf '[opencode] cannot create temporary answer file\n' >&2; return 1
+    fi
+    local previous_answer_file="${AGENT_OPENCODE_ANSWER_FILE:-}"
+    export AGENT_OPENCODE_ANSWER_FILE="$answerfile"
     if [ "$timeout_sec" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
         ( cd "$dir" && timeout --foreground --kill-after=10s "${timeout_sec}s" "${command[@]}" <"$stdin_src" 2>"$errfile" ) \
             | _provider_opencode_emit
@@ -182,6 +220,11 @@ _provider_opencode_invoke() {
         ( cd "$dir" && "${command[@]}" <"$stdin_src" 2>"$errfile" ) | _provider_opencode_emit
     fi
     statuses=("${PIPESTATUS[@]}")
+    if [ -n "$previous_answer_file" ]; then
+        export AGENT_OPENCODE_ANSWER_FILE="$previous_answer_file"
+    else
+        unset AGENT_OPENCODE_ANSWER_FILE
+    fi
     [ -n "$promptfile" ] && rm -f "$promptfile"
     local rate_limited="" rate_line=""
     if [ -s "$errfile" ]; then
@@ -193,6 +236,10 @@ _provider_opencode_invoke() {
         while IFS= read -r line; do printf '[opencode] %s\n' "$line" >&2; done <"$errfile"
     fi
     rm -f "$errfile"
+    # The answer goes out LAST, so every diagnostic above lands BEFORE the output marker and stays
+    # readable in the log without ever becoming part of the answer block.
+    if [ -s "$answerfile" ]; then cat "$answerfile"; fi
+    rm -f "$answerfile"
     # Tagged the same way codex/kimi tag their own provider errors (see agent.sh's
     # _extract_provider_reason): this is what turns a generic error/timeout into agent.sh's distinct
     # state=limited, with the CLI's own message in meta reason= instead of just this stderr line.

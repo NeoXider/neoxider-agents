@@ -420,16 +420,15 @@ prompt_stdin_file() {
 }
 
 # Engines whose CLI can take the prompt on stdin, so a prompt over the argv ceiling still works.
-# codex and gemini pass it as an argument only, and their `</dev/null` guard exists to keep a
-# headless run from blocking on an interactive stdin -- so they refuse instead of failing opaquely.
-PROMPT_STDIN_ENGINES=" claude opencode "
+# Gemini passes it as an argument only; its `</dev/null` guard keeps a headless run from blocking.
+PROMPT_STDIN_ENGINES=" claude opencode codex "
 
 # Refuses, with the reason, when this engine cannot carry a prompt of this size.
 prompt_fits_engine() {
     local eng="$1" text="$2"
     prompt_needs_stdin "$text" || return 0
     case "$PROMPT_STDIN_ENGINES" in *" $eng "*) return 0 ;; esac
-    printf 'agent.sh: prompt is %s characters and -e %s hands it to the CLI as a command-line argument, which the platform caps near 32000. Use -e claude or -e opencode for a prompt this size.\n' \
+    printf 'agent.sh: prompt is %s characters and -e %s hands it to the CLI as a command-line argument, which the platform caps near 32000. Use an engine that supports stdin prompts for this size.\n' \
         "${#text}" "$eng" >&2
     return 1
 }

@@ -59,6 +59,20 @@ bash agent.sh run -C . "say hello"        # your first subagent
 bash agent.sh gui                         # ...or drive everything from a browser
 ```
 
+**Free lane, no OpenRouter API key.** With OpenCode authenticated locally, its Zen free tier works through the same wrapper, and
+`opencode/space-bunny-free` is a current free model (verified 2026-09-29) with no short alias — pass
+the id verbatim, `opencode/` prefix included:
+
+```bash
+bash agent.sh run -e opencode -m opencode/space-bunny-free -t spot-check -C . \
+  "Summarize what changed in the last commit"
+bash agent.sh log -f spot-check          # watch it work, same as any other engine
+```
+
+An unknown `-m` is passed through to the CLI unchanged rather than rejected, so brand-new Zen ids
+work the day they appear without touching any provider file. Free-tier liveness is uneven, so keep
+a bounded timeout and read the log rather than assuming silence means failure.
+
 <details>
 <summary><b>Installation options & requirements</b></summary>
 
@@ -420,8 +434,36 @@ hidden multiplication of both retry loops.
 otherwise mixes its startup banner/session-id/error-log/"tokens used" chrome (and, on Windows, a
 cp866-mojibake OS-notification line) into the same stream as the answer — so the codex provider
 runs `codex exec --json` and extracts just the final agent message, which also cleaned up
-`agent.sh last` and the GUI chat view. Image content in messages is not rendered (replaced with an
-`[image omitted]` note) — the wrapped CLI can't see images either way.
+`agent.sh last` and the GUI chat view.
+
+**Images are attached for real on two engines.** Most engines still get an `[image omitted]` note
+in place of the picture, but a bridge started with `-e codex` or with `-e opencode` (the safe CLI
+path) accepts OpenAI `image_url` data URLs and hands the actual file to the model — `codex exec -i`
+or `opencode run -f` — so the turn is genuinely multimodal:
+
+```jsonc
+{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo…"}}
+```
+
+| Rule | Behaviour |
+|---|---|
+| Formats | `data:image/png`, `data:image/jpeg`, `data:image/webp` — **`image/jpg` is rejected** |
+| Per turn | at most **8 images**, at most **4 MiB** of decoded data per image → HTTP **413** |
+| Remote URLs | unsupported on purpose (a data URL needs no outbound fetch of an untrusted link) |
+| Bad input | unsupported format, `http(s)://` URL, broken base64, or bytes not matching the declared format → HTTP **400** naming the exact `messages[i].content[j].image_url` |
+| Cleanup | images live in a per-turn temp dir deleted after normal completion or a handled timeout; abrupt process termination may leave a temp file |
+| Transcript | the prompt keeps an `[image attached to Codex CLI]` / `[image attached to OpenCode CLI]` marker so the text record stays honest |
+| Not covered | `claude`, `kimi`, `gemini`; opencode's opt-in `AGENT_OPENCODE_NATIVE_UNSAFE=1` HTTP path; the safe path stays under the same `AGENT_CHAT_ONLY=1` gate that strips tools |
+
+Both the fresh-run and the resumed-session turn honour this (on resume only the new message tail is
+validated), so an image can arrive mid-conversation.
+Camera tools that return an `ok` JSON result with `camera` and `dataUrl` are also lifted into an
+image part automatically. The CLI receives the pixels, while its text prompt keeps the camera
+summary without the base64 payload.
+
+GPT-6 Luna/Sol require Codex CLI 0.156.1 or newer;
+select them with `-e codex -m 6-luna` or `-e codex -m 6-sol` on separate ports.
+
 
 **One process = one fixed engine/model/effort** for its whole lifetime. To compare models, run the
 command again with different `-e/-m/-f/-p`. `codex` resume preserves its pinned model/effort

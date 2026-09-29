@@ -12,7 +12,7 @@ PROVIDER_CODEX_RESUME_NEEDS_MODEL=1
 # The 5.6 family (luna/sol/terra) needs codex-cli >= 0.144 -- older CLIs get a 400
 # "The '<model>' model requires a newer version of Codex" from the server. gpt-5.6-terra is the
 # default (user preference). A raw model id passed via -m still falls through unchanged (e.g.
-# -m gpt-5.5 for an older model on demand).
+# -m gpt-5.5 for an older model on demand). GPT-6 Sol/Luna need a newer CLI (0.156.1+ verified).
 provider_codex_resolve() {
     local alias="${1:-5.6-terra}"; P_EFFORT="medium"
     case "$alias" in
@@ -20,6 +20,8 @@ provider_codex_resolve() {
         5.6-sol|sol)                P_MODEL="gpt-5.6-sol" ;;
         5.6-high|high)              P_MODEL="gpt-5.6-sol"; P_EFFORT="high" ;;
         5.6-luna|luna)              P_MODEL="gpt-5.6-luna" ;;
+        6-sol|sol6|gpt6-sol)        P_MODEL="gpt-6-sol" ;;
+        6-luna|luna6|gpt6-luna)     P_MODEL="gpt-6-luna" ;;
         spark|5.3|5.3-spark|codex-spark) P_MODEL="gpt-5.3-codex-spark" ;;
         *) P_MODEL="$alias" ;;
     esac
@@ -152,6 +154,15 @@ sys.stdout.write(msg)
 if not msg.endswith("\n"):
     sys.stdout.write("\n")
 '
+}
+
+_provider_codex_image_args() {
+    [ "${AGENT_CHAT_ONLY:-0}" = 1 ] || return 0
+    [ -n "${AGENT_CODEX_IMAGE_PATHS:-}" ] || return 0
+    local path
+    while IFS= read -r path; do
+        [ -n "$path" ] && [ -f "$path" ] && printf '%s\n' -i "$path"
+    done <<< "$AGENT_CODEX_IMAGE_PATHS"
 }
 
 # _provider_codex_mcp_args — turns AGENT_CODEX_MCP="name=url,name2=url2" into repeated
@@ -392,12 +403,20 @@ provider_codex_prepare_resume() {
 provider_codex_run_cmd() {
     local dir="$1" model="$2" effort="$3" prompt="$4"
     local -a sbargs; mapfile -t sbargs < <(_provider_codex_chatonly_args)
+    local -a image_args; mapfile -t image_args < <(_provider_codex_image_args)
+    local promptfile="" prompt_arg="$prompt" stdin_src="/dev/null"
+    if prompt_needs_stdin "$prompt"; then
+        promptfile="$(prompt_stdin_file "$prompt")" \
+            || { printf '[codex] cannot stage a long prompt for stdin\n' >&2; return 1; }
+        prompt_arg="-"; stdin_src="$promptfile"
+    fi
     codex exec -m "$model" -c model_reasoning_effort="$effort" \
         "${sbargs[@]}" --skip-git-repo-check -C "$dir" \
-        --json "$prompt" </dev/null 2>&1 | _provider_codex_emit
+        "${image_args[@]}" --json "$prompt_arg" <"$stdin_src" 2>&1 | _provider_codex_emit
     # Surface a parser failure (e.g. python missing/crashed) rather than masking it behind codex's
     # own exit code -- otherwise the task could be marked done with empty/partial output.
     local rc_codex=${PIPESTATUS[0]} rc_emit=${PIPESTATUS[1]}
+    [ -n "$promptfile" ] && rm -f -- "$promptfile"
     [ "$rc_emit" -ne 0 ] && return "$rc_emit"
     return "$rc_codex"
 }
@@ -407,9 +426,16 @@ provider_codex_run_cmd() {
 # above opts into that) -- same pattern provider_claude_resume_cmd uses. Same `--json` cleanup.
 _provider_codex_resume_once() {
     local raw="$1" dir="$2" session="$3" answer="$4"; shift 4
+    local promptfile="" answer_arg="$answer" stdin_src="/dev/null"
+    if prompt_needs_stdin "$answer"; then
+        promptfile="$(prompt_stdin_file "$answer")" \
+            || { printf '[codex] cannot stage a long reply for stdin\n' >&2; return 1; }
+        answer_arg="-"; stdin_src="$promptfile"
+    fi
     ( cd "$dir" && codex exec resume --skip-git-repo-check \
-        "$@" --json "$session" "$answer" </dev/null 2>&1 ) | tee "$raw" | _provider_codex_emit
+        "$@" --json "$session" "$answer_arg" <"$stdin_src" 2>&1 ) | tee "$raw" | _provider_codex_emit
     local statuses=("${PIPESTATUS[@]}")
+    [ -n "$promptfile" ] && rm -f -- "$promptfile"
     [ "${statuses[0]}" -ne 0 ] && return "${statuses[0]}"
     [ "${statuses[1]}" -ne 0 ] && return "${statuses[1]}"
     return "${statuses[2]}"
@@ -430,6 +456,8 @@ provider_codex_resume_cmd() {
     [ ${#isoargs[@]} -gt 0 ] && cargs+=("${isoargs[@]}")
     [ -n "$P_MODEL" ] && cargs+=(-m "$P_MODEL")
     [ -n "$P_EFFORT" ] && cargs+=(-c "model_reasoning_effort=\"$P_EFFORT\"")
+    local -a image_args; mapfile -t image_args < <(_provider_codex_image_args)
+    [ ${#image_args[@]} -gt 0 ] && cargs+=("${image_args[@]}")
     # Repeat the lock check immediately before exec to close most of the preflight/launch race.
     # If Codex still wins that race and returns its explicit conflict, wait again and retry ONCE.
     _provider_codex_wait_for_writer "$session" || return $?
