@@ -150,7 +150,7 @@ def read_log(name):
 
 
 _PROVIDER_NOISE_RE = re.compile(r"^(?:\[(?:agent-activity|opencode|codex|kimi|gemini|claude)\] "
-                                r"|AGENT_PROVIDER_ERROR: |!! TIMEOUT: )")
+                                r"|session id: |AGENT_PROVIDER_ERROR: |!! TIMEOUT: )")
 
 
 def _strip_provider_noise(text):
@@ -179,7 +179,8 @@ class ProviderNoiseStreamFilter:
     """Keep provider diagnostics out of SSE content before bytes reach the client."""
 
     _PREFIXES = ("[agent-activity] ", "[opencode] ", "[codex] ", "[kimi] ",
-                 "[gemini] ", "[claude] ", "AGENT_PROVIDER_ERROR: ", "!! TIMEOUT: ")
+                 "[gemini] ", "[claude] ", "session id: ",
+                 "AGENT_PROVIDER_ERROR: ", "!! TIMEOUT: ")
 
     def __init__(self, sink):
         self.sink = sink

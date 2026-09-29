@@ -2838,6 +2838,7 @@ class ProviderNoiseStreamFilterTests(unittest.TestCase):
         chunks = []
         filtered = srv.ProviderNoiseStreamFilter(chunks.append)
         source = ('```json\n{"tool_calls":[{"name":"spawn_object","arguments":{}}]}\n```\n'
+                  'session id: ses_example123\n'
                   '[codex] activity: item.completed\n'
                   '[opencode] unknown format "uint32"\n'
                   'Done')
@@ -2847,6 +2848,18 @@ class ProviderNoiseStreamFilterTests(unittest.TestCase):
         self.assertEqual('```json\n{"tool_calls":[{"name":"spawn_object","arguments":{}}]}\n```\nDone',
                          ''.join(chunks))
         self.assertGreater(len(chunks), 1)
+
+    def test_session_id_before_first_tool_call_is_not_streamed(self):
+        chunks = []
+        filtered = srv.ProviderNoiseStreamFilter(chunks.append)
+        source = ('session id: ses_example123\n'
+                  '[opencode] activity: step_start\n'
+                  '```json\n{"tool_calls":[{"name":"execute_lua","arguments":{"code":"return 1"}}]}\n```')
+        for i in range(0, len(source), 2):
+            filtered.feed(source[i:i + 2])
+        filtered.finish()
+        self.assertEqual('```json\n{"tool_calls":[{"name":"execute_lua","arguments":{"code":"return 1"}}]}\n```',
+                         ''.join(chunks))
 
     def test_reset_discards_partial_prefix_from_failed_retry(self):
         chunks = []
