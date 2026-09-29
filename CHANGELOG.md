@@ -16,6 +16,7 @@ All notable changes to this project are documented here. Format follows
 - Codex now reads long prompts from stdin on initial and resumed turns, so a large benchmark transcript no longer fails at the Windows command-line length limit.
 - OpenCode's image attachment no longer consumes the text prompt as another `-f` argument. Its final answer is kept clear of trailing CLI diagnostics, including `unknown format` messages.
 - Live SSE responses filter provider bookkeeping lines before emitting content. Camera JSON lifting is restricted to CLI engines that can actually attach the image.
+- OpenCode session identifiers are filtered from live SSE content. They remain in task logs for resume bookkeeping but no longer consume a benchmark turn as assistant text.
 
 ### Fixed
 
