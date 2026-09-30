@@ -25,6 +25,8 @@ provider_claude_resolve() {
         # claude-opus-4-8, hence the separate opus5 id.
         ""|default|opus5) P_MODEL="claude-opus-5" ;;
         sonnet) P_MODEL="claude-sonnet-5"; [ -z "$eff" ] && eff="high" ;;
+        sonnet55) P_MODEL="claude-sonnet-5-5"; [ -z "$eff" ] && eff="high" ;;
+        opus55) P_MODEL="claude-opus-5-5" ;;
         opus)  P_MODEL="opus" ;;
         haiku) P_MODEL="haiku" ;;
         *) P_MODEL="$base" ;;

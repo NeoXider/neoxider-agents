@@ -1180,10 +1180,11 @@ def resolve_claude_model(model, effort):
     resolved = {
         "": "claude-opus-5", "default": "claude-opus-5", "opus5": "claude-opus-5",
         "sonnet": "claude-sonnet-5", "opus": "opus", "haiku": "haiku",
+        "sonnet55": "claude-sonnet-5-5", "opus55": "claude-opus-5-5",
     }.get(base)
     if resolved is None:
         raise ValueError("unsupported Claude model alias")
-    resolved_effort = effort or derived_effort or ("high" if base == "sonnet" else "")
+    resolved_effort = effort or derived_effort or ("high" if base in ("sonnet", "sonnet55") else "")
     allowed_efforts = set((PROVIDERS.get("claude") or {}).get("efforts") or ())
     if resolved_effort and resolved_effort not in allowed_efforts:
         raise ValueError("unsupported Claude effort")
