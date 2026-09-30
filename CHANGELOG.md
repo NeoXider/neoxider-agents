@@ -6,6 +6,16 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **opencode: a dead `small_model` no longer kills a session.** opencode uses the *small model* from the user's `opencode.json` for background work even when `-m` names another model, so a `small_model` that pointed at a local server that was not running (LM Studio) ended healthy hosted-model sessions with `stream error ... small=true`. The provider now pins `small_model` to the model of the run through an inline `OPENCODE_CONFIG_CONTENT` override (verified with `opencode debug config`; the user's files are never edited). Opt out with `AGENT_OPENCODE_KEEP_SMALL_MODEL=1`; a caller-provided `OPENCODE_CONFIG_CONTENT` is respected.
+- **opencode: transient provider/network failures are retried automatically.** Stream errors, connection resets, 502/503/504 and `Failed to execute` used to end the task as `state=error` and needed a human `reply`. The provider now retries up to `AGENT_OPENCODE_RETRIES` (default 3) times with 15s/30s/60s backoff, **continuing the same session** (`-s <id>`) with a short continue prompt so nothing already done is thrown away. Rate limits, watchdog timeouts and unrecognised failures are never retried.
+- **opencode: long tool calls no longer look like a hung engine.** A `dotnet build` or a lift makes opencode emit no events for many minutes, and the no-output watchdog (`AGENT_SILENCE_SEC`) killed healthy agents as `state=silent` (four of eight in one hour). A keepalive now prints `[opencode] activity: tool running` every `AGENT_OPENCODE_KEEPALIVE_SEC` (60) seconds **only while a build/tool process exists in the task's process tree** (Windows), so a genuinely wedged engine is still caught. Disable with `AGENT_OPENCODE_TOOL_KEEPALIVE=0`.
+
+### Added
+
+- `tests/test_opencode_reliability.sh` (19 checks: pin env, the pin reaching the child and not leaking, retry continuing the same session, rate-limit and unknown failures not retried, retry bound, opt-out); verified to fail on a copy with the fix removed.
+
 ### Added
 
 - The OpenAI-compatible CLI bridge passes validated PNG, JPEG, and WebP image data URLs to Codex and OpenCode turns, including session continuations and camera tool results encoded as JSON. It limits each turn to eight images and each decoded image to 4 MiB, and returns a clear 400 or 413 for invalid input.
