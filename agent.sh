@@ -825,6 +825,19 @@ hdr() { # kind "info" LABEL "text" logfile
 # last output block (after the last separator), with the streaming ACTIVITY markers dropped:
 # they exist so a tool-only stretch still grows the log for the liveness watchdog, and they are
 # progress, not answer. `agent.sh log` still shows them — that is where progress belongs.
+# Маркер «результат задачи кто-то прочитал» (last / wait). Без него `pending` считает завершённую задачу ничьей:
+# именно так пропадает итог агента, запущенного через `run ... &` в фоне оболочки, о завершении которого harness не узнаёт.
+mark_seen() { : > "$LOGDIR/$1.seen" 2>/dev/null || true; }
+is_unread() {
+    local m; m="$(meta_file "$1")"
+    [ -e "$m" ] || return 1
+    # Только свежие задачи (окно AGENT_PENDING_HOURS, по умолчанию 24 ч): старые логи без маркера — не «потерянные» результаты.
+    [ -n "${_PEND_REF:-}" ] && { [ "$m" -nt "$_PEND_REF" ] || return 1; }
+    case "$(eff_state "$1")" in running|idle) return 1 ;; esac
+    [ -e "$LOGDIR/$1.seen" ] || return 0
+    [ "$m" -nt "$LOGDIR/$1.seen" ]
+}
+
 last_output() {
     awk '/^---------- output ----------$/{buf=""; next}
          /^\[agent-activity\] /{next}
@@ -1282,6 +1295,7 @@ case "$cmd" in
             echo "[agent.sh] ⇉ fanned $fan_n (pid $!)" >&2
         done
         echo "[agent.sh] launched $fan_i parallel task(s) under '$fan_base'. Poll: agent.sh list" >&2
+        echo "[agent.sh] ⚠ To get a completion NOTIFICATION start ONE tracked background job now: agent.sh wait   (Claude Code: Bash with run_in_background:true). A plain '&' or >/dev/null launch is invisible to the orchestrator; check 'agent.sh pending' before answering." >&2
         ;;
     test-api)
         # Thin wrapper on top of `run`, not a new provider: builds a prompt instructing the
@@ -1401,6 +1415,27 @@ except Exception:
         if [ -n "$f" ]; then require_task_name "$f"; log="$LOGDIR/$f.log"; else log="$(_latest_file log)"; fi
         [ -e "${log:-}" ] || die "log not found: ${f:-<latest>}"
         last_output "$log"
+        [ -n "$f" ] && mark_seen "$f"
+        ;;
+    # pending — завершённые задачи, чей результат ещё никто не прочитал (`last`/`wait` не вызывали).
+    # Звать в начале каждого хода оркестратора и перед финальным ответом пользователю: страхует от потерянного итога, если
+    # уведомление о завершении не пришло (агент запущен не через фоновый вызов инструмента, а через `&` в оболочке).
+    # Код выхода 0 всегда; с --strict код 3, если есть непрочитанные (удобно в скриптах и хуках).
+    pending)
+        p_strict=0; [ "${1:-}" = "--strict" ] && p_strict=1
+        p_n=0
+        # одна эталонная метка «N часов назад» на весь проход (сравнение -nt дёшево, find на каждую задачу на Windows медленный)
+        _PEND_REF="$LOGDIR/.pending_ref"; touch -d "${AGENT_PENDING_HOURS:-24} hours ago" "$_PEND_REF" 2>/dev/null || _PEND_REF=""
+        for mf in "$LOGDIR"/*.meta; do
+            [ -e "$mf" ] || continue
+            n="${mf##*/}"; n="${n%.meta}"
+            valid_task_name "$n" || continue
+            is_unread "$n" || continue
+            p_n=$((p_n+1))
+            echo "⚑ unread  $n  state=$(eff_state "$n")  -> agent.sh last $n"
+        done
+        [ "$p_n" -eq 0 ] && echo "[agent.sh] pending: no unread results"
+        [ "$p_strict" = 1 ] && [ "$p_n" -gt 0 ] && exit 3
         ;;
     # wait [names...] — completion primitive for orchestrators that have their own background-job
     # mechanism: blocks until every named task leaves `running` (the SAME eff_state machine as list/
@@ -1458,6 +1493,7 @@ except Exception:
             echo ""
             echo "========== wait | $n | $(eff_state "$n") =========="
             if [ -e "$logf" ]; then last_output "$logf"; else echo "(no log for $n)"; fi
+            mark_seen "$n"
         done
         echo "WAIT_DONE tasks=${#w_names[@]} rc=$w_rc"
         exit "$w_rc"

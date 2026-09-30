@@ -18,6 +18,8 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- **`agent.sh pending` and read-markers: a finished task can no longer be silently forgotten.** `last <name>` and `wait` write `<name>.seen`; `pending` lists tasks that finished within `AGENT_PENDING_HOURS` (default 24) with no newer marker (`--strict` exits 3). `fan` now prints the exact tracked-background-job instruction. SKILL.md gains a top-level rule: start agents with the harness's background mechanism (Claude Code: `run_in_background: true`), never with a bare `&`, which hides completion from the orchestrator.
+
 - The OpenAI-compatible CLI bridge passes validated PNG, JPEG, and WebP image data URLs to Codex and OpenCode turns, including session continuations and camera tool results encoded as JSON. It limits each turn to eight images and each decoded image to 4 MiB, and returns a clear 400 or 413 for invalid input.
 - Added GPT-6 Luna and Sol Codex aliases and documented the free `opencode/space-bunny-free` model.
 
