@@ -144,6 +144,64 @@ _provider_opencode_image_args() {
     done <<< "$AGENT_OPENCODE_IMAGE_PATHS"
 }
 
+# ---------------------------------------------------------------------------------------------
+# Reliability helpers (2026-09-30). See the header of tools/patch_opencode_provider.py in the
+# neoxider-agents changelog for the incidents behind each of them.
+# ---------------------------------------------------------------------------------------------
+
+# _provider_opencode_model_of ARGS... — prints the value following -m/--model, if any.
+_provider_opencode_model_of() {
+    local prev=""
+    for a in "$@"; do
+        if [ "$prev" = "-m" ] || [ "$prev" = "--model" ]; then printf '%s' "$a"; return 0; fi
+        prev="$a"
+    done
+    return 0
+}
+
+# _provider_opencode_pin_env MODEL — prints KEY=VALUE lines for `env`. ALWAYS prints at least one
+# (keeps `export` from being called with no operands).
+#
+# small_model pinning: opencode uses the "small model" of the user's config for background work
+# (titles, summaries) EVEN WHEN -m names a different model. A user whose small_model is a local
+# server that is not running (LM Studio) got sessions killed with `stream error ... small=true` while
+# the main hosted model was healthy. The run's own model is the only one we know works, so it also
+# becomes small_model - via OPENCODE_CONFIG_CONTENT, which merges over the user's files and never
+# edits them. Opt out with AGENT_OPENCODE_KEEP_SMALL_MODEL=1; a caller-provided
+# OPENCODE_CONFIG_CONTENT is respected untouched.
+_provider_opencode_pin_env() {
+    local model="$1"
+    printf '%s\n' "AGENT_OPENCODE_WRAPPED=1"
+    [ "${AGENT_OPENCODE_KEEP_SMALL_MODEL:-0}" = 1 ] && return 0
+    [ -n "${OPENCODE_CONFIG_CONTENT:-}" ] && return 0
+    [ -n "$model" ] || return 0
+    # ids are provider/model with [A-Za-z0-9._:/-] only; anything else is not worth JSON-escaping
+    printf '%s' "$model" | grep -qE '^[A-Za-z0-9._:/-]+$' || return 0
+    printf '%s\n' "OPENCODE_CONFIG_CONTENT={\"small_model\":\"${model}\"}"
+}
+
+# _provider_opencode_keepalive STATEFILE — background loop. Every AGENT_OPENCODE_KEEPALIVE_SEC (60)
+# seconds prints a heartbeat line IF a build/tool process exists under this task's process tree.
+# Why: a tool call (dotnet build, an IL lift, a test run) makes opencode emit no events for many
+# minutes, and agent.sh's no-output watchdog (AGENT_SILENCE_SEC=600) killed healthy agents as
+# state=silent. The heartbeat is conditional on a live tool process, so a genuinely wedged engine
+# (no tool running) is still caught by the watchdog, and AGENT_TIMEOUT_SEC still bounds everything.
+# Windows only (needs /proc/<pid>/winpid and PowerShell); a no-op elsewhere.
+_provider_opencode_keepalive() {
+    [ "${AGENT_OPENCODE_TOOL_KEEPALIVE:-1}" = 1 ] || return 0
+    local root; root="$(cat "/proc/$$/winpid" 2>/dev/null)"
+    [ -n "$root" ] || return 0
+    command -v powershell >/dev/null 2>&1 || return 0
+    local every="${AGENT_OPENCODE_KEEPALIVE_SEC:-60}" n
+    local ps='$root=[int]$args[0]; $all=Get-CimInstance Win32_Process; $ids=@{$root=1}; do{$c=0; foreach($p in $all){ if($ids.ContainsKey([int]$p.ParentProcessId) -and -not $ids.ContainsKey([int]$p.ProcessId)){$ids[[int]$p.ProcessId]=1;$c++} }}while($c); $names="dotnet","MSBuild","csc","VBCSCompiler","git","python","python3","pwsh","robocopy","unzip","cl","link","ninja","make","curl","cargo","node","npm","ilspycmd","Cpp2IL"; @($all | Where-Object { $ids.ContainsKey([int]$_.ProcessId) -and $_.ProcessId -ne $PID -and $_.ParentProcessId -ne $PID -and ($names -contains ($_.Name -replace "\.exe$","")) }).Count'
+    while :; do
+        sleep "$every"
+        n="$(powershell -NoProfile -ExecutionPolicy Bypass -Command "& { $ps }" "$root" 2>/dev/null | tr -d '\r' | tail -1)"
+        case "$n" in ''|*[!0-9]*) n=0 ;; esac
+        [ "$n" -gt 0 ] && printf '[opencode] activity: tool running (%s helper processes)\n' "$n"
+    done
+}
+
 # _provider_opencode_invoke DIR PROMPT EXTRA... — the single CLI invocation both run and resume use.
 # EXTRA are session flags (`-s <id>`) or nothing. Kept as one function on purpose: run and resume
 # must share the stdin/stderr/timeout handling below, or a fix to one silently skips the other.
@@ -213,13 +271,17 @@ _provider_opencode_invoke() {
     fi
     local previous_answer_file="${AGENT_OPENCODE_ANSWER_FILE:-}"
     export AGENT_OPENCODE_ANSWER_FILE="$answerfile"
+    local -a pin_env; mapfile -t pin_env < <(_provider_opencode_pin_env "$(_provider_opencode_model_of "$@")")
+    local keepalive_pid=""
+    _provider_opencode_keepalive & keepalive_pid=$!
     if [ "$timeout_sec" -gt 0 ] 2>/dev/null && command -v timeout >/dev/null 2>&1; then
-        ( cd "$dir" && timeout --foreground --kill-after=10s "${timeout_sec}s" "${command[@]}" <"$stdin_src" 2>"$errfile" ) \
+        ( cd "$dir" && export "${pin_env[@]}" && timeout --foreground --kill-after=10s "${timeout_sec}s" "${command[@]}" <"$stdin_src" 2>"$errfile" ) \
             | _provider_opencode_emit
     else
-        ( cd "$dir" && "${command[@]}" <"$stdin_src" 2>"$errfile" ) | _provider_opencode_emit
+        ( cd "$dir" && export "${pin_env[@]}" && "${command[@]}" <"$stdin_src" 2>"$errfile" ) | _provider_opencode_emit
     fi
     statuses=("${PIPESTATUS[@]}")
+    [ -n "$keepalive_pid" ] && { kill "$keepalive_pid" 2>/dev/null; wait "$keepalive_pid" 2>/dev/null; }
     if [ -n "$previous_answer_file" ]; then
         export AGENT_OPENCODE_ANSWER_FILE="$previous_answer_file"
     else
@@ -233,6 +295,13 @@ _provider_opencode_invoke() {
         # task — retrying it immediately just burns another watchdog window.
         rate_line="$(grep -aiE 'rate limit|429|quota' "$errfile" | tail -1)"
         [ -n "$rate_line" ] && rate_limited=1
+        # Transient = the CLI failed AND said so in a way that a retry can fix. Decided here, while
+        # the stderr is still on disk; consumed by _provider_opencode_invoke_retry via a state file.
+        if [ -z "$rate_limited" ] && [ "${statuses[0]}" -ne 124 ] \
+           && { [ "${statuses[0]}" -ne 0 ] || [ "${statuses[1]}" -ne 0 ]; } \
+           && grep -aiEq 'stream error|Failed to execute|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|fetch failed|network error|overloaded|Bad Gateway|Service Unavailable|Gateway Time-?out|HTTP (502|503|504)|status[ =:]+(502|503|504)' "$errfile"; then
+            [ -n "${AGENT_OPENCODE_STATE_FILE:-}" ] && printf 'transient\n' >"$AGENT_OPENCODE_STATE_FILE"
+        fi
         while IFS= read -r line; do printf '[opencode] %s\n' "$line" >&2; done <"$errfile"
     fi
     rm -f "$errfile"
@@ -260,6 +329,61 @@ _provider_opencode_invoke() {
     return "${statuses[1]}"
 }
 
+# _provider_opencode_invoke_retry DIR PROMPT EXTRA... — _provider_opencode_invoke plus bounded automatic
+# recovery from TRANSIENT provider/network failures (stream errors, connection resets, 502/503/504,
+# "Failed to execute"). Before 2026-09-30 such a failure ended the task as state=error and a human
+# had to reply "continue"; with eight agents running that happened three times in an hour.
+# The retry CONTINUES THE SAME SESSION (-s <id>, taken from the `session id:` line the first attempt
+# printed) with a short continue prompt, so nothing already read or done is thrown away; with no
+# session id yet it re-runs the original prompt. Backoff 15s, 30s, 60s...
+# NEVER retried: rate limits (retrying just burns the next window), watchdog timeouts (rc 124),
+# and any failure whose cause is not recognisably transient. AGENT_OPENCODE_RETRIES=0 disables.
+_provider_opencode_invoke_retry() {
+    local dir="$1" prompt="$2"; shift 2
+    local max="${AGENT_OPENCODE_RETRIES:-3}" attempt=0 rc tmp sid delay
+    local -a base=("$@") cur
+    case "$max" in ''|*[!0-9]*) max=3 ;; esac
+    local model; model="$(_provider_opencode_model_of "$@")"
+    local statefile; statefile="$(mktemp -t opencode-state-XXXXXX 2>/dev/null)" || statefile=""
+    export AGENT_OPENCODE_STATE_FILE="$statefile"
+    cur=("${base[@]}"); local cur_prompt="$prompt"
+    while :; do
+        : >"$statefile" 2>/dev/null
+        tmp="$(mktemp -t opencode-try-XXXXXX 2>/dev/null)"
+        _provider_opencode_invoke "$dir" "$cur_prompt" "${cur[@]}" | tee "$tmp"
+        rc=${PIPESTATUS[0]}
+        if [ "$rc" -eq 0 ] || [ "$max" -eq 0 ] || [ "$attempt" -ge "$max" ] \
+           || ! grep -q '^transient$' "$statefile" 2>/dev/null; then
+            rm -f "$tmp" "$statefile"; unset AGENT_OPENCODE_STATE_FILE
+            return "$rc"
+        fi
+        attempt=$((attempt + 1))
+        sid="$(grep -a '^session id:' "$tmp" | head -1 | awk '{print $3}')"
+        # prefer the session from this attempt; otherwise keep whatever session the caller passed
+        if [ -z "$sid" ]; then
+            local prev="" a
+            for a in "${base[@]}"; do [ "$prev" = "-s" ] && sid="$a"; prev="$a"; done
+        fi
+        rm -f "$tmp"
+        delay=$((15 * (1 << (attempt - 1)))); [ "$delay" -gt 120 ] && delay=120
+        printf '[opencode] transient provider/network failure (rc=%s) - retry %s/%s in %ss%s\n' \
+            "$rc" "$attempt" "$max" "$delay" "${sid:+, continuing session $sid}" >&2
+        sleep "$delay"
+        cur=(); local skip=0 a
+        for a in "${base[@]}"; do
+            if [ "$skip" -eq 1 ]; then skip=0; continue; fi
+            case "$a" in -s|--session) skip=1; continue ;; --continue) continue ;; esac
+            cur+=("$a")
+        done
+        if [ -n "$sid" ]; then
+            cur+=(-s "$sid")
+            cur_prompt="Your previous turn was interrupted by a transient provider/network error. Continue exactly where you left off - read your PROGRESS file if you need to - and do not redo finished steps."
+        else
+            cur_prompt="$prompt"
+        fi
+    done
+}
+
 # provider_opencode_run_cmd DIR MODEL EFFORT PROMPT — runs the CLI and emits clean final text.
 # MODEL is the raw -m value (may be empty). EFFORT maps to opencode's --variant flag (its
 # reasoning-effort equivalent: high/max/minimal/...), if given.
@@ -273,7 +397,7 @@ provider_opencode_run_cmd() {
     local -a extra=()
     [ -n "$model" ] && extra+=(-m "$model")
     [ -n "$effort" ] && extra+=(--variant "$effort")
-    _provider_opencode_invoke "$dir" "$prompt" "${extra[@]}"
+    _provider_opencode_invoke_retry "$dir" "$prompt" "${extra[@]}"
 }
 
 # agent.sh resolves the alias into $P_MODEL/$P_EFFORT before calling resume when this is 1. opencode
@@ -291,7 +415,7 @@ provider_opencode_resume_cmd() {
     [ -n "$P_MODEL" ] && extra+=(-m "$P_MODEL")
     [ -n "$P_EFFORT" ] && extra+=(--variant "$P_EFFORT")
     if [ -n "$session" ]; then extra+=(-s "$session"); else extra+=(--continue); fi
-    _provider_opencode_invoke "$dir" "$answer" "${extra[@]}"
+    _provider_opencode_invoke_retry "$dir" "$answer" "${extra[@]}"
 }
 
 # provider_opencode_doctor — prints a single-line JSON object to stdout.
