@@ -24,6 +24,18 @@ engine's subagents natively; the agent.sh wrapper is ONLY for foreign engines.
   `agent.sh run -e claude`); kimi/codex/opencode/gemini → agent.sh.
 - From Codex: codex models → native codex subagents; kimi/claude/opencode/gemini → agent.sh.
 
+## Completion notifications: the one rule (never skip)
+
+A subagent's completion reaches the orchestrator ONLY as the exit of a background job the orchestrator's own harness tracks.
+- **Claude Code:** start `bash "$SK" run ...` (or `wait <name>`) with the Bash tool's `run_in_background: true`. The command blocks until the
+  agent finishes and prints its final answer, so the notification carries the result.
+- **NEVER** launch with a plain shell `&` (or `nohup`, `>/dev/null 2>&1 &`): the harness cannot see that process, no notification ever
+  arrives, and the result is silently lost until somebody thinks to look (this happened on 2026-10-01).
+- For a `fan` wave, follow it with ONE tracked `bash "$SK" wait` (no names = the whole wave) as a background job.
+- **Safety net:** run `bash "$SK" pending` at the start of every turn and before the final answer to the user. It lists tasks that finished
+  (last 24 h, `AGENT_PENDING_HOURS`) whose result nobody read; reading it with `last <name>` or `wait` clears it. `pending --strict` exits 3
+  when something is unread.
+
 ## Work as an orchestrator (default mode)
 
 Own the outcome, not just the delegation. Delegate bounded work when it can run independently
