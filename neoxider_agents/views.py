@@ -152,9 +152,12 @@ def wait(store, names, timeout=0, poll=5):
         raise
     finally:
         for name in watched:
-            with Lock(store.path(name, ".waiter")):
-                if store.read(name).get("wait_token") == token:
-                    store.update(name, wait_pid="", wait_start="", wait_token="")
+            try:
+                with Lock(store.path(name, ".waiter")):
+                    if store.read(name).get("wait_token") == token:
+                        store.update(name, wait_pid="", wait_start="", wait_token="")
+            except (OSError, ValueError):
+                pass
 
 
 def _wait(store, names, timeout, poll):
@@ -227,30 +230,49 @@ def log(store, name, opts):
 
 def clean(store, opts):
     count = 0
+    failures = []
+    dry = bool(opts.get("-n") or opts.get("--dry-run"))
     for name, meta, _ in store.scan():
         state = effective(store, name, meta)
         if state in ("running", "idle", "orphaned") or (state == "waiting" and not opts.get("--all")):
             continue
         if store.inbox(name) and not (opts.get("--all") or opts.get("--purge")):
             continue
-        paths = [store.path(name, ".md"), store.path(name, ".log"), store.path(name, ".launcher.log")]
+        paths = [store.path(name, ".md"), store.path(name, ".launcher.log")]
         from .logs import prune_task
-        if store.path(name, ".log").exists():
-            prune_task(store, name, meta, force=True, dry=bool(opts.get("-n") or opts.get("--dry-run")))
+        before = len(failures)
+        if prune_task(store, name, meta, force=True, dry=dry, errors=failures):
+            print("[agent.sh] %s %s" % ("would remove" if dry else "remove", store.path(name, ".log")))
+            count += 1
+        if len(failures) > before and opts.get("--purge"):
+            # Preserve the task and its only answer when migration/removal failed.
+            continue
         if meta.get("dir") and (meta.get("progress") == "1" or not meta.get("core_version")):
             paths.append(Path(meta["dir"]) / ("PROGRESS.%s.md" % name))
         if opts.get("--purge"):
-            paths += [Path(p.path) for p in os.scandir(str(store.root)) if p.name.startswith(name + ".") and p.is_file()]
-            box = store.path(name, ".inbox")
-            if box.is_dir():
-                paths += list(box.iterdir()) + [box]
-            baseline = store.path(name, ".baseline.files")
-            allowed_root = store.root.resolve()
-            resolved_baseline = baseline.resolve()
-            if baseline.is_dir() and not baseline.is_symlink() and allowed_root in resolved_baseline.parents:
-                paths += sorted(baseline.rglob("*"), key=lambda p: len(p.parts), reverse=True) + [baseline]
-        for path in paths:
-            if path.exists():
+            try:
+                paths += [Path(p.path) for p in os.scandir(str(store.root))
+                          if p.name.startswith(name + ".") and p.is_file() and p.name != name + ".log"]
+                box = store.path(name, ".inbox")
+                try:
+                    if box.is_dir():
+                        paths += list(box.iterdir()) + [box]
+                except OSError as error:
+                    failures.append((box, error))
+                baseline = store.path(name, ".baseline.files")
+                allowed_root = store.root.resolve()
+                resolved_baseline = baseline.resolve()
+                try:
+                    if baseline.is_dir() and not baseline.is_symlink() and allowed_root in resolved_baseline.parents:
+                        paths += sorted(baseline.rglob("*"), key=lambda p: len(p.parts), reverse=True) + [baseline]
+                except OSError as error:
+                    failures.append((baseline, error))
+            except OSError as error:
+                failures.append((store.path(name, ".meta"), error))
+                continue
+        for path in dict.fromkeys(paths):
+            try:
+                path.stat()
                 resolved = path.resolve()
                 allowed = store.root.resolve()
                 project = Path(meta["dir"]).resolve() if meta.get("dir") else None
@@ -258,9 +280,17 @@ def clean(store, opts):
                 if resolved != allowed and allowed not in resolved.parents and not project_progress:
                     print("[neoxider] skip cleanup path outside task state: " + str(path))
                     continue
-                print("[agent.sh] %s %s" % ("would remove" if opts.get("-n") or opts.get("--dry-run") else "remove", path))
-                if not (opts.get("-n") or opts.get("--dry-run")):
+                print("[agent.sh] %s %s" % ("would remove" if dry else "remove", path))
+                if not dry:
                     path.rmdir() if path.is_dir() else path.unlink()
                 count += 1
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                failures.append((path, error))
     print("[agent.sh] clean: %s file(s)" % count)
-    return 0
+    for path, error in failures:
+        print("[neoxider] could not remove %s: %s; retry clean" % (path, error), file=sys.stderr)
+    if failures:
+        print("[neoxider] clean: %s file(s) could not be removed" % len(failures), file=sys.stderr)
+    return 1 if failures else 0

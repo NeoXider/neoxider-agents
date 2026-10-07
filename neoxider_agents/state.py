@@ -45,7 +45,7 @@ def atomic_write(path, text):
     finally:
         try:
             temporary.unlink()
-        except FileNotFoundError:
+        except OSError:
             pass
 
 
@@ -117,9 +117,9 @@ class Lock:
                 break
             except FileNotFoundError:
                 break
-            except PermissionError:
+            except OSError:
                 if time.monotonic() >= deadline:
-                    raise
+                    break
                 Event().wait(0.01)
         try:
             self.path.rmdir()
@@ -335,4 +335,7 @@ class Store:
         return files, "\n\n".join("Message #%s:\n%s" % (int(path.stem), path.read_text(encoding="utf-8")) for path in files)
 
     def seen(self, name):
-        self.path(name, ".seen").touch(mode=0o600)
+        try:
+            self.path(name, ".seen").touch(mode=0o600)
+        except OSError:
+            pass

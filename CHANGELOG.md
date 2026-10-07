@@ -6,6 +6,11 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Make lazy log pruning and housekeeping tolerate filesystem races and sharing violations;
+  preserve answers before expiry and report explicit cleanup failures without aborting state views.
+
 ### Added
 
 - Phase 2B convenience: implicit `run`, answer-only `ask`, file/stdin prompts, config defaults,

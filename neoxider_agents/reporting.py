@@ -97,10 +97,13 @@ def begin_snapshot(store, name, directory, force=False):
     if force:
         for old in folder.iterdir():
             if old.is_file() and not old.is_symlink():
-                old.unlink()
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
         try:
             store.path(name, ".changes.json").unlink()
-        except FileNotFoundError:
+        except OSError:
             pass
     remaining = [BASELINE_TEXT_LIMIT]
 
@@ -211,7 +214,10 @@ def file_changes(store, name, directory, freeze=False, frozen=True):
             entry["binary"] = True
         result.append(entry)
     if freeze:
-        atomic_write(store.path(name, ".changes.json"), json.dumps(result, ensure_ascii=False))
+        try:
+            atomic_write(store.path(name, ".changes.json"), json.dumps(result, ensure_ascii=False))
+        except OSError:
+            pass
     return result
 
 

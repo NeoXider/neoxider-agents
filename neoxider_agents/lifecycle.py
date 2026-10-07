@@ -381,7 +381,10 @@ def finish_notification(store, name, notify):
     if notify:
         from .notifications import notify_task
         accepted = notify_task(name, meta.get("state", "done"))
-        store.update(name, notification_attempted=1, notification_accepted=int(bool(accepted)))
+        try:
+            store.update(name, notification_attempted=1, notification_accepted=int(bool(accepted)))
+        except OSError:
+            pass
 
 
 def restart(store, ref, text, opts):

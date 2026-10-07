@@ -139,7 +139,10 @@ class OutputFilter:
                         stream.write(block)
         self.answer_path = path
         for part in self.part_paths.values():
-            part.unlink()
+            try:
+                part.unlink()
+            except OSError:
+                pass
         self.part_paths.clear()
         self._trim_answer_file()
         self.had_answer = self._answer_bounds[1] > self._answer_bounds[0]

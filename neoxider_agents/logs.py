@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import uuid
 from .state import atomic_write, last_output, tail
 
 DEFAULT_CAP = 2 * 1024 * 1024
@@ -60,7 +61,7 @@ class TailWriter:
         self.stream.close()
 
 
-def prune_task(store, name, meta=None, force=False, dry=False):
+def prune_task(store, name, meta=None, force=False, dry=False, errors=None):
     data = meta if meta is not None else store.read(name)
     if data.get("state") == "running" or (not force and enabled(data.get("keep_logs", "0"))):
         return False
@@ -77,13 +78,42 @@ def prune_task(store, name, meta=None, force=False, dry=False):
                     # Migrate a legacy final answer before removing its only copy.
                     from .state import output_chunks
                     answer = store.path(name, ".answer")
-                    with answer.open("w", encoding="utf-8", newline="\n") as out:
-                        for chunk in output_chunks(path):
-                            out.write(chunk)
+                    temporary = answer.with_name(answer.name + ".migration." + uuid.uuid4().hex)
+                    try:
+                        with temporary.open("x", encoding="utf-8", newline="\n") as out:
+                            for chunk in output_chunks(path):
+                                out.write(chunk)
+                        # Publish a complete copy without overwriting another pruner's answer.
+                        try:
+                            os.link(str(temporary), str(answer))
+                        except FileExistsError:
+                            pass
+                    finally:
+                        try:
+                            temporary.unlink()
+                        except FileNotFoundError:
+                            pass
+                        except OSError as error:
+                            if errors is not None:
+                                errors.append((temporary, error))
                 path.unlink()
             return True
-    except FileNotFoundError:
-        pass
+    except FileNotFoundError as error:
+        # A vanished raw log is a successful race loser. A vanished migration
+        # file with the raw log still present is a failed explicit cleanup.
+        if errors is not None:
+            try:
+                path.stat()
+            except FileNotFoundError:
+                pass
+            except OSError as stat_error:
+                errors.append((path, stat_error))
+            else:
+                errors.append((path, error))
+    except OSError as error:
+        # Leaving the raw file in place is the retry record for the next state read.
+        if errors is not None:
+            errors.append((path, error))
     return False
 
 
@@ -92,8 +122,11 @@ def record_digest(path, kind, detail, engine="", stamp=None):
     # Store only the small redacted digest, never provider payloads or reasoning.
     row = dict(recorded_at=stamp or time.time(), engine=engine, kind=kind,
                detail=compact(detail, 240))
-    with Path(path).open("a", encoding="utf-8", newline="\n") as out:
-        out.write(json.dumps(row, ensure_ascii=False) + "\n")
+    try:
+        with Path(path).open("a", encoding="utf-8", newline="\n") as out:
+            out.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def save_answer(store, name, output_filter=None, fallback=""):
@@ -121,15 +154,19 @@ def answer_text(store, name):
 
 def print_answer(store, name):
     path = store.path(name, ".answer")
-    if path.is_file():
-        with path.open(encoding="utf-8") as source:
-            for chunk in iter(lambda: source.read(65536), ""):
-                print(chunk, end="")
-    else:
-        from .state import output_chunks
-        if store.path(name, ".log").exists():
-            for chunk in output_chunks(store.path(name, ".log")):
-                print(chunk, end="")
+    try:
+        if path.is_file():
+            with path.open(encoding="utf-8") as source:
+                for chunk in iter(lambda: source.read(65536), ""):
+                    print(chunk, end="")
+        else:
+            from .state import output_chunks
+            if store.path(name, ".log").exists():
+                for chunk in output_chunks(store.path(name, ".log")):
+                    print(chunk, end="")
+    except OSError:
+        # Another reader may just have migrated and removed the legacy capture.
+        print(answer_text(store, name), end="")
 
 
 def digest_rows(store, name, count=25):
