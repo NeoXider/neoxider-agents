@@ -20,8 +20,8 @@ across **Codex · Claude Code · Kimi Code · opencode · Gemini CLI**.
 
 ```bash
 agent.sh run -t fix-readme -C /path/to/project "fix the typo in the README"   # launch
-agent.sh log -f fix-readme                                                    # watch it live
-agent.sh reply fix-readme "yes, use option B"                                 # answer its question
+agent.sh peek -f fix-readme                                                   # readable live activity
+agent.sh send fix-readme "also cover option B"                               # queue while running; resume otherwise
 agent.sh status fix-readme                                                    # done? stuck? what changed?
 ```
 
@@ -35,7 +35,7 @@ By [NeoXider](https://github.com/NeoXider).
 
 | Surface | Command | What it's for |
 |---|---|---|
-| 🖥️ **CLI** | `agent.sh run / fan / reply / log / status / doctor` | scripting, orchestration, CI |
+| 🖥️ **CLI** | `agent.sh run / fan / send / peek / stop / restart / status / doctor` | scripting, orchestration, CI |
 | 🌐 **Web panel** | `agent.sh gui` → http://127.0.0.1:8765 | a project tree of subagents, chat with each one, launch new tasks, live limits |
 | 🔌 **OpenAI API** | `agent.sh openai-server -e claude -m sonnet -p 8801` | point any OpenAI client / benchmark / phone app at your CLI subscription |
 
@@ -99,7 +99,7 @@ Requirements (you already have these if you use any of the CLIs below):
 
 - Bash 4 or newer (Git Bash on Windows; on macOS install current Bash with `brew install bash` —
   the system `/bin/bash` 3.2 is too old; Linux distributions normally provide a suitable version)
-- Python 3, standard library only — needed for the GUI and the API bridge, not for `agent.sh`
+- Python 3, standard library only — needed for the GUI, API bridge and readable activity digest
 - At least one of the wrapped CLIs: [Codex CLI](https://github.com/openai/codex),
   [Claude Code](https://github.com/anthropics/claude-code),
   [Kimi Code](https://github.com/MoonshotAI/kimi-code), opencode, or the Gemini CLI —
@@ -148,12 +148,15 @@ Both servers refuse to be careless about it:
 
 ## Features
 
+- **Control a running agent.** `send` queues durable follow-ups, `peek` shows readable activity,
+  `stop` interrupts a task by name, and `restart` continues its saved session. `reply` is an
+  alias for `send`.
 - **One thread per task.** `run` creates `<name>.log` + `<name>.meta`; every `reply` appends to
   the *same* log with a timestamped header, so the whole conversation with a subagent reads as
   one file — no session hunting.
 - **Live state, not just logs.** `running` / `running (no output for Nm)` (alive but quiet) /
   `waiting` (the agent asked a question) / `done` / `error` / `stalled` (process died — e.g. the
-  machine was turned off). The CLI and the GUI run the *same* liveness rules, so they cannot
+  machine was turned off) / `stopped` (`⏹`, stopped by the orchestrator). The CLI and the GUI run the *same* liveness rules, so they cannot
   disagree about a task.
 - **No silent forever-hangs.** Every step runs under a wall-clock deadline (`AGENT_TIMEOUT_SEC`,
   default 30 min). On expiry the whole process tree is killed — including the native Windows
@@ -241,6 +244,70 @@ with no extra setup.
 **Full command reference:** [`SKILL.md`](SKILL.md) — model aliases, the question-detection
 heuristic, path-normalization notes, every environment knob, and the known trade-offs. It doubles
 as the operating manual an AI agent reads before using this tool.
+
+---
+
+## Control a running agent
+
+```text
+agent.sh send NAME [--now] [-C dir] (TEXT | --prompt-file F)
+agent.sh reply NAME [--now] [-C dir] (TEXT | --prompt-file F)
+agent.sh send --flush NAME
+agent.sh stop NAME... | --all-mine
+agent.sh restart NAME [TEXT | --prompt-file F] [--fresh]
+agent.sh peek NAME [-n N] [-f] [--raw]
+```
+
+`send` to a running task returns immediately with `queued (#N)`. Messages are written
+atomically to `AGENT_CLI_LOGS/NAME.inbox/` in sequence order. The owning wrapper combines the
+queued messages into a numbered follow-up turn in the same session after the current turn ends,
+then checks for more messages before finishing. A tracked `wait NAME` returns after that drain
+and prints the final answer. A send to a settled task resumes immediately; `reply` behaves
+identically, including `reply NAME --prompt-file F`.
+
+Delivery is durable and at least once: a crash after provider execution but before inbox
+acknowledgement can replay the batch. Inspect partial edits before recovery. The drain is bounded
+by `AGENT_INBOX_MAX_TURNS` (default 32); reaching the limit leaves the task `waiting`, retains the
+inbox and requires `send --flush NAME` to continue delivery.
+
+```bash
+bash agent.sh peek fix-readme -n 25 -f
+bash agent.sh send fix-readme "Add a regression test for the reported case"
+bash agent.sh send fix-readme --now "Stop the current approach; inspect partial edits and use option B"
+bash agent.sh stop fix-readme
+bash agent.sh restart fix-readme "Keep the existing edits and finish the tests"
+bash agent.sh wait fix-readme
+```
+
+Use `--now` when the current work must change immediately: it stops the current process tree
+and resumes with the new message plus queued messages. Tool edits already made remain on disk;
+an interrupted command may be incomplete. Plain `stop` preserves the session ID, inbox, log and
+`PROGRESS.<task>.md`; repeated stops are harmless. Stop uses process-tree termination and cannot
+guarantee graceful native cancellation. `stop --all-mine` uses `AGENT_PARENT`, or
+`AGENT_ORCHESTRATOR_ID` when parent ownership is absent; it refuses if no ownership is available.
+Set ownership consistently when launching and controlling tasks. `restart` normally keeps the
+same session; without text it asks the agent to inspect
+`git status/diff` and continue unfinished work. `restart --fresh` starts a new session from the
+stored original prompt, engine, model, effort and directory, retaining `previous_session` in meta.
+
+`peek` shows recent commands and exit codes, file/tool activity, short assistant text, thinking
+markers, errors, retries and turn usage where the stream provides them. It defaults to 25 entries;
+`--raw` shows redacted source lines. Plain-text providers fall back to a labelled text tail.
+`list` and `status` show the last activity and queued count. If a wrapper dies before delivery,
+they and `pending` report `N undelivered message(s)`; use `send --flush NAME` or `restart NAME` to
+recover them. `pending` also flags stopped tasks, and `wait` treats `stopped` as settled with
+exit 0. `clean` protects an undelivered inbox unless `--all` or `--purge` explicitly overrides it.
+
+Resume-capable engines are Claude, Codex, Kimi and OpenCode. Gemini's provider has
+`supports_resume=false`: a running follow-up is refused; after a stop, start fresh with
+`restart --fresh` or `run`. Resume preflight failures preserve the task's previous state, exit
+and answer and record `last_send_error` in meta. Options work before or after positionals;
+`--` ends option parsing, unknown flags fail, and `<command> --help` starts no task.
+
+When upgrading, let old launchers settle or stop them before switching to the complete new
+installation, including its helpers. Do not replace an executing `agent.sh` in place. Wrappers
+already running before the upgrade cannot auto-drain newly queued messages; their inbox remains
+visible, and `send --flush NAME` delivers it after the old turn settles.
 
 ---
 

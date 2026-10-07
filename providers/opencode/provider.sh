@@ -51,8 +51,9 @@ provider_opencode_resolve() {
 # No usable python -> raw passthrough.
 _provider_opencode_emit() {
     if ! _agent_python; then cat; return 0; fi
-    PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
+    PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
 import sys, json, time, os
+from activity import record_event
 try:
     sys.stdin.reconfigure(errors="ignore")
 except Exception:
@@ -78,6 +79,9 @@ for line in sys.stdin:
         o = json.loads(s)
     except Exception:
         continue
+    if not isinstance(o, dict):
+        continue
+    record_event(o, "opencode")
     if o.get("sessionID") and sid is None:
         sid = o["sessionID"]
         print("session id: %s" % sid, flush=True)
@@ -281,7 +285,8 @@ _provider_opencode_invoke() {
         ( cd "$dir" && export "${pin_env[@]}" && "${command[@]}" <"$stdin_src" 2>"$errfile" ) | _provider_opencode_emit
     fi
     statuses=("${PIPESTATUS[@]}")
-    [ -n "$keepalive_pid" ] && { kill "$keepalive_pid" 2>/dev/null; wait "$keepalive_pid" 2>/dev/null; }
+    # Kill the helper's sleep child too: a pending sleep otherwise retains stdout and delays EOF.
+    [ -n "$keepalive_pid" ] && { _kill_tree "$keepalive_pid"; wait "$keepalive_pid" 2>/dev/null; }
     if [ -n "$previous_answer_file" ]; then
         export AGENT_OPENCODE_ANSWER_FILE="$previous_answer_file"
     else

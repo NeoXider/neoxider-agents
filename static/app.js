@@ -69,16 +69,34 @@ async function sendReply() {
   btn.disabled = true;
   btn.innerHTML = spin();
   try {
-    const r = await jpost("/api/reply", { task: SEL, answer: a, terminal: $("#r-term").checked });
+    const r = await jpost("/api/task/send", { task: SEL, message: a, terminal: $("#r-term").checked });
     if (r.error) {
       toast("error", t("toast.reply_not_sent"), r.error);
       return;
     }
     $("#answer").value = "";
     setTimeout(refresh, 600);
+  } catch (err) {
+    surfaceApiError(err);
   } finally {
     btn.disabled = false;
     btn.innerHTML = old;
+  }
+}
+
+async function stopTask(taskName, btn) {
+  if (!CURRENT_TASKS.has(taskName)) return;
+  btn.disabled = true;
+  try {
+    const result = await jpost("/api/task/stop", { task: taskName });
+    if (result.ok) {
+      toast("success", taskName, t("toast.task_stopped"));
+      await refresh();
+    }
+  } catch (err) {
+    surfaceApiError(err);
+  } finally {
+    btn.disabled = false;
   }
 }
 $("#answer").addEventListener("keydown", e => {

@@ -55,7 +55,9 @@ do not create workers, ledgers, or progress files solely to follow a ritual.
    ports, process restarts and releases: disjoint source files alone do not make tasks independent.
    Workers must not commit, publish, restart shared services or expand scope unless assigned that
    responsibility. Keep useful independent implementation or integration work for yourself.
-4. **Track without churn.** Reuse the exact task/session ID. Read logs before retrying; distinguish
+4. **Track without churn.** Reuse the exact task/session ID. Prefer `peek` for readable activity,
+   `send` for follow-ups, `stop` for cancellation and `restart` for recovery over blind waiting.
+   Read logs before retrying; distinguish
    a provider interruption from a failed implementation. Check partial edits and side effects before
    resume/retry so actions are not duplicated. A quiet live process is not evidence of a hang.
    Use bounded waits rather than rapid polling. Answer worker questions from existing context;
@@ -150,22 +152,25 @@ bash "$SK" run  -e kimi -m highspeed -C dir "prompt" # explicit managed high-spe
 bash "$SK" test-api --base-url http://127.0.0.1:8080 --goal "check /health, then POST+GET /item" --out r.json
                                                      # thin wrapper on `run`: agent exercises a local
                                                      # HTTP API via its own curl/shell, returns strict JSON
-bash "$SK" reply fix-readme "answer"                  # continue the task by name (session/dir taken from meta)
-bash "$SK" reply SESSION_UUID "answer"                 # or by uuid; with no argument — the last task
-                                                     # reply works on claude/codex/kimi/opencode. Use it to
-                                                     # CORRECT a task in flight instead of killing it: the
-                                                     # agent keeps everything it has already read and done.
+bash "$SK" send NAME [--now] [-C dir] (TEXT | --prompt-file F)  # queue while running; resume otherwise
+bash "$SK" reply NAME [--now] [-C dir] (TEXT | --prompt-file F) # identical alias; session/dir from meta
+bash "$SK" send --flush NAME                          # deliver an undelivered inbox after wrapper failure
+bash "$SK" stop NAME... | --all-mine                  # stop the process tree; preserve session and files
+bash "$SK" restart NAME [TEXT | --prompt-file F] [--fresh] # resume, or new session from original prompt
+bash "$SK" peek NAME [-n N] [-f] [--raw]              # readable recent activity; default last 25 entries
 bash "$SK" log  fix-readme                            # the entire task thread (run + all replies in one file)
 bash "$SK" log  -f fix-readme                         # follow a live background agent (tail -f)
 bash "$SK" log  -l fix-readme                         # only the last step
 bash "$SK" last fix-readme                            # only the agent's last answer
-bash "$SK" status fix-readme                          # state: state/stage/changed files/whether a reply is needed
+bash "$SK" status fix-readme                          # state, last activity/age, queued messages, changed files
 bash "$SK" wait name-a name-b                         # BLOCK until named tasks settle, then print each final answer;
-                                                      # exit 0 = settled, exit 2 = --timeout hit while still running
+                                                      # includes inbox drain; stopped = settled (exit 0)
+                                                      # exit 2 = --timeout hit while still running
 bash "$SK" wait --timeout 3600                        # no names = watch ALL currently-running tasks (whole wave); default poll 5s
 bash "$SK" list                                       # table: state / engine / model / age / files / session
 bash "$SK" clean                                      # delete md clutter (<name>.md + PROGRESS.<name>.md) of STOPPED
                                                      # tasks; live running/idle tasks are never touched;
+                                                     # protects undelivered inboxes unless --all/--purge;
                                                      # --all incl. waiting, --purge also .log/.meta, -n dry-run
 bash "$SK" doctor                                     # pre-flight: foreign CLI availability + codex limits when needed
 bash "$SK" doctor --json                              # machine-readable snapshot (used by the panel)
@@ -178,6 +183,62 @@ bash "$SK" gui 8765 --lan --token SECRET              # ...reachable from anothe
                                                      # --lan (the panel launches full-auto agents); the other device
                                                      # opens http://<this-host>:8765/?token=SECRET once
 ```
+
+## Control foreign workers like native subagents
+
+Keep the native-first routing rule. For a foreign engine, `send`/`peek`/`stop`/`restart` give
+the wrapper a similar control surface: inspect work, steer a live task, interrupt it, and resume
+its saved context. Start resume commands and `wait` through your harness's tracked background
+mechanism when they can run for a long time; a running-task `send` returns immediately.
+
+`send NAME "message"` on a running task prints `queued (#N)` and atomically saves a message in
+`$AGENT_CLI_LOGS/NAME.inbox/`. The owning wrapper drains messages in sequence order after the
+current turn, combines them into one numbered follow-up, resumes the same session and checks
+again before marking the task finished. `AGENT_INBOX_MAX_TURNS` bounds drain rounds (default 32);
+reaching the limit leaves the task `waiting` with its inbox retained for `send --flush NAME`.
+Delivery is durable and at least once: a crash after provider execution but before inbox
+acknowledgement may replay the batch. Inspect partial edits before recovery.
+`wait NAME` includes the drain rather than returning between turns.
+On a settled task, `send` resumes immediately. `reply` is the identical compatibility alias;
+`reply NAME --prompt-file F` reads the file as the message.
+
+Prefer a queued `send` when the current work can finish. Use `send NAME --now "message"` only
+when it must change immediately: stop the current process tree, keep the session and resume
+with the new message plus the existing inbox. An interrupted tool may have applied partial
+edits; tell the agent to inspect them before continuing. Stop uses process-tree termination:
+it cannot undo writes, guarantee graceful native cancellation or guarantee a tool finished cleanly.
+
+`stop NAME...` is idempotent and sets `⏹ stopped` with reason `stopped by orchestrator`, keeping
+the session ID, log, inbox and `PROGRESS.<task>.md`. `stop --all-mine` uses the same ownership as
+`pending`/`wait`; keep `AGENT_PARENT` consistent across launch and control calls, or use
+`AGENT_ORCHESTRATOR_ID` when parent ownership is absent. Without ownership `--all-mine` refuses.
+`restart NAME`
+stops a live task and resumes its session. Its default message asks for `git status/diff`, then
+continuation without redoing completed work. Pass text or `--prompt-file` to give another
+instruction. `restart NAME --fresh` instead starts a new session from the stored original
+prompt and engine/model/effort/directory and records the old ID as `previous_session`.
+
+`peek NAME` defaults to the last 25 readable events: commands and exit codes, file paths, tool
+calls, short assistant text, thinking markers, errors, retries and usage where available.
+`-n N` adjusts the tail; `-f` follows until the task ends; `--raw` shows redacted source lines.
+Structured Codex/OpenCode/Claude/Kimi streams are summarized; plain text gets a labelled tail.
+`status`/`list` show last activity kind/age and queued count using a cheap log tail. If the owning
+wrapper dies, an inbox is reported as `N undelivered message(s)`; recover with
+`send --flush NAME` or `restart NAME`. `pending` flags these and stopped tasks as needing
+attention. `wait` settles stopped tasks with exit 0. `clean` protects undelivered messages
+unless `--all`/`--purge` explicitly overrides that protection.
+
+Resume support is a provider capability: Claude/Codex/Kimi/OpenCode support it; Gemini does
+not. A running send to `supports_resume=false` is refused, and a stopped task requires a fresh
+run (`restart --fresh` or `run`). A bad send/reply preflight preserves the previous state,
+exit and answer and records `last_send_error`. All commands accept `--help` without starting
+work; options can appear before or after positionals, unknown flags fail, and `--` ends option
+parsing when message text itself begins with a dash.
+
+**Upgrade discipline.** Settle or stop old launchers before switching to the whole new installation
+with its helpers; do not replace an executing `agent.sh` in place. A pre-upgrade running wrapper
+cannot auto-drain newly queued messages. The inbox remains visible and can be delivered with
+`send --flush NAME` after the old turn settles.
 
 ## Windows / PowerShell invocation (verified 2026-08-17)
 
@@ -247,6 +308,7 @@ bash "$SK" gui 8765 --lan --token SECRET              # ...reachable from anothe
 | `AGENT_TIMEOUT_SEC` | `1800` | Wall-clock deadline for ONE step (`run`/`reply`). On expiry the whole process tree is killed, `!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=<N>s and was killed` is appended to the log, and the task ends as `state=error exit=124`. `0` disables it (only for genuinely long jobs). |
 | `AGENT_RETRIES` | `2` | Additional provider attempts after a transient failure. Set `0` when an outer caller (such as the API bridge) owns retries. Attempts stop when retrying could repeat autonomous side effects. |
 | `AGENT_RETRY_DELAY` | `8` | Seconds between safe transient retries. |
+| `AGENT_INBOX_MAX_TURNS` | `32` | Maximum automatic follow-up drain turns; reaching it leaves `waiting` with the inbox intact for manual `send --flush NAME`. |
 | `AGENT_STALE_SEC` | `300` | Silence after which a still-alive task is reported as `running (no output for Nm)` instead of plain `running` — same wording in the CLI and in the GUI. Reporting only; does not end the task. |
 | `AGENT_SILENCE_SEC` | `600` | No-output **watchdog**: if a step produces no NEW log activity for this long, the process tree is killed and the task ends as `state=silent` — distinct from `state=error exit=124` (`AGENT_TIMEOUT_SEC`, "took too long overall"): these record different watchdog triggers, not proven causes. Measured from the last real stream activity (codex/kimi emit throttled heartbeats), not from step start. Healthy work without observable output can still be killed; inspect partial edits before retrying. `0` disables it. |
 | `AGENT_CODEX_USER_CONFIG` | unset | `1` = let codex load `~/.codex/config.toml` again. Off by default **on purpose** — see ["Codex: every shell command hangs"](#codex-every-shell-command-hangs-environment-issue) below. |
@@ -485,11 +547,11 @@ CLI is one new directory, zero edits to `agent.sh`/`gui.py`. Implementation deta
 (tree/i18n/toasts/splitters/caching/path normalization): [docs/GUI.md](docs/GUI.md).
 
 **Task state.** After every step the wrapper sets in `.meta`:
-`state` (`running`/`done`/`waiting`/`error`/`limited`/`silent`), the `exit` code, `files` (how many
+`state` (`running`/`done`/`waiting`/`error`/`limited`/`silent`/`stopped`), the `exit` code, `files` (how many
 files the agent changed per `git status`), `pid` + `winpid`, `started`, `reason` (human-readable —
 see below), and `timeout`/`silence` (set only when the matching watchdog killed the task). Icons in
 `list`/`status`: `▶` running, `▷` running-but-silent, `✔` done, `⏳` waiting, `✖` error, `⚠` stalled,
-`⛔` limited (provider said no), `◌` silent (no-output watchdog fired).
+`⛔` limited (provider said no), `◌` silent (no-output watchdog fired), `⏹` stopped by orchestrator.
 
 **Working or stuck (liveness) — one truth for CLI and GUI.** Both `agent.sh status`/`list` and the web
 panel run the SAME state machine (`eff_state` in `agent.sh` and in `gui.py`):
@@ -503,6 +565,7 @@ panel run the SAME state machine (`eff_state` in `agent.sh` and in `gui.py`):
 | no output for > `AGENT_SILENCE_SEC` — watchdog killed the tree | `silent` | `◌ silent` → read the log, then `reply` or re-run |
 | provider itself ended the turn (usage/rate limit, quota, auth expiry, unavailable model) | `limited` | `⛔ limited` → `reason=` shows the provider's own message verbatim |
 | process exited after the provider dropped the turn for another reason | `error` | `✖ error` → read the log tail, then resume with `reply` (see below) |
+| explicitly stopped by the orchestrator | `stopped` | `⏹ stopped` → `restart NAME` to continue the saved session |
 
 `idle` is an honest third state, not an error: a codex/claude step flushes its log only when the step
 ENDS, so silence alone never means dead. This is what used to make the CLI say *running* and the GUI say
@@ -583,7 +646,7 @@ agent message ever appeared gets a short, clean marker instead of a raw JSON dum
 **Durable checkpoint (survives shutdown).** After every step a `<name>.md` is generated — a
 human-readable markdown file: a header (state/engine/session/dir/changed files/resume command) + the
 whole thread. Plus the codex/claude/kimi sessions themselves live on disk, so even
-after a reboot the task continues via `agent.sh reply <name> "continue"`. By default the agent also
+after a reboot the task continues via `agent.sh send <name> "continue"` (`reply` is an alias). By default the agent also
 maintains its own **per-task** `PROGRESS.<task>.md` in the working directory (Summary/TL;DR, checklist,
 step-by-step log with findings, conclusions) and reads it on resume — resumable after a crash and
 readable by an orchestrator without re-running the agent. The filename is keyed by task name so several
@@ -682,7 +745,7 @@ to specify `-C`.
 
 It can be run in the background (`run_in_background`) — stdin is closed in the script, so the agent
 won't hang waiting for input. While the agent is working in the background — watch it via
-`agent.sh log -f <name>`.
+`agent.sh peek -f <name>`; `log -f` remains available for the full transcript.
 NEVER call `codex exec` without `</dev/null` outside this wrapper.
 
 Gotchas (verified):
@@ -779,9 +842,9 @@ A handy alias (git-bash, add to `~/.bashrc`):
 ```bash
 alias agent='bash ~/.claude/skills/neoxider-agents/agent.sh'
 # agent run -t readme -C /c/Git/CoreAI "fix the typo in the README"
-# agent log -f readme     # watch what the agent is doing, in real time
+# agent peek -f readme    # readable activity, in real time
 # agent last readme       # short summary: the agent's last answer
-# agent reply readme "also fix the CHANGELOG"   # append a message to the same session
+# agent send readme "also fix the CHANGELOG"    # queue/resume in the same session
 ```
 
 ## Ready-made analogues (research, 2026-07)

@@ -19,13 +19,39 @@ bash $SK run  -t <name> -C <dir> "<prompt>"     # new task (Claude Code / Opus 5
 bash $SK run  -e kimi -t <name> -C <dir> "..."  # Kimi Code, Kimi K3 by default
 bash $SK run  -e claude -t <name> -C <dir> "..." # -e: codex|claude|kimi|opencode|gemini
 bash $SK fan  -t <base> -C <dir> "p1" "p2" ...   # N parallel background tasks (<base>-01, -02, ...)
-bash $SK reply <name> "<answer>"                 # continue a task by name
+bash $SK send <name> "<message>"                 # queue while running; resume otherwise (reply is an alias)
+bash $SK send <name> --prompt-file F             # options also work after the task name
+bash $SK send <name> --now "<message>"           # interrupt the turn, then resume with the message + inbox
+bash $SK send --flush <name>                     # recover an undelivered inbox
+bash $SK stop <name>...                          # stop by name; --all-mine uses current ownership
+bash $SK restart <name> ["<message>"]            # resume saved session; --fresh replays original prompt
+bash $SK peek <name> [-n N] [-f] [--raw]          # readable activity; default last 25 entries
 bash $SK log  -f <name>                          # follow a task live
 bash $SK status <name>                           # state / current step / needs a reply?
 bash $SK doctor                                   # foreign CLI availability + limits, when needed
 bash $SK doctor --deep                            # + one REAL run per engine that must EXECUTE a shell command
 bash $SK gui                                      # web GUI (stable default port 8765; or: ./bin/neoxider gui)
 ```
+
+**Control running workers.** Prefer `send`/`peek`/`stop`/`restart` over blind waiting.
+A running `send` returns `queued (#N)` and saves ordered messages atomically in
+`$AGENT_CLI_LOGS/NAME.inbox/`; the owner drains them in the same session after the turn,
+before finishing. A tracked `wait NAME` includes the drain. `reply` has identical behavior.
+Use `--now` only when the current work must change immediately; interruption can leave
+partial edits, so inspect the working tree before continuing. `stop` is idempotent and
+preserves session, logs, inbox and `PROGRESS.<task>.md`, with state `⏹ stopped`.
+`restart` defaults to checking `git status/diff` and continuing unfinished work;
+`--fresh` uses the stored original prompt/engine/model/effort/directory in a new session.
+Keep `AGENT_PARENT` consistent for ownership-based `stop --all-mine`/`wait`/`pending`;
+`AGENT_ORCHESTRATOR_ID` is the fallback, and `--all-mine` refuses without ownership.
+Stop uses process-tree termination and cannot guarantee graceful native cancellation.
+`list`/`status` show last activity and queued count; `pending` flags stopped tasks and
+`N undelivered message(s)` if the wrapper died. Recover those with `send --flush NAME`
+or `restart NAME`. `clean` protects undelivered inboxes unless `--all`/`--purge` is explicit.
+Gemini (`supports_resume=false`) refuses running follow-ups and requires a fresh run
+after stopping. All commands accept `--help` without starting work, reject unknown flags,
+and accept options before/after positionals; `--` ends option parsing. Failed send/reply
+preflight preserves the previous state/exit/answer and records `last_send_error`.
 
 **Never a silent hang.** Every step runs under `AGENT_TIMEOUT_SEC` (default 1800s): on
 expiry the whole process tree is killed, the log gets a `!! TIMEOUT …` line and the task

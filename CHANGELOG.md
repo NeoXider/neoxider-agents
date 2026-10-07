@@ -6,40 +6,24 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
-### Fixed
-
-- **opencode: a dead `small_model` no longer kills a session.** opencode uses the *small model* from the user's `opencode.json` for background work even when `-m` names another model, so a `small_model` that pointed at a local server that was not running (LM Studio) ended healthy hosted-model sessions with `stream error ... small=true`. The provider now pins `small_model` to the model of the run through an inline `OPENCODE_CONFIG_CONTENT` override (verified with `opencode debug config`; the user's files are never edited). Opt out with `AGENT_OPENCODE_KEEP_SMALL_MODEL=1`; a caller-provided `OPENCODE_CONFIG_CONTENT` is respected.
-- **opencode: transient provider/network failures are retried automatically.** Stream errors, connection resets, 502/503/504 and `Failed to execute` used to end the task as `state=error` and needed a human `reply`. The provider now retries up to `AGENT_OPENCODE_RETRIES` (default 3) times with 15s/30s/60s backoff, **continuing the same session** (`-s <id>`) with a short continue prompt so nothing already done is thrown away. Rate limits, watchdog timeouts and unrecognised failures are never retried.
-- **opencode: long tool calls no longer look like a hung engine.** A `dotnet build` or a lift makes opencode emit no events for many minutes, and the no-output watchdog (`AGENT_SILENCE_SEC`) killed healthy agents as `state=silent` (four of eight in one hour). A keepalive now prints `[opencode] activity: tool running` every `AGENT_OPENCODE_KEEPALIVE_SEC` (60) seconds **only while a build/tool process exists in the task's process tree** (Windows), so a genuinely wedged engine is still caught. Disable with `AGENT_OPENCODE_TOOL_KEEPALIVE=0`.
-
 ### Added
+
+- **Native-like controls for wrapper tasks.** `send` (with `reply` as an identical alias)
+  queues ordered, durable follow-ups while a resume-capable engine runs; the owning wrapper
+  drains its inbox before completion. `send --now` interrupts and resumes, `stop` preserves
+  session/log/inbox/progress, `restart` resumes or uses `--fresh` to replay the original prompt,
+  and `peek` shows a redacted, readable activity digest. Status/list expose activity and queued
+  messages; pending flags stopped tasks and undelivered inboxes. Clean protects inboxes by
+  default and wait treats stopped tasks as settled.
+- GUI task controls use authenticated `POST /api/task/stop` and `/api/task/send`, with Stop and
+  Send message controls and English/Russian labels.
 
 - `tests/test_opencode_reliability.sh` (19 checks: pin env, the pin reaching the child and not leaking, retry continuing the same session, rate-limit and unknown failures not retried, retry bound, opt-out); verified to fail on a copy with the fix removed.
-
-### Added
 
 - **`agent.sh pending` and read-markers: a finished task can no longer be silently forgotten.** `last <name>` and `wait` write `<name>.seen`; `pending` lists tasks that finished within `AGENT_PENDING_HOURS` (default 24) with no newer marker (`--strict` exits 3). `fan` now prints the exact tracked-background-job instruction. SKILL.md gains a top-level rule: start agents with the harness's background mechanism (Claude Code: `run_in_background: true`), never with a bare `&`, which hides completion from the orchestrator.
 
 - The OpenAI-compatible CLI bridge passes validated PNG, JPEG, and WebP image data URLs to Codex and OpenCode turns, including session continuations and camera tool results encoded as JSON. It limits each turn to eight images and each decoded image to 4 MiB, and returns a clear 400 or 413 for invalid input.
 - Added GPT-6 Luna and Sol Codex aliases and documented the free `opencode/space-bunny-free` model.
-
-### Fixed
-
-- Codex now reads long prompts from stdin on initial and resumed turns, so a large benchmark transcript no longer fails at the Windows command-line length limit.
-- OpenCode's image attachment no longer consumes the text prompt as another `-f` argument. Its final answer is kept clear of trailing CLI diagnostics, including `unknown format` messages.
-- Live SSE responses filter provider bookkeeping lines before emitting content. Camera JSON lifting is restricted to CLI engines that can actually attach the image.
-- OpenCode session identifiers are filtered from live SSE content. They remain in task logs for resume bookkeeping but no longer consume a benchmark turn as assistant text.
-
-### Fixed
-
-- **Баннер лимита больше не сливается со следующей строкой в логе.** В ветке итогового события
-  фильтра потока, в отличие от двух соседних, не обновлялся признак начала строки, поэтому для
-  прогона, где напечатан ТОЛЬКО итог (ровно случай баннера о лимите или отказа, который больше
-  нигде не всплывает), финальный перевод строки не дописывался. Это не косметика: разбор отказов
-  провайдера читает эти логи построчно, а слипшаяся строка — ровно то, на чём такой разбор
-  промахивается. Тест на это существовал и падал.
-
-### Added
 
 - **Claude tasks stream by default, so a working agent stops looking like a stuck one.**
   `claude -p` prints nothing at all until the turn ends, so a worker that spent twenty minutes
@@ -56,7 +40,45 @@ All notable changes to this project are documented here. Format follows
   `session_id`, so `reply` targets the exact session instead of whatever was last touched in that
   directory — the failure mode the skill has warned about for parallel workers.
 
+- **`agent.sh wait <names>` completion primitive.** Blocks until the named tasks (or every
+  task currently running) leave `running`, prints each final state and the agent's last answer;
+  exit code 2 on timeout. Lets an orchestrator with its own background-job mechanism get a
+  completion notification — one background job per watched task.
+
 ### Fixed
+
+- Windows tree termination kills the native root tree first, then only captured MSYS children
+  whose PID generation still matches, avoiding termination of a reused PID.
+- Without `/proc`, macOS process-identity checks fall back to `ps` start time (`lstart`) and
+  command. Covered by mocks/fixtures; live macOS execution remains unverified.
+- Serialize stop with automatic inbox-drain publication, so a drain cannot overwrite `stopped`.
+- Fresh restart recovers provider session IDs only from the current generation, keeping prior
+  retained transcripts from restoring an old session.
+- `send --now` before a session ID is available fails without stopping the task and directs the
+  orchestrator to a normal queued send.
+- Parse CLI options before or after positionals, including `reply NAME --prompt-file F`;
+  support `--` and per-command `--help`; reject unknown flags. A failed send/reply preflight
+  records `last_send_error` without overwriting a task's previous state, exit or answer.
+- Preserve the controlling step PID before command substitutions during resumed and fresh
+  turns, so stop/restart targets the wrapper that actually owns the provider process tree.
+- Capture guarded provider stdout and forward it on the watchdog tick (about once per second),
+  preventing an orphaned descendant's inherited output pipe from hanging EOF/completion.
+
+- **opencode: a dead `small_model` no longer kills a session.** opencode uses the *small model* from the user's `opencode.json` for background work even when `-m` names another model, so a `small_model` that pointed at a local server that was not running (LM Studio) ended healthy hosted-model sessions with `stream error ... small=true`. The provider now pins `small_model` to the model of the run through an inline `OPENCODE_CONFIG_CONTENT` override (verified with `opencode debug config`; the user's files are never edited). Opt out with `AGENT_OPENCODE_KEEP_SMALL_MODEL=1`; a caller-provided `OPENCODE_CONFIG_CONTENT` is respected.
+- **opencode: transient provider/network failures are retried automatically.** Stream errors, connection resets, 502/503/504 and `Failed to execute` used to end the task as `state=error` and needed a human `reply`. The provider now retries up to `AGENT_OPENCODE_RETRIES` (default 3) times with 15s/30s/60s backoff, **continuing the same session** (`-s <id>`) with a short continue prompt so nothing already done is thrown away. Rate limits, watchdog timeouts and unrecognised failures are never retried.
+- **opencode: long tool calls no longer look like a hung engine.** A `dotnet build` or a lift makes opencode emit no events for many minutes, and the no-output watchdog (`AGENT_SILENCE_SEC`) killed healthy agents as `state=silent` (four of eight in one hour). A keepalive now prints `[opencode] activity: tool running` every `AGENT_OPENCODE_KEEPALIVE_SEC` (60) seconds **only while a build/tool process exists in the task's process tree** (Windows), so a genuinely wedged engine is still caught. Disable with `AGENT_OPENCODE_TOOL_KEEPALIVE=0`.
+
+- Codex now reads long prompts from stdin on initial and resumed turns, so a large benchmark transcript no longer fails at the Windows command-line length limit.
+- OpenCode's image attachment no longer consumes the text prompt as another `-f` argument. Its final answer is kept clear of trailing CLI diagnostics, including `unknown format` messages.
+- Live SSE responses filter provider bookkeeping lines before emitting content. Camera JSON lifting is restricted to CLI engines that can actually attach the image.
+- OpenCode session identifiers are filtered from live SSE content. They remain in task logs for resume bookkeeping but no longer consume a benchmark turn as assistant text.
+
+- **Баннер лимита больше не сливается со следующей строкой в логе.** В ветке итогового события
+  фильтра потока, в отличие от двух соседних, не обновлялся признак начала строки, поэтому для
+  прогона, где напечатан ТОЛЬКО итог (ровно случай баннера о лимите или отказа, который больше
+  нигде не всплывает), финальный перевод строки не дописывался. Это не косметика: разбор отказов
+  провайдера читает эти логи построчно, а слипшаяся строка — ровно то, на чём такой разбор
+  промахивается. Тест на это существовал и падал.
 
 - **A prompt that mentions a rate limit no longer kills its own task as `limited`.** The live
   provider-failure watchdog scanned the last 8000 bytes of the log from its first tick, and the log
@@ -78,8 +100,6 @@ All notable changes to this project are documented here. Format follows
   the first stream event of every codex/kimi run was more than ten seconds "since the last
   heartbeat" and printed one — even a one-second answer opened with a progress line the caller then
   had to strip, and the emitter's own session-id line stopped being the first thing in the output.
-
-### Fixed
 
 - **Combined gate is green again after the opencode-resume upstream.** `provider.json`
   now declares `supports_resume: true` and `provider_opencode_resume_cmd` continues
@@ -132,6 +152,16 @@ All notable changes to this project are documented here. Format follows
   given) also picks up idle tasks instead of ignoring them. `clean` already had this right; `wait`
   did not. Regression test added with RED/GREEN evidence.
 
+- **GUI polling error spam.** Consecutive identical error toasts within 60 seconds now share one
+  bounded `×N` history record and only the first occurrence creates a visible popup.
+- **Windows background launches opened terminal tabs.** GUI run/reply/bridge subprocesses now use
+  `CREATE_NO_WINDOW` plus a hidden startup state by default; a visible console is created only when
+  the user explicitly enables the terminal checkbox.
+- **Windowless long-lived servers on Windows.** `gui` and `openai-server` now prefer a no-console
+  interpreter (`pythonw.exe`, overridable via `$AGENT_PYTHON_W`) when one exists, so the server never
+  parks in a visible command window; `gui-launcher.bat` starts from a hidden PowerShell host unless you
+  set `NEOXIDER_GUI_VISIBLE=1`.
+
 ### Changed
 
 - **A bridge bug is diagnosable again.** The catch-all logged only the exception's type
@@ -153,25 +183,6 @@ All notable changes to this project are documented here. Format follows
   nothing recording why. Also records the practical adaptation during an outage: split the work into
   several short `fan`-ed tasks, because short turns survive where one long turn keeps dying.
   The liveness table gains the matching `error` row.
-
-### Added
-
-- **`agent.sh wait <names>` completion primitive.** Blocks until the named tasks (or every
-  task currently running) leave `running`, prints each final state and the agent's last answer;
-  exit code 2 on timeout. Lets an orchestrator with its own background-job mechanism get a
-  completion notification — one background job per watched task.
-
-### Fixed
-
-- **GUI polling error spam.** Consecutive identical error toasts within 60 seconds now share one
-  bounded `×N` history record and only the first occurrence creates a visible popup.
-- **Windows background launches opened terminal tabs.** GUI run/reply/bridge subprocesses now use
-  `CREATE_NO_WINDOW` plus a hidden startup state by default; a visible console is created only when
-  the user explicitly enables the terminal checkbox.
-- **Windowless long-lived servers on Windows.** `gui` and `openai-server` now prefer a no-console
-  interpreter (`pythonw.exe`, overridable via `$AGENT_PYTHON_W`) when one exists, so the server never
-  parks in a visible command window; `gui-launcher.bat` starts from a hidden PowerShell host unless you
-  set `NEOXIDER_GUI_VISIBLE=1`.
 
 ## [0.4.0] - 2026-08-25
 

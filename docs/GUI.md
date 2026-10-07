@@ -66,6 +66,21 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
 - **Watchdog kills are surfaced, not hidden**: a task killed by `AGENT_TIMEOUT_SEC` carries
   `timeout=<secs>` in its `.meta`, which the chat header shows as a `⏱ killed after Ns` pill and the
   toast reports instead of a bare exit code.
+- **Task controls**: authenticated `POST /api/task/stop` and `POST /api/task/send` use the same
+  token and JSON/same-origin guards as other mutations. The selected task offers **Stop**
+  (**Остановить**) and **Send message** (**Отправить сообщение**). A running send queues a
+  follow-up through `agent.sh send`; a settled send resumes its saved session. Task cards expose
+  queued count and recent activity, and render `stopped` as `⏹ stopped` / `⏹ остановлен`.
+  Stop preserves the session, inbox, logs and per-task progress, so the CLI's `restart` can
+  continue it. These endpoints delegate lifecycle control to the wrapper rather than killing
+  arbitrary PIDs supplied by the browser. Resume-incapable providers report an explicit error.
+  Send accepts JSON `{task, message, now?: bool, terminal?: bool}` (`answer` is a compatibility
+  alias for `message`) and returns `{ok: true, accepted: true}` after launching the CLI, not
+  after provider completion. Check task status / `last_send_error` for delivery or preflight
+  failures. The GUI limits messages to 20 000 UTF-8 bytes; use CLI `--prompt-file` for longer
+  text. Stop accepts `{task}` and returns `{ok: true}` only after a successful CLI stop.
+  Both reject malformed requests with 400 and missing tasks with 404; stop errors return 409
+  and launch/timeout errors 500.
 - **Full-dialog chat view** (`GET /api/dialog?task=<name>[&full=1]`, parsed by `parse_dialog()` /
   `parse_output_blocks()` in `gui.py`, rendered by `static/chat.js`): the chat tab shows the WHOLE
   conversation of a task, Claude-Code-style — every `run`/`reply` step in order with a separator

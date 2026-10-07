@@ -46,8 +46,9 @@ _provider_codex_emit() {
         cat   # no usable python -> raw passthrough (degraded but not broken)
         return 0
     fi
-    PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
+    PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
 import sys, json, time
+from activity import record_event
 try:
     sys.stdin.reconfigure(errors="ignore")   # codex prints a cp866 OS-notification line that is not UTF-8
 except Exception:
@@ -88,6 +89,9 @@ for line in sys.stdin:
         o = json.loads(s)
     except Exception:
         continue
+    if not isinstance(o, dict):
+        continue
+    record_event(o, "codex")
     t = o.get("type")
     # Throttled activity heartbeat (same pattern as opencode/kimi): codex otherwise writes NOTHING
     # to the log between the thread.started line and the final answer, even on a genuinely long,

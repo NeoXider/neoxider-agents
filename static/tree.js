@@ -77,6 +77,7 @@ async function refresh() {
         <span class="em ${isLive(x.state) ? "running" : ""}" title="${esc(stateLabel(x.state, x.idle_sec))}">${x.act || ""}${x.topic || ""}</span>
         <span class="nm" title="${esc(x.name)}">${esc(x.title || x.name)}</span>
         <span class="pill">${esc(x.engine)}/${esc(x.model)}</span>
+        ${x.queued ? `<span class="pill" title="${esc(t("chat.queued").replace("{n}", x.queued))}">✉ ${esc(x.queued)}</span>` : ""}
       </div>${sub}`;
       };
       const rows = sortU(roots).map(renderTask).join("") || `<div class="task empty-row">${t("tree.no_tasks")}</div>`;

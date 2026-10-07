@@ -1,0 +1,6 @@
+{"type":"step_start","sessionID":"fixture-session","part":{"type":"step-start"}}
+{"type":"tool_use","part":{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"sleep 30"},"metadata":{"exit":0}}}}
+{"type":"tool_use","part":{"type":"tool","tool":"read","state":{"input":{"filePath":"src/main.py"}}}}
+{"type":"tool_use","part":{"type":"tool","tool":"edit","state":{"input":{"filePath":"src/main.py"}}}}
+{"type":"text","part":{"text":"Follow-up delivered."}}
+{"type":"step_finish","part":{"tokens":{"input":50,"output":11}}}

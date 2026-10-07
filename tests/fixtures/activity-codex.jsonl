@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"fixture-session"}
+{"type":"item.started","item":{"type":"command_execution","command":"git status --short"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"git status --short","exit_code":0}}
+{"type":"item.completed","item":{"type":"file_change","changes":[{"kind":"add","path":"src/new.py"},{"kind":"update","path":"src/main.py"}]}}
+{"type":"item.completed","item":{"type":"reasoning","text":"private reasoning should never appear"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"Finished the assignment."}}
+{"type":"turn.completed","usage":{"input_tokens":42,"output_tokens":9}}

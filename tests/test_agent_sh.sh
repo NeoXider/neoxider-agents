@@ -14,18 +14,27 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE" || exit 1
 
 # --- scratch LOGDIR: never touch the real ~/.claude/agent-cli-logs -----------------------
-SCRATCH_LOGDIR="$(mktemp -d)" || { echo "FAIL: mktemp could not create the test scratch directory" >&2; exit 1; }
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*) AGENT_TEST_ROOT="${AGENT_TEST_ROOT:-D:/Temp/agents-oc}" ;;
+    *) AGENT_TEST_ROOT="${AGENT_TEST_ROOT:-${TMPDIR:-/tmp}/agents-oc}" ;;
+esac
+mkdir -p "$AGENT_TEST_ROOT" || exit 1
+AGENT_TEST_ROOT="$(cd "$AGENT_TEST_ROOT" && pwd -P)" || exit 1
+case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*) AGENT_TEST_ROOT="$(cygpath -m "$AGENT_TEST_ROOT")" ;; esac
+SCRATCH_LOGDIR="$(mktemp -d "$AGENT_TEST_ROOT/agent-sh.XXXXXX")" || { echo "FAIL: mktemp could not create the test scratch directory" >&2; exit 1; }
 if [ -z "$SCRATCH_LOGDIR" ] || [ ! -d "$SCRATCH_LOGDIR" ]; then
     echo "FAIL: mktemp returned an empty or invalid test scratch directory" >&2
     exit 1
 fi
 cleanup() {
     case "${SCRATCH_LOGDIR:-}" in ''|/|.|..) echo "REFUSING unsafe test cleanup target: '${SCRATCH_LOGDIR:-}'" >&2; return 1 ;; esac
+    case "$SCRATCH_LOGDIR" in "$AGENT_TEST_ROOT"/agent-sh.*) ;; *) echo "REFUSING cleanup outside test root: '$SCRATCH_LOGDIR'" >&2; return 1 ;; esac
     rm -rf -- "$SCRATCH_LOGDIR"
 }
 trap cleanup EXIT
 
 export AGENT_CLI_LOGS="$SCRATCH_LOGDIR"
+export AGENT_OPENCODE_TOOL_KEEPALIVE=0
 
 # Source agent.sh's functions (meta_set/meta_get/provider_*_resolve/etc.) without running any
 # real command. "list" is a read-only, harmless subcommand (just lists *.meta in LOGDIR, which
@@ -658,6 +667,7 @@ unset AGENT_OPENCODE_CHATONLY_CONFIG
 # A real executable test double exercises GNU timeout (shell functions cannot be exec'd by timeout).
 OPENCODE_FAKE_BIN="$SCRATCH_LOGDIR/opencode-bin"
 mkdir -p "$OPENCODE_FAKE_BIN"
+command -v cygpath >/dev/null 2>&1 && OPENCODE_FAKE_BIN="$(cygpath -u "$OPENCODE_FAKE_BIN")"
 printf '%s\n' '#!/usr/bin/env bash' 'sleep 30' > "$OPENCODE_FAKE_BIN/opencode"
 chmod +x "$OPENCODE_FAKE_BIN/opencode"
 old_path="$PATH"
@@ -1297,6 +1307,7 @@ make_py_stub() { # make_py_stub NAME EXIT_CODE — a fake interpreter: runs noth
     chmod +x "$FAKE_BIN/$1"
 }
 
+command -v cygpath >/dev/null 2>&1 && FAKE_BIN="$(cygpath -u "$FAKE_BIN")"
 PATH_SAVE="$PATH"
 while IFS='|' read -r desc py3_rc python_rc py_rc agent_python expected; do
     [ "$desc" = "DESC" ] && continue
@@ -1363,6 +1374,7 @@ assert_eq "file_mtime yields empty output for a missing path" "" "$(file_mtime "
 # GNU/BSD fallback: fake `stat` binaries that speak only one flavor each.
 STAT_FAKE="$SCRATCH_LOGDIR/statfake"
 mkdir -p "$STAT_FAKE"
+command -v cygpath >/dev/null 2>&1 && STAT_FAKE="$(cygpath -u "$STAT_FAKE")"
 make_stat_stub() { # make_stat_stub gnu|bsd|broken — respond only to that stat's flag syntax
     case "$1" in
         gnu)    printf '#!/usr/bin/env bash\n[ "$1" = -c ] && { echo 1700000000; exit 0; }\nexit 1\n' ;;
@@ -1695,6 +1707,17 @@ assert_eq "openai-server without python exits non-zero" "1" "$bridge_rc"
 assert_match "openai-server without python says so clearly" 'needs python' "$bridge_out"
 
 # ============================================================================================
+section "offline agent controls"
+if _agent_python; then
+    if PYTHONIOENCODING=utf-8 "$_AGENT_PY" "$HERE/tests/test_agent_control.py"; then
+        pass "offline control lifecycle acceptance suite"
+    else
+        fail "offline control lifecycle acceptance suite"
+    fi
+else
+    fail "offline control lifecycle acceptance needs stdlib Python"
+fi
+
 section "summary"
 # ============================================================================================
 TOTAL=$((PASS + FAIL))

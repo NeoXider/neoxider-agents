@@ -140,16 +140,22 @@ async function loadThread(task) {
     <span class="pill">${esc(task.engine)}/${esc(task.model)}</span>
     <span class="pill">${esc(task.files)} ${esc(t("chat.files"))}</span>
     ${task.state === "waiting" ? `<span class="pill" style="color:var(--wait);border-color:var(--wait)">${t("chat.waiting")}</span>` : ""}
+    ${task.state === "stopped" ? `<span class="pill">${esc(t("chat.stopped"))}</span>` : ""}
+    ${task.queued ? `<span class="pill" style="color:var(--wait)">${esc(t("chat.queued").replace("{n}", task.queued))}</span>` : ""}
+    ${task.last_activity && task.last_activity.kind ? `<span class="pill">${esc(t("chat.activity").replace("{kind}", task.last_activity.kind).replace("{age}", task.last_activity.age_sec))}</span>` : ""}
     ${task.state === "stalled" ? `<span class="pill" style="color:var(--stall)">${t("chat.stalled")}</span>` : ""}
     ${task.state === "running" ? '<span class="pill" style="color:var(--run);border-color:var(--run)">' + spin(t("chat.running")) + "</span>" : ""}
     ${task.state === "idle" ? '<span class="pill" style="color:var(--run);border-color:var(--run)">' + spin(stateLabel("idle", task.idle_sec)) + "</span>" : ""}
     ${task.state === "error" && task.timeout ? `<span class="pill" style="color:var(--stall)">${t("chat.timeout").replace("{s}", task.timeout)}</span>` : ""}
     <span class="sp"></span><span class="pill" title="dir">${esc(base(task.dir))}</span>
     ${whole}
+    ${isLive(task.state) ? `<button class="mini" id="btn-stop-task">${esc(t("chat.stop"))}</button>` : ""}
     <button class="mini" data-tools="expand">${esc(t("chat.expand_all"))}</button>
     <button class="mini" data-tools="collapse">${esc(t("chat.collapse_all"))}</button>
     <button class="mini${showThinking ? " on" : ""}" id="btn-think">💭 ${esc(t("chat.thinking"))}</button>`;
   const wholeButton = $("#chead [data-show-whole]");
+  const stopButton = $("#btn-stop-task");
+  if (stopButton) stopButton.addEventListener("click", () => stopTask(task.name, stopButton));
   if (wholeButton) wholeButton.addEventListener("click", showWholeDialog);
   const expandButton = $("#chead [data-tools=expand]");
   const collapseButton = $("#chead [data-tools=collapse]");

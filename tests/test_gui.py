@@ -1709,6 +1709,134 @@ class ApiTestRouteRemovedTests(unittest.TestCase):
             shutil.rmtree(scratch, ignore_errors=True)
 
 
+class TaskControlRouteTests(unittest.TestCase):
+    """Task controls share authentication/CSRF guards and never interpolate shell text."""
+
+    def setUp(self):
+        self.original = (gui.LOGDIR, gui.GUI_TOKEN, gui.spawn, gui.subprocess.run)
+        isolated_root = os.environ.get("AGENT_GUI_TEST_ROOT", "D:/Temp/agents-oc") if os.name == "nt" else tempfile.gettempdir()
+        os.makedirs(isolated_root, exist_ok=True)
+        self.scratch = tempfile.mkdtemp(prefix="gui-control-", dir=isolated_root)
+        gui.LOGDIR = self.scratch
+        gui.GUI_TOKEN = ""
+        with open(os.path.join(self.scratch, "task-1.meta"), "w", encoding="utf-8") as f:
+            f.write("engine=opencode\nstate=stopped\nsession=session-1\n")
+        self.spawned, self.stopped = [], []
+        gui.spawn = lambda args, terminal=False: self.spawned.append((args, terminal))
+
+        def fake_run(args, **kw):
+            self.stopped.append((args, kw))
+            return types.SimpleNamespace(returncode=0, stdout="stopped", stderr="")
+
+        gui.subprocess.run = fake_run
+
+    def tearDown(self):
+        gui.LOGDIR, gui.GUI_TOKEN, gui.spawn, gui.subprocess.run = self.original
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def _post(self, path, data, headers=None):
+        sent = []
+
+        class Fake:
+            client_address = ("127.0.0.1", 4242)
+            _reject_unauthorized = gui.H._reject_unauthorized
+            _read_json_object_body = gui.H._read_json_object_body
+
+            def __init__(self):
+                body = json.dumps(data).encode()
+                self.path = path
+                self.headers = {"Content-Length": str(len(body)),
+                                "Content-Type": "application/json", "Host": "127.0.0.1:8765"}
+                self.headers.update(headers or {})
+                self.rfile = io.BytesIO(body)
+
+            def _send(self, code, body, ctype="application/json"):
+                try:
+                    result = json.loads(body)
+                except ValueError:
+                    result = {"error": body}
+                sent.append((code, result))
+
+        gui.H.do_POST(Fake())
+        return sent[0]
+
+    def test_send_preserves_option_looking_text_and_forwards_now(self):
+        for now in (False, True):
+            code, result = self._post("/api/task/send", {"task": "task-1", "message": "--help", "now": now})
+            self.assertEqual(code, 200)
+            self.assertTrue(result["accepted"])
+            self.assertEqual(self.spawned[-1],
+                             (["send", "task-1"] + (["--now"] if now else []) + ["--", "--help"], False))
+
+    def test_stop_uses_wrapper_and_waits_for_its_result(self):
+        code, result = self._post("/api/task/stop", {"task": "task-1"})
+        self.assertEqual(code, 200)
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(self.stopped), 1)
+        args, kw = self.stopped[0]
+        self.assertEqual(args, [gui.BASH, gui.SK, "stop", "task-1"])
+        self.assertTrue(kw["capture_output"])
+        self.assertEqual(self.spawned, [])
+
+    def test_stop_failure_and_launch_failure_are_reported(self):
+        gui.subprocess.run = lambda *a, **kw: types.SimpleNamespace(returncode=1)
+        self.assertEqual(self._post("/api/task/stop", {"task": "task-1"})[0], 409)
+
+        def fail(*a, **kw):
+            raise OSError("secret prompt detail")
+
+        gui.spawn = fail
+        code, result = self._post("/api/task/send", {"task": "task-1", "message": "continue"})
+        self.assertEqual(code, 500)
+        self.assertNotIn("secret", result["error"])
+
+    def test_invalid_inputs_and_missing_task_never_launch(self):
+        for path in ("/api/task/stop", "/api/task/send"):
+            for task in (True, "../victim", "--all-mine", "missing"):
+                with self.subTest(path=path, task=task):
+                    code, _ = self._post(path, {"task": task, "message": "continue"})
+                    self.assertEqual(code, 404 if task == "missing" else 400)
+        for message in (True, [], "", "a\0b", "x" * 30001):
+            self.assertEqual(self._post("/api/task/send", {"task": "task-1", "message": message})[0], 400)
+        for field in ("now", "terminal"):
+            self.assertEqual(self._post("/api/task/send", {"task": "task-1", "message": "go", field: "true"})[0], 400)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.stopped, [])
+
+    def test_controls_require_token_and_same_origin(self):
+        for path in ("/api/task/send", "/api/task/stop"):
+            gui.GUI_TOKEN = "test-token"
+            self.assertEqual(self._post(path, {"task": "task-1", "message": "go"})[0], 401)
+            self.assertEqual(self._post(path, {"task": "task-1", "message": "go"},
+                                        {"X-Agent-Token": "test-token"})[0], 200)
+            gui.GUI_TOKEN = ""
+            self.assertEqual(self._post(path, {"task": "task-1", "message": "go"},
+                                        {"Origin": "https://evil.example"})[0], 403)
+
+    def test_stopped_and_undelivered_inbox_are_visible(self):
+        inbox = os.path.join(self.scratch, "task-1.inbox")
+        os.mkdir(inbox)
+        for name in ("000001.msg", "000002.msg.inflight", ".tmp-3"):
+            with open(os.path.join(inbox, name), "w", encoding="utf-8") as f:
+                f.write("message")
+        task = gui.list_tasks()[0]
+        self.assertEqual(task["state"], "stopped")
+        self.assertEqual(task["act"], "⏹")
+        self.assertEqual(task["queued"], 2)
+        self.assertNotIn("stopped", gui.LIVE_STATES)
+
+    def test_last_activity_uses_the_shared_digest_without_exposing_arguments(self):
+        with open(os.path.join(self.scratch, "task-1.activity.jsonl"), "w", encoding="utf-8") as f:
+            json.dump({"recorded_at": gui.time.time() - 10, "engine": "codex",
+                       "event": {"type": "item.completed", "item": {"type": "command_execution",
+                                 "command": "echo secret-argument", "exit_code": 0}}}, f)
+            f.write("\n")
+        task = gui.list_tasks()[0]
+        self.assertEqual(task["last_activity"]["kind"], "command")
+        self.assertGreaterEqual(task["last_activity"]["age_sec"], 10)
+        self.assertNotIn("secret-argument", json.dumps(task))
+
+
 class GuiPostBodyGuardTests(unittest.TestCase):
     """gui.do_POST answers garbled/oversized bodies with controlled 400/413 instead of
     crashing on int()/rfile.read or reading an unbounded body into memory."""

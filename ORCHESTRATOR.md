@@ -20,7 +20,9 @@ For a plugin install use `SK="$CLAUDE_PLUGIN_ROOT/agent.sh"`; for a manual skill
 > Workers return changes, verification evidence, failed/unrun checks, blockers and active work;
 > they do not commit, publish or restart shared services unless assigned that responsibility.
 >
-> Reuse exact task IDs, read logs before retrying and inspect partial side effects. Silence is
+> Reuse exact task IDs. Use `peek` for activity, `send` for follow-ups, `stop` for interruption
+> and `restart` for recovery instead of blind waits. Read logs before retrying and inspect
+> partial side effects. Silence is
 > not proof of a hang. Review every diff and verify the integrated result with required checks
 > and the user's actual runtime path where applicable. Do not equate configured with working.
 > Complete authorized integration/restart/release steps, preserve unrelated work and report
@@ -62,7 +64,7 @@ always wins.
 - **opencode** — works via `--auto`. Free-tier aliases resolve to real ids (`-m free`, `-m ox`, …); raw `provider/model` still passes through. `ollama` and `zai` are disabled in `~/.config/opencode/opencode.json` as of 2026-08-24 — Ollama's cloud DeepSeek 403s without a paid subscription, and the local one is 8B.
 - **gemini** — needs `GEMINI_API_KEY` (Google sign-in is geo-blocked for some accounts); unavailable until a key is set.
 
-**Token economy (already on by default):** `--terse` (concise output) and per-task `PROGRESS.md` are
+**Token economy (already on by default):** `--terse` (concise output) and per-task `PROGRESS.<task>.md` are
 on by default. Add `--no-terse` for exploratory work, `--no-progress` for throwaway one-shots. The
 biggest lever is still model/effort — drop to `spark`/`haiku`/`-f low` for easy work.
 
@@ -76,16 +78,33 @@ poll `agent.sh list` / `status <name>`:
 
 | State | What it means | What you do |
 |---|---|---|
-| `running` (`▶`) | alive and producing output | wait; `agent.sh log -f <name>` to watch |
-| `running (no output for Nm)` (`▷`, meta state `idle`) | alive but quiet — normal for a long codex/claude step, whose log only flushes when the step ends | wait; only worry if N approaches your `AGENT_TIMEOUT_SEC` |
-| `waiting` (`⏳`) | the agent asked a question | `agent.sh reply <name> "…"` |
-| `stalled` (`⚠`) | the process is gone (reboot/kill) | `agent.sh reply <name> "continue"` |
+| `running` (`▶`) | alive and producing output | `peek -f NAME`; `send NAME "…"` to queue a follow-up |
+| `running (no output for Nm)` (`▷`, meta state `idle`) | alive but quiet; silence does not prove a hang | inspect `peek`/processes; keep waits bounded |
+| `waiting` (`⏳`) | the agent asked a question | `agent.sh send NAME "…"` (`reply` also works) |
+| `stalled` (`⚠`) | the process is gone (reboot/kill) | inspect edits, then `restart NAME` or `send --flush NAME` |
+| `stopped` (`⏹`) | orchestrator stopped the process tree; session and edits remain | `agent.sh restart NAME "…"` |
 | `error` + `⏱ killed by the step watchdog` | it hit the deadline | re-scope the task, or re-run with a bigger `AGENT_TIMEOUT_SEC` |
 
 The CLI and the web panel compute this identically, so the two never contradict each other. When diagnosing foreign CLI execution on a new machine or after an upgrade, use
 `agent.sh doctor --deep`: it makes each
 engine actually execute a shell command, which is the only way to catch an engine that answers happily
 while every command it runs hangs.
+
+`send` to a running task returns `queued (#N)`; its wrapper resumes the same session with
+ordered inbox messages after the turn and drains again before completing. Keep one tracked
+`wait NAME` for completion: it includes those follow-up turns. `list`/`status` show queued
+messages and last activity; `pending` also flags stopped tasks and undelivered inboxes.
+If the wrapper died, `send --flush NAME` or `restart NAME` recovers queued messages.
+
+Use `send NAME --now "…"` when the current approach must stop immediately. It interrupts the
+process tree and resumes with your message plus the queue; inspect partial edits first.
+`stop NAME...` is idempotent, retaining session/log/inbox/progress; process-tree termination
+cannot guarantee graceful native cancellation. `stop --all-mine` uses `AGENT_PARENT`, falling
+back to `AGENT_ORCHESTRATOR_ID`; missing ownership is refused. `restart NAME` defaults to an instruction to inspect
+`git status/diff` and continue unfinished work; `--fresh` starts the original prompt as a new
+session with the stored engine/model/effort/directory. For Gemini (`supports_resume=false`),
+running follow-ups are refused; use a fresh run after stopping. Full syntax is in
+[SKILL.md](SKILL.md#control-foreign-workers-like-native-subagents).
 
 ---
 

@@ -1,0 +1,5 @@
+{"type":"system","subtype":"init","session_id":"fixture-session"}
+{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"thinking","thinking":"private reasoning should never appear"}}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"python -m unittest"}},{"type":"tool_use","name":"Read","input":{"file_path":"src/main.py"}},{"type":"tool_use","name":"Write","input":{"file_path":"src/new.py"}}]}}
+{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Verified successfully."}}}
+{"type":"result","result":"Verified successfully.","usage":{"input_tokens":60,"output_tokens":12}}

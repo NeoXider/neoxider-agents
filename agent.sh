@@ -21,6 +21,11 @@
 #                      exercise a local HTTP API via its own shell/curl and report a
 #                      structured JSON result (thin wrapper on `run`, tagged kind=api-test)
 #   agent.sh reply  [-e engine] [-C dir] [name|session_id] "answer"      — continue a task/session
+#   agent.sh send NAME [--now] [-C dir] (TEXT | --prompt-file F)       — queue/resume a follow-up (reply is an alias)
+#   agent.sh send --flush NAME                                       — deliver an orphaned durable inbox
+#   agent.sh stop NAME... | --all-mine                               — stop owned trees; keep sessions and inboxes
+#   agent.sh restart NAME [TEXT | --prompt-file F] [--fresh]          — resume interrupted work; --fresh replays original prompt
+#   agent.sh peek NAME [-n N] [-f] [--raw]                            — redacted activity digest (default last 25 entries)
 #   agent.sh log    [-f] [-n N] [-l] [name]                              — thread: -f follow, -n N lines, -l last step
 #   agent.sh last   [name]                                               — only the agent's last reply
 #   agent.sh status [name]                                               — state: state/step/changed files/needs reply?
@@ -126,7 +131,15 @@ case "$AGENT_STALE_SEC"   in ''|*[!0-9]*) AGENT_STALE_SEC=300   ;; esac
 AGENT_SILENCE_SEC="${AGENT_SILENCE_SEC:-600}"
 case "$AGENT_SILENCE_SEC" in ''|*[!0-9]*) AGENT_SILENCE_SEC=600 ;; esac
 
-die() { echo "agent.sh: $*" >&2; exit 1; }
+die() {
+    case "${cmd:-}" in send|reply|restart)
+        if [ -n "${CLI_TARGET:-}" ] && declare -F meta_set >/dev/null && [ -f "$(meta_file "$CLI_TARGET")" ]; then
+            local error_text="$*"; error_text="${error_text//$'\n'/ }"; error_text="${error_text//$'\r'/ }"
+            meta_set "$CLI_TARGET" last_send_error "$error_text"
+        fi ;;
+    esac
+    echo "agent.sh: $*" >&2; exit 1;
+}
 now() { date '+%Y-%m-%d %H:%M:%S'; }
 
 # --- process control (git-bash safe) ---------------------------------------
@@ -157,16 +170,34 @@ _child_pids() {
 # what actually walks the OS process tree; the msys-side recursion below handles the shell wrappers
 # (and is the whole story on Linux/macOS, where there is no winpid).
 _kill_tree() {
-    local pid="${1:-}" k wp
+    local pid="${1:-}" k wp stamp i
+    local -a children=() child_stamps=()
     [ -n "$pid" ] || return 0
+    wp="$(_winpid "$pid")"
+    if [ -n "$wp" ] && command -v taskkill >/dev/null 2>&1; then
+        # Capture MSYS children before killing their parent. Native ancestry can differ from
+        # MSYS ancestry; stop the root first so its loop cannot replace children during cleanup.
+        for k in $(_child_pids "$pid"); do
+            [ "$k" = "$pid" ] && continue
+            children+=("$k")
+            stamp=""; declare -F _pid_stamp >/dev/null && stamp="$(_pid_stamp "$k")"
+            child_stamps+=("$stamp")
+        done
+        taskkill //F //T //PID "$wp" >/dev/null 2>&1
+        kill -TERM "$pid" 2>/dev/null
+        kill -KILL "$pid" 2>/dev/null
+        for ((i=0; i<${#children[@]}; i++)); do
+            k="${children[i]}"; stamp="${child_stamps[i]}"
+            if declare -F _pid_stamp >/dev/null; then
+                [ -n "$stamp" ] && [ "$stamp" = "$(_pid_stamp "$k")" ] || continue
+            fi
+            _kill_tree "$k"
+        done
+        return 0
+    fi
     for k in $(_child_pids "$pid"); do
         [ "$k" = "$pid" ] || _kill_tree "$k"
     done
-    wp="$(_winpid "$pid")"
-    if [ -n "$wp" ] && command -v taskkill >/dev/null 2>&1; then
-        # //F //T -> /F /T: the doubled slash stops MSYS from mangling the flag into a path.
-        taskkill //F //T //PID "$wp" >/dev/null 2>&1
-    fi
     kill -TERM "$pid" 2>/dev/null
     kill -KILL "$pid" 2>/dev/null
     return 0
@@ -236,19 +267,20 @@ _guarded_run_watched() {
     local secs="${1:-0}" log="${2:-}" silence="${3:-0}"; shift 3
     case "$secs" in ''|*[!0-9]*) secs=0 ;; esac
     case "$silence" in ''|*[!0-9]*) silence=0 ;; esac
-    local child rc=0 deadline=0 nowt lm reason
-    ( "$@" ) 2>&1 &
+    local child rc=0 deadline=0 nowt lm reason capture offset=0
+    capture="$(mktemp "$LOGDIR/.agent-stream.XXXXXX")" || return 1
+    # A provider/helper that outlives the turn must not retain tee's pipe and block completion.
+    # exec redirects permanently inside the child; the owner alone forwards this regular file.
+    ( exec >"$capture" 2>&1; "$@" ) &
     child=$!
-    if [ "$secs" -le 0 ] && { [ "$silence" -le 0 ] || [ -z "$log" ]; }; then
-        wait "$child"; rc=$?
-        return "$rc"
-    fi
     [ "$secs" -gt 0 ] && deadline=$(( $(date +%s) + secs ))
     while kill -0 "$child" 2>/dev/null; do
+        _flush_guard_capture "$capture"
         nowt=$(date +%s)
         if [ "$deadline" -gt 0 ] && [ "$nowt" -ge "$deadline" ]; then
             _kill_tree "$child"
             wait "$child" 2>/dev/null
+            _flush_guard_capture "$capture"; rm -f -- "$capture"
             printf '\n!! TIMEOUT: step exceeded AGENT_TIMEOUT_SEC=%ss and was killed (process tree terminated)\n' "$secs"
             return 124
         fi
@@ -257,6 +289,7 @@ _guarded_run_watched() {
             if [ -n "$reason" ]; then
                 _kill_tree "$child"
                 wait "$child" 2>/dev/null
+                _flush_guard_capture "$capture"; rm -f -- "$capture"
                 printf '\n!! PROVIDER FAILURE: %s (process tree terminated)\n' "$reason"
                 return 126
             fi
@@ -266,6 +299,7 @@ _guarded_run_watched() {
                 if [ -n "$lm" ] && [ $(( nowt - lm )) -ge "$silence" ]; then
                     _kill_tree "$child"
                     wait "$child" 2>/dev/null
+                    _flush_guard_capture "$capture"; rm -f -- "$capture"
                     printf '\n!! SILENT: no output for %ss (AGENT_SILENCE_SEC=%ss) — engine appears stuck, process tree terminated\n' \
                         "$(( nowt - lm ))" "$silence"
                     return 125
@@ -275,7 +309,18 @@ _guarded_run_watched() {
         sleep 1
     done
     wait "$child"; rc=$?
+    _flush_guard_capture "$capture"; rm -f -- "$capture"
     return "$rc"
+}
+
+_flush_guard_capture() {
+    # offset is local to _guarded_run_watched (Bash dynamic scope).
+    local size
+    size="$(wc -c < "$1")"; size="${size//[[:space:]]/}"
+    [ "$size" -gt "$offset" ] || return 0
+    # Read exactly the published snapshot; a racing append belongs to the next flush.
+    tail -c "+$((offset+1))" "$1" | head -c "$((size-offset))"
+    offset="$size"
 }
 
 # minimal JSON string escaper shared by provider doctor functions (backslash, quote, control chars).
@@ -347,7 +392,7 @@ cmd="${1:-}"
 [ -n "$cmd" ] || die "usage: agent.sh run|fan|reply|log|last|wait|status|list|clean|doctor|provider-info|gui|openai-server|help ... (run 'agent.sh help' for the full reference)"
 shift
 
-engine="claude"; engine_explicit=0; model=""; model_explicit=0; effort_override=""; effort_explicit=0; dir="$(pwd)"; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1; terse=1; prompt_file=""
+engine="claude"; engine_explicit=0; model=""; model_explicit=0; effort_override=""; effort_explicit=0; dir="$(pwd)"; dir_explicit=0; name="task-$(date +%Y%m%d-%H%M%S)-$$"; progress=1; terse=1; prompt_file=""
 # ^ engine=claude by default -> Opus 5 (see providers/claude). Pass -e codex for the gpt-5.6 family.
 # ^ progress=1 by default: every task keeps a PROGRESS.md checkpoint (resumable after a crash,
 # and an orchestrator can read the summary without re-running the agent). Disable with --no-progress.
@@ -361,6 +406,7 @@ parent="${AGENT_PARENT:-}"   # parent task name (for the tree); can be set via e
 task_kind=""; base_url=""; test_goal=""; out_file=""   # test-api only (see that subcommand)
 
 parse_opts() {
+    REST=(); send_now=0; send_flush=0; restart_fresh=0
     while [ $# -gt 0 ]; do
         case "$1" in
             -e|-m|-f|-C|-t|-P|--base-url|--goal|--out|--prompt-file)
@@ -370,7 +416,7 @@ parse_opts() {
                     -e) engine="$2"; engine_explicit=1 ;;
                     -m) model="$2"; model_explicit=1 ;;
                     -f) effort_override="$2"; effort_explicit=1 ;;
-                    -C) dir="$2" ;;
+                    -C) dir="$2"; dir_explicit=1 ;;
                     -t) name="$2" ;;
                     -P) parent="$2" ;;
                     --base-url) base_url="$2" ;;
@@ -382,10 +428,14 @@ parse_opts() {
             -p) progress=1; shift ;;                 # kept for compat; progress is on by default
             --no-progress) progress=0; shift ;;      # opt out of the PROGRESS.md checkpoint
             --no-terse|--verbose) terse=0; shift ;;  # opt out of the concision directive
-            *) break ;;
+            --now) case "$cmd" in send|reply) send_now=1 ;; *) command_help "$cmd" >&2; die "$cmd: unknown option '$1'" ;; esac; shift ;;
+            --flush) case "$cmd" in send|reply) send_flush=1 ;; *) command_help "$cmd" >&2; die "$cmd: unknown option '$1'" ;; esac; shift ;;
+            --fresh) [ "$cmd" = restart ] || die "$cmd: unknown option '$1'"; restart_fresh=1; shift ;;
+            --) shift; REST+=("$@"); break ;;
+            -*) command_help "$cmd" >&2; die "$cmd: unknown option '$1' (use -- before literal option-like text)" ;;
+            *) REST+=("$1"); shift ;;
         esac
     done
-    REST=("$@")
 }
 
 # Reads the prompt/answer text handed over as a file instead of an argument.
@@ -605,7 +655,7 @@ meta_set_many() {
     # Validate the entire batch before locking/writing. Metadata is a line-based format;
     # CR/LF cannot be represented as values without injecting a different field.
     [ "$#" -ge 3 ] && [ $(( ($# - 1) % 2 )) -eq 0 ] || return 1
-    local f tmp key value read_rc
+    local f tmp key value read_rc _META_LOCK_TOKEN="" _META_LOCK_STATE=""
     local -a exclusions=() records=()
     local -A seen=()
     f="$(meta_file "$1")" || return 1
@@ -647,8 +697,16 @@ meta_set() {
 meta_get()  { local f; f="$(meta_file "${1:-}")" || return 1; grep -m1 "^${2:-}=" "$f" 2>/dev/null | cut -d= -f2- ; }
 
 resolve_session() {
-    local n="$1" s; s="$(meta_get "$n" session)"; [ -n "$s" ] && { echo "$s"; return; }
-    grep -m1 -oE 'session id: [[:alnum:]_.-]+' "$LOGDIR/$n.log" 2>/dev/null | cut -d' ' -f3
+    local n="$1" s offset; s="$(meta_get "$n" session)"; [ -n "$s" ] && { echo "$s"; return; }
+    offset="$(meta_get "$n" session_log_offset)"
+    case "$offset" in ''|*[!0-9]*) offset=0 ;; esac
+    # Fresh restarts retain the transcript, but old-generation session hints must never resume it.
+    tail -c "+$((offset+1))" "$LOGDIR/$n.log" 2>/dev/null | awk '
+        BEGIN { engine=1 }
+        /^========== \[/ { engine=0 }
+        /^---------- output ----------$/ { engine=1; next }
+        engine && /^session id: [[:alnum:]_.-]+/ { print $3 }
+    ' | tail -1
 }
 name_by_session() { local s="$1" f
     for f in "$LOGDIR"/*.meta; do [ -e "$f" ] || continue
@@ -808,7 +866,7 @@ state_label() {
         *)    printf '%s' "$1" ;;
     esac
 }
-state_icon() { case "$1" in running) echo "▶";; idle) echo "▷";; done) echo "✔";; waiting) echo "⏳";; error) echo "✖";; stalled) echo "⚠";; limited) echo "⛔";; silent) echo "◌";; *) echo "•";; esac; }
+state_icon() { case "$1" in running) echo "▶";; idle) echo "▷";; done) echo "✔";; waiting) echo "⏳";; error) echo "✖";; stalled) echo "⚠";; limited) echo "⛔";; silent) echo "◌";; stopped) echo "⏹";; *) echo "•";; esac; }
 
 # The line that separates what agent.sh ECHOED (run header, prompt, reply answer) from what the
 # ENGINE printed. hdr writes it after every echo, the provider filters print a fresh one before the
@@ -832,6 +890,8 @@ is_unread() {
     local m; m="$(meta_file "$1")"
     [ -e "$m" ] || return 1
     # Только свежие задачи (окно AGENT_PENDING_HOURS, по умолчанию 24 ч): старые логи без маркера — не «потерянные» результаты.
+    [ "$(inbox_count "$1")" = 0 ] || return 0
+    [ "$(eff_state "$1")" != stopped ] || return 0
     [ -n "${_PEND_REF:-}" ] && { [ "$m" -nt "$_PEND_REF" ] || return 1; }
     case "$(eff_state "$1")" in running|idle) return 1 ;; esac
     [ -e "$LOGDIR/$1.seen" ] || return 0
@@ -1032,6 +1092,7 @@ _recovery_hint() {
 finish_step() {
     local n="$1" rc="$2" log tdir nfiles=0 closing output nonblank reason="" provider_reason="" is_conflict=0
     log="$LOGDIR/$n.log"; tdir="$(meta_get "$n" dir)"; [ -n "$tdir" ] || tdir="$dir"
+    [ "$(meta_get "$n" state)" != stopped ] || return 0
     output="$(last_output "$log")"
     nonblank="$(printf '%s' "$output" | tr -d '[:space:]')"
     printf '%s' "$output" | _has_thread_writer_conflict && is_conflict=1
@@ -1221,23 +1282,31 @@ _require_engine_run() {
 _do_run_dispatch() {
     _require_engine_run "$engine"   # BEFORE the first .log/.meta write: no ghost tasks
     require_task_name "$name"
+    case "$(eff_state "$name")" in running|idle) die "run: task '$name' is already running; use send" ;; esac
+    _claim_task "$name"
     log="$LOGDIR/$name.log"; _secure_state_truncate "$log" || die "cannot create protected task log: $log"
     # NB: capture the pid into a variable FIRST. $BASHPID inside a command substitution reports
     # the substitution's own throwaway subshell, so `winpid "$(_winpid "$BASHPID")"` would record
     # the winpid of a process that is already dead -- and gui.py would call the task stalled while
     # the CLI called it running (exactly the bug this pairing is meant to end).
     step_pid="$BASHPID"
-    local -a initial_meta=(engine "$engine" model "${model:-default}" resolved_model "" effort "" session ""
-        dir "$dir" state running reason "" exit "" pid "$step_pid" winpid "$(_winpid "$step_pid")"
-        started "$(now)" timeout "")
-    [ -n "$parent" ] && initial_meta+=(parent "$parent")
+    local -a initial_meta=(engine "$engine" model "${model:-default}" resolved_model "" effort "" session "" session_log_offset 0
+        dir "$dir" state running reason "" exit "" pid "$step_pid" pid_start "$(_pid_stamp "$step_pid")" winpid "$(_winpid "$step_pid")"
+        started "$(now)" timeout "" original_prompt "$LOGDIR/$name.original.txt"
+        original_engine "$engine" original_model "$model" original_effort "$effort_override" original_dir "$dir"
+        orchestrator "${AGENT_ORCHESTRATOR_ID:-}" parent "$parent")
+    _secure_state_truncate "$LOGDIR/$name.original.txt" || die "cannot store original prompt"
+    printf '%s' "$prompt" > "$LOGDIR/$name.original.txt"
+    export AGENT_ACTIVITY_FILE="$LOGDIR/$name.activity.jsonl"
     [ -n "$task_kind" ] && initial_meta+=(kind "$task_kind")
     meta_set_many "$name" "${initial_meta[@]}" || die "cannot initialize task metadata: $name"
     echo "[agent.sh] ▶ run task=$name engine=$engine model=${model:-default} dir=$dir" >&2
     hdr run "engine=$engine model=${model:-default} dir=$dir" PROMPT "$prompt" "$log"
     rc=0
     provider_dispatch_run "$engine" "$model" "$dir" "$prompt" "$name"
-    finish_step "$name" "$rc"
+    _finish_with_inbox "$name"; local result=$?
+    _release_task
+    return "$result"
 }
 
 # builds the instructive prompt for `test-api`: exercise a local HTTP API via the agent's own
@@ -1265,6 +1334,16 @@ Do NOT run git commit. Do NOT modify any files unless the goal explicitly requir
 PROMPT
 }
 
+source "$HERE/agent_control.sh"
+CLI_TARGET=""
+case "$cmd" in send|reply|restart)
+    for candidate in "$@"; do
+        if valid_task_name "$candidate" && [ -f "$(meta_file "$candidate")" ]; then CLI_TARGET="$candidate"; break; fi
+    done ;;
+esac
+_validate_cli_args "$@"
+set -- "${CLI_ARGS[@]}"
+
 case "$cmd" in
     run)
         parse_opts "$@"
@@ -1274,6 +1353,7 @@ case "$cmd" in
         [ "$terse" = 1 ] && prompt="$prompt$TERSE_PROTO"
         _do_run_dispatch
         dispatch_rc=$?
+        exit "$dispatch_rc"
         ;;
     fan)
         # Launch N agents IN PARALLEL from one call: each positional prompt becomes its own
@@ -1336,64 +1416,83 @@ except Exception:
         fi
         exit "$dispatch_rc"
         ;;
-    reply)
+    send|reply)
         parse_opts "$@"
-        if [ -n "$prompt_file" ]; then ref="${REST[0]:-}"; answer="$(read_prompt_file)"
-        elif [ ${#REST[@]} -ge 2 ]; then ref="${REST[0]}"; answer="${REST[1]}"
-        else ref=""; answer="${REST[0]:-}"; fi
-        [ -n "$answer" ] || die "reply: needs an answer text"
-        if [ -z "$ref" ]; then tname="$(latest_task)"; [ -n "$tname" ] || die "reply: no tasks — specify name/session id"
-        elif valid_task_name "$ref" && [ -e "$(meta_file "$ref")" ]; then tname="$ref"
-        elif [[ "$ref" =~ ^[0-9a-f-]{36}$|^ses_[[:alnum:]_.-]+$|^session_[[:alnum:]_.-]+$ ]]; then tname="$(name_by_session "$ref")"
-        else
-            require_task_name "$ref"
-            tname="$ref"
-            # An explicit NAME must point at a real task. Without this check a typo fell through
-            # every lookup empty-handed: engine stayed at the default claude, the session guard
-            # was bypassed by `[ "$engine" = claude ]`, a ghost .meta/.log got created, and
-            # `claude --continue` resumed WHATEVER conversation happened to be latest — an answer
-            # delivered into the wrong thread. Fail loudly instead.
-            [ -e "$(meta_file "$tname")" ] || die "reply: no such task '$ref' ($LOGDIR/$ref.meta missing) — see 'agent.sh list'"
+        ref="${REST[0]:-}"; answer=""
+        if [ -n "$prompt_file" ]; then
+            [ "${#REST[@]}" -le 1 ] || _send_error "use TEXT or --prompt-file, not both"
+            answer="$(read_prompt_file)" || _send_error "cannot read prompt file"
+        elif [ "$send_flush" != 1 ]; then
+            if [ "${#REST[@]}" -ge 2 ]; then
+                [ "${#REST[@]}" = 2 ] || _send_error "quote the message as one argument"
+                answer="${REST[1]}"
+            elif [ "$cmd" = reply ]; then answer="$ref"; ref=""; fi
         fi
-        if [ -n "${tname:-}" ]; then
-            session="$(resolve_session "$tname")"
-            mdir="$(meta_get "$tname" dir)"; [ -n "$mdir" ] && dir="$mdir"
-            meng="$(meta_get "$tname" engine)"; [ -n "$meng" ] && [ "$engine_explicit" = 0 ] && engine="$meng"
-            log="$LOGDIR/$tname.log"
-        else session="$ref"; tname="session-$ref"; require_task_name "$tname"; log="$LOGDIR/$tname.log"; meta_set "$tname" dir "$dir"; fi
-        # Validate the engine BEFORE touching .meta. provider_dispatch_resume dies further down, but
-        # by then state=running and pid= have already been written, so the dead task shows up as
-        # `⚠ stalled` and status helpfully advises re-running the very reply that cannot work. Seen
-        # historically on engines without a resume command (provider.json says supports_resume=false,
-        # e.g. gemini has no provider_gemini_resume_cmd), where the generic dispatcher blamed it
-        # on an "unknown engine".
-        declare -F "provider_${engine}_run_cmd" >/dev/null 2>&1 \
-            || die "reply: unknown engine '$engine' (task '$tname') — no providers/$engine/provider.sh defines it"
-        if ! declare -F "provider_${engine}_resume_cmd" >/dev/null 2>&1; then
-            rmodel="$(meta_get "$tname" model)"
-            die "reply: engine '$engine' cannot resume a session (supports_resume=false), so task '$tname' cannot be continued — start a fresh one instead: agent.sh run -t <name> -e $engine${rmodel:+ -m ${rmodel}} -C $dir \"...\""
+        if [ "$send_flush" = 1 ]; then
+            [ -z "$answer" ] && [ "${#REST[@]}" = 1 ] || _send_error "--flush needs only NAME"
+        else [ -n "$answer" ] || _send_error "needs a message text"; fi
+        _control_send
+        exit "$?"
+        ;;
+    stop)
+        stop_all=0; stop_names=(); stop_options=1
+        for a in "$@"; do
+            if [ "$stop_options" = 0 ]; then stop_names+=("$a"); continue; fi
+            case "$a" in --) stop_options=0 ;; --all-mine) stop_all=1 ;; *) stop_names+=("$a") ;; esac
+        done
+        if [ "$stop_all" = 1 ]; then
+            [ "${#stop_names[@]}" = 0 ] || die "stop: --all-mine cannot be combined with names"
+            [ -n "$parent" ] || [ -n "${AGENT_ORCHESTRATOR_ID:-}" ] || die "stop: --all-mine requires AGENT_PARENT or AGENT_ORCHESTRATOR_ID; ownership is unknown"
+            for mf in "$LOGDIR/"*.meta; do
+                [ -f "$mf" ] || continue; n="${mf##*/}"; n="${n%.meta}"
+                _task_is_mine "$n" && stop_names+=("$n")
+            done
+        else [ "${#stop_names[@]}" -gt 0 ] || die "stop: needs NAME... or --all-mine"; fi
+        for n in "${stop_names[@]}"; do _stop_task "$n"; done
+        ;;
+    restart)
+        parse_opts "$@"
+        [ "${#REST[@]}" -ge 1 ] && [ "${#REST[@]}" -le 2 ] || _send_error "restart needs NAME [TEXT]"
+        ref="${REST[0]}"; answer="${REST[1]:-}"
+        [ -z "$prompt_file" ] || { [ -z "$answer" ] || _send_error "use TEXT or --prompt-file, not both"; answer="$(read_prompt_file)" || _send_error "cannot read prompt file"; }
+        _resolve_control_task "$ref"
+        if [ "$restart_fresh" = 1 ]; then
+            [ -z "$answer" ] || _send_error "--fresh replays the original prompt; omit TEXT"
+            original_file="$(meta_get "$tname" original_prompt)"
+            [ -r "$original_file" ] || _send_error "original prompt unavailable for this legacy task"
+            prompt="$(cat "$original_file")"
+            engine="$(meta_get "$tname" original_engine)"; model="$(meta_get "$tname" original_model)"
+            effort_override="$(meta_get "$tname" original_effort)"; dir="$(meta_get "$tname" original_dir)"
+            _require_engine_run "$engine"
+            _stop_task "$tname"
+            previous_session="$(resolve_session "$tname")"; name="$tname"
+            # Fresh sessions preserve the transcript and pending inbox; only the context is new.
+            _claim_task "$name"
+            step_pid="$BASHPID"
+            session_log_offset="$(wc -c < "$log")"; session_log_offset="${session_log_offset//[[:space:]]/}"
+            meta_set_many "$name" previous_session "$previous_session" session "" session_log_offset "$session_log_offset" engine "$engine" dir "$dir" state running reason "" exit "" pid "$step_pid" pid_start "$(_pid_stamp "$step_pid")" winpid "$(_winpid "$step_pid")"
+            log="$LOGDIR/$name.log"; export AGENT_ACTIVITY_FILE="$LOGDIR/$name.activity.jsonl"
+            hdr run "restart --fresh engine=$engine" PROMPT "$prompt" "$log"
+            provider_dispatch_run "$engine" "$model" "$dir" "$prompt" "$name"
+            _finish_with_inbox "$name"; restart_rc=$?; _release_task; exit "$restart_rc"
         fi
-        [ "$progress" = 1 ] && answer="$answer$(progress_proto_reply "$tname")"   # per-task reminder; needs resolved $tname
-        [ -n "${session:-}" ] || [ "$engine" = claude ] || die "reply: could not find a session id (task '$tname'); specify uuid explicitly"
-        # Optional provider preflight happens BEFORE touching the shared log/meta. Codex uses this
-        # to wait on the actual thread-store file lock and for the prior wrapper to finish its final
-        # log/meta writes. Appending a reply header earlier interleaves both turns and lets the old
-        # turn overwrite the failed reply's state (the live defect this ordering fixes).
-        prepare_fn="provider_${engine}_prepare_resume"; PROVIDER_PREPARE_NOTE=""; prepare_rc=0
-        if declare -F "$prepare_fn" >/dev/null 2>&1; then
-            "$prepare_fn" "$session" "$tname" || prepare_rc=$?
-            [ "$prepare_rc" = 0 ] || die "reply: provider preflight failed for task '$tname' (exit=$prepare_rc): ${PROVIDER_PREPARE_NOTE:-session writer did not become available}"
-        fi
-        _secure_state_file "$log" || die "cannot create protected task log: $log"
-        # $$ is the SHELL's pid, safe inside $( ) — unlike $BASHPID.
-        meta_set_many "$tname" state running pid "$$" winpid "$(_winpid "$$")" timeout "" reason "" exit "" \
-            || die "cannot initialize reply metadata: $tname"
-        echo "[agent.sh] ▶ reply task=$tname session=$session dir=$dir" >&2
-        hdr reply "task=$tname session=$session" ANSWER "$answer" "$log"
-        [ -n "$PROVIDER_PREPARE_NOTE" ] && printf '%s\n' "$PROVIDER_PREPARE_NOTE" >> "$log"
-        rc=0
-        provider_dispatch_resume "$engine" "$dir" "$session" "$answer" "$tname"
-        finish_step "$tname" "$rc"
+        [ -n "$answer" ] || answer='The previous turn was interrupted. First check the working tree (git status/diff) for partial edits, then continue the assignment from where you stopped; do not redo finished work.'
+        _can_resume "$engine" || _send_error "engine '$engine' cannot resume; use restart --fresh"
+        _stop_task "$tname"
+        send_now=0; send_flush=0
+        _control_send
+        exit "$?"
+        ;;
+    peek)
+        peek_opts=(); n=""
+        while [ "$#" -gt 0 ]; do case "$1" in
+            -n) case "$2" in ''|*[!0-9]*) die "peek: -n must be non-negative" ;; esac; peek_opts+=(-n "$2"); shift 2 ;;
+            -f|--raw) peek_opts+=("$1"); shift ;;
+            *) [ -z "$n" ] || die "peek: needs one NAME"; n="$1"; shift ;;
+        esac; done
+        require_task_name "$n"; [ -f "$LOGDIR/$n.log" ] || die "peek: no log for '$n'"
+        _agent_python || die "peek: needs python"
+        PYTHONIOENCODING=utf-8 "$_AGENT_PY" "$HERE/activity.py" "$LOGDIR/$n.log" "${peek_opts[@]}"
         ;;
     log)
         follow=0; lines=0; lastonly=0
@@ -1430,9 +1529,10 @@ except Exception:
             [ -e "$mf" ] || continue
             n="${mf##*/}"; n="${n%.meta}"
             valid_task_name "$n" || continue
+            [ -z "$parent" ] || [ "$(meta_get "$n" parent)" = "$parent" ] || continue
             is_unread "$n" || continue
             p_n=$((p_n+1))
-            echo "⚑ unread  $n  state=$(eff_state "$n")  -> agent.sh last $n"
+            echo "$(state_icon "$(eff_state "$n")") unread  $n  state=$(eff_state "$n")  $(inbox_count "$n") undelivered message(s)  -> agent.sh last $n"
         done
         [ "$p_n" -eq 0 ] && echo "[agent.sh] pending: no unread results"
         [ "$p_strict" = 1 ] && [ "$p_n" -gt 0 ] && exit 3
@@ -1460,6 +1560,7 @@ except Exception:
                 [ -e "$mf" ] || continue
                 n="${mf##*/}"; n="${n%.meta}"
                 valid_task_name "$n" || continue
+                [ -z "$parent" ] || [ "$(meta_get "$n" parent)" = "$parent" ] || continue
                 case "$(eff_state "$n")" in running|idle) w_names+=("$n") ;; esac
             done
         fi
@@ -1509,6 +1610,8 @@ except Exception:
         live=""; [ "$st" = running ] || [ "$st" = idle ] && live=" (alive, pid $(meta_get "$n" pid))"
         echo "$(state_icon "$st") task=$n  state=$(state_label "$st" "${idle_s:-0}")${live}  engine=$e/${mo}  exit=${ex:-–}  files=${nf:-0}"
         echo "   dir=$d"; echo "   session=${s:-–}"
+        echo "   $(inbox_count "$n") undelivered message(s); $(activity_summary "$n")"
+        [ "$st" = stopped ] && echo "   ⏹ stopped by orchestrator; resume: agent.sh restart $n"
         echo "   started=$(meta_get "$n" started)  md=$LOGDIR/$n.md"
         [ "$st" = waiting ]  && echo "   → needs a REPLY: agent.sh reply $n \"...\""
         [ "$st" = stalled ]  && echo "   ⚠ process not alive (computer shut down / killed) — continue: agent.sh reply $n \"continue\""
@@ -1526,6 +1629,7 @@ except Exception:
         fi
         echo "   --- current step (last lines) ---"
         last_output "$LOGDIR/$n.log" | grep -v '^[[:space:]]*$' | tail -4 | sed 's/^/   /'
+        true
         ;;
     list)
         list_limit="${1:-20}"; case "$list_limit" in ''|*[!0-9]*) die "list: limit must be a non-negative integer" ;; esac
@@ -1594,7 +1698,8 @@ except Exception:
                 limited) detail="provider limit/failure — ${reason:-see log}" ;;
                 silent)  detail="no output — ${reason:-silence watchdog fired}" ;;
             esac
-            case "$est" in running) ic="▶";; idle) ic="▷";; done) ic="✔";; waiting) ic="⏳";; error) ic="✖";; stalled) ic="⚠";; limited) ic="⛔";; silent) ic="◌";; *) ic="•";; esac
+            case "$est" in running) ic="▶";; idle) ic="▷";; done) ic="✔";; waiting) ic="⏳";; error) ic="✖";; stalled) ic="⚠";; limited) ic="⛔";; silent) ic="◌";; stopped) ic="⏹";; *) ic="•";; esac
+            detail="${detail}${detail:+; }$(inbox_count "$n") undelivered message(s); $(activity_summary "$n")"
             age="$(( (list_now - fm) / 60 ))m"
             printf '%-2s %-24s %-8s %-9s %-13s %-6s %-6s %-8s %s\n' "$ic" "$n" "${est:-?}" "${e:-?}" "${mo:-?}" "$age" "${nf:-0}" "${s:0:8}" "$detail"
         done
@@ -1838,12 +1943,13 @@ PY
                 # writing to them. Before the idle state existed, such a task simply read as
                 # `running` here, so leaving idle out silently turned clean into a data loss.
                 running|idle) continue ;;
-                waiting) [ "$incl_waiting" = 1 ] || continue ;;
+                waiting) [ "$incl_waiting" = 1 ] || [ "$purge" = 1 ] || continue ;;
             esac
+            [ "$(inbox_count "$n")" = 0 ] || [ "$incl_waiting" = 1 ] || [ "$purge" = 1 ] || continue
             d="$(meta_get "$n" dir)"
             targets=("$LOGDIR/$n.md")
             [ -n "$d" ] && targets+=("$d/PROGRESS.$n.md")
-            [ "$purge" = 1 ] && targets+=("$LOGDIR/$n.log" "$f")
+            [ "$purge" = 1 ] && targets+=("$LOGDIR/$n.log" "$f" "$LOGDIR/$n.original.txt" "$LOGDIR/$n.activity.jsonl" "$LOGDIR/$n.seen" "$LOGDIR/$n.inbox/"*.msg "$LOGDIR/$n.inbox/sequence")
             hit=0
             for t in "${targets[@]}"; do
                 [ -n "$t" ] && [ -f "$t" ] || continue

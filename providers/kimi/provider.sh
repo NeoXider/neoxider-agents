@@ -26,8 +26,9 @@ _provider_kimi_emit() {
         cat
         return 0
     fi
-    PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
+    PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" PYTHONIOENCODING=utf-8 "$_AGENT_PY" -c '
 import json, sys, time
+from activity import record_event
 try:
     sys.stdin.reconfigure(errors="ignore")
 except Exception:
@@ -51,6 +52,9 @@ for line in sys.stdin:
         obj = json.loads(s)
     except Exception:
         continue
+    if not isinstance(obj, dict):
+        continue
+    record_event(obj, "kimi")
     # Throttled activity heartbeat -- see the same block in the codex provider for why: without it
     # a genuinely long, healthy turn looks identical (zero log growth) to a stuck one to agent.sh
     # SILENCE_SEC watchdog.
@@ -64,7 +68,10 @@ for line in sys.stdin:
         if isinstance(content, str) and content:
             answers.append(content)
     elif obj.get("role") == "meta" and obj.get("type") == "session.resume_hint":
-        sid = obj.get("session_id") or sid
+        hinted_sid = obj.get("session_id")
+        if hinted_sid and hinted_sid != sid:
+            sid = hinted_sid
+            print("session id: %s" % sid, flush=True)
     elif obj.get("type") == "error" or "error" in obj:
         # Best-effort: exact Kimi Code error-event shape is not documented here, so accept either a
         # top-level "error" field or type=="error", and unwrap a nested {"message": "..."} if given.
@@ -78,8 +85,6 @@ if not answers:
     raise SystemExit(3)
 answer = "\n".join(answers)
 answer = "\n".join((line + " ") if line == MARK else line for line in answer.split("\n"))
-if sid:
-    print("session id: %s" % sid)
 print(MARK)
 sys.stdout.write(answer)
 if not answer.endswith("\n"):

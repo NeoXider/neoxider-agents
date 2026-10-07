@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import openai_server as _bridge_runtime
+import activity as _activity
 
 # Opt-in diagnostics, same convention as openai_server.py: quiet (WARNING) unless AGENT_LOG_LEVEL
 # says otherwise -- request lines at DEBUG, a bridge kill that could not go through at WARNING,
@@ -315,7 +316,7 @@ def first_prompt(name):
             return (" ".join(buf))[:90]
     return ""
 
-ACT_BY_STATE = {"done": "✅", "waiting": "⏳", "error": "❌", "stalled": "⚠️"}
+ACT_BY_STATE = {"done": "✅", "waiting": "⏳", "error": "❌", "stalled": "⚠️", "stopped": "⏹"}
 ACT_RULES = [  # for running — based on the log's last line: what it's doing right now
     (("read", "open", "cat ", "grep", "ls "), "📖"),
     (("edit", "appl", "writ", "patch", "creat", "wrote"), "✏️"),
@@ -357,6 +358,18 @@ def topic_emoji(title):
             return em
     return "📝"
 
+def queued_messages(name):
+    """Include claimed messages while a resume is in flight; ignore atomic-write temp files."""
+    if safe_task_name(name) is None:
+        return 0
+    try:
+        with os.scandir(os.path.join(LOGDIR, name + ".inbox")) as entries:
+            return sum(1 for entry in entries if entry.is_file() and
+                       re.fullmatch(r"\d+\.msg(?:\.inflight)?", entry.name))
+    except OSError:
+        return 0
+
+
 def list_tasks():
     nowt = time.time()
     out = []
@@ -394,6 +407,8 @@ def list_tasks():
             "timeout": meta.get("timeout", ""),  # set when the step watchdog killed the task (exit 124)
             "idle_sec": int(nowt - lm) if lm else None,
             "updated": lm,
+            "queued": queued_messages(name),
+            "last_activity": _activity.summary(logp),
         })
     out.sort(key=lambda t: t["updated"] or 0, reverse=True)
     return out
@@ -818,6 +833,42 @@ def run_sync(args, timeout=30):
         return (p.stdout or "") + (p.stderr or "")
     except Exception as e:
         return "error: %s" % e
+
+
+def control_task(data, action):
+    """Validate the HTTP boundary; agent.sh remains the sole owner of sessions/process trees."""
+    task = safe_task_name(data.get("task"))
+    if task is None:
+        return 400, {"error": "invalid task name"}
+    if not task_exists(task):
+        return 404, {"error": "task no longer exists"}
+    if action == "send":
+        message = data.get("message", data.get("answer"))
+        if not isinstance(message, str) or not message.strip() or "\0" in message:
+            return 400, {"error": "message must be nonempty text without NUL characters"}
+        try:
+            if len(message.encode("utf-8")) > 20000:
+                return 400, {"error": "message exceeds the GUI command-line limit; use CLI --prompt-file"}
+        except UnicodeError:
+            return 400, {"error": "invalid message encoding"}
+        now, terminal = data.get("now", False), data.get("terminal", False)
+        if not isinstance(now, bool) or not isinstance(terminal, bool):
+            return 400, {"error": "now and terminal must be booleans"}
+        args = ["send", task] + (["--now"] if now else []) + ["--", message.strip()]
+        try:
+            spawn(args, terminal=terminal)
+        except (OSError, ValueError):
+            return 500, {"error": "could not launch task send"}
+        return 200, {"ok": True, "accepted": True}
+    try:
+        result = subprocess.run([BASH, SK, "stop", task], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=30, cwd=HERE,
+                                **_hidden_windows_kwargs())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 500, {"error": "could not complete task stop"}
+    if result.returncode != 0:
+        return 409, {"error": "task stop failed; inspect task status"}
+    return 200, {"ok": True}
 
 # Doctor/provider-info both shell out to agent.sh, which is not cheap (subprocess + the
 # provider's own CLI --version/login calls) -- cache each by key with a short TTL so switching
@@ -1950,6 +2001,9 @@ class H(BaseHTTPRequestHandler):
             if rdir:  # remember the project
                 register_project(rdir)
             self._send(200, json.dumps({"ok": True}))
+        elif u.path in ("/api/task/send", "/api/task/stop"):
+            code, result = control_task(data, u.path.rsplit("/", 1)[1])
+            self._send(code, json.dumps(result))
         elif u.path == "/api/reply":
             task = (data.get("task") or "").strip()
             answer = (data.get("answer") or "").strip()

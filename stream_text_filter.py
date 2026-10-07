@@ -28,6 +28,7 @@ forwards the log verbatim as answer text.
 import json
 import os
 import sys
+from activity import record_event
 
 # Opens every activity line. ASCII on purpose: this is written to a console whose encoding
 # is whatever Windows picked, and no real answer text starts a line with it, letting
@@ -78,6 +79,7 @@ def main(stdin=None, stdout=None, activity=None):
             continue
         if not isinstance(ev, dict):
             continue
+        record_event(ev, "claude")
         etype = ev.get("type")
         if etype == "system" and ev.get("subtype") == "init" and not seen_session:
             sid = ev.get("session_id") or ""

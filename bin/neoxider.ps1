@@ -2,7 +2,7 @@
 #   neoxider             -> prints a short usage summary (no side effects)
 #   neoxider gui [port]  -> opens the web GUI in your browser
 #   neoxider help        -> full agent.sh command reference
-#   neoxider <anything>  -> passed straight through to agent.sh (run/reply/log/doctor/...)
+#   neoxider <anything>  -> passed straight through to agent.sh (run/send/peek/stop/restart/...)
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Sk = Join-Path $Here "..\agent.sh"
 
