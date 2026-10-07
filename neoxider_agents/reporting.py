@@ -20,6 +20,22 @@ def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _git_listed_files(root):
+    """Tracked plus untracked-not-ignored files; ignored trees (Unity Library, scratch output) are never hashed."""
+    if not (root / ".git").exists():
+        return None
+    import subprocess
+    from .process import hidden_kwargs
+    try:
+        proc = subprocess.run(["git", "--no-optional-locks", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=60, **hidden_kwargs())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return [item for item in proc.stdout.decode("utf-8", "surrogateescape").split("\0") if item]
+
+
 def snapshot(directory, excluded=(), capture=None):
     """Hash working-tree contents, including pre-existing dirty and untracked files.
 
@@ -36,37 +52,48 @@ def snapshot(directory, excluded=(), capture=None):
         value = os.path.normcase(str(path))
         return any(value == item or value.startswith(item + os.sep) for item in excluded)
 
-    for parent, dirs, files in os.walk(str(root)):
-        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not ignored(Path(parent) / d)]
-        for name in files:
-            path = Path(parent) / name
-            if name.startswith("PROGRESS.") and name.endswith(".md") or name.startswith(".agent") or ignored(path):
+    def walk():
+        listed = _git_listed_files(root)
+        if listed is not None:
+            for relative in listed:
+                path = root / relative
+                if not any(part in IGNORED_DIRS for part in path.relative_to(root).parts[:-1]):
+                    yield path.parent, path.name
+            return
+        for parent, dirs, files in os.walk(str(root)):
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not ignored(Path(parent) / d)]
+            for name in files:
+                yield Path(parent), name
+
+    for parent, name in walk():
+        path = Path(parent) / name
+        if name.startswith("PROGRESS.") and name.endswith(".md") or name.startswith(".agent") or ignored(path):
+            continue
+        try:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                data = os.readlink(str(path)).encode("utf-8", "surrogateescape")
+                digest = hashlib.sha256(data).hexdigest()
+                entry = dict(sha256=digest, size=len(data), mtime_ns=info.st_mtime_ns, type="symlink")
+            elif stat.S_ISREG(info.st_mode):
+                digest = hashlib.sha256()
+                data = bytearray() if capture is not None and info.st_size <= TEXT_LIMIT else None
+                with path.open("rb") as source:
+                    for block in iter(lambda: source.read(65536), b""):
+                        digest.update(block)
+                        if data is not None:
+                            if len(data) + len(block) <= TEXT_LIMIT:
+                                data.extend(block)
+                            else:
+                                data = None
+                entry = dict(sha256=digest.hexdigest(), size=info.st_size, mtime_ns=info.st_mtime_ns, type="file")
+                if data is not None:
+                    capture(entry, bytes(data))
+            else:
                 continue
-            try:
-                info = path.lstat()
-                if stat.S_ISLNK(info.st_mode):
-                    data = os.readlink(str(path)).encode("utf-8", "surrogateescape")
-                    digest = hashlib.sha256(data).hexdigest()
-                    entry = dict(sha256=digest, size=len(data), mtime_ns=info.st_mtime_ns, type="symlink")
-                elif stat.S_ISREG(info.st_mode):
-                    digest = hashlib.sha256()
-                    data = bytearray() if capture is not None and info.st_size <= TEXT_LIMIT else None
-                    with path.open("rb") as source:
-                        for block in iter(lambda: source.read(65536), b""):
-                            digest.update(block)
-                            if data is not None:
-                                if len(data) + len(block) <= TEXT_LIMIT:
-                                    data.extend(block)
-                                else:
-                                    data = None
-                    entry = dict(sha256=digest.hexdigest(), size=info.st_size, mtime_ns=info.st_mtime_ns, type="file")
-                    if data is not None:
-                        capture(entry, bytes(data))
-                else:
-                    continue
-                result[path.relative_to(root).as_posix()] = entry
-            except OSError:
-                pass
+            result[path.relative_to(root).as_posix()] = entry
+        except OSError:
+            pass
     return result
 
 

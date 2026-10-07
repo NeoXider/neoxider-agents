@@ -227,15 +227,14 @@ class ProcessTests(unittest.TestCase):
             visible = process.hidden_kwargs(True, executable)
             self.assertTrue(visible["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP)
             self.assertFalse(visible["creationflags"] & subprocess.CREATE_NO_WINDOW)
-        self.assertFalse(process.hidden_kwargs(executable=sys.executable)["creationflags"] & subprocess.DETACHED_PROCESS)
+        self.assertTrue(process.hidden_kwargs(executable=sys.executable)["creationflags"] & subprocess.DETACHED_PROCESS)
 
     @unittest.skipUnless(os.name == "nt", "Windows hidden creation flags")
     def test_hidden_launch_keeps_a_hidden_console_for_grandchildren(self):
         for executable in ("", sys.executable, "node.exe", "codex.exe"):
-            flags = process.hidden_kwargs(executable=executable)["creationflags"]
+            flags = process.hidden_kwargs(executable=executable, console=True)["creationflags"]
             self.assertTrue(flags & subprocess.CREATE_NO_WINDOW)
             self.assertFalse(flags & subprocess.DETACHED_PROCESS)
-            self.assertTrue(flags & subprocess.CREATE_NEW_PROCESS_GROUP)
 
     @unittest.skipUnless(os.name == "nt", "Actual Windows PowerShell helper")
     def test_powershell_helper_executes_and_emits_stdout(self):

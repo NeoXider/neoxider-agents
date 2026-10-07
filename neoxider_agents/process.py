@@ -18,12 +18,15 @@ class LauncherStopped(KeyboardInterrupt):
     """Lets the owning command persist a stopped result after launcher cancellation."""
 
 
-def hidden_kwargs(terminal=False, executable=""):
+def hidden_kwargs(terminal=False, executable="", console=False):
     if os.name != "nt":
         return {}
-    # A detached process has no console, so every console child it starts (node -> codex.exe) opens a new
-    # visible window in the default terminal. A hidden console is inherited by the whole tree instead.
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP
+    name = str(executable).replace("\\", "/").rsplit("/", 1)[-1].lower()
+    powershell = name in ("powershell", "powershell.exe", "pwsh", "pwsh.exe")
+    # PowerShell 5.1 can exit successfully without executing when detached.
+    # A detached provider has no console, so a console child it starts (node -> codex.exe) opens a visible
+    # terminal window; console=True gives the provider tree one hidden console that the whole tree shares.
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP if terminal else 0 if powershell or console else subprocess.DETACHED_PROCESS
     result = {"creationflags": flags}
     if not terminal:
         result["creationflags"] |= subprocess.CREATE_NO_WINDOW
@@ -224,7 +227,7 @@ class ProcessTree:
 def spawn(argv, prompt_file, cwd=None, env=None, terminal=False):
     """Prompt bytes go to stdin; the provider never receives prompt text in argv."""
     _install_signals()
-    options = hidden_kwargs(terminal, argv[0])
+    options = hidden_kwargs(terminal, argv[0], console=True)
     job = None
     if os.name == "nt":
         from .windows import Job, ensure_lifetime_job, resume
