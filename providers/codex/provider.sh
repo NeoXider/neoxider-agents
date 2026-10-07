@@ -21,6 +21,7 @@ provider_codex_resolve() {
         5.6-high|high)              P_MODEL="gpt-5.6-sol"; P_EFFORT="high" ;;
         5.6-luna|luna)              P_MODEL="gpt-5.6-luna" ;;
         6-sol|sol6|gpt6-sol)        P_MODEL="gpt-6-sol" ;;
+        6.1-sol|sol61|gpt61-sol)    P_MODEL="gpt-6.1-sol" ;;
         6-luna|luna6|gpt6-luna)     P_MODEL="gpt-6-luna" ;;
         spark|5.3|5.3-spark|codex-spark) P_MODEL="gpt-5.3-codex-spark" ;;
         *) P_MODEL="$alias" ;;

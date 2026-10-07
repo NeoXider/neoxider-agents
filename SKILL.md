@@ -849,6 +849,7 @@ Gotchas (verified):
 | Alias | Model | When |
 |---|---|---|
 | `5.6-terra` / `terra` (default) | `gpt-5.6-terra`, effort medium | regular tasks |
+| `6.1-sol` / `sol61` | `gpt-6.1-sol`, effort medium (pass `-f high` for the usual hard work) | GPT-6.1 Sol; verified with codex-cli 0.160 on 2026-10-07 |
 | `6-sol` / `sol6` | `gpt-6-sol`, effort medium | GPT-6 Sol; requires Codex CLI 0.156.1+ |
 | `6-luna` / `luna6` | `gpt-6-luna`, effort medium | GPT-6 Luna; requires Codex CLI 0.156.1+ |
 | `5.6-sol` / `sol` | `gpt-5.6-sol`, effort medium | 5.6 variant / explicit Sol request |

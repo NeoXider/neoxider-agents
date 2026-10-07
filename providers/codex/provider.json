@@ -1,6 +1,6 @@
 {
   "label": "Codex",
-  "models": ["6-sol", "6-luna", "sol", "luna", "terra", "spark"],
+  "models": ["6.1-sol", "6-sol", "6-luna", "sol", "luna", "terra", "spark"],
   "efforts": ["medium", "high"],
   "default_model": "terra",
   "default_effort": "medium",

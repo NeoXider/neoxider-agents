@@ -21,6 +21,7 @@ class Provider(BaseProvider):
                    "terra": "gpt-5.6-terra", "default": "gpt-5.6-terra", "5.6-sol": "gpt-5.6-sol", "sol": "gpt-5.6-sol",
                    "5.6-high": "gpt-5.6-sol", "high": "gpt-5.6-sol", "5.6-luna": "gpt-5.6-luna", "luna": "gpt-5.6-luna",
                    "6-sol": "gpt-6-sol", "sol6": "gpt-6-sol", "gpt6-sol": "gpt-6-sol",
+                   "6.1-sol": "gpt-6.1-sol", "sol61": "gpt-6.1-sol", "gpt61-sol": "gpt-6.1-sol",
                    "6-luna": "gpt-6-luna", "luna6": "gpt-6-luna", "gpt6-luna": "gpt-6-luna",
                    "spark": "gpt-5.3-codex-spark", "5.3": "gpt-5.3-codex-spark", "5.3-spark": "gpt-5.3-codex-spark",
                    "codex-spark": "gpt-5.3-codex-spark"}
