@@ -264,10 +264,24 @@ dirty git tree or a non-git hash manifest. In a shared work directory, the delta
 during this task's lifetime. It cannot prove which concurrent agent authored an edit. The overlap
 warnings make shared-file edits visible; declare disjoint ownership or use isolated worktrees.
 Declared `--owns` scopes reported paths. Start status/hashes live in `.baseline.json`, with
-private text in `.baseline.files/` (2 MiB/file, 16 MiB/task); large/binary hashes remain comparable
+private text in `.baseline.files/` (2 MiB/file, 16 MiB/task); large/binary fingerprints remain comparable
 without line counts. Final deltas are frozen in `.changes.json`. `.history.jsonl` contains
 allowlisted redacted control metadata, never prompt bodies. Common VCS/dependency/cache/build
 directories, progress artifacts, `.agent*` and the state subtree are ignored by manifests.
+
+Git manifests use one `git ls-files -z --cached --others --exclude-standard` enumeration;
+ignored files are excluded, including Unity caches. Non-git/git-failure scans additionally
+skip `Library`, `Temp`, `obj`, `Logs`, `.vs`, `.idea`, `.gradle`, `.next` and `coverage`.
+`AGENT_BASELINE_BUDGET_SEC` (30 seconds) bounds each snapshot.
+`AGENT_BASELINE_MAX_FILES` defaults to 200000 Git candidates or 20000 fallback files;
+`AGENT_BASELINE_MAX_BYTES` (536870912 bytes) additionally bounds fallback scans.
+`AGENT_BASELINE_SIZE_CAP_BYTES` (8388608) selects full hashing or, for larger files,
+size, mtime and first/last 64 KiB fingerprints. Forced baselines reuse hashes by size/mtime;
+delta scans still rehash small files. Partial baselines explicitly report untracked counts (unknown for an
+unfinished walk), suppress uncertain additions/deletions, and persist optional version 2 keys.
+Dead-launcher classification never scans the workspace; `stop`, `result` or `diff` caches its
+delta lazily. Stamped dead-owner task/global locks recover automatically; timeouts name the
+holder PID. See [performance limits](docs/PERFORMANCE.md).
 
 | Native task operation | Wrapper operation |
 |---|---|

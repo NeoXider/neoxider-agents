@@ -8,6 +8,13 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- Bound task baselines to Git's tracked/unignored candidates or a fallback scan capped at
+  20000 files and 512 MiB, with a 30-second snapshot budget and configurable limits.
+  Skip Unity caches, reuse unchanged baseline hashes, fingerprint files above 8 MiB, and
+  report partial tracking in diff/result/dashboard while retaining version 2 compatibility.
+- Classify dead launchers without workspace scans during list/status/pending/ownership checks;
+  explicit stop/result/diff computes and caches the delta. Recover stamped dead-owner task and
+  global locks atomically; lock timeout errors identify the holder PID and liveness.
 - Make lazy log pruning and housekeeping tolerate filesystem races and sharing violations;
   preserve answers before expiry and report explicit cleanup failures without aborting state views.
 

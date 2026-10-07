@@ -208,12 +208,12 @@ def _usage(meta):
 
 def _delta_names(store, name, meta, current=None):
     if current is not None:
-        from .reporting import _different
+        from .reporting import _different, _delta_keys
         baseline = read_baseline(store, name)
         if not baseline:
             return []
         initial = baseline.get("files", baseline)
-        names = [path for path in set(initial) | set(current) if _different(initial.get(path), current.get(path))]
+        names = [path for path in _delta_keys(baseline, initial, current) if _different(initial.get(path), current.get(path))]
         return owned_paths(store, name, meta.get("dir", ""), names)
     if meta.get("changed_names") is not None and meta.get("state") not in ACTIVE:
         return [path for path in meta.get("changed_names", "").split(" | ") if path]
@@ -236,7 +236,11 @@ def dashboard_data(store):
             if normalized not in scans:
                 scans[normalized] = snapshot(directory, (store.root,))
             current = scans[normalized]
-        names = _delta_names(store, name, meta, current)
+        unreconciled = state not in ACTIVE and meta.get("state") in ACTIVE
+        names = [path for path in meta.get("changed_names", "").split(" | ") if path] if unreconciled else _delta_names(store, name, meta, current)
+        from .reporting import partial_warning
+        baseline = read_baseline(store, name)
+        warning = partial_warning(baseline, current) or meta.get("baseline_warning", "")
         activity_epoch = _epoch(meta, "last_activity_epoch") or _epoch(meta, "activity_epoch")
         if not activity_epoch:
             try:
@@ -248,7 +252,8 @@ def dashboard_data(store):
                          age_sec=max(0, round(now - _start(meta, stamp), 1)),
                          last_activity=_redact(meta.get("last_activity", ""))[:160],
                          activity_age_sec=max(0, round(now - activity_epoch, 1)),
-                         files_changed=len(names) if meta.get("delta_known") != "0" else None,
+                         files_changed=len(names) if meta.get("delta_known") != "0" and not unreconciled else None,
+                         baseline_partial=bool(baseline.get("partial")), baseline_warning=warning,
                          queued=len(store.inbox(name)), usage=usage, tokens=tokens, cost_usd=cost))
     return rows
 
@@ -283,6 +288,8 @@ def top(store, opts=None):
                            row["files_changed"] if row["files_changed"] is not None else "?", row["queued"],
                            row["tokens"] if row["tokens"] is not None else "-",
                            "$%.4f" % row["cost_usd"] if row["cost_usd"] is not None else "-", row["last_activity"]))
+                    if row["baseline_warning"]:
+                        print("[neoxider] %s: %s" % (row["name"], row["baseline_warning"]))
                 if not rows:
                     print("No tasks for this orchestrator.")
                 if not once:
@@ -328,7 +335,11 @@ def diff(store, name, opts=None):
         raise ValueError("diff: no such task '%s'; use neoxider list" % name)
     if not read_baseline(store, name):
         raise ValueError("diff: task '%s' has no start baseline; start a new task to track changes" % name)
-    changes = file_changes(store, name, meta.get("dir", ""), frozen=meta.get("state") not in ACTIVE)
+    meta, state = _explicit_state(store, name, meta)
+    changes = _explicit_changes(store, name, meta, state)
+    warning = store.read(name).get("baseline_warning", "")
+    if warning:
+        print("[neoxider] " + warning, file=sys.stderr)
     names = [entry["path"] for entry in changes]
     for conflict in overlaps(store, name, names):
         print("[neoxider] warning: task '%s' also changed %s during overlapping task lifetimes; authorship is ambiguous" %
@@ -372,18 +383,35 @@ def diff(store, name, opts=None):
     return 0
 
 
-def collect_result(store, name):
+def _explicit_state(store, name, meta):
     from .lifecycle import effective
+    state = effective(store, name, meta)
+    if state == "stopped" and meta.get("state") == "running":
+        from .reporting import record_stop
+        record_stop(store, name, by="user", reason="launcher stopped")
+        meta = store.read(name)
+    return meta, state
+
+
+def _explicit_changes(store, name, meta, state):
+    settled = state not in ACTIVE
+    cache = store.path(name, ".changes.json")
+    return file_changes(store, name, meta.get("dir", ""), freeze=settled and not cache.is_file(), frozen=settled)
+
+
+def collect_result(store, name):
     meta = store.read(name)
     if not meta:
         raise ValueError("result: no such task '%s'; use neoxider list" % name)
-    state = effective(store, name, meta)
+    meta, state = _explicit_state(store, name, meta)
     try:
         answer = store.path(name, ".answer").read_text(encoding="utf-8")
     except OSError:
         answer = last_output(store.path(name, ".log"))
     stopped = stop_block(store, name, meta) if state == "stopped" else None
-    changes = file_changes(store, name, meta.get("dir", ""), frozen=state not in ACTIVE)
+    changes = _explicit_changes(store, name, meta, state)
+    baseline = read_baseline(store, name)
+    warning = store.read(name).get("baseline_warning", "")
     start = _start(meta)
     end = _epoch(meta, "finished_epoch") or _epoch(meta, "ended_epoch")
     if not end and state not in ACTIVE:
@@ -407,6 +435,7 @@ def collect_result(store, name):
     return dict(task=name, state=state, exit_code=_number(meta.get("exit")), final_answer=answer, stop_report=stopped,
                 engine=meta.get("engine", ""), model=meta.get("model", ""), session=store.session(name, meta),
                 directory=meta.get("dir", ""), changed_files=changes, baseline_known=bool(read_baseline(store, name)),
+                baseline_partial=bool(baseline.get("partial")), baseline_warning=warning,
                 duration_sec=max(0, round((end or time.time()) - start, 3)) if start else None,
                 usage=usage, tokens=tokens, cost_usd=cost, history=history,
                 overlaps=overlaps(store, name, [entry["path"] for entry in changes]), attribution=ATTRIBUTION)
@@ -418,6 +447,8 @@ def result(store, name, opts=None):
     if opts.get("--json"):
         print(json.dumps(data, ensure_ascii=False))
     else:
+        if data.get("baseline_warning"):
+            print("[neoxider] " + data["baseline_warning"])
         print("task=%s state=%s exit=%s duration=%ss files=%s" %
               (name, data["state"], data["exit_code"], data["duration_sec"], len(data["changed_files"])))
         answer = data["stop_report"] or data["final_answer"]

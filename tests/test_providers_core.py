@@ -233,7 +233,7 @@ class NativeLaunchers(unittest.TestCase):
         with patch.dict(os.environ, {"PATH": path, "PATHEXT": ".EXE;.CMD"}):
             os.environ.pop("AGENT_TOOL_BIN", None)
             self.assertEqual(Path(which_native("tool")), npm_dir / "tool.exe")
-            self.assertEqual(executable("tool"), [str(npm_dir / "tool.exe")])
+            self.assertEqual([Path(item) for item in executable("tool")], [npm_dir / "tool.exe"])
 
     @unittest.skipUnless(os.name == "nt", "Windows extensionless shell shims")
     def test_stable_real_copy_next_to_a_shim_wins(self):
@@ -242,6 +242,12 @@ class NativeLaunchers(unittest.TestCase):
         with patch.dict(os.environ, {"PATH": str(self.folder), "PATHEXT": ".EXE;.CMD"}):
             os.environ.pop("AGENT_TOOL_BIN", None)
             self.assertEqual(Path(which_native("tool")), self.folder / "tool-real.exe")
+
+    @unittest.skipUnless(os.name == "nt", "Windows extensionless shell shims")
+    def test_extensionless_only_lookup_reports_missing(self):
+        (self.folder / "tool").write_text("#!/bin/sh\n", encoding="utf-8")
+        with patch.dict(os.environ, {"PATH": str(self.folder), "PATHEXT": ".EXE;.CMD"}):
+            self.assertIsNone(which_native("tool"))
 
 
 class Filters(unittest.TestCase):

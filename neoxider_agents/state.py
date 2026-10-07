@@ -1,6 +1,7 @@
 """Legacy-compatible atomic task state, publication locks and bounded log access."""
 import os
 import re
+import shutil
 import time
 import uuid
 from pathlib import Path
@@ -70,14 +71,14 @@ class Lock:
         self.owner = self.path / ("owner." + self.token)
 
     def __enter__(self):
-        from .process import pid_alive
+        from .process import pid_stamp
         deadline = time.monotonic() + self.timeout if self.timeout is not None else None
         sleeper = Event()
         candidate = Path(str(self.path) + ".candidate." + self.token)
         while True:
             try:
                 candidate.mkdir(mode=0o700)
-                (candidate / self.owner.name).write_text("%s %s\n" % (os.getpid(), self.token), encoding="ascii")
+                (candidate / self.owner.name).write_text("%s %s %s\n" % (os.getpid(), self.token, pid_stamp(os.getpid())), encoding="ascii")
                 os.rename(str(candidate), str(self.path))
                 return self
             except (FileExistsError, PermissionError, OSError):
@@ -86,28 +87,71 @@ class Lock:
                     candidate.rmdir()
                 except OSError:
                     pass
-            try:
-                owners = list(self.path.glob("owner*"))
-                for owner in owners:
-                    fields = owner.read_text(encoding="ascii").split()
-                    age = time.time() - owner.stat().st_mtime
-                    native = len(fields) > 1 and bool(re.fullmatch(r"[0-9]+-[0-9a-f]{32}", fields[1]))
-                    known_dead = native and not pid_alive(fields[0])
-                    if self.path.name.endswith(".owner.lock.d"):
-                        meta = read_meta(self.path.with_name(self.path.name[:-len(".owner.lock.d")] + ".meta"))
-                        if fields and fields[0] == meta.get("pid") and meta.get("winpid"):
-                            known_dead = not pid_alive(meta["winpid"], meta.get("pid_start", "") if meta.get("core_version") else "")
-                            if not known_dead:
-                                continue
-                    if fields and (known_dead or (not pid_alive(fields[0]) and age >= 10)):
-                        owner.unlink()
-                self.path.rmdir()
+            holders = self._holders()
+            if holders and all(not alive for _, alive in holders) and self._reclaim():
                 continue
-            except (OSError, ValueError):
-                pass
             if deadline and time.monotonic() >= deadline:
-                raise ValueError("task lock timed out: " + str(self.path))
+                detail = ", ".join("held by pid %s (%s)" % (pid, "alive" if alive else "dead") for pid, alive in holders)
+                raise ValueError("task lock timed out: " + str(self.path) + ("; " + detail if detail else "; holder unknown"))
             sleeper.wait(0.1)
+
+    def _holders(self):
+        from .process import pid_alive
+        try:
+            holders = []
+            for owner in self.path.glob("owner*"):
+                fields = owner.read_text(encoding="ascii").split()
+                if not fields or not fields[0].isdigit():
+                    return []  # Unknown writers must not be evicted.
+                # Bash generations use pid-random-time; Python uses pid-UUID.
+                native = len(fields) > 1 and fields[1].startswith(fields[0] + "-")
+                stamp = (fields[2] if len(fields) > 2 else "") if native else (fields[1] if len(fields) > 1 else "")
+                pid = fields[0]
+                if self.path.name.endswith(".owner.lock.d"):
+                    meta = read_meta(self.path.with_name(self.path.name[:-len(".owner.lock.d")] + ".meta"))
+                    if pid == meta.get("pid") and meta.get("winpid"):
+                        pid, stamp = meta["winpid"], meta.get("pid_start", "") if meta.get("core_version") else ""
+                holders.append((pid, pid_alive(pid, stamp)))
+            return holders
+        except (OSError, UnicodeError, ValueError):
+            return []
+
+    def _reclaim(self):
+        # Keep this inode: unlinking an advisory lock lets another contender lock
+        # a different inode. OS locks are released automatically after a crash.
+        guard = Path(str(self.path) + ".reap")
+        try:
+            with guard.open("a+b") as stream:
+                if not guard.stat().st_size:
+                    stream.write(b"0")
+                    stream.flush()
+                stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    # Another reaper may already have published a live generation.
+                    holders = self._holders()
+                    if not holders or any(alive for _, alive in holders):
+                        return False
+                    retired = Path(str(self.path) + ".retired." + uuid.uuid4().hex)
+                    os.rename(str(self.path), str(retired))
+                    try:
+                        shutil.rmtree(str(retired))
+                    except OSError:
+                        pass  # Publication is already free; cleanup is best effort.
+                    return True
+                finally:
+                    if os.name == "nt":
+                        stream.seek(0)
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            return False
 
     def __exit__(self, *unused):
         deadline = time.monotonic() + 2

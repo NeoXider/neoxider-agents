@@ -57,7 +57,6 @@ def effective(store, name, meta=None, reconcile=True):
         if pid_alive(data.get("provider_pid"), data.get("provider_start", "")):
             return "orphaned"
         if data.get("core_version") and reconcile:
-            record_stop(store, name, by="user", reason="launcher stopped")
             return "stopped"
         return "stalled"
     try:
@@ -117,6 +116,10 @@ def stop(store, name, by="orchestrator", reason="stopped by orchestrator"):
     if not meta:
         raise ValueError("stop: no such task '%s'" % name)
     state = effective(store, name, meta)
+    if state == "stopped" and meta.get("state") == "running":
+        print(record_stop(store, name, by, reason), end="")
+        render_md(store, name)
+        return 0
     if state not in ("running", "idle", "orphaned", "stalled"):
         if state == "stopped":
             print(stop_block(store, name), end="")
@@ -353,9 +356,9 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             if code == 0 and not answer.strip():
                 code = 3
                 reason = "provider returned an empty answer; inspect the working tree (changes may have landed)"
-            names = changed_files(store, name, opts["dir"])
             from .reporting import file_changes
-            file_changes(store, name, opts["dir"], freeze=True)
+            changes = file_changes(store, name, opts["dir"], freeze=True)
+            names = [entry["path"] for entry in changes]
             state = "error" if code else "waiting" if files or looks_waiting(answer) else "done"
             store.update(name, state=state, exit=code, reason=" ".join((reason or ("provider exited %s" % code if code else "%s undelivered message(s); send --flush %s" % (len(files), name) if files else "")).split()),
                          files=len(names), changed_names=" | ".join(names))

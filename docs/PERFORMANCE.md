@@ -1,5 +1,65 @@
 # Performance
 
+## Bounded baselines and orphan reads
+
+Git working trees enumerate candidates with one hidden, timeout-bounded
+`git ls-files -z --cached --others --exclude-standard` call per snapshot. This includes dirty
+tracked and unignored untracked files while excluding ignored Unity/dependency trees.
+Git failures use a bounded walk. The fallback additionally skips `Library`, `Temp`, `obj`,
+`Logs`, `.vs`, `.idea`, `.gradle`, `.next` and `coverage`; ordinary `bin` and `Builds` directories
+remain visible unless Git ignores them.
+
+| Setting | Default | Meaning |
+|---|---:|---|
+| `AGENT_BASELINE_BUDGET_SEC` | 30 | Snapshot wall-time budget, including candidate enumeration |
+| `AGENT_BASELINE_MAX_FILES` | 200000 Git / 20000 fallback | Maximum candidate files inspected |
+| `AGENT_BASELINE_MAX_BYTES` | 536870912 | Maximum total candidate bytes in fallback scans |
+| `AGENT_BASELINE_SIZE_CAP_BYTES` | 8388608 | Full-hash limit; larger files fingerprint size, mtime and first/last 64 KiB |
+
+Version 2 baselines remain readable. Optional `partial`, `reason`, `not_tracked` and `source`
+keys describe completeness. Git candidate exhaustion reports a remaining count; an interrupted
+walk reports an unknown count because discovering the total would violate the budget.
+Diff/result/dashboard report partial tracking explicitly. Files missing from an incomplete
+start snapshot are never called added, and files missing from an incomplete current snapshot
+are never called deleted. A partial result is evidence of observed changes, not a complete
+workspace audit.
+
+Forced baselines reuse hashes and retained text blobs when size and nanosecond mtime match.
+Normal small-file delta scans still rehash contents, preserving restored-timestamp edit
+detection. Reuse can miss same-size edits with restored mtimes during a forced baseline;
+fingerprints can miss middle-only edits when size/mtime and sampled edges are unchanged.
+Large-file mtime changes count as fingerprint changes. Full text capture remains limited to
+2 MiB per file and 16 MiB of referenced text per task. Forced-run blob cleanup uses only
+remaining budget; unused blobs may remain until housekeeping removes the task. Metadata publication occurs after the scan;
+a blocking filesystem operation cannot be interrupted by a cooperative wall-time check.
+
+`effective()` only checks metadata and process identity. List/status/pending/wait and ownership
+checks do not snapshot an orphan's directory or persist a stop report. Such reports say the
+delta is pending until explicit stop/result/diff computes and freezes it in `.changes.json`.
+The global ownership lock never contains this scan. Live dashboard scans are separately
+bounded; unreconciled dead tasks show unknown counts without scanning.
+
+Locks record PID/start stamps and retire dead-owner generations by atomic rename before
+cleanup. A persistent one-byte `.lock.d.reap` file serializes reapers using OS locks, which
+release on process death. Live or unidentifiable holders are retained; timeout errors identify
+known holder PIDs and liveness. Failed retirement cleanup may leave a `.retired.*` directory
+without preventing acquisition. Avoid mixing older and newer launchers in one active state
+directory during rollout; existing baseline layout and provider sessions need no migration.
+The comparison policy changes for pre-fix baselines: previously captured paths that are now
+ignored can appear deleted, and switching a large file from a full hash to a fingerprint can
+appear modified. Start a fresh task baseline after rollout to compare under one policy.
+
+Merge verification on Windows/Python 3.14 retains the original benchmark thresholds. The final
+run passes seven of nine gates; the process-count gate expects 60 processes for 30 tasks but observes
+60 Python processes plus 60 console hosts. The benchmark launches both owners and providers
+through the provider-console helper, so upstream's shared hidden consoles add hosts to its
+raw inventory. This fixture/accounting mismatch remains explicit; hidden-console behavior
+and the process budget have not been weakened.
+The waiter reports zero audited spawns, but the final sampler sees one new child during
+startup (the earlier run saw none). Delayed console-host creation is consistent with this
+observation, but the benchmark does not retain that child's identity; this gate remains
+unresolved rather than being relaxed.
+
 ## Phase 2B acceptance
 
 Phase 2B keeps every existing budget unchanged. Reproduce from this clone with
@@ -25,10 +85,10 @@ locked tail writer capped at 2 MiB by default, trimming with half-cap slack to a
 the tail on every line. Only `--log` retains the full provider stream. State reads perform
 lazy TTL cleanup without a timer process; running tasks and persistent logs are protected.
 Final-answer reads stream in chunks. Empty-change results avoid scanning unrelated tasks;
-dashboard refresh shares a workspace hash scan across tasks and never spawns polling helpers.
-Baselines hash content and copy bounded text once at start; git uses `--no-optional-locks`,
+dashboard refresh shares a bounded workspace scan across tasks; Git candidate enumeration
+spawns a hidden helper for Git workspaces. Baselines copy bounded text once at start; git uses `--no-optional-locks`,
 and directories without a git marker avoid invoking git.
-These baseline costs depend on project size and are separate from command polling budgets.
+Baseline scan costs are bounded independently of command polling budgets.
 
 The earlier Phase 2A measurements and platform limitations below remain historical evidence.
 

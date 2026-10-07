@@ -76,6 +76,15 @@ overlaps. `brief --owns` writes contract text only. Baseline deltas include init
 trees and non-git directories; concurrent edits in a shared directory cannot prove authorship.
 Observed shared-file changes warn. Use disjoint ownership or isolated worktrees.
 
+Baselines enumerate Git tracked/unignored candidates; fallback scans skip Unity caches.
+`AGENT_BASELINE_BUDGET_SEC` defaults to 30 seconds. `AGENT_BASELINE_MAX_FILES` defaults to
+200000 Git candidates or 20000 fallback files; fallback scans also stop at
+`AGENT_BASELINE_MAX_BYTES` (536870912 bytes). `AGENT_BASELINE_SIZE_CAP_BYTES` (8388608)
+selects size/mtime plus first/last 64 KiB fingerprints.
+Partial baselines report incomplete tracking explicitly. Dead-launcher reads never scan the
+workspace; explicit stop/result/diff caches deltas. Dead-owner task/global locks recover and
+lock errors name the holder PID. See [performance limits](docs/PERFORMANCE.md).
+
 **Control running workers.** Prefer `send`/`peek`/`stop`/`restart` over blind waiting.
 A running `send` returns `queued (#N)` and saves ordered messages atomically in
 `$AGENT_CLI_LOGS/NAME.inbox/`; the owner drains them in the same session after the turn,

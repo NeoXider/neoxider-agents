@@ -44,11 +44,14 @@ def which_native(engine):
     for directory in os.environ.get("PATH", "").split(os.pathsep):
         if not directory:
             continue
+        sibling = Path(directory) / (engine + "-real.exe")
+        if sibling.is_file():
+            return str(sibling)
         for suffix in NATIVE_SUFFIXES:
             candidate = Path(directory) / (engine + suffix)
             if candidate.is_file():
                 return str(candidate)
-    return found
+    return None
 
 
 def executable(engine):
