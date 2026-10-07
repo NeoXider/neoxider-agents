@@ -842,7 +842,7 @@ def _hidden_windows_kwargs(new_process_group=False):
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
-    flags = subprocess.CREATE_NO_WINDOW | getattr(subprocess, "DETACHED_PROCESS", 0x8)
+    flags = subprocess.CREATE_NO_WINDOW
     if new_process_group:
         flags |= subprocess.CREATE_NEW_PROCESS_GROUP
     return {"creationflags": flags, "startupinfo": startupinfo}

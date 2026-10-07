@@ -24,9 +24,36 @@ def hidden_options():
     return {"creationflags": subprocess.CREATE_NO_WINDOW, "startupinfo": startup}
 
 
+NATIVE_SUFFIXES = (".exe", ".cmd", ".bat", ".ps1", ".py")
+
+
+def which_native(engine):
+    """PATH lookup that never returns an extensionless shell shim on Windows.
+
+    A shim such as ~/bin/opencode (a sh script) cannot be started by CreateProcess (WinError 193) and
+    PowerShell hands it to the shell, which opens the 'choose an app' dialog."""
+    found = shutil.which(engine)
+    if os.name != "nt":
+        return found
+    if found:
+        sibling = Path(found).with_name(engine + "-real.exe")
+        if sibling.is_file():
+            return str(sibling)
+        if Path(found).suffix.lower() in NATIVE_SUFFIXES:
+            return found
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory:
+            continue
+        for suffix in NATIVE_SUFFIXES:
+            candidate = Path(directory) / (engine + suffix)
+            if candidate.is_file():
+                return str(candidate)
+    return found
+
+
 def executable(engine):
     """Unwrap npm launchers to native exe/Node, preserving spaced UTF-8 paths."""
-    chosen = os.environ.get("AGENT_%s_BIN" % engine.upper()) or shutil.which(engine)
+    chosen = os.environ.get("AGENT_%s_BIN" % engine.upper()) or which_native(engine)
     if not chosen:
         raise FileNotFoundError("%s CLI not found in PATH" % engine)
     path = Path(chosen)
@@ -35,7 +62,7 @@ def executable(engine):
             return [sys.executable, str(path)]
         return [str(path)]
     text = path.read_text(encoding="utf-8-sig", errors="replace")
-    matches = re.findall(r'(?:%dp0%|\$basedir)[\\/]+([^"\r\n]+?\.(?:exe|js|cjs|mjs))', text, re.I)
+    matches = re.findall(r'(?:%dp0%|%~dp0|\$basedir)[\\/]*([^"\r\n]+?\.(?:exe|js|cjs|mjs))', text, re.I)
     for match in matches:
         target = path.parent / match.replace("\\", "/")
         if target.is_file() and target.suffix.lower() == ".exe" and target.name.lower() != "node.exe":

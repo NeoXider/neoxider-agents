@@ -12,7 +12,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from neoxider_agents.output import LIMIT, MARK, OutputFilter
-from neoxider_agents.providers import CONFLICT, executable, failure_reason, get_provider, hidden_options, is_transient_failure, provider_info
+from neoxider_agents.providers import CONFLICT, executable, failure_reason, get_provider, hidden_options, is_transient_failure, provider_info, which_native
 
 
 class Aliases(unittest.TestCase):
@@ -219,6 +219,29 @@ class NativeLaunchers(unittest.TestCase):
         launcher.write_text('"%dp0%\\node.exe" "%dp0%\\engine.js" %*', encoding="utf-8")
         with patch.dict(os.environ, {"AGENT_TEST_BIN": str(launcher)}):
             self.assertEqual(executable("test"), [str(self.folder / "node.exe"), str(self.folder / "engine.js")])
+
+    @unittest.skipUnless(os.name == "nt", "Windows extensionless shell shims")
+    def test_extensionless_shell_shim_is_never_launched(self):
+        shim_dir = self.folder / "shim"
+        npm_dir = self.folder / "npm"
+        shim_dir.mkdir()
+        npm_dir.mkdir()
+        (shim_dir / "tool").write_text("#!/bin/sh\n", encoding="utf-8")
+        (npm_dir / "tool").write_text("#!/bin/sh\n", encoding="utf-8")
+        (npm_dir / "tool.exe").touch()
+        path = os.pathsep.join((str(shim_dir), str(npm_dir)))
+        with patch.dict(os.environ, {"PATH": path, "PATHEXT": ".EXE;.CMD"}):
+            os.environ.pop("AGENT_TOOL_BIN", None)
+            self.assertEqual(Path(which_native("tool")), npm_dir / "tool.exe")
+            self.assertEqual(executable("tool"), [str(npm_dir / "tool.exe")])
+
+    @unittest.skipUnless(os.name == "nt", "Windows extensionless shell shims")
+    def test_stable_real_copy_next_to_a_shim_wins(self):
+        (self.folder / "tool").write_text("#!/bin/sh\n", encoding="utf-8")
+        (self.folder / "tool-real.exe").touch()
+        with patch.dict(os.environ, {"PATH": str(self.folder), "PATHEXT": ".EXE;.CMD"}):
+            os.environ.pop("AGENT_TOOL_BIN", None)
+            self.assertEqual(Path(which_native("tool")), self.folder / "tool-real.exe")
 
 
 class Filters(unittest.TestCase):

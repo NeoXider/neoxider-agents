@@ -227,7 +227,15 @@ class ProcessTests(unittest.TestCase):
             visible = process.hidden_kwargs(True, executable)
             self.assertTrue(visible["creationflags"] & subprocess.CREATE_NEW_PROCESS_GROUP)
             self.assertFalse(visible["creationflags"] & subprocess.CREATE_NO_WINDOW)
-        self.assertTrue(process.hidden_kwargs(executable=sys.executable)["creationflags"] & subprocess.DETACHED_PROCESS)
+        self.assertFalse(process.hidden_kwargs(executable=sys.executable)["creationflags"] & subprocess.DETACHED_PROCESS)
+
+    @unittest.skipUnless(os.name == "nt", "Windows hidden creation flags")
+    def test_hidden_launch_keeps_a_hidden_console_for_grandchildren(self):
+        for executable in ("", sys.executable, "node.exe", "codex.exe"):
+            flags = process.hidden_kwargs(executable=executable)["creationflags"]
+            self.assertTrue(flags & subprocess.CREATE_NO_WINDOW)
+            self.assertFalse(flags & subprocess.DETACHED_PROCESS)
+            self.assertTrue(flags & subprocess.CREATE_NEW_PROCESS_GROUP)
 
     @unittest.skipUnless(os.name == "nt", "Actual Windows PowerShell helper")
     def test_powershell_helper_executes_and_emits_stdout(self):
@@ -242,13 +250,15 @@ class ProcessTests(unittest.TestCase):
                 self.assertEqual(tree.process.returncode, 0, output)
                 self.assertEqual(output.strip(), b"ECHO", "helper exited without executing its command")
 
-    @unittest.skipUnless(os.name == "nt", "Windows detached owner budget")
-    def test_detached_provider_does_not_create_console_host(self):
-        from neoxider_agents.windows import processes
-        tree = self.launch("import time\ntime.sleep(90)\n")
-        time.sleep(0.15)
-        children = [row for row in processes() if row[1] == tree.pid]
-        self.assertFalse(any(row[2].lower() == "conhost.exe" for row in children), children)
+    @unittest.skipUnless(os.name == "nt", "Windows hidden console sharing")
+    def test_provider_console_grandchild_shares_the_hidden_console(self):
+        grandchild = "import ctypes;print(ctypes.windll.kernel32.GetConsoleProcessList((ctypes.c_uint*8)(),8))"
+        provider = self.script("console_probe.py", "import subprocess,sys\nprint(subprocess.check_output([sys.executable,'-c',%r]).decode().strip())\n" % grandchild)
+        tree = process.spawn([sys.executable, str(provider)], self.prompt, cwd=str(self.work))
+        self.trees.append(tree)
+        output, unused = tree.process.communicate(timeout=20)
+        self.assertEqual(tree.process.returncode, 0, output)
+        self.assertGreaterEqual(int(output.strip()), 2, "a console child opened its own console window instead of sharing the hidden one")
 
     @unittest.skipUnless(os.name == "nt", "Windows job lifetime")
     def test_hard_launcher_kill_reaches_provider_and_grandchild(self):

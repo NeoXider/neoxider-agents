@@ -21,10 +21,9 @@ class LauncherStopped(KeyboardInterrupt):
 def hidden_kwargs(terminal=False, executable=""):
     if os.name != "nt":
         return {}
-    name = str(executable).replace("\\", "/").rsplit("/", 1)[-1].lower()
-    powershell = name in ("powershell", "powershell.exe", "pwsh", "pwsh.exe")
-    # PowerShell 5.1 can exit successfully without executing when detached.
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP if terminal else 0 if powershell else subprocess.DETACHED_PROCESS
+    # A detached process has no console, so every console child it starts (node -> codex.exe) opens a new
+    # visible window in the default terminal. A hidden console is inherited by the whole tree instead.
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP
     result = {"creationflags": flags}
     if not terminal:
         result["creationflags"] |= subprocess.CREATE_NO_WINDOW
