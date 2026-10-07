@@ -13,6 +13,9 @@ STOP_EXIT = 130
 IGNORED_DIRS = frozenset((".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__",
                           ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cache", "dist", "build"))
 TEXT_LIMIT = 2 * 1024 * 1024
+WALK_FILE_LIMIT = 20000
+WALK_BYTE_LIMIT = 512 * 1024 * 1024
+SNAPSHOT_SECONDS = 30
 BASELINE_TEXT_LIMIT = 16 * 1024 * 1024
 
 
@@ -52,6 +55,8 @@ def snapshot(directory, excluded=(), capture=None):
         value = os.path.normcase(str(path))
         return any(value == item or value.startswith(item + os.sep) for item in excluded)
 
+    deadline = time.monotonic() + SNAPSHOT_SECONDS
+
     def walk():
         listed = _git_listed_files(root)
         if listed is not None:
@@ -60,12 +65,25 @@ def snapshot(directory, excluded=(), capture=None):
                 if not any(part in IGNORED_DIRS for part in path.relative_to(root).parts[:-1]):
                     yield path.parent, path.name
             return
+        count = 0
+        total = 0
         for parent, dirs, files in os.walk(str(root)):
+            if time.monotonic() > deadline:
+                return
             dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not ignored(Path(parent) / d)]
             for name in files:
+                count += 1
+                try:
+                    total += os.lstat(os.path.join(parent, name)).st_size
+                except OSError:
+                    pass
+                if count > WALK_FILE_LIMIT or total > WALK_BYTE_LIMIT:
+                    return
                 yield Path(parent), name
 
     for parent, name in walk():
+        if time.monotonic() > deadline:
+            break
         path = Path(parent) / name
         if name.startswith("PROGRESS.") and name.endswith(".md") or name.startswith(".agent") or ignored(path):
             continue
