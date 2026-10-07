@@ -17,10 +17,10 @@ accepted as `?token=` (once -- it is then stored in a cookie), an `X-Agent-Token
 a reverse proxy); tokenless loopback POSTs enforce JSON plus same-origin browser headers.
 
 The backend reads <name>.meta / <name>.log directly (fast, no parsing of `list`'s text),
-while actions (run/reply/doctor) shell out to agent.sh so all the logic lives in one place.
+while actions (run/reply/doctor) invoke the Python core so all the logic lives in one place.
 Provider metadata (label/models/limits) is glob-loaded from providers/*/provider.json, and
 per-provider info (version/login/rate limits) is fetched by shelling out to
-`agent.sh provider-info <engine>` — the plugin's own provider.sh owns that logic, gui.py
+`agent.sh provider-info <engine>` — the plugin's own provider.py owns that logic, gui.py
 does not hardcode any per-engine behavior.
 """
 import json, math, logging, os, re, sys, time, subprocess, socket, urllib.parse, urllib.request, glob, threading
@@ -55,33 +55,21 @@ def to_git_bash_path(p):
     return "/%s/%s" % (m.group(1).lower(), m.group(2)) if m else p
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# bash (git-bash) understands forward slashes in win paths, but NOT backslashes in argv -> normalize
-SK = os.path.join(HERE, "agent.sh").replace("\\", "/")
+# Invoke the Python core directly; no shell or Windows bash selection.
+SK = os.path.join(HERE, "agent.py")
 HTML = os.path.join(HERE, "gui.html")
 STATIC_DIR = os.path.join(HERE, "static")
 LOCALES_DIR = os.path.join(HERE, "locales")
 PROVIDERS_DIR = os.path.join(HERE, "providers")
-# the exact git-bash agent.sh uses (otherwise native-python may pick up WSL bash and fail
-# to find C:/... paths). Falls back to common git-bash locations so plain `python gui.py`
-# also works (not just via `agent.sh gui`).
-BASH = os.environ.get("AGENT_SH_BASH")
-if not BASH:
-    for c in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe",
-              r"C:\Program Files (x86)\Git\bin\bash.exe"):
-        if os.path.exists(c):
-            BASH = c
-            break
-    else:
-        BASH = "bash"
+PYTHON = sys.executable
+BASH = PYTHON  # Historical integrations imported this launcher executable name.
 LOGDIR = os.environ.get("AGENT_CLI_LOGS") or os.path.expanduser("~/.claude/agent-cli-logs")
 PROJECTS_FILE = os.path.join(LOGDIR, "projects.json")
-BRIDGES_DIR = os.path.join(LOGDIR, "bridges")  # openai_server.py drops bridge-<port>.json here
+BRIDGES_DIR = os.path.join(LOGDIR, "bridges")
 DOCTOR_CACHE_FILE = os.path.join(LOGDIR, "gui-doctor-cache.json")
-# Silence threshold, shared with agent.sh (same env var, same default): a still-alive task that
-# has not written anything for this long is reported as "running (no output for Nm)".
 STALE_SEC = int(os.environ.get("AGENT_STALE_SEC") or 300)
-MAX_BODY_BYTES = 10 * 1024 * 1024      # POST bodies above this get 413 before any byte is read
-DEFAULT_WAIT_TIMEOUT = 60.0            # /api/wait ?timeout= is clamped to finite [0, cap]
+MAX_BODY_BYTES = 10 * 1024 * 1024
+DEFAULT_WAIT_TIMEOUT = 60.0
 WAIT_TIMEOUT_CAP = 300.0
 _PROJECTS_LOCK = threading.Lock()
 
@@ -797,24 +785,20 @@ def _hidden_windows_kwargs(new_process_group=False):
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
-    flags = subprocess.CREATE_NO_WINDOW
+    flags = subprocess.CREATE_NO_WINDOW | getattr(subprocess, "DETACHED_PROCESS", 0x8)
     if new_process_group:
         flags |= subprocess.CREATE_NEW_PROCESS_GROUP
     return {"creationflags": flags, "startupinfo": startupinfo}
 
 
 def spawn(args, terminal=False, extra_env=None):
-    """Launch agent.sh in the background.
-
-    Windows must be explicitly windowless by default: console applications launched through
-    Git Bash may otherwise be adopted by the configured default terminal and open a visible tab.
-    terminal=True is the sole opt-in to a separate live console.
-    """
+    """Launch the Python core hidden; terminal=True explicitly opens a live console."""
     kw = dict(cwd=HERE)
+    child_env = os.environ.copy()
+    child_env.pop("AGENT_LAUNCHER_PID", None)
     if extra_env:
-        child_env = os.environ.copy()
         child_env.update(extra_env)
-        kw["env"] = child_env
+    kw["env"] = child_env
     if terminal and os.name == "nt":
         kw["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # explicit live-chat opt-in
     elif os.name == "nt":
@@ -823,11 +807,11 @@ def spawn(args, terminal=False, extra_env=None):
     else:
         kw.update(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         kw["start_new_session"] = True
-    return subprocess.Popen([BASH, SK] + args, **kw)
+    return subprocess.Popen([PYTHON, SK] + args, **kw)
 
 def run_sync(args, timeout=30):
     try:
-        p = subprocess.run([BASH, SK] + args, capture_output=True, text=True,
+        p = subprocess.run([PYTHON, SK] + args, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout, cwd=HERE,
                            **_hidden_windows_kwargs())
         return (p.stdout or "") + (p.stderr or "")
@@ -861,8 +845,9 @@ def control_task(data, action):
             return 500, {"error": "could not launch task send"}
         return 200, {"ok": True, "accepted": True}
     try:
-        result = subprocess.run([BASH, SK, "stop", task], capture_output=True, text=True,
+        result = subprocess.run([PYTHON, SK, "stop", task], capture_output=True, text=True,
                                 encoding="utf-8", errors="replace", timeout=30, cwd=HERE,
+                                env=dict(os.environ, AGENT_STOP_BY="gui"),
                                 **_hidden_windows_kwargs())
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return 500, {"error": "could not complete task stop"}
@@ -892,7 +877,7 @@ def _cached(key, compute, force=False):
 
 def provider_info(engine, force=False):
     """Info for one provider, for the right-hand panel (limits where the CLI exposes them).
-    Shells out to `agent.sh provider-info <engine>`, which sources providers/<engine>/provider.sh
+    Shells out to `agent.sh provider-info <engine>`, which loads providers/<engine>/provider.py
     and calls its provider_<engine>_doctor — all per-engine logic lives in the plugin, not here."""
     def compute():
         raw = run_sync(["provider-info", engine], timeout=25)
@@ -1063,10 +1048,9 @@ def engine_models(engine, force=False):
     if engine != "opencode":
         return static
     def compute():
-        # WHY via git-bash: `opencode` is an npm shim (opencode.cmd) that native-Windows python
-        # subprocess can't resolve by bare name; the same git-bash agent.sh uses finds it on PATH.
+        # Resolve npm command shims without requiring Bash on Windows.
         try:
-            p = subprocess.run([BASH, "-lc", "opencode models"], capture_output=True, text=True,
+            p = subprocess.run(_bridge_runtime._cli_command("opencode", "models"), capture_output=True, text=True,
                                encoding="utf-8", errors="replace", timeout=20, cwd=HERE,
                                **_hidden_windows_kwargs())
             got = [l.strip() for l in (p.stdout or "").splitlines()
@@ -1190,7 +1174,7 @@ def lan_ips():
 
 
 def kill_pid(pid):
-    """Terminate a bridge process by pid. taskkill /T on Windows (the bash launcher exec's into
+    """Terminate a bridge process by pid. taskkill /T on Windows (the core launches
     python, so the recorded pid IS python, but /T also reaps any stragglers); SIGTERM elsewhere."""
     if isinstance(pid, bool) or isinstance(pid, float):
         # JSON true would coerce to pid 1 and 1.9/1.0 would silently truncate to 1 -- refuse
@@ -1401,7 +1385,7 @@ def _bridge_command_args(cfg, port):
 
 def _bridge_process_payload_error(cfg):
     """Reject payloads beyond a conservative cross-platform argv/environment boundary."""
-    command_line = subprocess.list2cmdline([BASH, SK] + _bridge_command_args(cfg, cfg.port))
+    command_line = subprocess.list2cmdline([PYTHON, SK] + _bridge_command_args(cfg, cfg.port))
     if len(command_line) > _BRIDGE_PORTABLE_PROCESS_TEXT_LIMIT:
         return "bridge command-line values are too long to launch portably"
     if cfg.api_key:

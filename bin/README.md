@@ -1,69 +1,68 @@
 # The `neoxider` command
 
-`neoxider` with no arguments prints a short usage summary — it does not open the GUI
-as a side effect of a bare invocation. `neoxider gui [port]` explicitly opens the
-neoxider-agents web GUI in your browser (default port 8765, overridable via
-`$AGENT_GUI_PORT` or a one-off `neoxider gui <port>`). `neoxider help` prints the
-full `agent.sh` command reference. Any other argument is passed straight through to
-`agent.sh` — `neoxider run ...`, `neoxider doctor`, `neoxider log -f <name>`, etc. all
-work exactly like `bash agent.sh run ...`. It resolves its own location, so it works
-no matter where you cloned the repo.
+Python 3.8+ is the only runtime dependency. Windows PowerShell 5.1/7 and cmd entries
+invoke the core directly; Git Bash and WSL are unnecessary. `neoxider` without arguments
+prints help, `neoxider gui [port]` opens the local dashboard, and other arguments select
+core commands. The default GUI port is 8765 (`AGENT_GUI_PORT` overrides it).
 
-## Recommended: run the installer once (adds `bin/` to your `PATH`)
-
-This directory contains three entry points for the same command — `neoxider` (bash
-script), `neoxider.cmd` (cmd.exe/PowerShell wrapper), `neoxider.ps1` (PowerShell
-wrapper) — so once `bin/` is on your `PATH`, typing bare `neoxider` works from
-git-bash, `cmd.exe`, **and** PowerShell, with no per-shell setup.
-
-These scripts only touch *your own* PATH, and only when *you* run them — nothing runs
-itself automatically.
-
-**Windows** (PowerShell):
+## Install on Windows
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\bin\install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\bin\install.ps1
 ```
 
-Uses `[Environment]::SetEnvironmentVariable(..., "User")`, not `setx` — `setx` has a
-documented bug where it silently truncates an already-long `PATH`.
-
-**macOS / Linux / git-bash** (runtime requires Bash 4 or newer; macOS users should run
-`brew install bash` first):
-
-```bash
-bash bin/install.sh
-```
-
-Appends a `PATH` export to the startup file selected from `$SHELL` (`~/.zshrc`, `~/.bashrc`,
-or `~/.profile`).
-
-Either way: open a **new** terminal window afterward, then verify with
-`neoxider doctor` — it should print the engines/rate-limits table from any shell,
-with no `bash` prefix needed. Both scripts are idempotent (safe to run more than once).
-
-**Prefer to do it by hand instead?** Windows: Win+R → `sysdm.cpl` → Advanced →
-Environment Variables → edit your user `Path` → add the full path to this `bin`
-directory. macOS/Linux: add `export PATH="/path/to/neoxider-agents/bin:$PATH"` to your
-shell rc file yourself.
-
-## Alternative: per-shell alias/function (no PATH edit)
-
-If you'd rather not touch `PATH`, these do the same thing for one shell only:
-
-**bash / git-bash** — add to `~/.bashrc` (or `~/.bash_profile`), then `source` it:
-
-```bash
-alias neoxider='bash /path/to/neoxider-agents/bin/neoxider'
-```
-
-**PowerShell** — add to your profile (`notepad $PROFILE`), then `. $PROFILE` or open
-a new window:
+The installer adds this `bin/` directory to your user PATH with
+`[Environment]::SetEnvironmentVariable`, preserving a long PATH. Open a new shell:
 
 ```powershell
-function neoxider { & "C:\path\to\neoxider-agents\bin\neoxider.ps1" @args }
+neoxider doctor
+neoxider run -t hello -C D:/Git/MyProject "Say hello"
+neoxider send hello "Continue with a short example"
 ```
 
-**Plain `cmd.exe`** has no per-session profile/rc file to hook into — use the `PATH`
-method above, or always invoke it by full path
-(`C:\path\to\neoxider-agents\bin\neoxider.cmd doctor`).
+No registry/configuration changes happen before you explicitly run the installer.
+Without installing, use `.\bin\neoxider.ps1`, `.\bin\neoxider.cmd`, `.\agent.ps1`
+or `.\agent.cmd`. PowerShell serializes arguments as UTF-8 JSON over stdin, preserving
+Cyrillic, embedded quotes, empty arguments and newlines while keeping tokens out of files.
+All entries propagate the core exit code. Missing Python produces one error with the install fix.
+
+## Install on Linux/macOS
+
+```sh
+sh bin/install.sh
+```
+
+This idempotently appends a PATH export to the startup file selected from `$SHELL`
+(`~/.zshrc`, `~/.bashrc` or `~/.profile`). The entry is a POSIX shell shim; Bash 4 is only
+needed when explicitly selecting the retained `AGENT_LEGACY=1` engine. Python is discovered
+as `py -3`, `python`, or `python3` where applicable.
+
+## Completion
+
+Load in the current shell; add the same line to your profile to persist it:
+
+```powershell
+neoxider completion powershell | Out-String | Invoke-Expression
+```
+
+```bash
+source <(neoxider completion bash)
+```
+
+```zsh
+source <(neoxider completion zsh)
+```
+
+Completion covers commands, task names from `AGENT_CLI_LOGS`, and flags. It does not
+launch providers. A one-shell PowerShell function also works without editing PATH:
+
+```powershell
+function neoxider { & "D:/path/neoxider-agents/bin/neoxider.ps1" @args }
+```
+
+## Migration
+
+Existing task state remains in `AGENT_CLI_LOGS/<task>.meta/.log/.md/.inbox`. The old Bash
+engine is retained under `legacy/` for one release; `AGENT_LEGACY=1 ./agent.sh ...` selects
+it on POSIX/Git Bash. Native PowerShell and cmd always execute Python. Use a separate
+checkout during migration rather than replacing a running legacy wrapper's files.

@@ -1,6 +1,6 @@
 # neoxider-agents — agent instructions
 
-This repo is `agent.sh` + `gui.py`/`gui.html`: a non-interactive wrapper for launching
+This repo is the Python `neoxider_agents/` core + native launchers + `gui.py`/`gui.html`: a non-interactive wrapper for launching
 and managing CLI coding subagents (Codex, Claude Code, Kimi Code, opencode, Gemini CLI) across a
 shared thread-per-task log, plus an optional zero-dependency local web GUI.
 
@@ -13,25 +13,31 @@ pick up the same baseline instructions without extra setup.
 
 ## Quick reference
 
-```bash
-SK=./agent.sh
-bash $SK run  -t <name> -C <dir> "<prompt>"     # new task (Claude Code / Opus 5 by default)
-bash $SK run  -e kimi -t <name> -C <dir> "..."  # Kimi Code, Kimi K3 by default
-bash $SK run  -e claude -t <name> -C <dir> "..." # -e: codex|claude|kimi|opencode|gemini
-bash $SK fan  -t <base> -C <dir> "p1" "p2" ...   # N parallel background tasks (<base>-01, -02, ...)
-bash $SK send <name> "<message>"                 # queue while running; resume otherwise (reply is an alias)
-bash $SK send <name> --prompt-file F             # options also work after the task name
-bash $SK send <name> --now "<message>"           # interrupt the turn, then resume with the message + inbox
-bash $SK send --flush <name>                     # recover an undelivered inbox
-bash $SK stop <name>...                          # stop by name; --all-mine uses current ownership
-bash $SK restart <name> ["<message>"]            # resume saved session; --fresh replays original prompt
-bash $SK peek <name> [-n N] [-f] [--raw]          # readable activity; default last 25 entries
-bash $SK log  -f <name>                          # follow a task live
-bash $SK status <name>                           # state / current step / needs a reply?
-bash $SK doctor                                   # foreign CLI availability + limits, when needed
-bash $SK doctor --deep                            # + one REAL run per engine that must EXECUTE a shell command
-bash $SK gui                                      # web GUI (stable default port 8765; or: ./bin/neoxider gui)
+```powershell
+$SK = './agent.ps1'
+& $SK run  -t <name> -C <dir> "<prompt>"     # new task (Claude Code / Opus 5 by default)
+& $SK run  -e kimi -t <name> -C <dir> "..."  # Kimi Code, Kimi K3 by default
+& $SK run  -e claude -t <name> -C <dir> "..." # -e: codex|claude|kimi|opencode|gemini
+& $SK fan  -t <base> -C <dir> "p1" "p2" ...   # N parallel background tasks (<base>-01, -02, ...)
+& $SK send <name> "<message>"                 # queue while running; resume otherwise (reply is an alias)
+& $SK send <name> --prompt-file F             # options also work after the task name
+& $SK send <name> --now "<message>"           # interrupt the turn, then resume with the message + inbox
+& $SK send --flush <name>                     # recover an undelivered inbox
+& $SK stop <name>...                          # stop by name; --all-mine uses current ownership
+& $SK restart <name> ["<message>"]            # resume saved session; --fresh replays original prompt
+& $SK peek <name> [-n N] [-f] [--raw]          # readable activity; default last 25 entries
+& $SK log  -f <name>                          # follow a task live
+& $SK status <name>                           # state / current step / needs a reply?
+& $SK doctor                                   # foreign CLI availability + limits, when needed
+& $SK doctor --deep                            # + one REAL run per engine that must EXECUTE a shell command
+& $SK gui                                      # web GUI (stable default port 8765; or: ./bin/neoxider gui)
 ```
+
+Windows launchers use Python 3.8+ directly (PowerShell 5.1/7 or cmd), without Git Bash/WSL.
+POSIX `agent.sh` is a thin shim; `AGENT_LEGACY=1 ./agent.sh ...` selects the retained Bash
+engine for this release. Existing state files remain compatible. `stop` reaches the owning
+launcher with a STOPPED report and exit 130; cancelling the launcher kills its provider tree.
+See [SKILL.md](SKILL.md#windows--powershell-invocation) for native-parity and migration details.
 
 **Control running workers.** Prefer `send`/`peek`/`stop`/`restart` over blind waiting.
 A running `send` returns `queued (#N)` and saves ordered messages atomically in
@@ -159,7 +165,7 @@ provider key. Bring the bridge up and point the suite at it:
 
 ```bash
 SK=~/.claude/skills/neoxider-agents/agent.sh
-nohup bash $SK openai-server -e opencode -m muse -p 8801 > /tmp/bridge.log 2>&1 &
+bash "$SK" openai-server -e opencode -m muse -p 8801 # foreground; track in the harness
 curl -s http://127.0.0.1:8801/health     # {"ok": true, "engine": "opencode", ...}
 curl -s http://127.0.0.1:8801/v1/models  # the id the client must ask for
 ```
@@ -197,7 +203,7 @@ Native workers do not require CLI `doctor`; a worker report alone is not accepta
   than one subagent might be running, or you'll answer into the wrong session.
 - Every provider runs fully unattended: Codex defaults to `--sandbox danger-full-access`,
   Claude to `--dangerously-skip-permissions`, Gemini to `--yolo`, opencode to `--auto`,
-  and Kimi to its auto policy (see `providers/*/provider.sh`
+  and Kimi to its auto policy (see `providers/*/provider.py`
   and the "Adding a provider" section of [`README.md`](README.md) for the exact flag
   and the Codex/Claude opt-down variables). Do not remove those flags; a subagent's stdin
   is always closed, so a provider that blocks on a prompt hangs forever instead of failing loudly.

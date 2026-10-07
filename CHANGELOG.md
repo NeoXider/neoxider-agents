@@ -8,6 +8,14 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- Python 3.8+ standard-library core, native PowerShell 5.1/7 and cmd entries, UTF-8 stdin
+  argument transport, and PowerShell/bash/zsh completion. Windows no longer needs Git Bash.
+- Per-task Windows Job Objects / POSIX process groups, hidden provider launch boundaries,
+  launcher cancellation reports (exit 130), and legacy Bash migration switch.
+- GUI and API bridge invoke `agent.py` directly; OpenCode/Claude native paths resolve Windows
+  command shims without a Bash subprocess. State layout and provider result markers remain compatible.
+
+
 - **Native-like controls for wrapper tasks.** `send` (with `reply` as an identical alias)
   queues ordered, durable follow-ups while a resume-capable engine runs; the owning wrapper
   drains its inbox before completion. `send --now` interrupts and resumes, `stop` preserves

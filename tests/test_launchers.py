@@ -12,6 +12,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def hidden():
+    if os.name != "nt":
+        return {}
+    info = subprocess.STARTUPINFO()
+    info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    info.wShowWindow = subprocess.SW_HIDE
+    return {"startupinfo": info, "creationflags": subprocess.CREATE_NO_WINDOW}
+
+
 def find_bash():
     # On Windows prefer Git bash over WSL's bash.exe: WSL bash mangles
     # Windows paths (C:UsersUser...) and cannot run install.sh from a
@@ -93,6 +102,7 @@ class WindowsLauncherTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 timeout=30,
+                **hidden(),
             )
         self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
         self.assertIn("delegated:gui 8765", result.stdout)
@@ -110,6 +120,7 @@ class WindowsLauncherTests(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=60,
+            **hidden(),
         )
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("unknown command", (result.stdout + result.stderr).lower())
@@ -130,6 +141,7 @@ class WindowsLauncherTests(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=60,
+            **hidden(),
         )
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("unknown command", (result.stdout + result.stderr).lower())
@@ -148,6 +160,7 @@ class WindowsLauncherTests(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=60,
+            **hidden(),
         )
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("unknown command", (result.stdout + result.stderr).lower())
@@ -167,6 +180,7 @@ class PosixInstallerTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 timeout=30,
+                **hidden(),
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertTrue((Path(temp_home) / ".zshrc").is_file())

@@ -70,7 +70,7 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
     otherwise mixes its own startup banner/session-id/error-log/"tokens used" chrome (and, on
     Windows, a cp866-mojibake OS-notification line) into the same stream as the answer, so the
     codex provider runs it via `codex exec --json` and extracts just the final agent message --
-    see providers/codex/provider.sh (`_provider_codex_emit`). `claude`/`opencode`/`gemini` were
+    see providers/codex/provider.py (`_provider_codex_emit`). `claude`/`opencode`/`gemini` were
     already clean. (If a provider ever regresses, the bridge reads the CLI's captured output
     verbatim with no extra cleanup, so raw chrome would show through.)
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
@@ -80,7 +80,7 @@ import argparse, atexit, base64, binascii, contextlib, glob, hashlib, ipaddress,
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SK = os.path.join(HERE, "agent.sh").replace("\\", "/")
+SK = os.path.join(HERE, "agent.py")
 PROVIDERS_DIR = os.path.join(HERE, "providers")
 LOGDIR = os.environ.get("AGENT_CLI_LOGS") or os.path.expanduser("~/.claude/agent-cli-logs")
 # WHY: each running bridge drops a bridge-<port>.json here so the GUI (gui.py) can list, inspect
@@ -107,15 +107,21 @@ except ValueError:  # garbage in AGENT_LOG_LEVEL -> stay quiet rather than refus
     LOG.setLevel(logging.WARNING)
 LOG.propagate = False
 
-BASH = os.environ.get("AGENT_SH_BASH")
-if not BASH:
-    for c in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe",
-              r"C:\Program Files (x86)\Git\bin\bash.exe"):
-        if os.path.exists(c):
-            BASH = c
-            break
-    else:
-        BASH = "bash"
+PYTHON = sys.executable
+
+
+def _cli_command(name, *arguments):
+    """Resolve Windows npm launchers while keeping every spawn windowless."""
+    from neoxider_agents.providers import executable
+    try:
+        return executable(name) + list(arguments)
+    except FileNotFoundError:
+        pass
+    executable = shutil.which(name) or name
+    if os.name == "nt" and executable.lower().endswith((".cmd", ".bat")):
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c",
+                subprocess.list2cmdline([executable] + list(arguments))]
+    return [executable] + list(arguments)
 
 
 def load_providers():
@@ -303,7 +309,7 @@ def _hidden_windows_kwargs():
     startupinfo = subprocess.STARTUPINFO()
     startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     startupinfo.wShowWindow = subprocess.SW_HIDE
-    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0x8),
             "startupinfo": startupinfo}
 
 
@@ -554,6 +560,7 @@ def _chatonly_env():
     retain the full file, shell, and MCP access needed for coding work.
     """
     env = dict(os.environ)
+    env.pop("AGENT_LAUNCHER_PID", None)
     env["AGENT_CHAT_ONLY"] = "1"
     env.pop("AGENT_CODEX_IMAGE_PATHS", None)
     env.pop("AGENT_OPENCODE_IMAGE_PATHS", None)
@@ -582,8 +589,7 @@ def _chatonly_env():
 
 # Longest prompt still safe as a command-line argument. Windows caps a whole command line at
 # 32767 characters and the spawn fails outright above it -- as WinError 206, which Python raises as
-# FileNotFoundError, so the bridge answered a long conversation with an opaque 500. agent.sh takes
-# anything longer through --prompt-file instead. Keep in step with AGENT_ARGV_PROMPT_MAX in agent.sh.
+# FileNotFoundError, so stage longer histories for the core's --prompt-file input.
 ARGV_PROMPT_MAX = 16000
 
 
@@ -593,7 +599,9 @@ def _prompt_argument(text):
     if len(text) <= ARGV_PROMPT_MAX:
         yield [text]
         return
-    fd, path = tempfile.mkstemp(prefix="bridge-prompt-", suffix=".txt")
+    prompt_dir = os.path.join(LOGDIR, ".prompts")
+    os.makedirs(prompt_dir, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix="bridge-prompt-", suffix=".txt", dir=prompt_dir)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
@@ -607,7 +615,7 @@ def _prompt_argument(text):
 
 
 def run_agent(engine, model, effort, workdir, prompt, name, timeout):
-    args = [BASH, SK, "run", "--no-progress", "-e", engine, "-C", to_git_bash_path(workdir), "-t", name]
+    args = [PYTHON, SK, "run", "--no-progress", "-e", engine, "-C", to_git_bash_path(workdir), "-t", name]
     if model:
         args += ["-m", model]
     if effort:
@@ -627,7 +635,7 @@ def reply_agent(engine, model, effort, workdir, name, answer, timeout):
     Without this guard `last_output(read_log(name))` would echo the PREVIOUS successful answer as
     if it were the reply's -- a silent stale-answer bug. The caller (_run) falls back to a fresh
     run when it sees None."""
-    args = [BASH, SK, "reply", "--no-progress", "-e", engine]
+    args = [PYTHON, SK, "reply", "--no-progress", "-e", engine]
     if model:
         args += ["-m", model]
     if effort:
@@ -651,7 +659,7 @@ def reply_agent(engine, model, effort, workdir, name, answer, timeout):
 
 # --------------------------------------------------------------------------------------------
 # Live streaming (real token deltas). Engines here run their CLI in a streaming output mode
-# (see providers/<engine>/provider.sh + stream_text_filter.py) so the task log GROWS while the
+# (see providers/<engine>/provider.py + stream_text_filter.py) so the task log GROWS while the
 # model generates; the bridge tails the log and forwards each new piece to the SSE client.
 LIVE_STREAM_ENGINES = {"claude"}
 OUTPUT_MARKER = "---------- output ----------"
@@ -681,77 +689,89 @@ def _log_size(name):
 
 
 def _tail_task_log(name, proc, timeout, on_delta, start_size=0):
-    """Follows the task log while `proc` (the agent.sh subprocess) runs, forwarding every new
-    piece of ANSWER text (everything after this run's own "---------- output ----------" marker
-    line) to on_delta as it is appended. Byte-offset based with an incremental UTF-8 decoder --
-    a multi-byte character split across two reads must not become mojibake."""
+    """Stream this turn's first output block, excluding the core's final answer replay."""
     import codecs
     path = _log_path(name)
     deadline = time.time() + timeout
     decoder = codecs.getincrementaldecoder("utf-8")("replace")
     pos = start_size
-    pending = ""          # header text before this run's output marker
-    after_marker = False
+    candidate = ""
+    line_start = True
+    in_output = False
+    replayed = False
     killed = False
 
+    def consume(text):
+        nonlocal candidate, line_start, in_output, replayed
+        emitted = []
+        for char in text.replace("\r", ""):
+            if replayed:
+                break
+            if line_start:
+                if char == "\n" and candidate == OUTPUT_MARKER:
+                    if in_output:
+                        replayed = True
+                    in_output = True
+                    candidate = ""
+                else:
+                    candidate += char
+                    if not OUTPUT_MARKER.startswith(candidate):
+                        if in_output:
+                            emitted.append(candidate)
+                        candidate = ""
+                        line_start = char == "\n"
+            else:
+                if in_output:
+                    emitted.append(char)
+                line_start = char == "\n"
+        if emitted:
+            on_delta("".join(emitted))
+
     def drain():
-        nonlocal pos, pending, after_marker
+        nonlocal pos
         try:
             size = os.path.getsize(path)
         except OSError:
             return False
         if size <= pos:
             return False
-        with open(path, "rb") as f:
-            f.seek(pos)
-            data = f.read(size - pos)
-        pos = size
-        # \r stripped: on Windows the provider's filter writes CRLF line endings into the log;
-        # the final-answer path normalizes them via text-mode reads, so streamed deltas must
-        # match or the streamed text differs from the reconciled one.
-        text = decoder.decode(data).replace("\r", "")
-        if not text:
-            return True
-        if after_marker:
-            on_delta(text)
-            return True
-        pending += text
-        idx = pending.find(OUTPUT_MARKER + "\n")
-        if idx != -1:
-            after_marker = True
-            rest = pending[idx + len(OUTPUT_MARKER) + 1:]
-            pending = ""
-            if rest:
-                on_delta(rest)
+        with open(path, "rb") as file:
+            file.seek(pos)
+            data = file.read(min(65536, size - pos))
+        pos += len(data)
+        consume(decoder.decode(data))
         return True
 
     while True:
         alive = proc.poll() is None
         if drain():
-            continue  # keep draining back-to-back while data flows
+            continue
         if not alive:
             break
         if not killed and time.time() > deadline:
             _terminate_process_tree(proc)
             killed = True
         time.sleep(0.05)
+    consume(decoder.decode(b"", final=True))
+    if candidate and in_output and not replayed and candidate != OUTPUT_MARKER:
+        on_delta(candidate)
 
 
 def run_agent_live(engine, model, effort, workdir, prompt, name, timeout, on_delta):
     """run_agent, but with AGENT_STREAM_TEXT=1 and a log tail forwarding answer deltas while
     the CLI generates. Returns the same final answer text run_agent would."""
-    args = [BASH, SK, "run", "--no-progress", "-e", engine, "-C", to_git_bash_path(workdir), "-t", name]
+    args = [PYTHON, SK, "run", "--no-progress", "-e", engine, "-C", to_git_bash_path(workdir), "-t", name]
     if model:
         args += ["-m", model]
     if effort:
         args += ["-f", effort]
-    args.append(prompt)
-    proc = _popen_process_tree(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               cwd=HERE, env=_stream_env())
-    try:
-        _tail_task_log(name, proc, timeout, on_delta)
-    finally:
-        _release_process_tree(proc)
+    with _prompt_argument(prompt) as prompt_args:
+        proc = _popen_process_tree(args + prompt_args, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, cwd=HERE, env=_stream_env())
+        try:
+            _tail_task_log(name, proc, timeout, on_delta)
+        finally:
+            _release_process_tree(proc)
     return last_output(read_log(name))
 
 
@@ -759,20 +779,21 @@ def reply_agent_live(engine, model, effort, workdir, name, answer, timeout, on_d
     """reply_agent with a live log tail. Same None contract as reply_agent: None when the reply
     appended nothing or ended in a bad state (the caller decides whether a fresh-run fallback
     is still invisible to the client or the stream must be finalized as-is)."""
-    args = [BASH, SK, "reply", "--no-progress", "-e", engine]
+    args = [PYTHON, SK, "reply", "--no-progress", "-e", engine]
     if model:
         args += ["-m", model]
     if effort:
         args += ["-f", effort]
-    args += ["-C", to_git_bash_path(workdir), name, answer]
+    args += ["-C", to_git_bash_path(workdir), name]
     before_bytes = _log_size(name)
     before_text = len(read_log(name))
-    proc = _popen_process_tree(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               cwd=HERE, env=_stream_env())
-    try:
-        _tail_task_log(name, proc, timeout, on_delta, start_size=before_bytes)
-    finally:
-        _release_process_tree(proc)
+    with _prompt_argument(answer) as answer_args:
+        proc = _popen_process_tree(args + answer_args, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, cwd=HERE, env=_stream_env())
+        try:
+            _tail_task_log(name, proc, timeout, on_delta, start_size=before_bytes)
+        finally:
+            _release_process_tree(proc)
     after = read_log(name)
     if len(after) == before_text:
         return None
@@ -827,8 +848,7 @@ def _free_port():
 
 
 def _ensure_opencode_server():
-    """Boot one headless `opencode serve` (via the same bash the CLI path uses, so PATH/shims
-    resolve identically on Windows) and cache its base URL. Reused across all requests."""
+    """Boot one hidden native `opencode serve` and cache its base URL."""
     with _OC["lock"]:
         if _OC["base"] and _OC["proc"] and _OC["proc"].poll() is None:
             return _OC["base"]
@@ -843,7 +863,7 @@ def _ensure_opencode_server():
         env = dict(os.environ)
         env["OPENCODE_CONFIG"] = OPENCODE_CHATONLY_CONFIG.replace("\\", "/")
         proc = _popen_process_tree(
-            [BASH, "-lc", "opencode serve --port %d --hostname 127.0.0.1" % port],
+            _cli_command("opencode", "serve", "--port", str(port), "--hostname", "127.0.0.1"),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
         )
         base = "http://127.0.0.1:%d" % port
@@ -1043,7 +1063,7 @@ def _claude_native_ensure():
         _CL["queue"] = None
         q = queue.Queue()
         proc = _popen_process_tree(
-            [BASH, "-lc", _claude_native_cmd()],
+            _cli_command(*shlex.split(_claude_native_cmd())),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", cwd=SESSION.get("dir") or None,
         )
@@ -1391,7 +1411,7 @@ def render_messages(messages):
 # prompt-injection attempt (Claude Code has its own defenses against "ignore your role, you are
 # now X" text). This version instead states plainly, as background/context rather than a role
 # reassignment, that the session genuinely has no other tools -- which is also just TRUE: the
-# bridge launches every engine with AGENT_CHAT_ONLY=1 (see providers/{codex,claude}/provider.sh),
+# bridge launches every engine with AGENT_CHAT_ONLY=1 (see providers/{codex,claude}/provider.py),
 # which strips MCP servers and blocks shell/file/subagent access at the CLI-flag level, not just
 # by asking nicely. Verified live: with this framing + those flags, claude no longer refuses the
 # tool-calling instructions below as an injection, and correctly reports having no real tools

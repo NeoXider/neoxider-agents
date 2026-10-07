@@ -1,10 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # install.sh — one-time setup for the `neoxider` command (bash / git-bash / macOS / Linux).
 # Run this yourself (it does not run itself): appends a PATH export to your shell rc file.
 #
-#   bash bin/install.sh
-set -uo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+#   sh bin/install.sh
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 case "${SHELL##*/}" in
     zsh) rc="$HOME/.zshrc" ;;

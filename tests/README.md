@@ -1,7 +1,30 @@
 # Tests
 
-Four suites: three offline suites with no third-party dependencies or provider credentials, plus
-one manual live smoke.
+The Python core, native entry points, GUI and bridge use stdlib unittest fixtures. Preserved
+Bash suites exercise the one-release legacy implementation; live checks are separate.
+
+## Native core and entries
+
+```powershell
+$env:AGENT_CLI_LOGS = 'D:/Temp/agents-core/tests/state'
+python -m unittest discover -s tests -p 'test_*.py' -v
+python tests/bench_agent.py --out D:/Temp/agents-core/bench/core.json --check
+powershell.exe -NoProfile -File tests/test_powershell_entry.ps1
+```
+
+`test_agent_core.py` runs deterministic real provider subprocesses with file barriers, task inboxes,
+launcher cancellation and cross-compatibility fixtures. `test_providers_core.py`,
+`test_process_core.py`, `test_core_contracts.py` and `test_heartbeat_core.py` prove provider,
+Windows job/process, CLI and watchdog contracts. `test_native_entries.py` removes Git Bash/WSL
+from PATH and checks PowerShell/cmd UTF-8 prompts. PowerShell 7 is skipped when unavailable.
+
+`prove_core_defects.py` and the provider, contract and heartbeat suites' `--prove-defects` modes
+plant production source defects on disposable copies. Process mutation results are retained in
+the acceptance evidence under `D:/Temp/agents-core/process/proofs/`.
+`bench_agent.py --prove-budgets` plants violations of the budget
+gates. All test state uses isolated scratch directories; Windows defaults are under
+`D:/Temp/agents-core/`. `check_windows.py` samples visible windows on monotonic 100 ms deadlines
+and records timing gaps and overruns.
 
 ## Frontend toast suite
 
@@ -35,7 +58,7 @@ directories where needed, and rely only on stdlib `unittest`.
 bash tests/test_agent_sh.sh
 ```
 
-Sources `agent.sh` (via the harmless `list` subcommand) inside a scratch `AGENT_CLI_LOGS`
+Sources `legacy/agent.sh` (via the harmless `list` subcommand) inside a scratch `AGENT_CLI_LOGS`
 directory to exercise metadata locking, provider contracts, watchdog/liveness behavior, shared
 helpers, and waiting detection—without invoking a real agent CLI or touching the real logs. It
 prints per-test results and exits non-zero on failure.

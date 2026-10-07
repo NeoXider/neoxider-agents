@@ -1,8 +1,32 @@
-# GUI internals (`agent.sh gui`)
+# GUI internals (`neoxider gui`)
 
 Design notes and implementation details for the web control panel. The short operating
 summary lives in [SKILL.md](../SKILL.md); this file is for anyone changing `gui.py` /
 `gui.html` / `static/*`.
+
+Actions invoke `[sys.executable, agent.py, ...]` directly with hidden startup flags on Windows.
+Neither the GUI nor the bridge searches for Git Bash/WSL. OpenCode model discovery and optional
+native servers unwrap npm `.cmd` launchers into native executable/Node commands, with a hidden
+`cmd.exe` fallback for fixed launcher arguments. Historical
+`/c/...` paths are still accepted for state compatibility; the core translates them to native paths.
+`terminal=true` is the only explicit visible-console mode for task/bridge launches.
+
+The Windows live audit on 2026-10-07 found zero new visible consoles with the default
+OpenCode configuration, and six visible `Cua.AgentCursorOverlay.default` GUI overlays.
+Their process chain was `cua-driver.exe -> pythonw.exe -> opencode.exe -> core`: the configured
+`computerUseStdio` / `cua-driver` MCP servers start a cursor overlay while loading their schemas.
+Hidden subprocess flags hide console processes; configured GUI helpers can create their own
+windows. The isolated acceptance profile disables those two MCP servers per process through
+`OPENCODE_CONFIG_CONTENT` with `mcp.<name>.enabled=false`, retaining built-in shell tools and
+other MCP servers. It does not edit the user's global OpenCode configuration. Default-profile
+GUI visibility and isolated-profile results must be reported separately.
+
+The installed Cua driver help strings describe `--no-overlay` for both `serve` and `mcp`,
+so its MCP command can use `cua-driver.exe mcp --no-overlay`. The
+[daemon reference](https://cua.ai/docs/cua-driver/reference/cli/daemon) documents the switch;
+the [MCP reference](https://cua.ai/docs/cua-driver/reference/cli/mcp) omits it. This installed-version
+flag was found through a read-only binary audit, rather than a live MCP launch. No environment
+override was established. The isolated acceptance profile does not test that flag.
 
 A lightweight local web control panel (python-stdlib, zero dependencies): a
 project→subagents tree on the left, a chat with the agent (markdown + bubbles) in the center,
@@ -38,7 +62,7 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   free port + a `!!!!` banner with the real URL) · `none` (nothing free in +50 → an explicit error,
   never a silent no-op). Parallel workers each write to their own `<name>.meta/.log`, so a shared
   overview is safe (and concurrency-safe at the file level too — `meta_set`'s read-modify-write is
-  wrapped in a portable `mkdir`-based lock).
+  wrapped in per-task file locks in the Python core).
 - **Task liveness is NOT computed here anymore** — `gui.py`'s `eff_state()` is a mirror of
   `agent.sh`'s. It used to have its own rule ("running + log quiet for 5 min = stalled"), which
   contradicted the CLI's ("pid alive = running") on every long task: a codex step buffers its output
@@ -118,7 +142,7 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   The active project is on top and expanded; each project has its own scroll (`max-height`), so a large
   project (many tasks) doesn't push the others out of view. Scrollbars are custom-styled to match the
   dark theme (`::-webkit-scrollbar`).
-- **Path normalization**: the GUI (native Windows python) and `agent.sh` (git-bash) write the same
+- **Path normalization**: the GUI and core (native Python) write the same
   path differently (`C:\Git\X` vs `C:/Git/X` vs `/c/Git/X`). `gui.py`'s `to_git_bash_path()` converts
   ANY path to unix-style (`/c/...`) at the moment it's sent to `-C` / saved to `projects.json` — otherwise
   tasks from the GUI would be grouped separately from tasks in the same folder launched from the CLI.
@@ -140,15 +164,11 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   `toggleBridgeReq` expands one call's prompt+output in place. `POST /api/bridge/stop` kills the
   recorded pid (`taskkill /F /T` on Windows) and drops the file. The port is bind-checked before
   launch so a busy/reserved port fails fast. opencode's model list is fetched live via
-  `GET /api/models?engine=` (`opencode models` through git-bash, since the npm shim isn't resolvable
-  by native-Windows python); other engines fall back to `provider.json`. Frontend:
+  `GET /api/models?engine=` (`opencode models` through the hidden native Windows launcher); other engines fall back to `provider.json`. Frontend:
   `static/bridgetab.js` (ids are `brg-*` to avoid colliding with the folder-browser's `br-*` ids).
-- **Providers are plugins**: each CLI lives entirely under `providers/<name>/` — `provider.json`
-  (label/models/**efforts**/limits/default_model/default_effort) drives the GUI's dropdown, model
-  list, **separate effort dropdown**, and adaptive limits panel; `provider.sh` defines
-  `provider_<name>_resolve`/`_run_cmd`/`_resume_cmd`/`_doctor`. `agent.sh` auto-sources every
-  `providers/*/provider.sh` and dispatches generically — adding a new CLI is one new directory,
-  zero edits to `agent.sh`/`gui.py`/`gui.html`.
+- **Providers are plugins**: each CLI lives under `providers/<name>/`. `provider.json`
+  supplies labels, models, efforts and defaults; `provider.py` supplies resolution, command
+  building and doctor output. The retained legacy Bash engine uses `provider.sh` for one release.
 - **Model + effort are separate inputs** (`-f <effort>` on the CLI, its own dropdown in the GUI) —
   not baked into the model alias string anymore. `-f` overrides whatever a provider's own
   `_resolve` would have derived from an alias suffix, and is the *only* way to set effort for

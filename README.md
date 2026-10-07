@@ -4,7 +4,7 @@
 
 **A tiny local control room for AI coding subagents.**
 
-One bash wrapper, one zero-dependency web panel, and an OpenAI-compatible HTTP bridge —
+One Python core, native PowerShell/cmd/POSIX launchers, a zero-dependency web panel, and an OpenAI-compatible HTTP bridge —
 across **Codex · Claude Code · Kimi Code · opencode · Gemini CLI**.
 
 [![zero dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)](#installation)
@@ -16,18 +16,25 @@ across **Codex · Claude Code · Kimi Code · opencode · Gemini CLI**.
 
 ---
 
-## What it is, in one screen
+## PowerShell quick start
 
-```bash
-agent.sh run -t fix-readme -C /path/to/project "fix the typo in the README"   # launch
-agent.sh peek -f fix-readme                                                   # readable live activity
-agent.sh send fix-readme "also cover option B"                               # queue while running; resume otherwise
-agent.sh status fix-readme                                                    # done? stuck? what changed?
+Install Python 3.8+ from python.org with **Add Python to PATH**, clone this repository,
+and install the command with `powershell -NoProfile -ExecutionPolicy Bypass -File .\bin\install.ps1`.
+Open a new shell and use these three commands:
+
+```powershell
+neoxider doctor
+neoxider run -t fix-readme -C D:/Git/MyProject "Fix the README typo and report the change"
+neoxider send fix-readme "Also check the example command"
 ```
 
-No daemon. No database. No npm/cargo/pip step. `agent.sh` targets Bash 4+, `gui.py`
-is Python standard library only, the frontend is classic `<script>` tags — no bundler,
-no framework.
+`run` stays in the foreground until the answer is ready. Track that command as a background
+job through your orchestrator's harness to receive completion notifications. From another
+shell use `neoxider peek fix-readme`, `neoxider stop fix-readme` or `neoxider restart fix-readme`.
+Without installing PATH, use `.\agent.ps1` or `.\bin\neoxider.cmd`.
+
+No daemon, database or dependency install. Python uses only the standard library; Windows
+needs no Git Bash or WSL, and Linux/macOS launch through the POSIX shim.
 
 By [NeoXider](https://github.com/NeoXider).
 
@@ -50,13 +57,14 @@ whichever provider you picked. That gap is what this fills.
 
 ---
 
-## Quick start
+## POSIX quick start
 
-```bash
-git clone https://github.com/NeoXider/neoxider-agents.git && cd neoxider-agents
-bash agent.sh doctor                      # which CLIs are installed, logged in, and how much quota is left
-bash agent.sh run -C . "say hello"        # your first subagent
-bash agent.sh gui                         # ...or drive everything from a browser
+```sh
+git clone https://github.com/NeoXider/neoxider-agents.git
+cd neoxider-agents
+./agent.sh doctor
+./agent.sh run -t hello -C . "Say hello"
+./agent.sh gui
 ```
 
 **Free lane, no OpenRouter API key.** With OpenCode authenticated locally, its Zen free tier works through the same wrapper, and
@@ -97,9 +105,8 @@ cd neoxider-agents
 
 Requirements (you already have these if you use any of the CLIs below):
 
-- Bash 4 or newer (Git Bash on Windows; on macOS install current Bash with `brew install bash` —
-  the system `/bin/bash` 3.2 is too old; Linux distributions normally provide a suitable version)
-- Python 3, standard library only — needed for the GUI, API bridge and readable activity digest
+- Python 3.8+, standard library only, for core, GUI and bridge
+- A POSIX shell on Linux/macOS; native PowerShell 5.1/7 or cmd on Windows
 - At least one of the wrapped CLIs: [Codex CLI](https://github.com/openai/codex),
   [Claude Code](https://github.com/anthropics/claude-code),
   [Kimi Code](https://github.com/MoonshotAI/kimi-code), opencode, or the Gemini CLI —
@@ -111,6 +118,65 @@ side effect); `neoxider gui [port]` opens the panel; everything else passes stra
 `agent.sh`.
 
 </details>
+
+---
+
+## Native task controls
+
+| Action | Native task contract | neoxider contract |
+|---|---|---|
+| Start / resume | Tracked job completes with its answer | `run`, `reply` and `send` block; track the invocation in your harness |
+| Follow-up | Deliver to the same worker | `send NAME TEXT` queues ordered messages and drains before completion |
+| Interrupt | Completion reaches the launcher | `stop NAME` stops the tree and the owner prints `■ STOPPED`; owner and tracked `wait` exit 130 |
+| Change direction | Keep the worker identity | `send NAME --now TEXT` interrupts and resumes inside the existing wrapper |
+| Launcher cancelled | No abandoned worker | Job Object / process group kills descendants; recovery reports `launcher stopped` |
+| Recover | Continue saved context | `restart NAME`, or `restart NAME --fresh` for a new session |
+
+Command reference (native PowerShell/cmd: `neoxider`; POSIX: `./agent.sh`):
+
+| Commands | Arguments / purpose |
+|---|---|
+| `run`, `ask` | `[task options] TEXT` or `--prompt-file FILE`; foreground new task (`ask` is an alias) |
+| `fan` | `[task options] TEXT...`; launch a wave, then track `wait` |
+| `send`, `reply`, `restart` | `NAME [TEXT or --prompt-file FILE]`; send/reply accept `--now`/`--flush`, restart accepts `--fresh` |
+| `stop`, `peek`, `log` | `stop NAME...` / `--all-mine`; `peek NAME [-n N] [-f] [--raw]`; `log [NAME] [-f] [-n N] [-l]` |
+| `last`, `result`, `status`, `list` | `[NAME]` for answer/status (`result` aliases `last`); `list [LIMIT]` defaults to 20 |
+| `pending`, `wait` | `pending [--strict]`; `wait [NAME...] [--timeout SEC] [--poll SEC]` |
+| `clean`, `prune` | `[--all] [--purge] [-n or --dry-run]`; `prune` aliases `clean` |
+| `doctor`, `provider-info` | `doctor [--json or --deep]`; `provider-info ENGINE` prints one provider's diagnostic JSON |
+| `test-api` | `--base-url URL --goal TEXT [--out FILE] [task options]` |
+| `gui`, `openai-server` | `gui [PORT] [--localhost or --lan --token SECRET]`; `openai-server [-e ENGINE] [-m MODEL] [-f EFFORT] [-p PORT] [--api-key SECRET]` |
+| `completion`, `help` | `completion powershell or bash or zsh`; `help [COMMAND]` / `COMMAND --help` |
+
+Task options: `-e ENGINE -m MODEL -f EFFORT -C DIR -t NAME -P PARENT`.
+`-P` sets ownership; `-p` accepts the default progress mode, `--no-progress` disables it.
+`--no-terse`/`--verbose` suppress the terse directive; `--terminal` explicitly permits a visible
+provider console. Service `openai-server -p` sets its port. See [SKILL.md](SKILL.md) for examples.
+
+### Python core and migration
+
+Python 3.8+ and its standard library now implement the engine. PowerShell 5.1/7 and cmd
+invoke it natively; Linux and macOS keep the thin POSIX `agent.sh` shim. Git Bash and WSL
+are not Windows dependencies. Bash forks were expensive on Windows and failed under memory
+pressure; its launcher could expose terminal windows, select the WSL stub, or leave provider
+children alive. Python uses in-process polling/watchdogs, `CREATE_NO_WINDOW` and hidden
+startup info, Windows Job Objects with `KILL_ON_JOB_CLOSE`, and POSIX process groups.
+PowerShell carries arguments as UTF-8 JSON through stdin, preserving Cyrillic, embedded
+quotes and newlines without storing tokens in a transport file.
+
+The existing `AGENT_CLI_LOGS/<task>.meta`, `.log`, `.md` and `.inbox` layout remains readable
+across engines. Keep the existing state directory to resume old sessions. Logs retain
+`session id:` and `---------- output ----------`; exit 124/125/126 still identify deadline,
+silence and provider failures. Exit 130 identifies explicit cancellation, including `wait` on
+stopped tasks (`WAIT_DONE rc=130`); this deliberately replaces the Phase 1 wait exit 0. Watchdog termination
+also publishes a STOPPED report with its reason while retaining those existing codes/states.
+During this release the previous Bash implementation lives in `legacy/`: on POSIX use
+`AGENT_LEGACY=1 ./agent.sh ...`; on PowerShell set `$env:AGENT_LEGACY='1'` and explicitly
+invoke Git Bash on `agent.sh`. The native PowerShell/cmd entry always uses the Python core.
+Do not replace files in a checkout whose legacy wrapper is currently running: deploy the
+completed checkout after its launchers finish, or launch the new core from a separate checkout
+pointed at the same state directory. Running legacy tasks keep their legacy process lifetime
+until restarted by the new core.
 
 ---
 
@@ -296,7 +362,7 @@ markers, errors, retries and turn usage where the stream provides them. It defau
 `list` and `status` show the last activity and queued count. If a wrapper dies before delivery,
 they and `pending` report `N undelivered message(s)`; use `send --flush NAME` or `restart NAME` to
 recover them. `pending` also flags stopped tasks, and `wait` treats `stopped` as settled with
-exit 0. `clean` protects an undelivered inbox unless `--all` or `--purge` explicitly overrides it.
+exit 130 and `WAIT_DONE rc=130`. `clean` protects an undelivered inbox unless `--all` or `--purge` explicitly overrides it.
 
 Resume-capable engines are Claude, Codex, Kimi and OpenCode. Gemini's provider has
 `supports_resume=false`: a running follow-up is refused; after a stop, start fresh with
@@ -566,26 +632,20 @@ different port (`-p 8801/8802/…`, different `-e/-m/-f`) and point a separate r
 
 ## Adding a provider
 
-Create `providers/<name>/provider.sh` and `providers/<name>/provider.json` — nothing else changes.
-`agent.sh` sources every `providers/*/provider.sh` at startup; `gui.py` glob-loads every
-`providers/*/provider.json` for display metadata.
+Create `providers/<name>/provider.py` and `providers/<name>/provider.json`. The core lazily
+loads providers; the GUI reads their JSON metadata. Keep `provider.sh` only if that provider
+must also work with the retained legacy engine.
 
-- **`provider.json`**: `label`, `models`, `efforts` (e.g. `["low","medium","high"]`, or `[]` if the
-  provider has no effort concept), `default_model`, `default_effort`, `limits` (`"codex"`-style tag
-  or `null`), `supports_resume` — read by the model dropdown, the *separate* effort dropdown, the
-  rate-limit panel, and the bridge's session logic.
-- **`provider.sh`** defines a small `provider_<name>_*` contract:
-  - `provider_<name>_resolve MODEL_ALIAS` *(optional)* — sets `P_MODEL`/`P_EFFORT` from an alias
-    (e.g. a `-high` suffix). Skip it and the raw `-m` value passes through as `P_MODEL`.
-  - `provider_<name>_run_cmd DIR MODEL EFFORT PROMPT` — runs the CLI for a new task.
-  - `provider_<name>_resume_cmd DIR SESSION ANSWER` *(optional)* — resumes a session for `reply`.
-  - `provider_<name>_doctor` — prints one line of JSON:
-    `{"engine":…,"version":…,"available":true|false,"login":…,"limits":{…}|null,"note":…}`.
+- `provider.json` supplies `label`, `models`, `efforts`, `default_model`, `default_effort`,
+  `limits` and `supports_resume`, used by both the GUI and bridge.
+- `provider.py` exports a `Provider` subclass of `neoxider_agents.providers.BaseProvider`.
+  Set `engine` and `supports_resume`; implement `command(model, effort, cwd, session='',
+  chat_only=False)` to return argv. Optional hooks are `resolve`, `prepare_resume`, `doctor`,
+  `retry_reason` and `retry_delay`.
 
-**Every provider must run fully unattended.** This tool always runs CLIs with stdin closed
-(`</dev/null`) by design, so a subagent never hangs waiting for input — but that also means a
-provider that *can* block on an approval prompt hangs forever unless `run_cmd` passes its
-"don't ask" flag:
+Prompts reach providers through a UTF-8 file on stdin, never command-line arguments. The core
+owns hidden process launch, output filtering, watchdogs and control polling. Every provider
+must use unattended flags because interactive permission prompts cannot be answered:
 
 | Provider | Full-auto flag | Chat-only (bridge) |
 |---|---|---|
@@ -630,17 +690,17 @@ tool never touches your `~/.codex/`.
 
 ## Development
 
-```bash
-bash tests/test_agent_sh.sh          # bash logic: meta locking, watchdog, liveness, provider aliases
-python tests/test_gui.py             # gui.py: path normalization, state machine, LAN token auth
-python tests/test_openai_server.py   # bridge: tool-call parsing (all spellings), echo dedup,
-                                     # session extension/expiry, retries, API-key auth
-python -m unittest discover tests    # all of the Python ones at once
+```powershell
+$env:AGENT_CLI_LOGS = 'D:/Temp/agents-core/test-state'
+python -m unittest discover -s tests -p 'test_*.py'
+powershell -NoProfile -ExecutionPolicy Bypass -File tests/test_powershell_entry.ps1
+python tests/bench_agent.py
 ```
 
-Two offline test suites plus launcher/distribution checks, zero dependencies — stdlib and bash
-only, no pytest, no bats. They never
-invoke a real CLI and never touch your real `~/.claude/agent-cli-logs`.
+The Python core, GUI, bridge and launcher suites use the standard library, fake providers
+and isolated state. Legacy Bash scenarios remain under `tests/test_agent_sh.sh`; run them
+with the legacy switch. Planted quote/encoding defects prove that Windows entry checks detect
+PowerShell 5.1 argument corruption. Performance evidence is in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 For a real end-to-end check against a live CLI subagent (health, error codes, auth, fresh
 completion, session continuation, tool round-trip, divergence, `/reset`, idle expiry, streaming,

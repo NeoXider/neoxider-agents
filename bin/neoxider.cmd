@@ -1,15 +1,25 @@
 @echo off
-rem neoxider.cmd - lets plain cmd.exe (and PowerShell) resolve the bare word
-rem "neoxider" via PATHEXT, then hands off to the real bash launcher script.
-rem
-rem A bare `bash` on a fresh cmd.exe can resolve to the WSL stub at
-rem C:\Windows\System32\bash.exe, which cannot run this MSYS script (it opens the
-rem wrong filesystem / Store prompt and the launcher silently fails). Locate Git
-rem Bash explicitly from its common install paths, falling back to bare bash.
 setlocal
-set "GITBASH=%ProgramFiles%\Git\bin\bash.exe"
-if not exist "%GITBASH%" set "GITBASH=%ProgramFiles(x86)%\Git\bin\bash.exe"
-if not exist "%GITBASH%" set "GITBASH=%LocalAppData%\Programs\Git\bin\bash.exe"
-if not exist "%GITBASH%" set "GITBASH=bash"
-"%GITBASH%" "%~dp0neoxider" %*
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+where /q py.exe >nul 2>&1
+if not errorlevel 1 goto :py
+:find_python
+where /q python.exe >nul 2>&1
+if not errorlevel 1 goto :python
+where /q python3.exe >nul 2>&1
+if not errorlevel 1 goto :python3
+echo neoxider: Python 3.8+ is required. Install Python from python.org and enable "Add Python to PATH", then open a new shell. 1>&2
+exit /b 127
+:py
+set "NEOXIDER_PYTHON="
+for /f "delims=" %%P in ('py -3 -c "import sys; print(sys.executable)" 2^>nul') do set "NEOXIDER_PYTHON=%%P"
+if not defined NEOXIDER_PYTHON goto :find_python
+"%NEOXIDER_PYTHON%" "%~dp0..\agent.py" %*
+exit /b %ERRORLEVEL%
+:python
+python "%~dp0..\agent.py" %*
+exit /b %ERRORLEVEL%
+:python3
+python3 "%~dp0..\agent.py" %*
 exit /b %ERRORLEVEL%

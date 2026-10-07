@@ -1,18 +1,3 @@
-#!/usr/bin/env bash
-# neoxider — one-word launcher for neoxider-cockpit.
-#   neoxider             -> prints a short usage summary (no side effects)
-#   neoxider gui [port]  -> opens the web GUI in your browser
-#   neoxider help        -> full agent.sh command reference
-#   neoxider <anything>  -> passed straight through to agent.sh (run/send/peek/stop/restart/...)
-set -uo pipefail
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SK="$HERE/../agent.sh"
-
-if [ $# -eq 0 ]; then
-    # bare invocation used to silently auto-open the GUI in a browser -- surprising side
-    # effect for a bare command name. Now it just prints a pointer; `gui` is explicit.
-    echo "neoxider — control room for AI coding subagents. Run 'neoxider gui' for the web dashboard, or 'neoxider help' for the full command reference." >&2
-    exec bash "$SK" help
-else
-    exec bash "$SK" "$@"
-fi
+#!/bin/sh
+HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$HERE/../agent.sh" "$@"

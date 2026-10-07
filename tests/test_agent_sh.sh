@@ -11,12 +11,13 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AGENT_TEST_WORKTREE="$HERE"
 cd "$HERE" || exit 1
 
 # --- scratch LOGDIR: never touch the real ~/.claude/agent-cli-logs -----------------------
 case "$(uname -s 2>/dev/null)" in
-    MINGW*|MSYS*) AGENT_TEST_ROOT="${AGENT_TEST_ROOT:-D:/Temp/agents-oc}" ;;
-    *) AGENT_TEST_ROOT="${AGENT_TEST_ROOT:-${TMPDIR:-/tmp}/agents-oc}" ;;
+    MINGW*|MSYS*) AGENT_TEST_ROOT="${AGENT_TEST_ROOT:-D:/Temp/agents-core/legacy-tests}" ;;
+    *) AGENT_TEST_ROOT="${AGENT_TEST_ROOT:-${TMPDIR:-/tmp}/agents-core/legacy-tests}" ;;
 esac
 mkdir -p "$AGENT_TEST_ROOT" || exit 1
 AGENT_TEST_ROOT="$(cd "$AGENT_TEST_ROOT" && pwd -P)" || exit 1
@@ -41,15 +42,15 @@ export AGENT_OPENCODE_TOOL_KEEPALIVE=0
 # is empty in our scratch dir) — sourcing (not executing) it means reaching the end of the
 # script just returns control to us instead of exiting this test process.
 # shellcheck disable=SC1091
-source "$HERE/agent.sh" list >/dev/null 2>&1
+source "$AGENT_TEST_WORKTREE/legacy/agent.sh" list >/dev/null 2>&1
 
 # agent logs can contain prompts, source, paths and provider diagnostics. Newly created state must
 # stay owner-only even when the invoking shell starts with a permissive umask.
 PERM_LOGDIR="$SCRATCH_LOGDIR/permissions"
-( umask 022; AGENT_CLI_LOGS="$PERM_LOGDIR" source "$HERE/agent.sh" list >/dev/null 2>&1; meta_set secret_task token secret )
+( umask 022; AGENT_CLI_LOGS="$PERM_LOGDIR" source "$AGENT_TEST_WORKTREE/legacy/agent.sh" list >/dev/null 2>&1; meta_set secret_task token secret )
 perm_dir="$(stat -c '%a' "$PERM_LOGDIR" 2>/dev/null || stat -f '%Lp' "$PERM_LOGDIR" 2>/dev/null)"
 perm_meta="$(stat -c '%a' "$PERM_LOGDIR/secret_task.meta" 2>/dev/null || stat -f '%Lp' "$PERM_LOGDIR/secret_task.meta" 2>/dev/null)"
-preserved_umask="$(umask 022; AGENT_CLI_LOGS="$SCRATCH_LOGDIR/umask-preserved" source "$HERE/agent.sh" list >/dev/null 2>&1; umask)"
+preserved_umask="$(umask 022; AGENT_CLI_LOGS="$SCRATCH_LOGDIR/umask-preserved" source "$AGENT_TEST_WORKTREE/legacy/agent.sh" list >/dev/null 2>&1; umask)"
 
 # --- tiny assert framework ----------------------------------------------------------------
 PASS=0
@@ -344,7 +345,7 @@ assert_match "default name matches task-<timestamp>-<pid> shape" \
 # `source ./agent.sh ...` subprocess below is distinct) — verify distinctness by sourcing again
 # in a subshell with a different PID and comparing names.
 name_a="$name"
-name_b="$(bash -c "export AGENT_CLI_LOGS='$SCRATCH_LOGDIR'; source '$HERE/agent.sh' list >/dev/null 2>&1; echo \"\$name\"")"
+name_b="$(bash -c "export AGENT_CLI_LOGS='$SCRATCH_LOGDIR'; source '$AGENT_TEST_WORKTREE/legacy/agent.sh' list >/dev/null 2>&1; echo \"\$name\"")"
 if [ "$name_a" != "$name_b" ]; then
     pass "two separate process invocations produce distinct default task names (PID differs)"
 else
@@ -1007,7 +1008,7 @@ meta_set st_clean_idle dir ""
 : > "$SCRATCH_LOGDIR/st_clean_idle.log"
 touch -d "@$(( $(date +%s) - AGENT_STALE_SEC - 120 ))" "$SCRATCH_LOGDIR/st_clean_idle.log" 2>/dev/null \
     || touch -t "$(date -d '-1 hour' '+%Y%m%d%H%M' 2>/dev/null)" "$SCRATCH_LOGDIR/st_clean_idle.log" 2>/dev/null
-clean_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" clean -n --purge 2>&1)"
+clean_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$AGENT_TEST_WORKTREE/legacy/agent.sh" clean -n --purge 2>&1)"
 if printf '%s' "$clean_out" | grep -q 'st_clean_idle'; then
     fail "clean must not touch an idle (alive but quiet) task"
 else
@@ -1023,7 +1024,7 @@ meta_set st_wait_idle pid "$$"
 meta_set st_wait_idle dir ""
 : > "$SCRATCH_LOGDIR/st_wait_idle.log"
 touch -d "@$(( $(date +%s) - AGENT_STALE_SEC - 120 ))" "$SCRATCH_LOGDIR/st_wait_idle.log" 2>/dev/null     || touch -t "$(date -d '-1 hour' '+%Y%m%d%H%M' 2>/dev/null)" "$SCRATCH_LOGDIR/st_wait_idle.log" 2>/dev/null
-wait_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" wait st_wait_idle --timeout 1 --poll 1 2>&1)"; wait_rc=$?
+wait_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$AGENT_TEST_WORKTREE/legacy/agent.sh" wait st_wait_idle --timeout 1 --poll 1 2>&1)"; wait_rc=$?
 if [ "$wait_rc" = 2 ] && ! printf '%s' "$wait_out" | grep -q 'settled: st_wait_idle'; then
     pass "wait keeps blocking on an idle task and times out instead of calling it settled"
 else
@@ -1035,7 +1036,7 @@ section "task-name safety and option operand errors"
 # ============================================================================================
 
 for bad_name in '../escape' 'bad/name' 'bad\name' '-option' '.hidden' '_leading' '.' '..' 'has space' $'control\nname'; do
-    bad_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" run -t "$bad_name" "hi" 2>&1)"
+    bad_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$AGENT_TEST_WORKTREE/legacy/agent.sh" run -t "$bad_name" "hi" 2>&1)"
     bad_rc=$?
     assert_eq "invalid task name exits non-zero: [$bad_name]" "1" "$bad_rc"
     assert_match "invalid task name is explained: [$bad_name]" 'invalid task name|needs an operand' "$bad_out"
@@ -1047,7 +1048,7 @@ else
 fi
 
 for invocation in 'run -t' 'run -e' 'run -C' 'log -n'; do
-    operand_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" $invocation 2>&1)"
+    operand_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$AGENT_TEST_WORKTREE/legacy/agent.sh" $invocation 2>&1)"
     operand_rc=$?
     assert_eq "missing option operand is a usage error: $invocation" "1" "$operand_rc"
     assert_match "missing option operand never becomes an unbound-variable crash: $invocation" 'needs an operand' "$operand_out"
@@ -1056,7 +1057,7 @@ done
 # Exact task names win even when they look like provider session identifiers.
 printf 'engine=opencode\nmodel=exact-model\ndir=%s\nstate=done\n' "$SCRATCH_LOGDIR" > "$SCRATCH_LOGDIR/ses_exact.meta"
 printf 'engine=gemini\nsession=ses_exact\ndir=%s\nstate=done\n' "$SCRATCH_LOGDIR" > "$SCRATCH_LOGDIR/session_decoy.meta"
-exact_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" reply ses_exact continue 2>&1)"
+exact_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$AGENT_TEST_WORKTREE/legacy/agent.sh" reply ses_exact continue 2>&1)"
 exact_rc=$?
 assert_eq "exact task without a usable session fails before invoking a provider" "1" "$exact_rc"
 assert_match "session-looking exact task name is resolved before session lookup" \
@@ -1073,9 +1074,9 @@ mkdir -p "$SPACE_LOGDIR"
 printf 'engine=codex\nmodel=m1\nstate=done\n' > "$SPACE_LOGDIR/older.meta"
 sleep 1
 printf 'engine=claude\nmodel=m2\nstate=done\n' > "$SPACE_LOGDIR/newer.meta"
-space_list="$(AGENT_CLI_LOGS="$SPACE_LOGDIR" bash "$HERE/agent.sh" list 2>&1)"
+space_list="$(AGENT_CLI_LOGS="$SPACE_LOGDIR" bash "$AGENT_TEST_WORKTREE/legacy/agent.sh" list 2>&1)"
 assert_match "list works when AGENT_CLI_LOGS contains spaces" 'newer.*claude.*m2' "$space_list"
-space_status="$(AGENT_CLI_LOGS="$SPACE_LOGDIR" bash "$HERE/agent.sh" status 2>&1)"
+space_status="$(AGENT_CLI_LOGS="$SPACE_LOGDIR" bash "$AGENT_TEST_WORKTREE/legacy/agent.sh" status 2>&1)"
 assert_match "latest task works when AGENT_CLI_LOGS contains spaces" 'task=newer' "$space_status"
 
 # Legacy versions could crash after creating owner.<token> but before printf wrote pid/token. Empty
@@ -1288,7 +1289,7 @@ section "doctor structured output contract"
 
 # These are source-level contract checks: running a real doctor here would spawn every installed
 # CLI and make the pure-logic suite slow/flaky. The GUI tests exercise the resulting JSON parser.
-doctor_source="$(sed -n '/    doctor)/,/    gui)/p' "$HERE/agent.sh")"
+doctor_source="$(sed -n '/    doctor)/,/    gui)/p' "$AGENT_TEST_WORKTREE/legacy/agent.sh")"
 assert_match "doctor accepts a machine-readable --json mode" '--json' "$doctor_source"
 assert_match "doctor launches provider probes in background jobs" 'doctor_pids.*\$!' "$doctor_source"
 assert_match "doctor waits for every background provider probe" 'wait.*doctor_pid' "$doctor_source"
@@ -1551,7 +1552,7 @@ for s in "${TRANSIENT_NEGATIVE[@]}"; do
 done
 
 # no literal backspace bytes anywhere in agent.sh (the original \b regression)
-if LC_ALL=C grep -q "$(printf '\010')" "$HERE/agent.sh"; then
+if LC_ALL=C grep -q "$(printf '\010')" "$AGENT_TEST_WORKTREE/legacy/agent.sh"; then
     fail "agent.sh contains literal 0x08 backspace bytes"
 else
     pass "agent.sh contains no literal 0x08 bytes (portable boundaries instead)"
@@ -1559,7 +1560,7 @@ fi
 
 # AGENT_RETRY_DELAY input validation mirrors AGENT_RETRIES/AGENT_TIMEOUT_SEC
 assert_eq "non-numeric AGENT_RETRY_DELAY falls back to the default" "8" \
-    "$(AGENT_RETRY_DELAY='soon' bash -c "export AGENT_CLI_LOGS='$SCRATCH_LOGDIR'; source '$HERE/agent.sh' list >/dev/null 2>&1; echo \"\$AGENT_RETRY_DELAY\"")"
+    "$(AGENT_RETRY_DELAY='soon' bash -c "export AGENT_CLI_LOGS='$SCRATCH_LOGDIR'; source '$AGENT_TEST_WORKTREE/legacy/agent.sh' list >/dev/null 2>&1; echo \"\$AGENT_RETRY_DELAY\"")"
 
 # ============================================================================================
 section "retry attempt isolation and resume model inheritance"
@@ -1654,7 +1655,7 @@ section "run/fan validate the engine BEFORE any task artifact exists"
 # state=running + pid= were already written (ghost task reading `stalled` forever); under fan the
 # dying subshell's message was discarded entirely while "launched N parallel task(s)" still printed.
 
-run_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" run -e nosuchengine -t ghost_run "hi" 2>&1)"
+run_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$AGENT_TEST_WORKTREE/legacy/agent.sh" run -e nosuchengine -t ghost_run "hi" 2>&1)"
 run_rc=$?
 assert_eq "run with an unknown engine exits non-zero" "1" "$run_rc"
 assert_match "run names the offending engine" 'unknown engine: nosuchengine' "$run_out"
@@ -1664,7 +1665,7 @@ else
     pass "run with an unknown engine creates NO .meta/.log"
 fi
 
-fan_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" fan -e nosuchengine -t ghost_fan "p1" "p2" 2>&1)"
+fan_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$AGENT_TEST_WORKTREE/legacy/agent.sh" fan -e nosuchengine -t ghost_fan "p1" "p2" 2>&1)"
 fan_rc=$?
 assert_eq "fan with an unknown engine exits non-zero synchronously" "1" "$fan_rc"
 assert_match "fan reports the unknown engine visibly" 'unknown engine: nosuchengine' "$fan_out"
@@ -1681,7 +1682,7 @@ section "reply fails safely on a nonexistent task"
 # the session guard was bypassed, a ghost .meta was written and `claude --continue` resumed
 # whichever conversation happened to be LATEST. It must die before touching any file.
 
-reply_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$HERE/agent.sh" reply definitely_not_a_task "continue" 2>&1)"
+reply_out="$(AGENT_CLI_LOGS="$SCRATCH_LOGDIR" bash "$AGENT_TEST_WORKTREE/legacy/agent.sh" reply definitely_not_a_task "continue" 2>&1)"
 reply_rc=$?
 assert_eq "reply to a nonexistent task exits non-zero" "1" "$reply_rc"
 assert_match "reply names the missing task" 'no such task.*definitely_not_a_task' "$reply_out"
@@ -1696,12 +1697,12 @@ section "python entrypoints fail clearly without an interpreter"
 # ============================================================================================
 # Resolve bash NOW — the stripped PATH below must not break launching the interpreter itself.
 TEST_BASH="$(command -v bash)"
-gui_out="$(PATH=/nonexistent AGENT_CLI_LOGS="$SCRATCH_LOGDIR" "$TEST_BASH" "$HERE/agent.sh" gui 2>&1)"
+gui_out="$(PATH=/nonexistent AGENT_CLI_LOGS="$SCRATCH_LOGDIR" "$TEST_BASH" "$AGENT_TEST_WORKTREE/legacy/agent.sh" gui 2>&1)"
 gui_rc=$?
 assert_eq "gui without python exits non-zero" "1" "$gui_rc"
 assert_match "gui without python says so clearly" 'needs python' "$gui_out"
 
-bridge_out="$(PATH=/nonexistent AGENT_CLI_LOGS="$SCRATCH_LOGDIR" "$TEST_BASH" "$HERE/agent.sh" openai-server 2>&1)"
+bridge_out="$(PATH=/nonexistent AGENT_CLI_LOGS="$SCRATCH_LOGDIR" "$TEST_BASH" "$AGENT_TEST_WORKTREE/legacy/agent.sh" openai-server 2>&1)"
 bridge_rc=$?
 assert_eq "openai-server without python exits non-zero" "1" "$bridge_rc"
 assert_match "openai-server without python says so clearly" 'needs python' "$bridge_out"
@@ -1709,7 +1710,7 @@ assert_match "openai-server without python says so clearly" 'needs python' "$bri
 # ============================================================================================
 section "offline agent controls"
 if _agent_python; then
-    if PYTHONIOENCODING=utf-8 "$_AGENT_PY" "$HERE/tests/test_agent_control.py"; then
+    if PYTHONIOENCODING=utf-8 "$_AGENT_PY" "$AGENT_TEST_WORKTREE/tests/test_agent_control.py"; then
         pass "offline control lifecycle acceptance suite"
     else
         fail "offline control lifecycle acceptance suite"

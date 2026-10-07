@@ -1,6 +1,6 @@
 @echo off
 rem Double-click entry point for the neoxider web GUI. The real chain
-rem (neoxider.cmd -> git bash -> pythonw gui.py) runs in its own hidden console so no
+rem (neoxider.cmd -> Python core -> hidden GUI) runs in its own hidden console so no
 rem command-line window stays open on screen. Set NEOXIDER_GUI_VISIBLE=1 to keep this console instead
 rem (the launcher tests and debugging do that).
 if "%NEOXIDER_GUI_VISIBLE%"=="1" goto :direct

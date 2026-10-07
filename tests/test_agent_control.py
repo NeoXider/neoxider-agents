@@ -10,6 +10,9 @@ import time
 import unittest
 
 ROOT = Path(os.environ.get("AGENT_CONTROL_TEST_ROOT", Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(ROOT))
+from neoxider_agents.process import hidden_kwargs
+
 BASH = "C:/Program Files/Git/bin/bash.exe" if os.name == "nt" else shutil.which("bash")
 DEFAULT_RESTART = ("The previous turn was interrupted. First check the working tree (git status/diff) "
                    "for partial edits, then continue the assignment from where you stopped; do not redo finished work.")
@@ -17,7 +20,7 @@ DEFAULT_RESTART = ("The previous turn was interrupted. First check the working t
 
 class ControlRegressions(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-oc") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-oc"
+        base = Path("D:/Temp/agents-core/legacy-tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core-legacy"
         base.mkdir(parents=True, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=base, prefix="control-")
         self.base = Path(self.tmp.name)
@@ -58,9 +61,9 @@ class ControlRegressions(unittest.TestCase):
         self.assertFalse(incomplete, "fixture stdout did not close after bounded kill: " + ", ".join(incomplete))
 
     def cli(self, *args, env=None):
-        return subprocess.run([BASH, (ROOT / "agent.sh").as_posix(), *args], env=env or self.env,
+        return subprocess.run([BASH, (ROOT / "legacy/agent.sh").as_posix(), *args], env=env or self.env,
                               cwd=ROOT, text=True, encoding="utf-8", errors="replace",
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120, **hidden_kwargs())
 
     def ok(self, *args, env=None):
         result = self.cli(*args, env=env)
@@ -70,10 +73,10 @@ class ControlRegressions(unittest.TestCase):
     def start(self, name="task", blocked="1", parent="control-tests", prompt="ORIGINAL", work=None):
         work = work or self.work
         env = dict(self.env, FIXTURE_BLOCK_TURNS=blocked, AGENT_PARENT=parent)
-        job = subprocess.Popen([BASH, (ROOT / "agent.sh").as_posix(), "run", "-e", "fixture",
+        job = subprocess.Popen([BASH, (ROOT / "legacy/agent.sh").as_posix(), "run", "-e", "fixture",
                                 "-t", name, "-C", work.as_posix(), "--no-progress", "--no-terse", prompt],
                                env=env, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               text=True, encoding="utf-8", errors="replace")
+                               text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
         job.task_name = name
         self.jobs.append(job)
         self.until(lambda: (work / "turn.1.started").exists(), job)
@@ -149,9 +152,9 @@ class ControlRegressions(unittest.TestCase):
         prompt_files = [self.base / f"sender-{index}.txt" for index in range(2)]
         for path, text in zip(prompt_files, texts):
             path.write_text(text, encoding="utf-8")
-        senders = [subprocess.Popen([BASH, (ROOT / "agent.sh").as_posix(), "send", "task", "--prompt-file", path.as_posix()],
+        senders = [subprocess.Popen([BASH, (ROOT / "legacy/agent.sh").as_posix(), "send", "task", "--prompt-file", path.as_posix()],
                                   env=sender_env, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True, encoding="utf-8", errors="replace") for path in prompt_files]
+                                  text=True, encoding="utf-8", errors="replace", **hidden_kwargs()) for path in prompt_files]
         for sender in senders:
             sender.task_name = "task"
             self.jobs.append(sender)
@@ -188,9 +191,9 @@ class ControlRegressions(unittest.TestCase):
         self.until(lambda: (self.work / "turn.2.started").exists(), job)
         self.assertEqual(self.meta()["state"], "running")
         self.assertIn("queued (#2)", self.ok("send", "task", "DURING DRAIN"))
-        waiter = subprocess.Popen([BASH, (ROOT / "agent.sh").as_posix(), "wait", "task", "--poll", "1"],
+        waiter = subprocess.Popen([BASH, (ROOT / "legacy/agent.sh").as_posix(), "wait", "task", "--poll", "1"],
                                   env=self.env, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True, encoding="utf-8", errors="replace")
+                                  text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
         waiter.task_name = "task"
         self.jobs.append(waiter)
         self.assertIsNone(waiter.poll())
@@ -242,7 +245,7 @@ class ControlRegressions(unittest.TestCase):
                        "{ $p.CreationDate.ToUniversalTime().ToString('o') }")
             result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
                                     capture_output=True, text=True, timeout=20,
-                                    creationflags=subprocess.CREATE_NO_WINDOW)
+                                    **{**hidden_kwargs(), "creationflags": subprocess.CREATE_NO_WINDOW})
             self.assertEqual(result.returncode, 0, result.stderr)
             return result.stdout.strip()
         proc = Path(f"/proc/{pid}")
@@ -255,7 +258,7 @@ class ControlRegressions(unittest.TestCase):
             except FileNotFoundError:
                 return ""
         result = subprocess.run(["ps", "-p", str(pid), "-o", "stat=,lstart=,command="],
-                                capture_output=True, text=True, timeout=20)
+                                capture_output=True, text=True, timeout=20, **hidden_kwargs())
         line = result.stdout.strip()
         return line if line and not line.startswith("Z") and marker.as_posix() in line else ""
 
@@ -264,12 +267,12 @@ class ControlRegressions(unittest.TestCase):
         identity = ""
         pid = None
         try:
-            job = subprocess.Popen([BASH, (ROOT / "agent.sh").as_posix(), "run", "-e", "fixture", "-t", "task",
+            job = subprocess.Popen([BASH, (ROOT / "legacy/agent.sh").as_posix(), "run", "-e", "fixture", "-t", "task",
                                     "-C", self.work.as_posix(), "--no-progress", "--no-terse", "ORIGINAL"],
                                    env=dict(self.env, FIXTURE_NATIVE_GRANDCHILD="1", FIXTURE_BLOCK_TURNS="1",
                                             FIXTURE_PYTHON=sys.executable.replace("\\", "/")), cwd=ROOT,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True, encoding="utf-8", errors="replace")
+                                   text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
             job.task_name = "task"
             self.jobs.append(job)
             self.until(lambda: (self.work / "turn.1.started").exists(), job)
@@ -296,7 +299,7 @@ class ControlRegressions(unittest.TestCase):
                                f"-and $p.CreationDate.ToUniversalTime().ToString('o') -eq '{identity}') "
                                "{ Stop-Process -Id $p.ProcessId -Force }")
                     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-                                   capture_output=True, timeout=20, creationflags=subprocess.CREATE_NO_WINDOW)
+                                   capture_output=True, timeout=20, **{**hidden_kwargs(), "creationflags": subprocess.CREATE_NO_WINDOW})
                 else:
                     import signal
                     try:
@@ -484,9 +487,9 @@ class ControlRegressions(unittest.TestCase):
             with self.subTest(portability=scenario):
                 logs = self.base / ("portable-" + scenario)
                 logs.mkdir()
-                result = subprocess.run([BASH, script.as_posix(), (ROOT / "agent.sh").as_posix(), scenario],
+                result = subprocess.run([BASH, script.as_posix(), (ROOT / "legacy/agent.sh").as_posix(), scenario],
                                         env=dict(self.env, AGENT_CLI_LOGS=logs.as_posix()), cwd=ROOT,
-                                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+                                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, **hidden_kwargs())
                 meta_path = logs / "task.meta"
                 meta = dict(line.split("=", 1) for line in meta_path.read_text().splitlines() if "=" in line) if meta_path.exists() else {}
                 killed = (logs / "killed").read_text().splitlines() if (logs / "killed").exists() else []
@@ -509,10 +512,10 @@ class ControlRegressions(unittest.TestCase):
         self.ok("run", "-e", "fixture", "-t", "task", "-C", self.work.as_posix(),
                 "--no-progress", "--no-terse", "ORIGINAL")
         old = self.meta()["session"]
-        job = subprocess.Popen([BASH, (ROOT / "agent.sh").as_posix(), *args],
+        job = subprocess.Popen([BASH, (ROOT / "legacy/agent.sh").as_posix(), *args],
                                env=dict(self.env, FIXTURE_BLOCK_TURNS="2"), cwd=ROOT,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               text=True, encoding="utf-8", errors="replace")
+                               text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
         job.task_name = "task"
         self.jobs.append(job)
         self.until(lambda: (self.work / "turn.2.started").exists(), job)
@@ -526,7 +529,7 @@ if [ -r "/proc/$1/winpid" ]; then IFS= read -r proc_winpid < "/proc/$1/winpid"; 
 printf '%s\\n' "$proc_winpid"
 while IFS= read -r -d '' arg; do printf '%s\\n' "$arg"; done < "/proc/$1/cmdline"''',
                                 "--", meta["pid"]], env=self.env, cwd=ROOT,
-                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, **hidden_kwargs())
         lines = probe.stdout.splitlines()
         self.assertGreaterEqual(len(lines), 3, probe.stdout + probe.stderr)
         self.assertEqual(lines[0].rpartition(") ")[2].split()[19], meta["pid_start"])
@@ -562,8 +565,8 @@ resolve_session() { meta_set task state stopped; printf '%s' ses_saved; }
 provider_dispatch_resume() { printf 'started' > "$dir/unexpected-provider"; rc=0; }
 _finish_with_inbox task
 ''', encoding="utf-8")
-        result = subprocess.run([BASH, script.as_posix(), (ROOT / "agent.sh").as_posix(), self.work.as_posix()],
-                                env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=120)
+        result = subprocess.run([BASH, script.as_posix(), (ROOT / "legacy/agent.sh").as_posix(), self.work.as_posix()],
+                                env=self.env, cwd=ROOT, capture_output=True, text=True, timeout=120, **hidden_kwargs())
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.meta()["state"], "stopped")
         self.assertTrue((box / "000000000001.msg").exists())
@@ -573,10 +576,10 @@ _finish_with_inbox task
         self.ok("run", "-e", "fixture", "-t", "task", "-C", self.work.as_posix(),
                 "--no-progress", "--no-terse", "ORIGINAL")
         old = self.meta()["session"]
-        job = subprocess.Popen([BASH, (ROOT / "agent.sh").as_posix(), "restart", "task", "--fresh"],
+        job = subprocess.Popen([BASH, (ROOT / "legacy/agent.sh").as_posix(), "restart", "task", "--fresh"],
                                env=dict(self.env, FIXTURE_BLOCK_TURNS="2"), cwd=ROOT,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               text=True, encoding="utf-8", errors="replace")
+                               text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
         job.task_name = "task"
         self.jobs.append(job)
         self.until(lambda: (self.work / "turn.2.started").exists(), job)
@@ -625,11 +628,11 @@ _finish_with_inbox task
 
     def test_finished_provider_does_not_wait_for_orphan_stdout_eof(self):
         try:
-            job = subprocess.Popen([BASH, (ROOT / "agent.sh").as_posix(), "run", "-e", "fixture", "-t", "task",
+            job = subprocess.Popen([BASH, (ROOT / "legacy/agent.sh").as_posix(), "run", "-e", "fixture", "-t", "task",
                                     "-C", self.work.as_posix(), "--no-progress", "--no-terse", "ORIGINAL"],
                                    env=dict(self.env, FIXTURE_ORPHAN_STDOUT="1", FIXTURE_PYTHON=sys.executable.replace("\\", "/")),
                                    cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True, encoding="utf-8", errors="replace")
+                                   text=True, encoding="utf-8", errors="replace", **hidden_kwargs())
             job.task_name = "task"
             self.jobs.append(job)
             self.until(lambda: (self.work / "orphan.pid").exists(), job)
@@ -648,7 +651,7 @@ _finish_with_inbox task
                                f"if ($p -and $p.CommandLine.Replace('\\','/').Contains('{marker}')) "
                                "{ Stop-Process -Id $p.ProcessId -Force }")
                     subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-                                   capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                                   capture_output=True, **{**hidden_kwargs(), "creationflags": subprocess.CREATE_NO_WINDOW})
                 else:
                     import signal
                     try:

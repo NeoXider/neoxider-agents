@@ -6,12 +6,19 @@
 # Uses a shell-function stub for `opencode` exactly like tests/test_agent_sh.sh does.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SCRATCH_LOGS="$(mktemp -d)"; export AGENT_CLI_LOGS="$SCRATCH_LOGS"
+AGENT_TEST_WORKTREE="$HERE"
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*) AGENT_TEST_ROOT="${AGENT_TEST_ROOT:-D:/Temp/agents-core/legacy-tests}" ;;
+    *) AGENT_TEST_ROOT="${AGENT_TEST_ROOT:-${TMPDIR:-/tmp}/agents-core/legacy-tests}" ;;
+esac
+mkdir -p "$AGENT_TEST_ROOT" || exit 1
+SCRATCH_LOGS="$(mktemp -d "$AGENT_TEST_ROOT/opencode-logs.XXXXXX")" || exit 1
+export AGENT_CLI_LOGS="$SCRATCH_LOGS"
 # "list" is the harmless read-only subcommand the main test file uses to source agent.sh
 # shellcheck disable=SC1091
-source "$HERE/agent.sh" list >/dev/null 2>&1
+source "$AGENT_TEST_WORKTREE/legacy/agent.sh" list >/dev/null 2>&1
 # shellcheck disable=SC1091
-source "$HERE/providers/opencode/provider.sh"
+source "$AGENT_TEST_WORKTREE/legacy/providers/opencode/provider.sh"
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$1"; }
@@ -19,7 +26,8 @@ bad()  { FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$1"; }
 eq()   { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected [$2], got [$3])"; fi; }
 match(){ if printf '%s' "$3" | grep -Eq -- "$2"; then ok "$1"; else bad "$1 (no match for [$2] in [$3])"; fi; }
 
-SCRATCH="$(mktemp -d)"; trap 'rm -rf "$SCRATCH" "$SCRATCH_LOGS"' EXIT
+SCRATCH="$(mktemp -d "$AGENT_TEST_ROOT/opencode-work.XXXXXX")" || exit 1
+trap 'rm -rf "$SCRATCH" "$SCRATCH_LOGS"' EXIT
 export AGENT_OPENCODE_TIMEOUT_SEC=0 AGENT_OPENCODE_TOOL_KEEPALIVE=0
 
 # --- 1. pin env ----------------------------------------------------------------------------

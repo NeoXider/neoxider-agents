@@ -5,6 +5,20 @@ description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tas
 
 # CLI Subagents (Codex Orchestration)
 
+PowerShell is the Windows entry point. Resolve the installed skill or plugin once:
+
+```powershell
+$base = if ($env:CLAUDE_PLUGIN_ROOT) { $env:CLAUDE_PLUGIN_ROOT } elseif ($env:NEOXIDER_AGENTS_HOME) { $env:NEOXIDER_AGENTS_HOME } else { Join-Path $HOME '.claude/skills/neoxider-agents' }
+$SK = Join-Path $base 'agent.ps1'
+# Inside this repository: $SK = './agent.ps1'
+& $SK run -t inspect -C D:/Git/Project "Inspect the current change and report"
+& $SK peek inspect
+& $SK send inspect "Also inspect the tests"
+```
+
+Python 3.8+ is required; no Git Bash or WSL is involved. `neoxider` on PATH is equivalent.
+On Linux/macOS use the POSIX shim and the plugin resolution below.
+
 For foreign-engine subagent tasks, resolve the bundled wrapper from the plugin root; a manual
 clone/skill install falls back to the conventional skill directory:
 
@@ -27,12 +41,12 @@ engine's subagents natively; the agent.sh wrapper is ONLY for foreign engines.
 ## Completion notifications: the one rule (never skip)
 
 A subagent's completion reaches the orchestrator ONLY as the exit of a background job the orchestrator's own harness tracks.
-- **Claude Code:** start `bash "$SK" run ...` (or `wait <name>`) with the Bash tool's `run_in_background: true`. The command blocks until the
+- **Claude Code:** start `& $SK run ...` (or `wait <name>`) on Windows or `bash "$SK" run ...` on POSIX using your harness's tracked background job. The command blocks until the
   agent finishes and prints its final answer, so the notification carries the result.
 - **NEVER** launch with a plain shell `&` (or `nohup`, `>/dev/null 2>&1 &`): the harness cannot see that process, no notification ever
   arrives, and the result is silently lost until somebody thinks to look (this happened on 2026-10-01).
-- For a `fan` wave, follow it with ONE tracked `bash "$SK" wait` (no names = the whole wave) as a background job.
-- **Safety net:** run `bash "$SK" pending` at the start of every turn and before the final answer to the user. It lists tasks that finished
+- For a `fan` wave, follow it with ONE tracked `& $SK wait` (POSIX: `bash "$SK" wait`) (no names = the whole wave) as a background job.
+- **Safety net:** run `& $SK pending` (POSIX: `bash "$SK" pending`) at the start of every turn and before the final answer to the user. It lists tasks that finished
   (last 24 h, `AGENT_PENDING_HOURS`) whose result nobody read; reading it with `last <name>` or `wait` clears it. `pending --strict` exits 3
   when something is unread.
 
@@ -133,56 +147,75 @@ coordination channel either way — no extra DSH plugin required.
 
 ## Commands
 
-```bash
-bash "$SK" run  -t fix-readme -C /c/Git/Proj "prompt" # claude, claude-opus-5 (default); -t = task name
-bash "$SK" fan  -t audit -C dir "prompt A" "prompt B" # N parallel background tasks from one call
+```powershell
+& $SK run  -t fix-readme -C D:/Git/Proj "prompt" # claude, claude-opus-5 (default); -t = task name
+& $SK ask  -t inspect -C dir "prompt"           # alias for the same foreground run
+& $SK fan  -t audit -C dir "prompt A" "prompt B" # N parallel background tasks from one call
                                                      # (audit-01, audit-02, ...); shared -e/-m/-f/-C;
                                                      # returns at once — poll with list/status.
                                                      # Use instead of a hand-written `run ... &` loop
-bash "$SK" run  -t big-job -C dir "prompt"            # agent keeps PROGRESS.<task>.md by default (per-task, resumable + orchestrator-readable); --no-progress opts out
-bash "$SK" run  --no-terse -C dir "prompt"            # terse (concision) directive is ON by default to save output/turn tokens; --no-terse for exploratory/ambiguous work
-bash "$SK" run  --prompt-file p.txt -C dir            # prompt from a FILE, for text too long to pass as an argument
+& $SK run  -t big-job -C dir "prompt"            # agent keeps PROGRESS.<task>.md by default (per-task, resumable + orchestrator-readable); --no-progress opts out
+& $SK run  --no-terse -C dir "prompt"            # terse (concision) directive is ON by default to save output/turn tokens; --no-terse for exploratory/ambiguous work
+& $SK run  --prompt-file p.txt -C dir            # prompt from a FILE, for text too long to pass as an argument
                                                      # (the platform caps a command line near 32000 chars); works for `reply` too,
                                                      # where the positional argument is then the task name
-bash "$SK" run  -m spark -C /c/Git/Proj "prompt"      # trivial task -> spark
-bash "$SK" run  -e claude -m haiku -C dir "prompt"    # a different CLI: claude/opencode/gemini
-bash "$SK" run  -m sonnet -f low -e claude -C dir "prompt"  # -f <effort>, separate from -m <model>
-bash "$SK" run  -e kimi -C dir "prompt"              # Kimi Code, Kimi K3 by default
-bash "$SK" run  -e kimi -m highspeed -C dir "prompt" # explicit managed high-speed coding model
-bash "$SK" test-api --base-url http://127.0.0.1:8080 --goal "check /health, then POST+GET /item" --out r.json
+& $SK run  -m spark -C D:/Git/Proj "prompt"      # trivial task -> spark
+& $SK run  -e claude -m haiku -C dir "prompt"    # a different CLI: claude/opencode/gemini
+& $SK run  -m sonnet -f low -e claude -C dir "prompt"  # -f <effort>, separate from -m <model>
+& $SK run  -e kimi -C dir "prompt"              # Kimi Code, Kimi K3 by default
+& $SK run  -e kimi -m highspeed -C dir "prompt" # explicit managed high-speed coding model
+& $SK test-api --base-url http://127.0.0.1:8080 --goal "check /health, then POST+GET /item" --out r.json
                                                      # thin wrapper on `run`: agent exercises a local
                                                      # HTTP API via its own curl/shell, returns strict JSON
-bash "$SK" send NAME [--now] [-C dir] (TEXT | --prompt-file F)  # queue while running; resume otherwise
-bash "$SK" reply NAME [--now] [-C dir] (TEXT | --prompt-file F) # identical alias; session/dir from meta
-bash "$SK" send --flush NAME                          # deliver an undelivered inbox after wrapper failure
-bash "$SK" stop NAME... | --all-mine                  # stop the process tree; preserve session and files
-bash "$SK" restart NAME [TEXT | --prompt-file F] [--fresh] # resume, or new session from original prompt
-bash "$SK" peek NAME [-n N] [-f] [--raw]              # readable recent activity; default last 25 entries
-bash "$SK" log  fix-readme                            # the entire task thread (run + all replies in one file)
-bash "$SK" log  -f fix-readme                         # follow a live background agent (tail -f)
-bash "$SK" log  -l fix-readme                         # only the last step
-bash "$SK" last fix-readme                            # only the agent's last answer
-bash "$SK" status fix-readme                          # state, last activity/age, queued messages, changed files
-bash "$SK" wait name-a name-b                         # BLOCK until named tasks settle, then print each final answer;
-                                                      # includes inbox drain; stopped = settled (exit 0)
+& $SK send NAME [--now] [-C dir] (TEXT | --prompt-file F)  # queue while running; resume otherwise
+& $SK reply NAME [--now] [-C dir] (TEXT | --prompt-file F) # identical alias; session/dir from meta
+& $SK send --flush NAME                          # deliver an undelivered inbox after wrapper failure
+& $SK stop NAME... | --all-mine                  # stop the process tree; preserve session and files
+& $SK restart NAME [TEXT | --prompt-file F] [--fresh] # resume, or new session from original prompt
+& $SK peek NAME [-n N] [-f] [--raw]              # readable recent activity; default last 25 entries
+& $SK log  fix-readme                            # the entire task thread (run + all replies in one file)
+& $SK log  -f fix-readme                         # follow a live background agent (tail -f)
+& $SK log  -l fix-readme                         # only the last step
+& $SK last fix-readme                            # only the agent's last answer
+& $SK result fix-readme                          # alias for last; includes retained STOPPED report
+& $SK pending [--strict]                         # unread results / tasks needing attention; strict exits 3
+& $SK status fix-readme                          # state, last activity/age, queued messages, changed files
+& $SK wait name-a name-b                         # BLOCK until named tasks settle, then print each final answer;
+                                                      # includes inbox drain; stopped = settled (exit 130)
                                                       # exit 2 = --timeout hit while still running
-bash "$SK" wait --timeout 3600                        # no names = watch ALL currently-running tasks (whole wave); default poll 5s
-bash "$SK" list                                       # table: state / engine / model / age / files / session
-bash "$SK" clean                                      # delete md clutter (<name>.md + PROGRESS.<name>.md) of STOPPED
+& $SK wait --timeout 3600                        # no names = watch ALL currently-running tasks (whole wave); default poll 5s
+& $SK wait name-a --poll 2                       # report polling interval in seconds; internal control remains responsive
+& $SK list                                       # table: state / engine / model / age / files / session
+& $SK clean                                      # delete md clutter (<name>.md + PROGRESS.<name>.md) of STOPPED
                                                      # tasks; live running/idle tasks are never touched;
                                                      # protects undelivered inboxes unless --all/--purge;
                                                      # --all incl. waiting, --purge also .log/.meta, -n dry-run
-bash "$SK" doctor                                     # pre-flight: foreign CLI availability + codex limits when needed
-bash "$SK" doctor --json                              # machine-readable snapshot (used by the panel)
-bash "$SK" doctor --deep                              # + one REAL cheap run per engine that must EXECUTE a shell
+& $SK prune --dry-run                            # clean alias; --dry-run and -n are identical
+& $SK doctor                                     # pre-flight: foreign CLI availability + codex limits when needed
+& $SK doctor --json                              # machine-readable snapshot (used by the panel)
+& $SK doctor --deep                              # + one REAL cheap run per engine that must EXECUTE a shell
                                                      # command — catches "answers fine, every command hangs"
-bash "$SK" gui [port]                                 # web control panel over all providers (stable default :8765,
+& $SK provider-info codex                        # one provider's diagnostic JSON
+& $SK gui [port]                                 # web control panel over all providers (stable default :8765,
                                                      # or $AGENT_GUI_PORT, or a one-off port arg; if that port is
                                                      # held by someone else it moves to the next free one, loudly)
-bash "$SK" gui 8765 --lan --token SECRET              # ...reachable from another PC/phone. --token is MANDATORY with
+& $SK gui 8765 --lan --token SECRET              # ...reachable from another PC/phone. --token is MANDATORY with
                                                      # --lan (the panel launches full-auto agents); the other device
                                                      # opens http://<this-host>:8765/?token=SECRET once
+& $SK openai-server -e claude -m sonnet -p 8801    # OpenAI-compatible bridge; service -p means port
+& $SK completion powershell                     # prints completion script; also bash or zsh
+& $SK help provider-info                        # command reference; COMMAND --help also starts nothing
 ```
+
+Task commands (`run`/`ask`/`fan`/`send`/`reply`/`restart`/`test-api`) accept `-e ENGINE`,
+`-m MODEL`, `-f EFFORT`, `-C DIR`, `-t NAME` and `-P PARENT`.
+For `run`/`ask`/`send`/`reply`/`restart`, `--prompt-file FILE` replaces the message argument.
+`-P` sets ownership instead of `AGENT_PARENT`. Progress is on by default (`-p` is the
+compatibility progress flag); `--no-progress` disables it. `--no-terse` or `--verbose`
+suppresses the terse prompt directive. `--terminal` explicitly permits a visible provider
+console; the default is hidden. Options may precede or follow positional arguments;
+`--` ends option parsing. `list [LIMIT]` defaults to 20 rows; `log`/`last`/`result`/`status`
+can omit NAME to select the newest task.
 
 ## Control foreign workers like native subagents
 
@@ -225,7 +258,7 @@ Structured Codex/OpenCode/Claude/Kimi streams are summarized; plain text gets a 
 `status`/`list` show last activity kind/age and queued count using a cheap log tail. If the owning
 wrapper dies, an inbox is reported as `N undelivered message(s)`; recover with
 `send --flush NAME` or `restart NAME`. `pending` flags these and stopped tasks as needing
-attention. `wait` settles stopped tasks with exit 0. `clean` protects undelivered messages
+attention. `wait` settles stopped tasks with exit 130 and prints `WAIT_DONE rc=130`. `clean` protects undelivered messages
 unless `--all`/`--purge` explicitly overrides that protection.
 
 Resume support is a provider capability: Claude/Codex/Kimi/OpenCode support it; Gemini does
@@ -240,24 +273,78 @@ with its helpers; do not replace an executing `agent.sh` in place. A pre-upgrade
 cannot auto-drain newly queued messages. The inbox remains visible and can be delivered with
 `send --flush NAME` after the old turn settles.
 
-## Windows / PowerShell invocation (verified 2026-08-17)
+## Windows / PowerShell invocation
 
-- On Windows, `bash` on PATH may be WSL's (`C:\WINDOWS\system32\bash.exe`), which mangles
-  Windows paths (`C:UsersUser...`) and cannot find the script. Always call git-bash explicitly:
-  `& "C:\Program Files\Git\bin\bash.exe" "C:/Users/User/.claude/skills/neoxider-agents/agent.sh" doctor`
-  (forward slashes for the script argument; `-C` and paths inside prompts stay POSIX-style:
-  `/c/Git/Proj`).
-- From PowerShell, piping agent.sh output can surface a noisy `Unknown: ChildProcess.kill
-  (powershell.exe ...)` message even when the command succeeded — verify with
-  `agent.sh list` / `agent.sh status <name>` before assuming failure. `fan` returns immediately;
-  the launched task keeps running in the background.
-- **Completion notifications for orchestrators with their own background-job mechanism**
-  (an agent runtime that notifies you when a shell command exits, e.g. DeepSeek Harness):
-  launch one `agent.sh wait <task-name>` per task as a separate BACKGROUND job — it blocks
-  until the subagent finishes and then prints its final answer to stdout, so your job-
-  completion notification arrives with everything you need to verify. For an entire fan-out
-  wave use ONE call without names (it watches every running task; exits when all settle,
-  or at --timeout with exit code 2).
+Use `.\agent.ps1` (or `neoxider` after `bin/install.ps1`). Both Windows PowerShell 5.1
+and PowerShell 7 use UTF-8 stdin JSON transport; cmd uses `agent.cmd`. Native provider
+subprocesses and helpers are hidden by default. `terminal=true` in the GUI is explicit opt-in.
+
+```powershell
+$env:AGENT_CLI_LOGS = 'D:/Temp/my-agents'
+$env:AGENT_PARENT = 'review-wave'
+& $SK run -e codex -m gpt-6.1-sol -t audit -C D:/Git/Project --prompt-file prompt.txt
+& $SK send audit --now "Focus on the parser"
+& $SK stop audit
+& $SK restart audit
+& $SK completion powershell | Out-String | Invoke-Expression
+```
+
+Keep `run` / `reply` / `send` foreground commands inside the harness's tracked background
+job. The wrapper prints the result before returning. `fan` returns after launching tasks;
+track one `wait` for the wave. `wait --timeout SECONDS` returns 2 when its deadline expires.
+
+| Action | Native task contract | neoxider contract |
+|---|---|---|
+| Start / resume | Tracked job completes with its answer | `run`, `reply` and `send` block; track the invocation in your harness |
+| Follow-up | Deliver to the same worker | `send NAME TEXT` queues ordered messages and drains before completion |
+| Interrupt | Completion reaches the launcher | `stop NAME` stops the tree and the owner prints `■ STOPPED`; owner and tracked `wait` exit 130 |
+| Change direction | Keep the worker identity | `send NAME --now TEXT` interrupts and resumes inside the existing wrapper |
+| Launcher cancelled | No abandoned worker | Job Object / process group kills descendants; recovery reports `launcher stopped` |
+| Recover | Continue saved context | `restart NAME`, or `restart NAME --fresh` for a new session |
+
+Cancellation publishes a final block on the original launcher's stdout before exit 130:
+
+```text
+■ STOPPED task=NAME by=orchestrator at TIME reason=stopped by orchestrator
+· ran DURATION · last activity: DIGEST
+· files changed by this agent (delta since start): COUNT NAMES
+· partial result: LAST ASSISTANT MESSAGE
+· session=SESSION_ID
+· resume: neoxider send NAME "..." / neoxider restart NAME
+```
+
+If the launcher is gone, `stop` prints the retained block itself. `status`, `pending`, `wait`
+and `result` expose the stopped result. Killing only the PowerShell launcher is detected across
+the `py.exe` intermediary, so its Python/provider tree cannot remain active. Watchdog blocks
+use `by=watchdog` and their actual deadline/silence reason, retaining exit 124/125. Provider
+failures retain exit 126 and the provider's reason. `send --now` keeps the original wrapper
+alive and adds `↻ INTERRUPTED+RESUMED` to its completion output.
+
+### Python core and migration
+
+Python 3.8+ and its standard library now implement the engine. PowerShell 5.1/7 and cmd
+invoke it natively; Linux and macOS keep the thin POSIX `agent.sh` shim. Git Bash and WSL
+are not Windows dependencies. Bash forks were expensive on Windows and failed under memory
+pressure; its launcher could expose terminal windows, select the WSL stub, or leave provider
+children alive. Python uses in-process polling/watchdogs, `CREATE_NO_WINDOW` and hidden
+startup info, Windows Job Objects with `KILL_ON_JOB_CLOSE`, and POSIX process groups.
+PowerShell carries arguments as UTF-8 JSON through stdin, preserving Cyrillic, embedded
+quotes and newlines without storing tokens in a transport file.
+
+The existing `AGENT_CLI_LOGS/<task>.meta`, `.log`, `.md` and `.inbox` layout remains readable
+across engines. Keep the existing state directory to resume old sessions. Logs retain
+`session id:` and `---------- output ----------`; exit 124/125/126 still identify deadline,
+silence and provider failures. Exit 130 identifies explicit cancellation, including `wait` on
+stopped tasks (`WAIT_DONE rc=130`); this deliberately replaces the Phase 1 wait exit 0. Watchdog termination
+also publishes a STOPPED report with its reason while retaining those existing codes/states.
+During this release the previous Bash implementation lives in `legacy/`: on POSIX use
+`AGENT_LEGACY=1 ./agent.sh ...`; on PowerShell set `$env:AGENT_LEGACY='1'` and explicitly
+invoke Git Bash on `agent.sh`. The native PowerShell/cmd entry always uses the Python core.
+Do not replace files in a checkout whose legacy wrapper is currently running: deploy the
+completed checkout after its launchers finish, or launch the new core from a separate checkout
+pointed at the same state directory. Running legacy tasks keep their legacy process lifetime
+until restarted by the new core.
+
 - **Model ids with a provider prefix must be passed verbatim**: `-e opencode -m
   opencode/muse-spark-1.2-contributor-free` works; the bare id without the `opencode/` prefix
   errors. Short aliases (`-m free`, `-m ox`, …) resolve to the full id for you.
@@ -277,7 +364,7 @@ cannot auto-drain newly queued messages. The inbox remains visible and can be de
   ```
 
   Any unknown `-m` value falls through unchanged, so a new/free-tier id works the day it appears
-  without touching `providers/opencode/provider.sh` — that is why raw ids keep working here, and
+  without touching `providers/opencode/provider.py` — that is why raw ids keep working here, and
   why a missing alias is a convenience loss, not a failure. Prefer it over the pinned aliases when
   the user just wants a free one-shot answer; the aliases stay stable ids, this one tracks the
   vendor's current free lineup.
@@ -542,7 +629,7 @@ HTTPS reverse proxy cannot bypass it. Over the internet, put it behind a VPN or 
 is no TLS in the panel itself. If that port is held by **something else** (it happened: an unrelated WebSocket server on
 8765, which used to make `gui` print success while the browser tab failed with
 `invalid Connection header`), the panel now identifies the occupant, moves to the next free port and
-prints the chosen URL in a banner you cannot miss. Providers are plugins (`providers/<name>/provider.json` + `provider.sh`) — adding a
+prints the chosen URL in a banner you cannot miss. Providers are plugins (`providers/<name>/provider.json` + `provider.py`) — adding a
 CLI is one new directory, zero edits to `agent.sh`/`gui.py`. Implementation details
 (tree/i18n/toasts/splitters/caching/path normalization): [docs/GUI.md](docs/GUI.md).
 
@@ -567,21 +654,16 @@ panel run the SAME state machine (`eff_state` in `agent.sh` and in `gui.py`):
 | process exited after the provider dropped the turn for another reason | `error` | `✖ error` → read the log tail, then resume with `reply` (see below) |
 | explicitly stopped by the orchestrator | `stopped` | `⏹ stopped` → `restart NAME` to continue the saved session |
 
-`idle` is an honest third state, not an error: a codex/claude step flushes its log only when the step
-ENDS, so silence alone never means dead. This is what used to make the CLI say *running* and the GUI say
-*stalled* about the very same task — the CLI looked only at the pid, the GUI only at the log's mtime.
-(On Windows the two now compare notes through `winpid`, because a git-bash pid means nothing to python.)
-`agent.sh clean`, including `clean --purge`, skips `idle` exactly like `running`; otherwise it could
-delete a live quiet process's `.log`/`.meta` while that process was still writing to them.
+A quiet task can still be working. CLI and GUI compare native wrapper/provider identities and
+log activity; `clean`, including `clean --purge`, protects live quiet tasks like running tasks.
+New tasks store native wrapper and provider PIDs with start-time identities. Historical `winpid`
+and Git Bash metadata remain readable during migration.
 
-**Liveness means the ENGINE, not the wrapper.** A wrapper shell can stay `kill -0`-alive forever after
-the real engine process under it has died — stuck on a blocked read (a broken pipe whose write end an
-orphaned grandchild still holds open, or a hung `wait`). Seen live: `agent.sh status` reported
-`running (alive, pid N)` for a wrapper burning 0% CPU with a dead codex process underneath it, and the
-only way to tell was measuring the log's byte growth by hand. `eff_state` now checks for a live engine
-**descendant** (not just the wrapper pid) before calling a quiet task `idle`; with none, it reports
-`stalled` instead. This check is cached to one process-table snapshot per `agent.sh` invocation, so a
-`list`/`clean`/`wait` sweep over many tasks still costs one `ps` fork total, not one per task.
+**Liveness includes the provider and its launcher.** A live launcher with a dead provider is
+reported as stalled; a live provider whose launcher died is reported as orphaned. `stop` terminates
+an orphan and publishes its STOPPED report. Process snapshots are shared within an invocation;
+native Windows enumeration and POSIX process inspection run in Python without `ps`, `kill -0`
+or sleep subprocess polling. Per-task threads handle log output, control files and watchdogs.
 
 **No silent forever-hangs — two watchdogs, two observed triggers.** Every step runs under `AGENT_TIMEOUT_SEC`
 (default 30 min, "took too long overall") AND `AGENT_SILENCE_SEC` (default 10 min, "produced nothing
@@ -789,7 +871,7 @@ The 5.6 family (`sol`/`luna`/`terra`) requires **codex-cli >= 0.144** (older CLI
 | `opus` / `haiku` | no explicit effort (CLI default) | `opus` is the OLD Opus 4.8 alias (kept deliberately); haiku — trivial tasks |
 
 General pattern: `<model>-<effort>` (low/medium/high/xhigh/max) on any alias overrides the effort,
-e.g. `opus-high`. Implementation — `provider_claude_resolve()` in `providers/claude/provider.sh`.
+e.g. `opus-high`. Implementation — `Provider.resolve()` in `providers/claude/provider.py`.
 
 **Kimi Code** (`-e kimi`):
 

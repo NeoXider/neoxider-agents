@@ -1,0 +1,19 @@
+{
+  "label": "opencode",
+  "models": [
+    "free", "spark", "muse", "muse-spark",
+    "ox", "ox-alpha", "alpha",
+    "pickle", "big-pickle",
+    "hy3", "mimo",
+    "nemotron", "ultra",
+    "lightning", "nemotron-fast"
+  ],
+  "_models_note": "Aliases for the OpenCode Zen FREE tier (see providers/opencode/provider.sh for the id each maps to). Any other -m value passes through verbatim, so raw ids and other providers still work. Re-check the live list with `opencode models`.",
+  "efforts": ["minimal", "low", "medium", "high", "max"],
+  "default_model": "",
+  "default_effort": "",
+  "limits": null,
+  "_efforts_note": "from opencode's own --variant help text ('e.g. high, max, minimal') -- the exact accepted enum isn't independently confirmed beyond that hint.",
+  "resolved_label": "",
+  "supports_resume": true
+}

@@ -3,8 +3,73 @@
 A ready-to-paste prompt for running a session as an **orchestrator** that delegates work to CLI
 subagents via `agent.sh` (neoxider), plus a matrix of which model fits which task.
 
-For a plugin install use `SK="$CLAUDE_PLUGIN_ROOT/agent.sh"`; for a manual skill install use
-`SK="$HOME/.claude/skills/neoxider-agents/agent.sh"` (or use the `neoxider` command).
+For Windows use native PowerShell; after `bin/install.ps1`, `neoxider` is on PATH.
+For a plugin install use `$SK = Join-Path $env:CLAUDE_PLUGIN_ROOT 'agent.ps1'`; in a clone
+use `$SK = './agent.ps1'`. Linux/macOS use `./agent.sh` with the same command arguments.
+
+```powershell
+$env:AGENT_PARENT = 'my-wave'
+& $SK run -e opencode -t audit -C D:/Git/Project "Review the current diff"
+& $SK peek audit
+& $SK send audit "Include the test changes"
+& $SK stop audit
+& $SK restart audit
+& $SK pending
+```
+
+Track `run`/`send`/`reply` in your harness's background job mechanism: each invocation blocks
+until its answer (including queued turns) is ready. After `fan`, track `wait` for completion.
+Cancelling that tracked `wait` stops the detached fan workers it owns and records
+`reason=launcher stopped`. Waiting on an explicitly stopped task exits 130 with `WAIT_DONE rc=130`.
+No shell background tricks are needed.
+
+Use `& $SK help [COMMAND]` or `& $SK COMMAND --help` for the full reference. Commands are
+`run`/`ask`, `fan`, `send`/`reply`, `stop`, `restart`, `peek`, `log`, `last`/`result`, `pending`,
+`wait`, `status`, `list`, `clean`/`prune`, `doctor`, `provider-info`, `test-api`, `gui`,
+`openai-server`, `completion` and `help`. `ask` aliases `run`, `result` aliases `last`, and
+`prune` aliases `clean`. `provider-info ENGINE` returns one provider's diagnostic JSON.
+
+Task options include `-e ENGINE -m MODEL -f EFFORT -C DIR -t NAME -P PARENT`.
+Use `--prompt-file FILE` instead of TEXT for `run`/`ask`/`send`/`reply`/`restart`.
+Set `-P` or `AGENT_PARENT` consistently for ownership. Progress is on (`-p` compatibility
+flag); `--no-progress` disables it. `--no-terse`/`--verbose` suppress the terse directive;
+`--terminal` explicitly permits a visible provider console. `wait --poll SEC` controls its
+report interval, `clean --dry-run` equals `clean -n`, and `completion powershell|bash|zsh`
+prints shell completion. The bridge's `openai-server -p PORT` uses `-p` for its port.
+
+| Action | Native task contract | neoxider contract |
+|---|---|---|
+| Start / resume | Tracked job completes with its answer | `run`, `reply` and `send` block; track the invocation in your harness |
+| Follow-up | Deliver to the same worker | `send NAME TEXT` queues ordered messages and drains before completion |
+| Interrupt | Completion reaches the launcher | `stop NAME` stops the tree and the owner prints `■ STOPPED`; owner and tracked `wait` exit 130 |
+| Change direction | Keep the worker identity | `send NAME --now TEXT` interrupts and resumes inside the existing wrapper |
+| Launcher cancelled | No abandoned worker | Job Object / process group kills descendants; recovery reports `launcher stopped` |
+| Recover | Continue saved context | `restart NAME`, or `restart NAME --fresh` for a new session |
+
+### Python core and migration
+
+Python 3.8+ and its standard library now implement the engine. PowerShell 5.1/7 and cmd
+invoke it natively; Linux and macOS keep the thin POSIX `agent.sh` shim. Git Bash and WSL
+are not Windows dependencies. Bash forks were expensive on Windows and failed under memory
+pressure; its launcher could expose terminal windows, select the WSL stub, or leave provider
+children alive. Python uses in-process polling/watchdogs, `CREATE_NO_WINDOW` and hidden
+startup info, Windows Job Objects with `KILL_ON_JOB_CLOSE`, and POSIX process groups.
+PowerShell carries arguments as UTF-8 JSON through stdin, preserving Cyrillic, embedded
+quotes and newlines without storing tokens in a transport file.
+
+The existing `AGENT_CLI_LOGS/<task>.meta`, `.log`, `.md` and `.inbox` layout remains readable
+across engines. Keep the existing state directory to resume old sessions. Logs retain
+`session id:` and `---------- output ----------`; exit 124/125/126 still identify deadline,
+silence and provider failures. Exit 130 identifies explicit cancellation, including `wait` on
+stopped tasks (`WAIT_DONE rc=130`); this deliberately replaces the Phase 1 wait exit 0. Watchdog termination
+also publishes a STOPPED report with its reason while retaining those existing codes/states.
+During this release the previous Bash implementation lives in `legacy/`: on POSIX use
+`AGENT_LEGACY=1 ./agent.sh ...`; on PowerShell set `$env:AGENT_LEGACY='1'` and explicitly
+invoke Git Bash on `agent.sh`. The native PowerShell/cmd entry always uses the Python core.
+Do not replace files in a checkout whose legacy wrapper is currently running: deploy the
+completed checkout after its launchers finish, or launch the new core from a separate checkout
+pointed at the same state directory. Running legacy tasks keep their legacy process lifetime
+until restarted by the new core.
 
 ---
 

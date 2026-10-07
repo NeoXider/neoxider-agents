@@ -1,0 +1,18 @@
+{
+  "label": "Claude",
+  "models": ["opus5", "sonnet", "opus", "haiku", "sonnet55", "opus55"],
+  "efforts": ["low", "medium", "high", "xhigh", "max"],
+  "default_model": "opus5",
+  "default_effort": "",
+  "limits": null,
+  "resolved_label": "Opus 5",
+  "model_labels": {
+    "opus5": "Opus 5",
+    "sonnet": "Sonnet 5",
+    "opus": "Opus 4.8",
+    "haiku": "Haiku 4.5",
+    "sonnet55": "Sonnet 5.5",
+    "opus55": "Opus 5.5"
+  },
+  "supports_resume": true
+}

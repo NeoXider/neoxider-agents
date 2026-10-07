@@ -6,9 +6,14 @@
 #
 # Adds this bin/ directory to your user PATH (persisted via the registry, not `setx` —
 # setx has a documented bug where it silently truncates PATH if it's already long).
-# After this, `neoxider` works from a NEW cmd.exe, PowerShell, or git-bash window.
+# Python 3.8+ is the only runtime; Git Bash and WSL are not needed.
+# After this, `neoxider` works from a NEW cmd.exe or PowerShell window.
 
 $binDir = $PSScriptRoot
+if (-not (Get-Command py, python, python3 -CommandType Application -ErrorAction SilentlyContinue)) {
+    Write-Error 'Python 3.8+ is required. Install Python from python.org with Add Python to PATH enabled.'
+    exit 127
+}
 $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
 
 if ($currentPath -split ";" -contains $binDir) {
@@ -19,3 +24,5 @@ if ($currentPath -split ";" -contains $binDir) {
     Write-Host "Added to your user PATH: $binDir"
     Write-Host "Open a NEW terminal window, then run: neoxider doctor"
 }
+
+Write-Host 'Optional completion: neoxider completion powershell | Out-String | Invoke-Expression'

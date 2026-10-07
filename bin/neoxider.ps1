@@ -1,26 +1,40 @@
-# neoxider.ps1 - one-word launcher for neoxider-cockpit (PowerShell).
-#   neoxider             -> prints a short usage summary (no side effects)
-#   neoxider gui [port]  -> opens the web GUI in your browser
-#   neoxider help        -> full agent.sh command reference
-#   neoxider <anything>  -> passed straight through to agent.sh (run/send/peek/stop/restart/...)
-$Here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$Sk = Join-Path $Here "..\agent.sh"
-
-# A bare `bash` can resolve to the WSL stub (C:\Windows\System32\bash.exe), which cannot
-# run this MSYS script. Prefer Git Bash from its common install locations.
-$bash = @(
-    (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),
-    (Join-Path ${env:ProgramFiles(x86)} 'Git\bin\bash.exe'),
-    (Join-Path $env:LOCALAPPDATA 'Programs\Git\bin\bash.exe')
-) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
-if (-not $bash) { $bash = "bash" }
-
-if ($args.Count -eq 0) {
-    # bare invocation used to silently auto-open the GUI in a browser -- surprising side
-    # effect for a bare command name. Now it just prints a pointer; `gui` is explicit.
-    Write-Host "neoxider - control room for AI coding subagents. Run 'neoxider gui' for the web dashboard, or 'neoxider help' for the full command reference."
-    & $bash $Sk help
-} else {
-    & $bash $Sk @args
+# Native Windows PowerShell 5.1 / PowerShell 7 entry point.
+$ErrorActionPreference = 'Stop'
+$entry = Join-Path $PSScriptRoot '..\agent.py'
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$global:OutputEncoding = $utf8
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
+$env:AGENT_LAUNCHER_PID = [string]$PID
+$pythonCommand = $null
+$pythonPrefix = @()
+foreach ($candidate in @('py', 'python', 'python3')) {
+    $found = Get-Command $candidate -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($found) {
+        $pythonCommand = $found.Source
+        if ($candidate -eq 'py') {
+            try {
+                $resolvedPython = & $pythonCommand -3 -c 'import sys; print(sys.executable)' 2>$null
+                if ($LASTEXITCODE -ne 0 -or -not $resolvedPython -or -not (Test-Path -LiteralPath $resolvedPython -PathType Leaf)) {
+                    $pythonCommand = $null
+                    continue
+                }
+                $pythonCommand = [string]$resolvedPython
+            } catch {
+                $pythonCommand = $null
+                continue
+            }
+        }
+        break
+    }
 }
+if (-not $pythonCommand) {
+    [Console]::Error.WriteLine('neoxider: Python 3.8+ is required. Install Python from python.org and enable "Add Python to PATH", then open a new shell.')
+    exit 127
+}
+# JSON over stdin preserves quotes/newlines and never puts tokens in a file or argv.
+$argumentJson = ConvertTo-Json -InputObject @($args | ForEach-Object { [string]$_ }) -Compress
+$argumentJson | & $pythonCommand @pythonPrefix $entry --argv-stdin
 exit $LASTEXITCODE
