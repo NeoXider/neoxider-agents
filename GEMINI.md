@@ -2,7 +2,7 @@
 
 This repo is the Python `neoxider_agents/` core + native launchers + `gui.py`/`gui.html`: a non-interactive wrapper for launching
 and managing CLI coding subagents (Codex, Claude Code, Kimi Code, opencode, Gemini CLI) across a
-shared thread-per-task log, plus an optional zero-dependency local web GUI.
+tracked task state and a redacted activity digest, plus an optional zero-dependency local web GUI.
 
 Gemini CLI doesn't read the cross-tool `AGENTS.md` convention (Codex CLI and opencode
 do; Claude Code reads it as secondary context) — this file exists so Gemini picks up
@@ -15,7 +15,10 @@ here goes stale.
 
 ```powershell
 $SK = './agent.ps1'
-& $SK run  -t <name> -C <dir> "<prompt>"     # new task (Claude Code / Opus 5 by default)
+& $SK "<prompt>"                            # implicit run; cwd/config/detected engine
+& $SK ask "<prompt>"                        # final answer only; exit code = task result
+& $SK -p prompt.txt                          # file prompt; or pipe text into & $SK -
+& $SK run  -t <name> -C <dir> "<prompt>"     # tracked foreground task
 & $SK run  -e kimi -t <name> -C <dir> "..."  # Kimi Code, Kimi K3 by default
 & $SK run  -e claude -t <name> -C <dir> "..." # -e: codex|claude|kimi|opencode|gemini
 & $SK fan  -t <base> -C <dir> "p1" "p2" ...   # N parallel background tasks (<base>-01, -02, ...)
@@ -26,6 +29,13 @@ $SK = './agent.ps1'
 & $SK stop <name>...                          # stop by name; --all-mine uses current ownership
 & $SK restart <name> ["<message>"]            # resume saved session; --fresh replays original prompt
 & $SK peek <name> [-n N] [-f] [--raw]          # readable activity; default last 25 entries
+& $SK watch <name>                           # follow activity with a status footer
+& $SK top --once                             # orchestrator tasks; --json or dashboard alias
+& $SK diff <name> --stat                      # baseline delta; --names for paths only
+& $SK result <name> --json                    # structured completion report
+& $SK brief --outcome "Tests pass" --owns "src/**" --not-touch "providers/**" --return "Files and evidence" | & $SK run -t fix --owns "src/**" -
+& $SK config list                            # config get KEY / config set KEY VALUE
+& $SK completion powershell --install       # task/flag/engine/model completion; also bash/zsh
 & $SK log  -f <name>                          # follow a task live
 & $SK status <name>                           # state / current step / needs a reply?
 & $SK doctor                                   # foreign CLI availability + limits, when needed
@@ -39,13 +49,40 @@ engine for this release. Existing state files remain compatible. `stop` reaches 
 launcher with a STOPPED report and exit 130; cancelling the launcher kills its provider tree.
 See [SKILL.md](SKILL.md#windows--powershell-invocation) for native-parity and migration details.
 
+**Phase 2B defaults.** Directory = cwd; name = prompt slug plus collision-checked four-character
+ID; engine/model/effort = flags, then `AGENT_ENGINE` / `AGENT_MODEL` / `AGENT_EFFORT`, then config.
+Choosing an explicit different engine skips configured model/effort. Detection prefers installed
+Claude, otherwise the first installed provider. Config lives at
+`%APPDATA%/neoxider-agents/config.json` or `~/.config/neoxider-agents/config.json`;
+`XDG_CONFIG_HOME` is respected and `AGENT_CONFIG` overrides the file. Keys: engine/model/effort.
+The wrapper writes no project files by default. `--progress` / `AGENT_PROGRESS=1` opts into
+`PROGRESS.<task>.md`; `--no-progress` is accepted silently. Output is one start line plus a final
+block; `-v` / `--verbose` restores the stream. Raw logs are a bounded 2 MiB state-directory tail,
+removed by `clean` or after 24 h on the next CLI/GUI state read (`AGENT_LOG_MAX_BYTES`,
+`AGENT_LOG_TTL_HOURS`); TTL pruning is lazy, not a daemon. Default `fan` discards launcher
+stdout; only `--log` creates `.launcher.log`.
+`--log` / `AGENT_KEEP_LOGS=1` keeps full raw logs. Metadata, final `.answer`, compact redacted
+`.activity.jsonl`, baseline/history, prompts, session ID and inbox remain under `AGENT_CLI_LOGS`
+(default `~/.claude/agent-cli-logs`); provider-native sessions remain in provider storage.
+`peek`/`top`/`diff`/`result` and lifecycle commands continue working after raw pruning.
+`--notify` / `AGENT_NOTIFY=1` requests best-effort hidden desktop notifications.
+Provider prompts always travel via file/stdin; use `-p FILE` / `--prompt-file FILE` or stdin for
+large Unicode inputs. Trailing `-p` or `-p` followed by another option still enables progress;
+ambiguous old `-p TEXT` gives a fix to use `--progress TEXT`. Ordinary errors are one line with
+a fix; `--debug` enables traces.
+
+Record file ownership with `run --owns "glob,glob"`; `--strict-owns` refuses running declaration
+overlaps. `brief --owns` writes contract text only. Baseline deltas include initially dirty
+trees and non-git directories; concurrent edits in a shared directory cannot prove authorship.
+Observed shared-file changes warn. Use disjoint ownership or isolated worktrees.
+
 **Control running workers.** Prefer `send`/`peek`/`stop`/`restart` over blind waiting.
 A running `send` returns `queued (#N)` and saves ordered messages atomically in
 `$AGENT_CLI_LOGS/NAME.inbox/`; the owner drains them in the same session after the turn,
 before finishing. A tracked `wait NAME` includes the drain. `reply` has identical behavior.
 Use `--now` only when the current work must change immediately; interruption can leave
 partial edits, so inspect the working tree before continuing. `stop` is idempotent and
-preserves session, logs, inbox and `PROGRESS.<task>.md`, with state `⏹ stopped`.
+preserves session, retained results/activity, inbox and any opt-in `PROGRESS.<task>.md`, with state `⏹ stopped`.
 `restart` defaults to checking `git status/diff` and continuing unfinished work;
 `--fresh` uses the stored original prompt/engine/model/effort/directory in a new session.
 Keep `AGENT_PARENT` consistent for ownership-based `stop --all-mine`/`wait`/`pending`;
@@ -165,8 +202,8 @@ useful bounded work, honor explicit model choices, and serialize shared runtime 
 For Windows launches or shared-service changes, read [runtime discipline](docs/RUNTIME-DISCIPLINE.md).
 Native workers do not require CLI `doctor`; a worker report alone is not acceptance.
 
-- Give every task a meaningful name via `-t` — the auto-generated default
-  (`task-<timestamp>-<pid>`) is collision-safe but not descriptive.
+- Give coordinated tasks a stable name via `-t`; the auto-generated prompt slug plus
+  four-character ID is collision checked.
 - Always `reply` by task name (or session id) — never rely on "last task" when more
   than one subagent might be running, or you'll answer into the wrong session.
 - Every provider runs fully unattended: Codex defaults to `--sandbox danger-full-access`,

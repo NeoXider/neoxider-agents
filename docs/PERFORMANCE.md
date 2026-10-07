@@ -1,5 +1,37 @@
 # Performance
 
+## Phase 2B acceptance
+
+Phase 2B keeps every existing budget unchanged. Reproduce from this clone with
+`python tests/bench_agent.py --scratch D:/Temp/agents-ux/bench --out D:/Temp/agents-ux/bench/acceptance-final.json --check`.
+The Windows acceptance uses 200 completed tasks plus 30 running fake providers, five samples,
+and CI margin 1. All nine gates pass. Evidence includes the copied runtime fingerprint,
+process inventory and cleanup result; budget-defect proofs catch 9/9 planted violations at
+`D:/Temp/agents-ux/bench/budget-defects.json`.
+
+| Measurement | Phase 2A | Phase 2B |
+|---|---:|---:|
+| Warm list | 48.093 ms | 76.449 ms |
+| Warm status | 0.586 ms | 1.172 ms |
+| Warm pending | 48.541 ms | 76.442 ms |
+| Idle wait, one CPU core | 0.15572% | 0.31104% |
+| Idle wait child spawns | 0 | 0 |
+| Python startup median | 48.687 ms | 59.737 ms |
+| 11 MiB log tail peak traced allocation | 198,864 B | 198,862 B |
+| Task owners | 30 | 30 |
+
+The compact digest and final answer remain available after raw-log pruning. Raw writes use a
+locked tail writer capped at 2 MiB by default, trimming with half-cap slack to avoid rewriting
+the tail on every line. Only `--log` retains the full provider stream. State reads perform
+lazy TTL cleanup without a timer process; running tasks and persistent logs are protected.
+Final-answer reads stream in chunks. Empty-change results avoid scanning unrelated tasks;
+dashboard refresh shares a workspace hash scan across tasks and never spawns polling helpers.
+Baselines hash content and copy bounded text once at start; git uses `--no-optional-locks`,
+and directories without a git marker avoid invoking git.
+These baseline costs depend on project size and are separate from command polling budgets.
+
+The earlier Phase 2A measurements and platform limitations below remain historical evidence.
+
 The Python core removes Git Bash forks from state reads, polling and watchdogs. Each running task has one Python owner plus its provider tree. Windows providers start hidden, detached and suspended, join a Job Object before executing, and inherit a launcher lifetime job. Both jobs use `KILL_ON_JOB_CLOSE`; POSIX owners use a separate process group. Prompts go through a UTF-8 file, avoiding shell encoding and command-line limits.
 
 The migration keeps the thin `agent.sh` entry point for Linux/macOS and existing scripts. PowerShell and cmd invoke Python directly. A PowerShell rewrite would add Windows-only behavior and startup overhead. Git Bash on Windows has expensive forks, has failed under memory pressure, may resolve through WSL, and makes hidden launch/tree cancellation harder to guarantee.

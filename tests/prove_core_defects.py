@@ -8,7 +8,7 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = Path("D:/Temp/agents-core/core-proofs") if os.name == "nt" else Path(os.environ.get("TMPDIR", "/tmp")) / "agents-core-proofs"
+BASE = Path("D:/Temp/agents-ux/core-proofs") if os.name == "nt" else Path(os.environ.get("TMPDIR", "/tmp")) / "agents-core-proofs"
 MUTATIONS = [
     ("suffix-file", "cli.py", 'if "prompt_file" in opts:', 'if False:', "test_prompt_file_suffix_exact_utf8"),
     ("help-side-effects", "cli.py", 'usage(command)\n        return 0\n    if command in ("gui",', 'return 1\n    if command in ("gui",', "test_help_is_read_only_for_every_command"),

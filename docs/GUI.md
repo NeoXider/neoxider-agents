@@ -38,6 +38,17 @@ of the same signal, removed).
 Files: `gui.py` (backend) + `gui.html` (thin shell) + `static/*.js`/`static/style.css` (modular
 frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) + `locales/*.json`.
 
+Phase 2B retention is independent of the raw transcript. Task cards retain the original prompt
+title from `.original.prompt`, queue count, compact digest activity and failure reason after
+`.log` pruning. The chat falls back to `.answer` as a plain text result block when the raw log
+is absent; retained answers follow the existing pagination/block-size cap and cache invalidation
+rules. This fallback does not reconstruct old conversation turns or provider tool arguments.
+The default raw log is a 2 MiB tail with a 24-hour TTL; start a task with `--log` for a full
+transcript. TTL deletion is lazy on the next CLI/GUI state read, without a background sweep.
+Default `fan` discards launcher stdout; only `--log` creates `.launcher.log`.
+All these artifacts stay under `AGENT_CLI_LOGS`. The progress checkbox is unchecked
+by default and forwards `--progress`, requesting `PROGRESS.<task>.md` only when selected.
+
 - **Stable port**: resolved as explicit CLI arg > `$AGENT_GUI_PORT` env var > `8765` default, so the
   URL is bookmarkable across restarts instead of drifting between manual invocations. That priority
   is fixed; only the busy-port behaviour is smart (next bullet).
@@ -63,7 +74,9 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   never a silent no-op). Parallel workers each write to their own `<name>.meta/.log`, so a shared
   overview is safe (and concurrency-safe at the file level too — `meta_set`'s read-modify-write is
   wrapped in per-task file locks in the Python core).
-- **Task liveness is NOT computed here anymore** — `gui.py`'s `eff_state()` is a mirror of
+- **Task liveness** — `gui.py`'s `eff_state()` mirrors the core's basic owner-liveness rule.
+  Its clock uses retained `activity_epoch` and digest timestamps when the raw log is gone.
+  The rule originated as a mirror of
   `agent.sh`'s. It used to have its own rule ("running + log quiet for 5 min = stalled"), which
   contradicted the CLI's ("pid alive = running") on every long task: a codex step buffers its output
   and flushes the log only when it ends, so an honest 10-minute task read as *stalled* in the panel
@@ -81,12 +94,12 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   (not just the wrapper pid) before calling a quiet task `idle` — a wrapper stuck on a blocked read
   can stay alive long after the real engine process under it has died (see SKILL.md, "Liveness means
   the ENGINE, not the wrapper"). `gui.py` does not yet do this (no cheap process-tree enumeration on
-  Windows without an extra dependency), so a task the CLI now correctly calls `stalled` may still show
-  as `idle` here until this is ported. Two new terminal states, `limited` (a provider-level failure —
+  Windows in this GUI path), so a task the CLI now correctly calls `stalled` may still show
+  as `idle` here until this is ported. Terminal states `limited` (a provider-level failure —
   usage/rate limit, quota, auth, unavailable model) and `silent` (the no-output watchdog fired), pass
-  through `eff_state`'s `st != "running"` branch unchanged and render with the generic `•` bullet
-  (`activity_emoji`'s fallback) — functional, just without a dedicated icon or the `reason=` text
-  shown inline yet.
+  through `eff_state`'s `st != "running"` branch unchanged. Phase 2B gives both dedicated icons,
+  header state pills, escaped/redacted `reason=` text and warning toasts on transitions.
+  They count as settled and have no Stop button; existing Send message can resume when supported.
 - **Watchdog kills are surfaced, not hidden**: a task killed by `AGENT_TIMEOUT_SEC` carries
   `timeout=<secs>` in its `.meta`, which the chat header shows as a `⏱ killed after Ns` pill and the
   toast reports instead of a bare exit code.
@@ -95,7 +108,7 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   (**Остановить**) and **Send message** (**Отправить сообщение**). A running send queues a
   follow-up through `agent.sh send`; a settled send resumes its saved session. Task cards expose
   queued count and recent activity, and render `stopped` as `⏹ stopped` / `⏹ остановлен`.
-  Stop preserves the session, inbox, logs and per-task progress, so the CLI's `restart` can
+  Stop preserves the session, inbox, retained result/activity and any opt-in progress, so the CLI's `restart` can
   continue it. These endpoints delegate lifecycle control to the wrapper rather than killing
   arbitrary PIDs supplied by the browser. Resume-incapable providers report an explicit error.
   Send accepts JSON `{task, message, now?: bool, terminal?: bool}` (`answer` is a compatibility
@@ -105,9 +118,9 @@ frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) +
   text. Stop accepts `{task}` and returns `{ok: true}` only after a successful CLI stop.
   Both reject malformed requests with 400 and missing tasks with 404; stop errors return 409
   and launch/timeout errors 500.
-- **Full-dialog chat view** (`GET /api/dialog?task=<name>[&full=1]`, parsed by `parse_dialog()` /
-  `parse_output_blocks()` in `gui.py`, rendered by `static/chat.js`): the chat tab shows the WHOLE
-  conversation of a task, Claude-Code-style — every `run`/`reply` step in order with a separator
+- **Dialog chat view** (`GET /api/dialog?task=<name>[&full=1]`, parsed by `parse_dialog()` /
+  `parse_output_blocks()` in `gui.py`, rendered by `static/chat.js`): the chat tab shows the available
+  conversation tail, Claude-Code-style — `run`/`reply` steps in order with a separator
   line (kind · timestamp · duration), the full prompt of each step, and the step's output as
   ordered blocks. Tool calls render as one compact line (tool name + first line of the argument +
   duration when known) and expand on click to the full arguments + result; **expand all / collapse

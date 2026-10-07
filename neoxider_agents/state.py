@@ -248,7 +248,11 @@ class Store:
         return self.root / (valid_name(name) + suffix)
 
     def read(self, name):
-        return read_meta(self.path(name, ".meta"))
+        data = read_meta(self.path(name, ".meta"))
+        if data and data.get("state") != "running":
+            from .logs import prune_task
+            prune_task(self, name, data)
+        return data
 
     def update(self, name, **fields):
         for key, value in fields.items():
@@ -270,6 +274,9 @@ class Store:
                         result.append((entry.name[:-5], read_meta(entry.path), entry.stat().st_mtime))
                     except OSError:
                         pass
+        from .logs import prune_task
+        for name, meta, _ in result:
+            prune_task(self, name, meta)
         return sorted(result, key=lambda item: (-item[2], item[0]))
 
     def resolve(self, ref=""):

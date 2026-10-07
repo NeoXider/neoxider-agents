@@ -4,7 +4,7 @@
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const base = p => (!p ? t("tree.no_project") : p.replace(/[\/\\]+$/, "").split(/[\/\\]/).pop() || p);
-const isStrike = st => st === "done" || st === "stalled" || st === "error" || st === "stopped";
+const isStrike = st => ["done", "stalled", "error", "stopped", "limited", "silent"].includes(st);
 /* "idle" = the task's process is ALIVE but has produced no output for a while (agent.sh and
    gui.py compute it identically -- see eff_state in both). A live task, not a dead one. */
 const isLive = st => st === "running" || st === "idle";

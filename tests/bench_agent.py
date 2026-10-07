@@ -141,8 +141,8 @@ class Bench:
     def __init__(self, args):
         self.args = args
         self.base = Path(args.scratch).resolve()
-        if os.name == "nt" and (self.base.drive.upper() != "D:" or not self.base.as_posix().startswith("D:/Temp/agents-core/")):
-            raise ValueError("Windows benchmark scratch must be under D:/Temp/agents-core/")
+        if os.name == "nt" and (self.base.drive.upper() != "D:" or not self.base.as_posix().startswith("D:/Temp/agents-ux/")):
+            raise ValueError("Windows benchmark scratch must be under D:/Temp/agents-ux/")
         self.base.mkdir(parents=True, exist_ok=True)
         self.work = Path(tempfile.mkdtemp(prefix=args.engine + "-", dir=str(self.base)))
         self.logs = self.work / "state"
@@ -460,7 +460,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", choices=("core", "legacy"), default="core")
     parser.add_argument("--root", default=str(REPO))
-    parser.add_argument("--scratch", default="D:/Temp/agents-core/bench" if os.name == "nt" else str(Path(tempfile.gettempdir()) / "agents-core/bench"))
+    parser.add_argument("--scratch", default="D:/Temp/agents-ux/bench" if os.name == "nt" else str(Path(tempfile.gettempdir()) / "agents-core/bench"))
     parser.add_argument("--out", required=True)
     parser.add_argument("--finished", type=int, default=200)
     parser.add_argument("--running", type=int, default=30)

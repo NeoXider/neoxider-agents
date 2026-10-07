@@ -20,7 +20,7 @@ import stream_text_filter
 
 class ActivityTests(unittest.TestCase):
     def setUp(self):
-        scratch = Path("D:/Temp/agents-oc") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-oc"
+        scratch = Path("D:/Temp/agents-ux") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-oc"
         scratch.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=scratch, prefix="activity-")
         self.addCleanup(self.temp.cleanup)

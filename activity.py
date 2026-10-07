@@ -232,6 +232,9 @@ def entries(lines, fallback, raw=False):
         if not isinstance(record, dict):
             continue
         stamp = event_time(record, fallback)
+        if "kind" in record and "detail" in record:
+            yield stamp, record["kind"], redact(record["detail"]), True
+            continue
         event = record.get("event") if "recorded_at" in record else record
         if raw:
             yield stamp, "raw", json.dumps(safe_event(event), ensure_ascii=False), True

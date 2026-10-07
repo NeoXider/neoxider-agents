@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+sys.dont_write_bytecode = True
 
 
 def main():
@@ -17,6 +18,13 @@ def main():
         argv = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
     elif argv == ["--argv-env"]:
         argv = json.loads(os.environ.pop("NEOXIDER_ARGV_JSON"))
+    if isinstance(argv, dict):
+        import io
+        payload = argv
+        argv = payload.get("argv")
+        if not isinstance(payload.get("stdin", ""), str):
+            raise ValueError("stdin transport must contain text")
+        sys.stdin = io.StringIO(payload.get("stdin", ""))
     if not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv):
         raise ValueError("argv transport must contain a JSON list of strings")
     from neoxider_agents.cli import main as core
@@ -30,3 +38,8 @@ if __name__ == "__main__":
         os._exit(130)
     except KeyboardInterrupt:
         sys.exit(130)
+    except (ValueError, OSError) as error:
+        if "--debug" in sys.argv:
+            raise
+        print("neoxider: %s; check the launcher input or use --debug" % " ".join(str(error).split()), file=sys.stderr)
+        sys.exit(1)

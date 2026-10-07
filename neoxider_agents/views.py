@@ -68,21 +68,22 @@ def status(store, name):
     if state == "stopped":
         print(stop_block(store, name), end="")
     print("   --- current step (last lines) ---")
-    for line in [line for line in last_output(store.path(name, ".log")).splitlines() if line.strip()][-4:]:
+    from .logs import answer_text
+    for line in [line for line in answer_text(store, name).splitlines() if line.strip()][-4:]:
         print("   " + line)
     return 0
 
 
 def last(store, name, result=False):
     path = store.path(name, ".log")
-    if not path.is_file():
-        raise ValueError("log not found: " + name)
+    if not store.read(name):
+        raise ValueError("no such task: " + name)
     state = effective(store, name)
     if state == "stopped" or (result and store.path(name, ".stop").is_file()):
         print(stop_block(store, name), end="")
     else:
-        for chunk in output_chunks(path):
-            print(chunk, end="")
+        from .logs import print_answer
+        print_answer(store, name)
     store.seen(name)
     return 0
 
@@ -190,7 +191,7 @@ def _wait(store, names, timeout, poll):
     for name in names:
         state = effective(store, name)
         print("\n========== wait | %s | %s ==========" % (name, state))
-        if store.path(name, ".log").is_file():
+        if store.read(name):
             last(store, name, result=True)
         else:
             print("(no log for %s)" % name)
@@ -201,7 +202,8 @@ def _wait(store, names, timeout, poll):
 def log(store, name, opts):
     path = store.path(name, ".log")
     if not path.is_file():
-        raise ValueError("log not found: " + name)
+        print("[neoxider] raw log expired/cleaned; neoxider peek %s / last %s" % (name, name))
+        return 0
     offset = log_offset(path, int(opts.get("-n", 0)), bool(opts.get("-l")))
     with path.open(encoding="utf-8", errors="replace", newline="") as stream:
         stream.seek(offset)
@@ -211,6 +213,10 @@ def log(store, name, opts):
         offset = path.stat().st_size
         while effective(store, name) in ("running", "idle"):
             Event().wait(0.2)
+            if not path.exists():
+                break
+            if path.stat().st_size < offset:
+                offset = 0
             with path.open("rb") as stream:
                 stream.seek(offset)
                 chunk = stream.read(65536)
@@ -227,16 +233,31 @@ def clean(store, opts):
             continue
         if store.inbox(name) and not (opts.get("--all") or opts.get("--purge")):
             continue
-        paths = [store.path(name, ".md")]
-        if meta.get("dir"):
+        paths = [store.path(name, ".md"), store.path(name, ".log"), store.path(name, ".launcher.log")]
+        from .logs import prune_task
+        if store.path(name, ".log").exists():
+            prune_task(store, name, meta, force=True, dry=bool(opts.get("-n") or opts.get("--dry-run")))
+        if meta.get("dir") and (meta.get("progress") == "1" or not meta.get("core_version")):
             paths.append(Path(meta["dir"]) / ("PROGRESS.%s.md" % name))
         if opts.get("--purge"):
             paths += [Path(p.path) for p in os.scandir(str(store.root)) if p.name.startswith(name + ".") and p.is_file()]
             box = store.path(name, ".inbox")
             if box.is_dir():
                 paths += list(box.iterdir()) + [box]
+            baseline = store.path(name, ".baseline.files")
+            allowed_root = store.root.resolve()
+            resolved_baseline = baseline.resolve()
+            if baseline.is_dir() and not baseline.is_symlink() and allowed_root in resolved_baseline.parents:
+                paths += sorted(baseline.rglob("*"), key=lambda p: len(p.parts), reverse=True) + [baseline]
         for path in paths:
             if path.exists():
+                resolved = path.resolve()
+                allowed = store.root.resolve()
+                project = Path(meta["dir"]).resolve() if meta.get("dir") else None
+                project_progress = project and path.name == "PROGRESS.%s.md" % name and resolved.parent == project
+                if resolved != allowed and allowed not in resolved.parents and not project_progress:
+                    print("[neoxider] skip cleanup path outside task state: " + str(path))
+                    continue
                 print("[agent.sh] %s %s" % ("would remove" if opts.get("-n") or opts.get("--dry-run") else "remove", path))
                 if not (opts.get("-n") or opts.get("--dry-run")):
                     path.rmdir() if path.is_dir() else path.unlink()

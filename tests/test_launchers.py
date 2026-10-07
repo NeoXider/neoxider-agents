@@ -115,7 +115,7 @@ class WindowsLauncherTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt" and shutil.which("cmd"), "requires cmd.exe")
     def test_cmd_launcher_propagates_failure(self):
         result = subprocess.run(
-            ["cmd", "/d", "/c", str(ROOT / "bin" / "neoxider.cmd"), "not-a-command"],
+            ["cmd", "/d", "/c", str(ROOT / "bin" / "neoxider.cmd"), "run", "--invalid-option"],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -123,7 +123,7 @@ class WindowsLauncherTests(unittest.TestCase):
             **hidden(),
         )
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("unknown command", (result.stdout + result.stderr).lower())
+        self.assertIn("unknown option", (result.stdout + result.stderr).lower())
 
     @unittest.skipUnless(os.name == "nt" and shutil.which("powershell"), "requires Windows PowerShell")
     def test_windows_powershell_launcher_parses_and_propagates_failure(self):
@@ -135,7 +135,7 @@ class WindowsLauncherTests(unittest.TestCase):
                 "Bypass",
                 "-File",
                 str(ROOT / "bin" / "neoxider.ps1"),
-                "not-a-command",
+                "run", "--invalid-option",
             ],
             cwd=ROOT,
             capture_output=True,
@@ -144,7 +144,7 @@ class WindowsLauncherTests(unittest.TestCase):
             **hidden(),
         )
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("unknown command", (result.stdout + result.stderr).lower())
+        self.assertIn("unknown option", (result.stdout + result.stderr).lower())
 
     @unittest.skipUnless(os.name == "nt" and shutil.which("pwsh"), "requires PowerShell 7")
     def test_pwsh_launcher_propagates_failure(self):
@@ -154,7 +154,7 @@ class WindowsLauncherTests(unittest.TestCase):
                 "-NoProfile",
                 "-File",
                 str(ROOT / "bin" / "neoxider.ps1"),
-                "not-a-command",
+                "run", "--invalid-option",
             ],
             cwd=ROOT,
             capture_output=True,
@@ -163,7 +163,7 @@ class WindowsLauncherTests(unittest.TestCase):
             **hidden(),
         )
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("unknown command", (result.stdout + result.stderr).lower())
+        self.assertIn("unknown option", (result.stdout + result.stderr).lower())
 
 
 class PosixInstallerTests(unittest.TestCase):

@@ -10,6 +10,7 @@ from threading import Event
 from .state import Lock, MARK, atomic_write, last_output, native_path, valid_name
 from .reporting import STOP_EXIT, begin_snapshot, changed_files, now, record_stop, render_md, stop_block
 from .runtime import Turn, number_env, retry_wait
+from .logs import TailWriter, enabled, save_answer, print_answer
 
 DEFAULT_RESTART = ("The previous turn was interrupted. First check the working tree (git status/diff) "
                    "for partial edits, then continue the assignment from where you stopped; do not redo finished work.")
@@ -60,7 +61,7 @@ def effective(store, name, meta=None, reconcile=True):
             return "stopped"
         return "stalled"
     try:
-        idle = time.time() - store.path(name, ".log").stat().st_mtime
+        idle = time.time() - float(data.get("activity_epoch") or store.path(name, ".log").stat().st_mtime)
     except OSError:
         idle = 0
     return "idle" if idle > number_env("AGENT_STALE_SEC", 300) else "running"
@@ -68,8 +69,7 @@ def effective(store, name, meta=None, reconcile=True):
 
 def header(store, name, kind, prompt, detail):
     path = store.path(name, ".log")
-    fd = os.open(str(path), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as log:
+    with TailWriter(path, enabled(store.read(name).get("keep_logs", "0"))) as log:
         log.write("\n========== [%s] %s | %s ==========\n> %s:\n%s\n%s\n" % (
             kind, now(), detail, "PROMPT" if kind == "run" else "ANSWER",
             prompt.replace("\n" + MARK + "\n", "\n" + MARK + " \n").replace(MARK, MARK + " "), MARK))
@@ -81,6 +81,13 @@ def select_options(store, name, opts):
     for key in ("engine", "model", "effort", "dir"):
         if key not in result:
             result[key] = (meta.get("resolved_model") if key == "model" else "") or meta.get(key) or {"engine": "claude", "model": "", "effort": "", "dir": os.getcwd()}[key]
+    if not opts.get("_new"):
+        for flag, field in (("--progress", "progress"), ("--log", "keep_logs"), ("--notify", "notify")):
+            if flag not in result and enabled(meta.get(field, "0")):
+                result[flag] = True
+        result.setdefault("owns", meta.get("owns", ""))
+        if "--strict-owns" not in result and enabled(meta.get("strict_owns", "0")):
+            result["--strict-owns"] = True
     result["dir"] = native_path(result["dir"])
     if not Path(result["dir"]).is_dir():
         raise ValueError("working directory does not exist: " + result["dir"])
@@ -154,6 +161,8 @@ def send(store, ref, text, opts):
             if opts.get("--now") and not store.session(name):
                 raise ValueError("session id is not available yet; use send without --now to queue while the current turn starts")
             sequence = store.enqueue_locked(name, text)
+            from .ux_tracking import record_history
+            record_history(store, name, "send", sequence=sequence, now=bool(opts.get("--now")), queued=True)
             if opts.get("--now"):
                 from .process import signal_task
                 meta = store.read(name)
@@ -167,9 +176,19 @@ def send(store, ref, text, opts):
             return 0
     resolved, provider, model, effort, session = preflight(store, name, opts, True)
     with Lock(store.path(name, ".owner"), timeout=0):
+        from .ux_tracking import guard_ownership
+        with Lock(store.root / "ownership"):
+            guard_ownership(store, name, resolved["dir"], resolved.get("owns", ""), resolved.get("--strict-owns", False))
+            from .process import pid_stamp
+            resolved["_generation"] = uuid.uuid4().hex
+            store.update(name, state="running", pid=os.getpid(), pid_start=pid_stamp(os.getpid()),
+                         winpid=os.getpid() if os.name == "nt" else "", generation=resolved["_generation"],
+                         owns=resolved.get("owns", ""), dir=resolved["dir"])
         with Lock(store.path(name, ".inbox")):
             if not opts.get("--flush"):
-                store.enqueue_locked(name, text)
+                sequence = store.enqueue_locked(name, text)
+                from .ux_tracking import record_history
+                record_history(store, name, "send", sequence=sequence, now=False, queued=False)
             files, prompt = store.batch_locked(name)
         if not files:
             print("[agent.sh] inbox empty: " + name)
@@ -179,18 +198,35 @@ def send(store, ref, text, opts):
 
 def run(store, name, prompt, opts, fresh=False):
     valid_name(name)
-    defaults = dict(engine="claude", model="", effort="", dir=os.getcwd())
+    defaults = dict(engine="claude", model="", effort="", dir=os.getcwd(), _new=not fresh)
     defaults.update(opts)
     resolved, provider, model, effort, _ = preflight(store, name, defaults, False)
     if not fresh and effective(store, name) in ("running", "idle", "orphaned"):
         raise ValueError("run: task '%s' is already running; use send" % name)
     with Lock(store.path(name, ".owner"), timeout=0):
+        from .process import pid_stamp
+        from .ux_tracking import guard_ownership, record_history
+        with Lock(store.root / "ownership"):
+            guard_ownership(store, name, resolved["dir"], opts.get("owns", ""), opts.get("--strict-owns", False))
+            resolved["_generation"] = uuid.uuid4().hex
+            store.update(name, owns=opts.get("owns", ""), strict_owns=int(bool(opts.get("--strict-owns"))),
+                         generation=resolved["_generation"], state="running", engine=resolved["engine"],
+                         dir=resolved["dir"], pid=os.getpid(), pid_start=pid_stamp(os.getpid()),
+                         winpid=os.getpid() if os.name == "nt" else "")
         if not fresh:
             atomic_write(store.path(name, ".log"), "")
+            for suffix in (".activity.jsonl", ".history.jsonl", ".answer"):
+                try:
+                    store.path(name, suffix).unlink()
+                except FileNotFoundError:
+                    pass
+            store.update(name, usage_json="", cost_usd="")
         original = store.path(name, ".original.prompt")
         atomic_write(original, prompt)
         store.update(name, original_prompt=original.as_posix(), original_engine=resolved["engine"],
-                     original_model=model, original_effort=effort, original_dir=resolved["dir"])
+                     original_model=model, original_effort=effort, original_dir=resolved["dir"], task_started_epoch=time.time())
+        begin_snapshot(store, name, resolved["dir"], force=True)
+        record_history(store, name, "restart" if fresh else "run")
         return execute(store, name, resolved, provider, model, effort, "", prompt, False, [])
 
 
@@ -198,8 +234,13 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
     from .process import pid_stamp
     from .providers import failure_reason
     started_epoch = time.time()
-    generation = uuid.uuid4().hex
+    generation = opts.get("_generation") or uuid.uuid4().hex
     old = store.read(name)
+    quiet_answer = opts.get("ask", False)
+    progress_on = not opts.get("--no-progress") and (opts.get("--progress") or enabled(os.environ.get("AGENT_PROGRESS", "0")))
+    verbose = not quiet_answer and (opts.get("--verbose") or opts.get("-v"))
+    keep_logs = opts.get("--log") or enabled(os.environ.get("AGENT_KEEP_LOGS", "0"))
+    notify = opts.get("--notify") or enabled(os.environ.get("AGENT_NOTIFY", "0"))
     offset = store.path(name, ".log").stat().st_size if store.path(name, ".log").exists() else 0
     store.update(name, core_version="2", generation=generation, state="running", exit="", reason="",
                  engine=provider.engine, model=model + ("-" + effort if effort else ""), resolved_model=model, effort=effort, dir=opts["dir"],
@@ -208,7 +249,13 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
                  detached=int(os.environ.get("AGENT_DETACHED") == "1"), wait_pid="", wait_start="", wait_token="",
                  started=now(), started_epoch=started_epoch, parent=opts.get("parent", os.environ.get("AGENT_PARENT", old.get("parent", ""))),
                  orchestrator=os.environ.get("AGENT_ORCHESTRATOR_ID", old.get("orchestrator", "")), last_send_error="", timeout="", silence="")
+    store.update(name, progress=int(bool(progress_on)), verbose=int(bool(verbose)), keep_logs=int(bool(keep_logs)),
+                 notify=int(bool(notify)), activity_epoch=started_epoch, finished_epoch="",
+                 task_started_epoch=old.get("task_started_epoch") or started_epoch)
     begin_snapshot(store, name, opts["dir"])
+    if not quiet_answer:
+        hint = " (progress/log echo off; --progress/-v to enable)" if not progress_on and not verbose else ""
+        print("[neoxider] started task=%s engine=%s/%s%s" % (name, provider.engine, model, hint), flush=True)
     try:
         store.path(name, ".stop").unlink()
     except OSError:
@@ -217,7 +264,7 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
     notes = []
     while True:
         augmented = prompt
-        if not opts.get("--no-progress"):
+        if progress_on:
             augmented += progress(name, resume)
         if not resume and not (opts.get("--no-terse") or opts.get("--verbose")):
             augmented += TERSE
@@ -231,7 +278,17 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
         if session:
             store.update(name, session=session)
         answer = output_filter.last_assistant if output_filter else ""
-        answer = answer or last_output(store.path(name, ".log"))
+        answer = answer or (last_output(store.path(name, ".log")) if output_filter is None else "")
+        save_answer(store, name, output_filter, answer)
+        if output_filter:
+            usage = dict(output_filter.usage)
+            if usage:
+                previous = json.loads(store.read(name).get("usage_json") or "{}")
+                for key, value in usage.items():
+                    previous[key] = previous.get(key, 0) + value
+                store.update(name, usage_json=json.dumps(previous))
+            if output_filter.cost is not None:
+                store.update(name, cost_usd=float(store.read(name).get("cost_usd") or 0) + output_filter.cost)
         retry_output = "".join(output_filter.raw) if output_filter else answer
         if action == "stop":
             state = "error" if code == 124 else "silent" if code == 125 else "stopped"
@@ -241,8 +298,13 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
                 store.update(name, timeout=number_env("AGENT_TIMEOUT_SEC", 1800))
             if code == 125:
                 store.update(name, silence=number_env("AGENT_SILENCE_SEC", 600))
-            print("".join(notes) + block, end="", flush=True)
+            if quiet_answer:
+                print_answer(store, name)
+                print("neoxider: task=%s state=%s exit=%s; %s" % (name, state, code, reason), file=sys.stderr)
+            else:
+                print("".join(notes) + block, end="", flush=True)
             render_md(store, name)
+            finish_notification(store, name, notify)
             return code
         if action == "interrupt":
             notes.append("↻ INTERRUPTED+RESUMED task=%s session=%s\n" % (name, session))
@@ -250,12 +312,17 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             delivered = []
         elif code and provider.retry_reason(retry_output, code, session) and retries < min(provider.retry_limit, number_env("AGENT_RETRIES", provider.retry_limit)):
             retries += 1
-            with store.path(name, ".log").open("a", encoding="utf-8") as log:
+            with TailWriter(store.path(name, ".log"), keep_logs) as log:
                 log.write("[agent.sh] RETRY %s after %s\n" % (retries, provider.retry_reason(retry_output, code, session)))
             if not retry_wait(turn, number_env("AGENT_RETRY_DELAY", provider.retry_delay(retries))):
                 block = record_stop(store, name, turn.by or "orchestrator", turn.reason, STOP_EXIT, "stopped", answer, turn.last_activity)
-                print("".join(notes) + block, end="", flush=True)
+                if quiet_answer:
+                    print_answer(store, name)
+                    print("neoxider: task=%s stopped; use neoxider restart %s" % (name, name), file=sys.stderr)
+                else:
+                    print("".join(notes) + block, end="", flush=True)
                 render_md(store, name)
+                finish_notification(store, name, notify)
                 return STOP_EXIT
             resume = bool(session)
             if resume:
@@ -263,9 +330,16 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             continue
         elif (action == "failure" and code == 126) or (output_filter and output_filter.final_failure(code)):
             reason = reason or (output_filter.final_failure(code) if output_filter else failure_reason(answer))
+            from activity import redact
+            reason = redact(reason)
             block = record_stop(store, name, by or "watchdog", reason, 126, "limited", answer, turn.last_activity)
-            print("".join(notes) + block, end="", flush=True)
+            if quiet_answer:
+                print_answer(store, name)
+                print("neoxider: task=%s limited; %s" % (name, reason), file=sys.stderr)
+            else:
+                print("".join(notes) + block, end="", flush=True)
             render_md(store, name)
+            finish_notification(store, name, notify)
             return 126
         with Lock(store.path(name, ".inbox")):
             if code == 0 and action != "interrupt":
@@ -280,24 +354,34 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
                 code = 3
                 reason = "provider returned an empty answer; inspect the working tree (changes may have landed)"
             names = changed_files(store, name, opts["dir"])
+            from .reporting import file_changes
+            file_changes(store, name, opts["dir"], freeze=True)
             state = "error" if code else "waiting" if files or looks_waiting(answer) else "done"
             store.update(name, state=state, exit=code, reason=" ".join((reason or ("provider exited %s" % code if code else "%s undelivered message(s); send --flush %s" % (len(files), name) if files else "")).split()),
                          files=len(names), changed_names=" | ".join(names))
-        print("".join(notes), end="")
-        if session:
-            print("session id: " + session)
-        print(MARK)
-        if output_filter and output_filter.answer_path:
-            for chunk in output_filter.iter_answer():
-                print(chunk, end="")
-            if not answer.endswith("\n"):
-                print()
-            sys.stdout.flush()
-        else:
-            print(answer, end="" if answer.endswith("\n") else "\n", flush=True)
-        print("[agent.sh] %s task=%s exit=%s files=%s" % (state, name, code, len(names)), file=sys.stderr)
+        store.update(name, finished_epoch=time.time())
+        if not quiet_answer:
+            print("".join(notes), end="")
+            if session:
+                print("session id: " + session)
+            print(MARK)
+        print_answer(store, name)
+        sys.stdout.flush()
+        if not quiet_answer:
+            print("[agent.sh] %s task=%s exit=%s files=%s" % (state, name, code, len(names)))
         render_md(store, name)
+        finish_notification(store, name, notify)
         return code
+
+
+def finish_notification(store, name, notify):
+    from .logs import record_digest
+    meta = store.read(name)
+    record_digest(store.path(name, ".activity.jsonl"), "end", "state=%s exit=%s" % (meta.get("state"), meta.get("exit")), meta.get("engine", ""))
+    if notify:
+        from .notifications import notify_task
+        accepted = notify_task(name, meta.get("state", "done"))
+        store.update(name, notification_attempted=1, notification_accepted=int(bool(accepted)))
 
 
 def restart(store, ref, text, opts):

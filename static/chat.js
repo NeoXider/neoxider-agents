@@ -141,6 +141,8 @@ async function loadThread(task) {
     <span class="pill">${esc(task.files)} ${esc(t("chat.files"))}</span>
     ${task.state === "waiting" ? `<span class="pill" style="color:var(--wait);border-color:var(--wait)">${t("chat.waiting")}</span>` : ""}
     ${task.state === "stopped" ? `<span class="pill">${esc(t("chat.stopped"))}</span>` : ""}
+    ${["limited", "silent"].includes(task.state) ? `<span class="pill" style="color:var(--stall)">${esc(task.state)}</span>` : ""}
+    ${task.reason ? `<span class="pill" style="color:var(--stall)" title="${esc(task.reason)}">${esc(task.reason)}</span>` : ""}
     ${task.queued ? `<span class="pill" style="color:var(--wait)">${esc(t("chat.queued").replace("{n}", task.queued))}</span>` : ""}
     ${task.last_activity && task.last_activity.kind ? `<span class="pill">${esc(t("chat.activity").replace("{kind}", task.last_activity.kind).replace("{age}", task.last_activity.age_sec))}</span>` : ""}
     ${task.state === "stalled" ? `<span class="pill" style="color:var(--stall)">${t("chat.stalled")}</span>` : ""}

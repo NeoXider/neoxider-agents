@@ -8,6 +8,24 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- Phase 2B convenience: implicit `run`, answer-only `ask`, file/stdin prompts, config defaults,
+  prompt-derived task names, `brief` contracts and one-command completion installation.
+- `top` / `dashboard`, `diff` with dirty-tree/non-git baselines, ownership overlap warnings,
+  structured `result`, `watch` and optional hidden desktop notifications.
+- GUI retained-answer/title/activity fallbacks after raw-log pruning; explicit limited/silent
+  states and failure reasons; existing queue and authenticated stop/send controls preserved.
+
+### Changed
+
+- Progress files are opt-in (`--progress`, `AGENT_PROGRESS=1`); `--no-progress` remains a silent
+  compatibility flag. The wrapper writes no project files by default.
+- Output defaults to one start line and a final block (`-v` / `--verbose` restores live output).
+  Raw logs default to an ephemeral 2 MiB tail with a 24-hour TTL; `--log` / `AGENT_KEEP_LOGS=1`
+  retains full logs. Metadata, final answer, compact redacted digest, baselines and inbox survive pruning.
+- `ask` returns only the final answer; `result` now returns a structured report rather than aliasing `last`.
+
+### Added (earlier phases)
+
 - Python 3.8+ standard-library core, native PowerShell 5.1/7 and cmd entries, UTF-8 stdin
   argument transport, and PowerShell/bash/zsh completion. Windows no longer needs Git Bash.
 - Per-task Windows Job Objects / POSIX process groups, hidden provider launch boundaries,

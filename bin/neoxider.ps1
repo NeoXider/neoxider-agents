@@ -35,6 +35,20 @@ if (-not $pythonCommand) {
     exit 127
 }
 # JSON over stdin preserves quotes/newlines and never puts tokens in a file or argv.
-$argumentJson = ConvertTo-Json -InputObject @($args | ForEach-Object { [string]$_ }) -Compress
+$launchArguments = @($args | ForEach-Object { [string]$_ })
+$pipelineLines = @($input | ForEach-Object { [string]$_ })
+if ($launchArguments -contains '-') {
+    $promptInput = $pipelineLines -join "`n"
+    if ($pipelineLines.Count -eq 0 -and [Console]::IsInputRedirected) {
+        $promptInput = [Console]::In.ReadToEnd()
+    }
+    if ($pipelineLines.Count -eq 0 -and -not [Console]::IsInputRedirected) {
+        [Console]::Error.WriteLine('neoxider: stdin prompt is empty; pipe text into neoxider - or use -p FILE.')
+        exit 1
+    }
+    $argumentJson = ConvertTo-Json -InputObject @{ argv = $launchArguments; stdin = $promptInput } -Compress -Depth 3
+} else {
+    $argumentJson = ConvertTo-Json -InputObject $launchArguments -Compress
+}
 $argumentJson | & $pythonCommand @pythonPrefix $entry --argv-stdin
 exit $LASTEXITCODE

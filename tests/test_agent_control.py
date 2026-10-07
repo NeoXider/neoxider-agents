@@ -20,7 +20,7 @@ DEFAULT_RESTART = ("The previous turn was interrupted. First check the working t
 
 class ControlRegressions(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-core/legacy-tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core-legacy"
+        base = Path("D:/Temp/agents-ux/legacy-tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core-legacy"
         base.mkdir(parents=True, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=base, prefix="control-")
         self.base = Path(self.tmp.name)

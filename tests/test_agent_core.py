@@ -19,7 +19,7 @@ from neoxider_agents.lifecycle import looks_waiting
 
 class CoreTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-core/tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core"
+        base = Path("D:/Temp/agents-ux/tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="core-", dir=str(base))
         self.base = Path(self.temp.name)

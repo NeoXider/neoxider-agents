@@ -1837,6 +1837,173 @@ class TaskControlRouteTests(unittest.TestCase):
         self.assertNotIn("secret-argument", json.dumps(task))
 
 
+class RetainedTaskTests(unittest.TestCase):
+    """Retention is independent of ephemeral raw logs; guards still apply to every artifact."""
+    def setUp(self):
+        self.scratch = tempfile.mkdtemp(prefix="gui-retained-")
+        self.original_logdir, self.original_pid_alive = gui.LOGDIR, gui.pid_alive
+        gui.LOGDIR = self.scratch
+        gui._DIALOG_CACHE.clear()
+        self.write(".meta", "state=done\nengine=codex\n")
+
+    def tearDown(self):
+        gui.LOGDIR, gui.pid_alive = self.original_logdir, self.original_pid_alive
+        gui._DIALOG_CACHE.clear()
+        shutil.rmtree(self.scratch)
+
+    def write(self, suffix, value):
+        with open(os.path.join(self.scratch, "retained" + suffix), "w", encoding="utf-8") as handle:
+            handle.write(value)
+
+    def test_final_answer_survives_pruning_without_becoming_provider_json(self):
+        answer = '{"type":"error","message":"This is the answer, not an event"}'
+        self.write(".answer", answer)
+        payload = gui.dialog_payload("retained")
+        self.assertFalse(payload["raw_log_available"])
+        self.assertEqual(len(payload["steps"]), 1)
+        self.assertEqual(payload["steps"][0]["blocks"], [{"type": "text", "text": answer}])
+        self.assertEqual(payload["state"], "done")
+
+    def test_retained_answer_cache_refreshes_when_answer_changes(self):
+        self.write(".answer", "one")
+        gui.dialog_payload("retained")
+        self.write(".answer", "a newer longer answer")
+        payload = gui.dialog_payload("retained")
+        self.assertEqual(payload["steps"][0]["blocks"][0]["text"], "a newer longer answer")
+
+    def test_retained_answer_obeys_default_payload_cap(self):
+        answer = "a" * (gui._DIALOG_BLOCK_CAP + 1)
+        self.write(".answer", answer)
+        block = gui.dialog_payload("retained")["steps"][0]["blocks"][0]
+        self.assertTrue(block["truncated"])
+        self.assertEqual(len(block["text"]), gui._DIALOG_BLOCK_CAP)
+        self.assertEqual(gui.dialog_payload("retained", full=True)["steps"][0]["blocks"][0]["text"], answer)
+
+    def test_prompt_title_survives_pruned_and_rotated_logs(self):
+        self.write(".original.prompt", "Проверь код\nи тесты")
+        self.write(".log", "tail without the original prompt")
+        self.assertEqual(gui.list_tasks()[0]["title"], "Проверь код и тесты")
+
+    def test_retained_activity_is_the_liveness_clock(self):
+        gui.pid_alive = lambda _meta: True
+        epoch = gui.time.time() - gui.STALE_SEC - 10
+        self.write(".meta", "state=running\nactivity_epoch=%s\n" % epoch)
+        self.assertEqual(gui.task_state("retained")[0], "idle")
+        self.assertEqual(gui.list_tasks()[0]["state"], "idle")
+
+    def test_digest_activity_emoji_survives_pruned_raw_log(self):
+        event = {"recorded_at": gui.time.time(), "event": {"type": "item.completed", "item": {
+            "type": "file_change", "changes": [{"kind": "update", "path": "test.py"}]}}}
+        self.write(".activity.jsonl", json.dumps(event) + "\n")
+        self.assertEqual(gui.activity_emoji("retained", "running"), "✏️")
+
+    def test_compact_digest_remains_visible_after_raw_log_pruning(self):
+        self.write(".activity.jsonl", json.dumps({"recorded_at": gui.time.time() - 12,
+                   "engine": "codex", "kind": "command", "detail": "command completed"}) + "\n")
+        task = gui.list_tasks()[0]
+        self.assertEqual(task["last_activity"]["kind"], "command")
+        self.assertGreaterEqual(task["last_activity"]["age_sec"], 12)
+        self.assertEqual(gui.activity_emoji("retained", "running"), "🔧")
+
+    def test_limited_and_silent_keep_reason_and_have_explicit_icons(self):
+        for state, icon in (("limited", "⚠️"), ("silent", "⏱")):
+            with self.subTest(state=state):
+                self.write(".meta", "state=%s\nreason=provider ended the turn\n" % state)
+                task = gui.list_tasks()[0]
+                self.assertEqual(task["act"], icon)
+                self.assertEqual(task["reason"], "provider ended the turn")
+                self.assertNotIn(state, gui.LIVE_STATES)
+
+    def test_new_artifact_suffixes_preserve_path_guard(self):
+        for suffix in (".answer", ".original.prompt", ".activity.jsonl"):
+            with self.subTest(suffix=suffix):
+                self.assertIsNone(gui.safe_task_path("../victim", suffix))
+                self.assertEqual(gui.safe_task_path("retained", suffix), os.path.join(self.scratch, "retained" + suffix))
+        self.assertIsNone(gui.safe_task_path("retained", "/../victim"))
+
+    def test_gui_progress_is_opt_in_and_uses_unambiguous_flag(self):
+        spawned = []
+        original = gui.spawn
+        gui.spawn = lambda args, **kwargs: spawned.append(args)
+        try:
+            TerminalOptInRouteTests._call("/api/run", {"prompt": "one"})
+            TerminalOptInRouteTests._call("/api/run", {"prompt": "two", "progress": True})
+        finally:
+            gui.spawn = original
+        self.assertNotIn("--progress", spawned[0])
+        self.assertIn("--progress", spawned[1])
+        self.assertNotIn("-p", spawned[1])
+
+    def test_gui_read_prunes_expired_log_preserves_answer_and_honors_opt_ins(self):
+        previous_ttl = os.environ.get("AGENT_LOG_TTL_HOURS")
+        os.environ["AGENT_LOG_TTL_HOURS"] = "24"
+        try:
+            for state, keep, expired, should_prune in (
+                    ("done", "0", True, True), ("running", "0", True, False),
+                    ("done", "1", True, False), ("done", "0", False, False)):
+                with self.subTest(state=state, keep=keep, expired=expired):
+                    self.write(".meta", "state=%s\nkeep_logs=%s\n" % (state, keep))
+                    self.write(".log", "ephemeral provider output")
+                    self.write(".answer", "retained final answer")
+                    log = os.path.join(self.scratch, "retained.log")
+                    stamp = gui.time.time() - (25 * 3600 if expired else 60)
+                    os.utime(log, (stamp, stamp))
+                    self.assertEqual(gui.read_meta("retained")["state"], state)
+                    self.assertEqual(os.path.exists(log), not should_prune)
+                    with open(os.path.join(self.scratch, "retained.answer"), encoding="utf-8") as handle:
+                        self.assertEqual(handle.read(), "retained final answer")
+        finally:
+            if previous_ttl is None:
+                os.environ.pop("AGENT_LOG_TTL_HOURS", None)
+            else:
+                os.environ["AGENT_LOG_TTL_HOURS"] = previous_ttl
+
+
+class RetainedGuiDefectProofTests(unittest.TestCase):
+    def test_each_retention_regression_check_catches_a_production_defect(self):
+        with open(GUI_PATH, encoding="utf-8") as handle:
+            source = handle.read()
+        defects = [
+            ("answer", "if not size and answer_key[1]:", "if False and answer_key[1]:",
+             "test_final_answer_survives_pruning_without_becoming_provider_json"),
+            ("cache", "key = (name, mtime, size, answer_key)", "key = (name, mtime, size)",
+             "test_retained_answer_cache_refreshes_when_answer_changes"),
+            ("cap", 'b[fld] = v[:_DIALOG_BLOCK_CAP]', 'b[fld] = v',
+             "test_retained_answer_obeys_default_payload_cap"),
+            ("title", 'path = safe_task_path(name, ".original.prompt")', 'path = None',
+             "test_prompt_title_survives_pruned_and_rotated_logs"),
+            ("activity", 'epoch = float(meta.get("activity_epoch") or 0)', 'epoch = 0',
+             "test_retained_activity_is_the_liveness_clock"),
+            ("digest", 'if kind in known:', 'if False and kind in known:',
+             "test_digest_activity_emoji_survives_pruned_raw_log"),
+            ("failure-states", '"limited": "⚠️", "silent": "⏱"', '"limited": "•", "silent": "•"',
+             "test_limited_and_silent_keep_reason_and_have_explicit_icons"),
+            ("artifact", '".meta", ".answer", ".original.prompt"', '".meta", ".original.prompt"',
+             "test_new_artifact_suffixes_preserve_path_guard"),
+            ("progress", 'if data.get("progress"): args += ["--progress"]',
+             'if data.get("progress"): args += ["-p"]',
+             "test_gui_progress_is_opt_in_and_uses_unambiguous_flag"),
+            ("gui-ttl", '_prune_task(_StateStore(LOGDIR), name, d)', 'pass',
+             "test_gui_read_prunes_expired_log_preserves_answer_and_honors_opt_ins"),
+        ]
+        global gui
+        original_gui = gui
+        try:
+            for name, anchor, replacement, method in defects:
+                with self.subTest(defect=name):
+                    self.assertEqual(source.count(anchor), 1, "mutation must match exactly once")
+                    mutated = types.ModuleType("gui_defect_" + name.replace("-", "_"))
+                    mutated.__file__ = GUI_PATH
+                    exec(compile(source.replace(anchor, replacement, 1), GUI_PATH, "exec"), mutated.__dict__)
+                    gui = mutated
+                    result = unittest.TestResult()
+                    RetainedTaskTests(method).run(result)
+                    self.assertFalse(result.errors, "proof must fail its behavior assertion, not the harness")
+                    self.assertTrue(result.failures, "planted defect escaped the targeted check")
+        finally:
+            gui = original_gui
+
+
 class GuiPostBodyGuardTests(unittest.TestCase):
     """gui.do_POST answers garbled/oversized bodies with controlled 400/413 instead of
     crashing on int()/rfile.read or reading an unbounded body into memory."""

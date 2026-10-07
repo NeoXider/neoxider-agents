@@ -83,7 +83,7 @@ class Heartbeat(unittest.TestCase):
 
 def prove_defects():
     from neoxider_agents.providers import hidden_options
-    base = Path("D:/Temp/agents-core/review") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/review"
+    base = Path("D:/Temp/agents-ux/review") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/review"
     base.mkdir(parents=True, exist_ok=True)
     defects = [
         ('os.environ.get("AGENT_OPENCODE_TOOL_KEEPALIVE", "1") == "1"', 'True', "test_environment_opt_out"),

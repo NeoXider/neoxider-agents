@@ -52,6 +52,8 @@ class OutputFilter:
         self._spool_prefix = task or os.environ.get("AGENT_TASK") or "output"
         self._spool_id = "%s-%s" % (os.getpid(), uuid.uuid4().hex)
         self._claude_new_message = True
+        self.usage = {}
+        self.cost = None
 
     def _spool(self, suffix="answer"):
         if not self._spool_root:
@@ -224,9 +226,31 @@ class OutputFilter:
             self.raw_size -= len(self.raw.popleft())
 
     def _activity(self, event):
-        from activity import digest, record_event
+        from activity import digest
+        from .logs import record_digest
         self.events = list(digest(event))
-        record_event(event, self.engine)
+        target = os.environ.get("AGENT_ACTIVITY_FILE")
+        if target:
+            for kind, detail in self.events:
+                record_digest(target, kind, detail, self.engine)
+        tag = event.get("type", "")
+        part = event.get("part") or {}
+        usage = event.get("usage") or part.get("tokens") or part.get("usage")
+        if isinstance(usage, dict) and tag in ("result", "turn.completed", "step_finish"):
+            # Preserve provider-reported numeric counts only; no invented estimates.
+            numeric = {k: v for k, v in usage.items() if isinstance(v, (int, float))}
+            aliases = {"input": "input_tokens", "output": "output_tokens", "total": "total_tokens", "reasoning": "reasoning_tokens"}
+            cache = usage.get("cache")
+            if isinstance(cache, dict):
+                for key in ("read", "write"):
+                    if isinstance(cache.get(key), (int, float)):
+                        numeric["cache_%s_tokens" % key] = cache[key]
+            for key, value in numeric.items():
+                key = aliases.get(key, key)
+                self.usage[key] = self.usage.get(key, 0) + value
+        cost = event.get("total_cost_usd", event.get("cost", part.get("cost")))
+        if isinstance(cost, (int, float)) and tag in ("result", "turn.completed", "step_finish"):
+            self.cost = (self.cost or 0) + cost
 
     def feed(self, line):
         self.events = []

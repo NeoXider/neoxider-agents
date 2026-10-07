@@ -22,7 +22,7 @@ from neoxider_agents.providers import get_provider
 
 class Contracts(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-core/review") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/review"
+        base = Path("D:/Temp/agents-ux/review") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/review"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="contracts-", dir=base)
         self.addCleanup(self.temp.cleanup)
@@ -188,7 +188,7 @@ class Contracts(unittest.TestCase):
 
 
 def prove_defects():
-    base = Path("D:/Temp/agents-core/review") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/review"
+    base = Path("D:/Temp/agents-ux/review") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/review"
     base.mkdir(parents=True, exist_ok=True)
     defects = [
         ("diagnostics.py", "generated_at=generated, engines=results, raw=raw, deep_engines=deep_engines", "generated_at=generated, engines=results", "test_doctor_legacy_json_shape"),

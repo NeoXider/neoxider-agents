@@ -1,6 +1,6 @@
 """Run each activity regression against a planted defect in an isolated source copy.
 
-No live CLI, no repository edits. Evidence is written under D:/Temp/agents-oc on
+No live CLI, no repository edits. Evidence is written under D:/Temp/agents-ux on
 Windows (a dedicated temp subtree elsewhere). Run: python tests/prove_activity_defects.py
 """
 import importlib.util
@@ -42,7 +42,7 @@ def import_file(name, path):
 
 
 def main():
-    base = Path("D:/Temp/agents-oc") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-oc"
+    base = Path("D:/Temp/agents-ux") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-oc"
     base.mkdir(parents=True, exist_ok=True)
     original = (ROOT / "activity.py").read_text(encoding="utf-8")
     evidence = []

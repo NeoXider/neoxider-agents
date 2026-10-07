@@ -29,6 +29,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import openai_server as _bridge_runtime
 import activity as _activity
+from neoxider_agents.logs import prune_task as _prune_task
+from neoxider_agents.state import Store as _StateStore
 
 # Opt-in diagnostics, same convention as openai_server.py: quiet (WARNING) unless AGENT_LOG_LEVEL
 # says otherwise -- request lines at DEBUG, a bridge kill that could not go through at WARNING,
@@ -166,7 +168,7 @@ def safe_task_name(value):
 def safe_task_path(value, suffix, must_exist=False):
     """Resolve one task artifact under LOGDIR; never return a path outside that directory."""
     name = safe_task_name(value)
-    if name is None or suffix not in (".log", ".meta"):
+    if name is None or suffix not in (".log", ".meta", ".answer", ".original.prompt", ".activity.jsonl"):
         return None
     root = os.path.abspath(LOGDIR)
     path = os.path.abspath(os.path.join(root, name + suffix))
@@ -188,15 +190,33 @@ def task_state(name):
     """Effective state + raw meta for one task, for the /api/wait convenience endpoint --
     a lighter-weight lookup than list_tasks() since it only needs a single named task."""
     meta = read_meta(name)
-    try:
-        log_path = safe_task_path(name, ".log")
-        lm = os.path.getmtime(log_path) if log_path else 0
-    except OSError:
-        lm = 0
+    lm = activity_mtime(name, meta)
     return eff_state(meta, lm, time.time()), meta
+
+
+def activity_mtime(name, meta):
+    """Use retained activity when a bounded raw log has expired or rotated."""
+    stamps = [0]
+    try:
+        epoch = float(meta.get("activity_epoch") or 0)
+        if math.isfinite(epoch) and epoch > 0:
+            stamps.append(epoch)
+    except (TypeError, ValueError):
+        pass
+    for suffix in (".log", ".activity.jsonl"):
+        path = safe_task_path(name, suffix)
+        try:
+            if path:
+                stamps.append(os.path.getmtime(path))
+        except OSError:
+            pass
+    return max(stamps)
 
 def read_meta(name):
     d = {}
+    name = safe_task_name(name)
+    if name is None:
+        return d
     path = safe_task_path(name, ".meta")
     if path is None:
         return d
@@ -208,6 +228,12 @@ def read_meta(name):
                     d[k] = v
     except OSError:
         pass
+    if d:
+        try:
+            _prune_task(_StateStore(LOGDIR), name, d)
+        except OSError:
+            # A read-only/busy state directory must not break the panel's read path.
+            pass
     return d
 
 def _win_pid_alive(pid):
@@ -292,6 +318,15 @@ def clamp_wait_timeout(raw, default=DEFAULT_WAIT_TIMEOUT, cap=WAIT_TIMEOUT_CAP):
 
 def first_prompt(name):
     """First line of the first PROMPT — used as the "chat" title in the tree."""
+    path = safe_task_path(name, ".original.prompt")
+    try:
+        if path:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                title = " ".join(handle.read(512).split())[:90]
+                if title:
+                    return title
+    except OSError:
+        pass
     lines = read_log(name).splitlines()
     for i, l in enumerate(lines):
         if l.strip() in ("> PROMPT:", "> ANSWER:"):
@@ -304,7 +339,8 @@ def first_prompt(name):
             return (" ".join(buf))[:90]
     return ""
 
-ACT_BY_STATE = {"done": "✅", "waiting": "⏳", "error": "❌", "stalled": "⚠️", "stopped": "⏹"}
+ACT_BY_STATE = {"done": "✅", "waiting": "⏳", "error": "❌", "stalled": "⚠️", "stopped": "⏹",
+                "limited": "⚠️", "silent": "⏱"}
 ACT_RULES = [  # for running — based on the log's last line: what it's doing right now
     (("read", "open", "cat ", "grep", "ls "), "📖"),
     (("edit", "appl", "writ", "patch", "creat", "wrote"), "✏️"),
@@ -331,6 +367,10 @@ def activity_emoji(name, state):
     if state in ACT_BY_STATE:
         return ACT_BY_STATE[state]
     if state in LIVE_STATES:   # idle is still a live task, just a quiet one
+        kind = _activity.summary(os.path.join(LOGDIR, name + ".log")).get("kind")
+        known = {"read": "📖", "edited": "✏️", "created": "✏️", "command": "🔧", "thinking": "💭"}
+        if kind in known:
+            return known[kind]
         lines = [l for l in read_log(name).splitlines() if l.strip()]
         last = (lines[-1] if lines else "").lower()
         for kws, em in ACT_RULES:
@@ -371,9 +411,8 @@ def list_tasks():
             continue
         meta = read_meta(name)
         logp = os.path.join(LOGDIR, name + ".log")
-        try:
-            lm = os.path.getmtime(logp)
-        except OSError:
+        lm = activity_mtime(name, meta)
+        if not lm:
             lm = os.path.getmtime(os.path.join(LOGDIR, mf)) if os.path.exists(os.path.join(LOGDIR, mf)) else 0
         st = eff_state(meta, lm, nowt)
         title = first_prompt(name)
@@ -393,6 +432,7 @@ def list_tasks():
             "started": meta.get("started", ""),
             "kind": meta.get("kind", ""),  # "api-test" for agent.sh test-api tasks, else ""
             "timeout": meta.get("timeout", ""),  # set when the step watchdog killed the task (exit 124)
+            "reason": _activity.redact(meta.get("reason", ""))[:500],
             "idle_sec": int(nowt - lm) if lm else None,
             "updated": lm,
             "queued": queued_messages(name),
@@ -742,13 +782,29 @@ def dialog_payload(name, full=False, offset=None, limit=None):
         mtime, size = 0, 0
     now = time.time()
     meta = read_meta(name)
-    state = eff_state(meta, mtime, now)
-    key = (name, mtime, size)
+    state = eff_state(meta, activity_mtime(name, meta), now)
+    answer_path = safe_task_path(name, ".answer")
+    try:
+        answer_stat = os.stat(answer_path) if answer_path else None
+        answer_key = (answer_stat.st_mtime_ns, answer_stat.st_size) if answer_stat else (0, 0)
+    except OSError:
+        answer_key = (0, 0)
+    key = (name, mtime, size, answer_key)
     hit = _DIALOG_CACHE.get("parsed")
     if hit and hit[0] == key:
         steps = hit[1]
     else:
         steps = parse_dialog(read_log(name), mtime, now)
+        if not size and answer_key[1]:
+            try:
+                with open(answer_path, encoding="utf-8", errors="replace") as handle:
+                    answer = handle.read()
+                # The retained answer is a text block, never interpreted as provider JSON.
+                steps = [{"kind": "result", "prompt": "", "blocks": [{"type": "text", "text": answer}],
+                          "epoch": None, "ts": "", "info": "", "prompt_label": "",
+                          "duration_s": None, "duration": ""}]
+            except OSError:
+                pass
         _DIALOG_CACHE.clear()
         _DIALOG_CACHE["parsed"] = (key, steps)
     total = len(steps)
@@ -776,7 +832,8 @@ def dialog_payload(name, full=False, offset=None, limit=None):
     return {"name": name, "state": state, "engine": meta.get("engine", "?"),
             "model": meta.get("model", "?"), "total_steps": total, "offset": off,
             "has_more": off > 0, "steps": out, "now": now,
-            "mtime": mtime, "log_size": size}
+            "mtime": mtime or (answer_key[0] / 1000000000), "log_size": size,
+            "raw_log_available": bool(size)}
 
 def _hidden_windows_kwargs(new_process_group=False):
     """Popen/run kwargs that prevent Windows' default terminal from creating a visible tab."""
@@ -1979,7 +2036,7 @@ class H(BaseHTTPRequestHandler):
             if rdir:                 args += ["-C", rdir]
             if task_name:             args += ["-t", task_name]
             if parent_name:           args += ["-P", parent_name]
-            if data.get("progress"): args += ["-p"]
+            if data.get("progress"): args += ["--progress"]
             args.append(prompt)
             spawn(args, terminal=terminal)
             if rdir:  # remember the project
@@ -2001,7 +2058,7 @@ class H(BaseHTTPRequestHandler):
             if not isinstance(terminal, bool):
                 return self._send(400, json.dumps({"error": "terminal must be a boolean"}))
             args = ["reply", task, answer]
-            if data.get("progress"): args = ["reply", "-p", task, answer]
+            if data.get("progress"): args = ["reply", "--progress", task, answer]
             spawn(args, terminal=terminal)
             self._send(200, json.dumps({"ok": True}))
         elif u.path == "/api/project":

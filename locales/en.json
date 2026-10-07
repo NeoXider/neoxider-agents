@@ -39,7 +39,7 @@
   "form.auto": "auto",
   "form.prompt": "prompt",
   "form.prompt_placeholder": "do exactly this…",
-  "form.progress": "keep a PROGRESS.md (-p)",
+  "form.progress": "keep per-task progress (--progress)",
   "form.terminal": "open in a terminal (see the live chat)",
   "form.run": "▶ run",
   "limits.title": "Limits",

@@ -12,6 +12,7 @@ function notifyTransitions(tasks) {
                            : t("toast.task_error") + " " + (task.exit || "?"));
       else if (task.state === "waiting") toast("warning", "⏳ " + task.name, t("toast.task_waiting"));
       else if (task.state === "stalled") toast("warning", "⚠ " + task.name, t("toast.task_stalled"));
+      else if (["limited", "silent"].includes(task.state)) toast("warning", task.name, task.reason || task.state);
     }
     prevStates[task.name] = task.state;
   }

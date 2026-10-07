@@ -23,15 +23,89 @@ and install the command with `powershell -NoProfile -ExecutionPolicy Bypass -Fil
 Open a new shell and use these three commands:
 
 ```powershell
-neoxider doctor
-neoxider run -t fix-readme -C D:/Git/MyProject "Fix the README typo and report the change"
-neoxider send fix-readme "Also check the example command"
+neoxider ask "Explain this project in two sentences"
+neoxider -t fix-readme "Fix the README typo and report the change"
+neoxider result fix-readme --json
 ```
 
-`run` stays in the foreground until the answer is ready. Track that command as a background
+Run these from your project directory. No subcommand means `run`; `ask` prints only the final
+answer and returns the task exit code. `run` stays in the foreground until the answer is ready,
+printing one start line and a final-result block. Track that command as a background
 job through your orchestrator's harness to receive completion notifications. From another
 shell use `neoxider peek fix-readme`, `neoxider stop fix-readme` or `neoxider restart fix-readme`.
 Without installing PATH, use `.\agent.ps1` or `.\bin\neoxider.cmd`.
+
+### Defaults and files
+
+| Setting | Default | Change it |
+|---|---|---|
+| Working directory | Current directory | `-C DIR` |
+| Task name | Short prompt slug plus four random characters; collision checked | `-t NAME` |
+| Engine/model/effort | Flags, then `AGENT_ENGINE` / `AGENT_MODEL` / `AGENT_EFFORT`, then config; otherwise installed-engine detection | `config set engine codex`, `config set model MODEL`, `config set effort low` |
+| Project progress file | Off | `--progress` or `AGENT_PROGRESS=1`; `--no-progress` remains accepted |
+| Terminal output | One start line and one final block; `ask` is answer only | `-v` / `--verbose` streams output; `--no-terse` changes prompt concision |
+| Raw provider logs | Ephemeral tail, at most 2 MiB per task, expires after 24 hours | `--log` / `AGENT_KEEP_LOGS=1` keeps full logs; `AGENT_LOG_MAX_BYTES` / `AGENT_LOG_TTL_HOURS` |
+| Desktop notifications | Off | `--notify` / `AGENT_NOTIFY=1`, best effort |
+
+The wrapper writes no project files by default. `--progress` asks the worker to maintain
+`PROGRESS.<task>.md` there; provider work can still change the files the task requests.
+All task state lives under `AGENT_CLI_LOGS` (default `~/.claude/agent-cli-logs`): `.meta`
+(state/session/ownership), `.answer` (final answer), `.activity.jsonl` (compact redacted digest),
+baseline/history/control sidecars, original prompt and `.inbox/` (durable messages). The `.log`
+tail is optional diagnostic data: `peek`, `top`, `diff`, `result`, `last`, controls and `wait`
+continue working after it is pruned. TTL pruning is lazy: it occurs on the next CLI or GUI
+state read, without a background deletion daemon;
+`clean` removes settled raw logs immediately. `--log` skips automatic TTL pruning until cleaned.
+Snapshots (`.md`) summarize retained results; they do not preserve a second raw transcript.
+The provider's own native sessions remain in its normal provider directories.
+
+| State artifact (prefix = task name) | Purpose / retention |
+|---|---|
+| `.meta`, `.answer`, `.activity.jsonl` | Task state/session ID, clean final or partial answer, compact redacted activity; kept while listed |
+| `.baseline.json`, `.baseline.files/` | Start status/hashes and private text snapshots; at most 2 MiB text per file / 16 MiB per task |
+| `.changes.json`, `.history.jsonl` | Frozen final deltas and allowlisted redacted send/stop/restart metadata; history excludes prompts |
+| `.original.prompt`, `.prompt`, `.fan.prompt` | Original/resume/provider input, kept in state rather than provider argv |
+| `.inbox/` | Ordered queued messages, including in-flight messages preserved for recovery |
+| `.stop`, `.seen`, `.md` | Cancellation report, result-read marker and final-result Markdown summary |
+| `.log` | Ephemeral raw tail by default; `--log` retains full output; `clean` removes settled raw logs |
+| `.launcher.log` | Fan launcher output only with `--log`; default fan stdout is discarded; `clean` removes settled launcher logs |
+| `.control`, lock/reservation/answer-spool files | Transient control, atomic publication and streaming transport; normally removed by the owner |
+
+Baseline hashes cover binary/large files, with line counts unavailable beyond snapshot limits.
+The manifest ignores VCS/dependency/cache/build directories (`.git`, `.hg`, `.svn`,
+`node_modules`, `.venv`, `venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`,
+`.cache`, `dist`, `build`), `PROGRESS.*.md`, `.agent*` and the configured state subtree.
+Declared `--owns` scopes reported file paths. `clean --purge` also removes settled task state;
+undelivered inboxes are protected unless `--all` / `--purge` is explicit.
+
+Config lives in `%APPDATA%/neoxider-agents/config.json` on Windows or
+`$XDG_CONFIG_HOME/neoxider-agents/config.json` or `~/.config/neoxider-agents/config.json` on POSIX.
+`AGENT_CONFIG` selects a different config file. Config keys are `engine`, `model` and `effort`;
+an explicit different engine skips that config's model/effort. Without an engine setting,
+local detection prefers installed Claude and otherwise the first installed provider.
+Use `neoxider config list`,
+`neoxider config get engine`, and `neoxider config set engine codex`.
+Install completions once with `neoxider completion powershell --install`
+(`bash` and `zsh` are also supported).
+
+Prompts can come from `neoxider -p prompt.txt`, `neoxider --prompt-file prompt.txt`, or
+`Get-Content -Raw prompt.txt | neoxider -`. Provider prompts always travel through a file or
+stdin, preserving Unicode and avoiding Windows' command-line length limit. Use a prompt file
+or stdin for large inputs. Errors fit on one line with a fix; `--debug` exposes diagnostics.
+
+```powershell
+neoxider brief --outcome "Fix the parser; all parser tests pass" --owns "src/parser.py,tests/test_parser.py" --not-touch "providers/**" --return "Changed files and test evidence" | neoxider run -t parser -
+neoxider top --once
+neoxider diff parser --stat
+```
+
+`top` (alias `dashboard`) shows your orchestrator's tasks; `--json` emits a snapshot.
+`watch NAME` follows readable activity with a status footer. `diff NAME` compares file content
+with the start baseline, including pre-existing dirty files; `--names` and `--stat` summarize it.
+In a shared directory these are changes during the task's lifetime, not proof of authorship.
+`--owns "glob,glob"` warns about running ownership overlaps; `--strict-owns` refuses them.
+Observed shared-file changes also warn. Use disjoint ownership or isolated worktrees when
+several agents may edit at once.
 
 No daemon, database or dependency install. Python uses only the standard library; Windows
 needs no Git Bash or WSL, and Linux/macOS launch through the POSIX shim.
@@ -131,27 +205,38 @@ side effect); `neoxider gui [port]` opens the panel; everything else passes stra
 | Change direction | Keep the worker identity | `send NAME --now TEXT` interrupts and resumes inside the existing wrapper |
 | Launcher cancelled | No abandoned worker | Job Object / process group kills descendants; recovery reports `launcher stopped` |
 | Recover | Continue saved context | `restart NAME`, or `restart NAME --fresh` for a new session |
+| Quick answer | Foreground answer with task exit code | `ask TEXT`; output contains only the final answer |
+| Observe a wave | Activity and queued messages | `top [--once] [--json]`, `peek NAME`, `watch NAME` |
+| Review changes | Compare with the task's starting tree | `diff NAME [--names or --stat]`; dirty trees and non-git directories supported |
+| Review completion | Retained structured report | `result NAME [--json]`, including answer, files, duration, usage when known and control history |
 
 Command reference (native PowerShell/cmd: `neoxider`; POSIX: `./agent.sh`):
 
 | Commands | Arguments / purpose |
 |---|---|
-| `run`, `ask` | `[task options] TEXT` or `--prompt-file FILE`; foreground new task (`ask` is an alias) |
+| `run`, `ask` | `[task options] TEXT`, `-p FILE` / `--prompt-file FILE`, or `-` stdin; no subcommand also runs; ask prints only the final answer |
+| `brief` | `--outcome TEXT --owns GLOBS --not-touch GLOBS --return TEXT [--context-file FILE]`; prints a contract for piping to `run -` |
 | `fan` | `[task options] TEXT...`; launch a wave, then track `wait` |
 | `send`, `reply`, `restart` | `NAME [TEXT or --prompt-file FILE]`; send/reply accept `--now`/`--flush`, restart accepts `--fresh` |
 | `stop`, `peek`, `log` | `stop NAME...` / `--all-mine`; `peek NAME [-n N] [-f] [--raw]`; `log [NAME] [-f] [-n N] [-l]` |
-| `last`, `result`, `status`, `list` | `[NAME]` for answer/status (`result` aliases `last`); `list [LIMIT]` defaults to 20 |
+| `last`, `status`, `list` | `[NAME]` for final answer/status; `list [LIMIT]` defaults to 20 |
+| `top`, `dashboard`, `watch` | `top [--once] [--json]`; `watch NAME` follows digest and status |
+| `diff`, `result` | `diff NAME [--stat or --names]`; `result NAME [--json]` returns structured completion |
 | `pending`, `wait` | `pending [--strict]`; `wait [NAME...] [--timeout SEC] [--poll SEC]` |
 | `clean`, `prune` | `[--all] [--purge] [-n or --dry-run]`; `prune` aliases `clean` |
 | `doctor`, `provider-info` | `doctor [--json or --deep]`; `provider-info ENGINE` prints one provider's diagnostic JSON |
 | `test-api` | `--base-url URL --goal TEXT [--out FILE] [task options]` |
 | `gui`, `openai-server` | `gui [PORT] [--localhost or --lan --token SECRET]`; `openai-server [-e ENGINE] [-m MODEL] [-f EFFORT] [-p PORT] [--api-key SECRET]` |
-| `completion`, `help` | `completion powershell or bash or zsh`; `help [COMMAND]` / `COMMAND --help` |
+| `config`, `completion`, `help` | `config get KEY`, `config set KEY VALUE`, `config list`; `completion powershell or bash or zsh [--install]`; `help [COMMAND]` / `COMMAND --help` |
 
 Task options: `-e ENGINE -m MODEL -f EFFORT -C DIR -t NAME -P PARENT`.
-`-P` sets ownership; `-p` accepts the default progress mode, `--no-progress` disables it.
-`--no-terse`/`--verbose` suppress the terse directive; `--terminal` explicitly permits a visible
-provider console. Service `openai-server -p` sets its port. See [SKILL.md](SKILL.md) for examples.
+`-P` sets ownership. `--owns GLOBS` / `--strict-owns` guard declared ownership. Progress is
+opt-in (`--progress`); legacy bare `-p` remains a compatibility flag when trailing or followed
+by another option, while `-p FILE` reads a prompt. Ambiguous old `-p TEXT` gives a fix to use
+`--progress TEXT`. `--no-progress` is accepted silently. `--no-terse` suppresses the terse directive;
+`-v` / `--verbose` streams output, `--log` keeps full logs, and `--notify` enables optional
+desktop notifications. `--terminal` explicitly permits a visible provider console.
+Service `openai-server -p` sets its port. See [SKILL.md](SKILL.md) for examples.
 
 ### Python core and migration
 
@@ -217,13 +302,13 @@ Both servers refuse to be careless about it:
 - **Control a running agent.** `send` queues durable follow-ups, `peek` shows readable activity,
   `stop` interrupts a task by name, and `restart` continues its saved session. `reply` is an
   alias for `send`.
-- **One thread per task.** `run` creates `<name>.log` + `<name>.meta`; every `reply` appends to
-  the *same* log with a timestamped header, so the whole conversation with a subagent reads as
-  one file — no session hunting.
+- **One identity per task.** Metadata, final answers, redacted activity and durable messages
+  outlive the bounded raw log. `--log` retains the complete diagnostic transcript.
 - **Live state, not just logs.** `running` / `running (no output for Nm)` (alive but quiet) /
   `waiting` (the agent asked a question) / `done` / `error` / `stalled` (process died — e.g. the
-  machine was turned off) / `stopped` (`⏹`, stopped by the orchestrator). The CLI and the GUI run the *same* liveness rules, so they cannot
-  disagree about a task.
+  machine was turned off) / `stopped` (`⏹`, stopped by the orchestrator) / `limited` (provider
+  limit/auth/model failure) / `silent` (no-output watchdog). The GUI shares the owner-liveness
+  rule; the CLI additionally checks engine descendants for legacy quiet tasks (see [GUI notes](docs/GUI.md)).
 - **No silent forever-hangs.** Every step runs under a wall-clock deadline (`AGENT_TIMEOUT_SEC`,
   default 30 min). On expiry the whole process tree is killed — including the native Windows
   grandchildren a plain `timeout` leaves orphaned — the log gets an explicit `!! TIMEOUT …` line
@@ -231,7 +316,7 @@ Both servers refuse to be careless about it:
 - **Durable checkpoints.** A markdown snapshot (`<name>.md`) after every step, plus the CLI's own
   resumable sessions: a task survives a reboot, and `agent.sh reply <name> "continue"` picks up
   where it left off. Each task also keeps its own `PROGRESS.<task>.md` checklist in the working
-  directory (`--no-progress` opts out).
+  directory only with `--progress` or `AGENT_PROGRESS=1`.
 - **`fan` — parallel batches in one call.** `agent.sh fan -t audit -C dir "p1" "p2" "p3"` launches
   each prompt as its own background task (`audit-01`, `audit-02`, …) and returns immediately.
 - **`doctor` — pre-flight before you fan out.** Which CLIs are installed, login state, and live
@@ -260,10 +345,10 @@ Both servers refuse to be careless about it:
 <details>
 <summary><b>A real HTTP API, not just a GUI backend</b> — <code>/api/thread</code>, <code>/api/stream</code>, <code>/api/wait</code></summary>
 
-History = the task's own `<name>.log`, already the full multi-turn conversation (every
-`run`/`reply` appends to it with a timestamped header) — `/api/thread?task=<name>` exposes it
-as-is, nothing extra to build. Tool calls = the underlying CLI's own real shell/file actions,
-verbatim in the log; there is no separate "tool call" schema layered on top.
+`/api/thread?task=<name>` exposes the available raw log tail. `--log` retains the full
+multi-turn transcript; with default retention old turns can be truncated or expire.
+`/api/dialog` falls back to the retained final answer after raw pruning. Queue, activity,
+failure reason and stop/send controls remain available.
 
 - **`/api/stream?task=<name>`** — a Server-Sent Events (`text/event-stream`) endpoint that tails a
   task's `.log` in real time and pushes each new line as a `data: …` event, instead of making the
@@ -281,7 +366,7 @@ verbatim in the log; there is no separate "tool call" schema layered on top.
 <details>
 <summary><b>Shared state, multiple installs, GUI port behaviour</b></summary>
 
-All state (`.meta`/`.log`/`.md` per task) lives under `AGENT_CLI_LOGS`
+All state (metadata, answer, digest, baseline, raw tail and inbox) lives under `AGENT_CLI_LOGS`
 (`~/.claude/agent-cli-logs` by default) — shared on purpose, so one GUI shows every subagent no
 matter which provider or which install launched it; concurrent writes to the same task are made
 safe by a portable file lock. For strict isolation (two people on one machine, "personal" vs
@@ -348,7 +433,7 @@ bash agent.sh wait fix-readme
 Use `--now` when the current work must change immediately: it stops the current process tree
 and resumes with the new message plus queued messages. Tool edits already made remain on disk;
 an interrupted command may be incomplete. Plain `stop` preserves the session ID, inbox, log and
-`PROGRESS.<task>.md`; repeated stops are harmless. Stop uses process-tree termination and cannot
+any opt-in `PROGRESS.<task>.md`; repeated stops are harmless. Stop uses process-tree termination and cannot
 guarantee graceful native cancellation. `stop --all-mine` uses `AGENT_PARENT`, or
 `AGENT_ORCHESTRATOR_ID` when parent ownership is absent; it refuses if no ownership is available.
 Set ownership consistently when launching and controlling tasks. `restart` normally keeps the

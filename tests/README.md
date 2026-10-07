@@ -6,9 +6,9 @@ Bash suites exercise the one-release legacy implementation; live checks are sepa
 ## Native core and entries
 
 ```powershell
-$env:AGENT_CLI_LOGS = 'D:/Temp/agents-core/tests/state'
+$env:AGENT_CLI_LOGS = 'D:/Temp/agents-ux/tests/state'
 python -m unittest discover -s tests -p 'test_*.py' -v
-python tests/bench_agent.py --out D:/Temp/agents-core/bench/core.json --check
+python tests/bench_agent.py --out D:/Temp/agents-ux/bench/acceptance-final.json --check
 powershell.exe -NoProfile -File tests/test_powershell_entry.ps1
 ```
 
@@ -20,11 +20,20 @@ from PATH and checks PowerShell/cmd UTF-8 prompts. PowerShell 7 is skipped when 
 
 `prove_core_defects.py` and the provider, contract and heartbeat suites' `--prove-defects` modes
 plant production source defects on disposable copies. Process mutation results are retained in
-the acceptance evidence under `D:/Temp/agents-core/process/proofs/`.
+the Phase 2A acceptance evidence under `D:/Temp/agents-core/process/proofs/`.
 `bench_agent.py --prove-budgets` plants violations of the budget
 gates. All test state uses isolated scratch directories; Windows defaults are under
-`D:/Temp/agents-core/`. `check_windows.py` samples visible windows on monotonic 100 ms deadlines
+`D:/Temp/agents-ux/`. `check_windows.py` samples visible windows on monotonic 100 ms deadlines
 and records timing gaps and overruns.
+
+Phase 2B adds `test_ux_launch.py` (29 contracts), `test_ux_storage.py` (30),
+`test_ux_tracking.py` (48), and GUI TTL/retained-answer coverage. Launch and tracking suites
+accept `--prove-defects`; `python tests/prove_ux_storage.py` proves storage contracts.
+GUI defect proofs are embedded in `tests/test_gui.py`: run
+`python -B tests/test_gui.py RetainedGuiDefectProofTests -v` for its ten source mutations.
+Use `AGENT_GUI_TEST_ROOT=D:/Temp/agents-ux/gui-proof` for isolated GUI fixtures. Other
+disposable source copies and failures live under `D:/Temp/agents-ux/`. The benchmark
+separately proves its budget gates.
 
 ## Frontend toast suite
 

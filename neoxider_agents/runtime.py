@@ -59,6 +59,8 @@ class Turn:
         self.provider, self.model, self.effort = provider, model, effort
         self.directory, self.session, self.prompt = directory, session, prompt
         self.terminal = terminal
+        from .logs import enabled
+        self.verbose = enabled(store.read(name).get("verbose", "0"))
         self.action = None
         self.reason = ""
         self.by = ""
@@ -97,8 +99,12 @@ class Turn:
     def _line(self, line, log, output_filter):
         if line.endswith("\r\n"):
             line = line[:-2] + "\n"
+        if self.provider.engine in ("codex", "opencode", "kimi", "claude") and line.lstrip().startswith("{"):
+            log.write(line)
         for fragment in output_filter.feed(line):
             log.write(fragment)
+            if self.verbose:
+                print(fragment, end="", flush=True)
             self.output.append(fragment[-4096:])
             if fragment.strip():
                 self.last_activity = fragment.strip().splitlines()[-1][:500]
@@ -107,14 +113,15 @@ class Turn:
             self.last_activity = "%s %s" % (kind, detail)
             log.write("[agent-activity] " + self.last_activity + "\n")
         log.flush()
+        from activity import redact
         sid = output_filter.session
         if sid and sid != self.session:
             self.session = sid
             self.store.update(self.name, session=sid)
         # Filter activity sidecar is redacted and decoded in-process.
         if time.monotonic() - self.last_meta_time >= 0.5:
-            self.store.update(self.name, activity_epoch=time.time(), last_activity=" ".join(self.last_activity.split())[:500],
-                              partial_result=" ".join(output_filter.last_assistant[-1200:].split()))
+            self.store.update(self.name, activity_epoch=time.time(), last_activity=redact(" ".join(self.last_activity.split()))[:500],
+                              partial_result=redact(" ".join(output_filter.last_assistant[-1200:].split())))
             self.last_meta_time = time.monotonic()
 
     def run(self):
@@ -156,7 +163,8 @@ class Turn:
             self.store.update(self.name, provider_pid=self.tree.pid, provider_start=self.tree.stamp,
                               job_name=self.tree.job_name, control_event=getattr(control, "name", self.name))
             heartbeat = ToolHeartbeat(self.provider.engine, self.tree.pid)
-            with self.store.path(self.name, ".log").open("a", encoding="utf-8", newline="\n") as log:
+            from .logs import TailWriter, enabled, record_digest
+            with TailWriter(self.store.path(self.name, ".log"), enabled(self.store.read(self.name).get("keep_logs", "0"))) as log:
                 pump = threading.Thread(target=self._pump, args=(self.tree.process.stdout, log, output_filter), daemon=True)
                 pump.start()
                 previous = None
@@ -185,6 +193,7 @@ class Turn:
                     if activity:
                         self.last_output_time = time.monotonic()
                         self.last_activity = activity
+                        record_digest(self.store.path(self.name, ".activity.jsonl"), "tool", activity, self.provider.engine)
                         log.write("[agent-activity] " + activity + "\n")
                         log.flush()
                         self.store.update(self.name, activity_epoch=time.time(), last_activity=activity)

@@ -1,6 +1,6 @@
 ---
 name: neoxider-agents
-description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (Claude Code / Opus 5 by default; also Kimi Code / Kimi K3, Codex, opencode, and Gemini) through the agent.sh wrapper, then verify and integrate their results. Covers run/fan, model selection, resume/reply, logs, and verification. Also covers ledger mode for single hard tasks (plan/tasks.json/notes/solution loop with test verifier, up to 10 rounds). Use for multi-agent coordination, bounded delegation, worker recovery and verification; keep small or tightly coupled work local.
+description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (configured or detected engine; Claude Code, Kimi Code, Codex, opencode, Gemini) through native neoxider launchers, then verify and integrate their results. Covers ask/run/brief, top/diff/result, model selection, send/stop/restart, retention, and verification. Also covers ledger mode for single hard tasks (plan/tasks.json/notes/solution loop with test verifier, up to 10 rounds). Use for multi-agent coordination, bounded delegation, worker recovery and verification; keep small or tightly coupled work local.
 ---
 
 # CLI Subagents (Codex Orchestration)
@@ -69,7 +69,11 @@ do not create workers, ledgers, or progress files solely to follow a ritual.
    ports, process restarts and releases: disjoint source files alone do not make tasks independent.
    Workers must not commit, publish, restart shared services or expand scope unless assigned that
    responsibility. Keep useful independent implementation or integration work for yourself.
-4. **Track without churn.** Reuse the exact task/session ID. Prefer `peek` for readable activity,
+   Build a contract with `brief --outcome ... --owns ... --not-touch ... --return ...` and pipe
+   it to `run -`. Add `run --owns "glob,glob"` to record ownership; `--strict-owns` refuses
+   overlapping declarations from running tasks. `brief --owns` only writes prompt text.
+4. **Track without churn.** Reuse the exact task/session ID. Use `top --once` for your wave,
+   `diff NAME` to inspect baseline changes and `result NAME --json` for completion. Prefer `peek` for readable activity,
    `send` for follow-ups, `stop` for cancellation and `restart` for recovery over blind waiting.
    Read logs before retrying; distinguish
    a provider interruption from a failed implementation. Check partial edits and side effects before
@@ -148,13 +152,19 @@ coordination channel either way — no extra DSH plugin required.
 ## Commands
 
 ```powershell
-& $SK run  -t fix-readme -C D:/Git/Proj "prompt" # claude, claude-opus-5 (default); -t = task name
-& $SK ask  -t inspect -C dir "prompt"           # alias for the same foreground run
+& $SK "prompt"                                  # no subcommand = run; cwd/config/detected engine
+& $SK run  -t fix-readme -C D:/Git/Proj "prompt" # -t = explicit task name
+& $SK ask  -C dir "prompt"                      # final answer only; exit code = task result
+& $SK -p prompt.txt                             # prompt file; provider argv never carries the prompt
+Get-Content -Raw prompt.txt | & $SK -            # stdin; Unicode and long text
+& $SK brief --outcome "Tests pass" --owns "src/**" --not-touch "providers/**" --return "Files and evidence" | & $SK run -t fix --owns "src/**" -
 & $SK fan  -t audit -C dir "prompt A" "prompt B" # N parallel background tasks from one call
                                                      # (audit-01, audit-02, ...); shared -e/-m/-f/-C;
                                                      # returns at once — poll with list/status.
                                                      # Use instead of a hand-written `run ... &` loop
-& $SK run  -t big-job -C dir "prompt"            # agent keeps PROGRESS.<task>.md by default (per-task, resumable + orchestrator-readable); --no-progress opts out
+& $SK run  --progress -t big-job -C dir "prompt" # opt-in PROGRESS.<task>.md; default creates no project files
+& $SK run  --log -v -t diagnose "prompt"        # full persistent raw log + live terminal stream
+& $SK run  --notify "prompt"                    # optional best-effort finish/waiting notification
 & $SK run  --no-terse -C dir "prompt"            # terse (concision) directive is ON by default to save output/turn tokens; --no-terse for exploratory/ambiguous work
 & $SK run  --prompt-file p.txt -C dir            # prompt from a FILE, for text too long to pass as an argument
                                                      # (the platform caps a command line near 32000 chars); works for `reply` too,
@@ -173,11 +183,14 @@ coordination channel either way — no extra DSH plugin required.
 & $SK stop NAME... | --all-mine                  # stop the process tree; preserve session and files
 & $SK restart NAME [TEXT | --prompt-file F] [--fresh] # resume, or new session from original prompt
 & $SK peek NAME [-n N] [-f] [--raw]              # readable recent activity; default last 25 entries
-& $SK log  fix-readme                            # the entire task thread (run + all replies in one file)
+& $SK watch NAME                                # peek -f with status footer
+& $SK top [--once] [--json]                      # orchestrator tasks; dashboard is an alias
+& $SK diff NAME [--stat] [--names]               # content baseline, including initial dirty tree
+& $SK log  fix-readme                            # available raw tail; --log at run retains the whole thread
 & $SK log  -f fix-readme                         # follow a live background agent (tail -f)
 & $SK log  -l fix-readme                         # only the last step
 & $SK last fix-readme                            # only the agent's last answer
-& $SK result fix-readme                          # alias for last; includes retained STOPPED report
+& $SK result fix-readme [--json]                 # state, answer, files, duration, known usage/cost, control history
 & $SK pending [--strict]                         # unread results / tasks needing attention; strict exits 3
 & $SK status fix-readme                          # state, last activity/age, queued messages, changed files
 & $SK wait name-a name-b                         # BLOCK until named tasks settle, then print each final answer;
@@ -186,7 +199,7 @@ coordination channel either way — no extra DSH plugin required.
 & $SK wait --timeout 3600                        # no names = watch ALL currently-running tasks (whole wave); default poll 5s
 & $SK wait name-a --poll 2                       # report polling interval in seconds; internal control remains responsive
 & $SK list                                       # table: state / engine / model / age / files / session
-& $SK clean                                      # delete md clutter (<name>.md + PROGRESS.<name>.md) of STOPPED
+& $SK clean                                      # prune settled raw logs and md clutter
                                                      # tasks; live running/idle tasks are never touched;
                                                      # protects undelivered inboxes unless --all/--purge;
                                                      # --all incl. waiting, --purge also .log/.meta, -n dry-run
@@ -203,19 +216,67 @@ coordination channel either way — no extra DSH plugin required.
                                                      # --lan (the panel launches full-auto agents); the other device
                                                      # opens http://<this-host>:8765/?token=SECRET once
 & $SK openai-server -e claude -m sonnet -p 8801    # OpenAI-compatible bridge; service -p means port
-& $SK completion powershell                     # prints completion script; also bash or zsh
+& $SK config list                                # small engine/model/effort config; get KEY / set KEY VALUE
+& $SK completion powershell --install           # install task/flag/engine/model completion; also bash or zsh
 & $SK help provider-info                        # command reference; COMMAND --help also starts nothing
 ```
 
 Task commands (`run`/`ask`/`fan`/`send`/`reply`/`restart`/`test-api`) accept `-e ENGINE`,
 `-m MODEL`, `-f EFFORT`, `-C DIR`, `-t NAME` and `-P PARENT`.
 For `run`/`ask`/`send`/`reply`/`restart`, `--prompt-file FILE` replaces the message argument.
-`-P` sets ownership instead of `AGENT_PARENT`. Progress is on by default (`-p` is the
-compatibility progress flag); `--no-progress` disables it. `--no-terse` or `--verbose`
-suppresses the terse prompt directive. `--terminal` explicitly permits a visible provider
+`-P` sets ownership instead of `AGENT_PARENT`. `--owns "glob,glob"` records file ownership;
+`--strict-owns` refuses a declared overlap with a running task. Progress is off by default;
+`--progress` / `AGENT_PROGRESS=1` enables it and `--no-progress` remains a silent compatibility
+alias. `-p FILE` reads a prompt file; trailing `-p` or `-p` followed by another option still
+enables progress. Ambiguous old `-p TEXT` gives a fix to use `--progress TEXT`. `--no-terse`
+suppresses the terse prompt directive. `-v` / `--verbose` restores live output, `--log` /
+`AGENT_KEEP_LOGS=1` keeps full raw logs, and `--notify` / `AGENT_NOTIFY=1` enables optional
+desktop notifications. `--terminal` explicitly permits a visible provider
 console; the default is hidden. Options may precede or follow positional arguments;
 `--` ends option parsing. `list [LIMIT]` defaults to 20 rows; `log`/`last`/`result`/`status`
-can omit NAME to select the newest task.
+can omit NAME to select the newest task. `--debug` enables tracebacks; ordinary errors give
+one line with a fix and spelling suggestions when relevant.
+
+### Defaults, retention and change attribution
+
+The directory defaults to cwd, and task names use a short prompt slug plus a collision-checked
+four-character ID. Engine/model/effort use explicit flags, then `AGENT_ENGINE` / `AGENT_MODEL` /
+`AGENT_EFFORT`, then `config`. Local detection prefers installed Claude, otherwise the first
+installed engine, so the first run also works with only one provider installed. Config is
+`%APPDATA%/neoxider-agents/config.json` on Windows, `~/.config/neoxider-agents/config.json`
+on POSIX (`XDG_CONFIG_HOME` is respected). `AGENT_CONFIG` selects another file. Keys are engine,
+model and effort; choosing an explicit different engine skips the config's model/effort.
+Inspect with `config list` / `config get KEY` and write with `config set KEY VALUE`.
+
+The wrapper writes nothing in the project unless progress is explicitly enabled. Task state
+stays under `AGENT_CLI_LOGS` (default `~/.claude/agent-cli-logs`): metadata/session ID, `.answer`,
+compact redacted `.activity.jsonl`, start baseline/history, original prompt, controls and inbox.
+Raw `.log` is a bounded 2 MiB tail, deleted on `clean` or after 24 hours at the next CLI/GUI state
+read. TTL cleanup is lazy, with no background deletion daemon. Default `fan` discards launcher
+stdout; only `--log` creates `.launcher.log`. `AGENT_LOG_MAX_BYTES` and `AGENT_LOG_TTL_HOURS` change those bounds; `--log` keeps full
+raw logs and opts out of TTL pruning. Final answer/digest/session and durable messages survive
+raw pruning while the task remains listed. Provider-native sessions stay in provider storage.
+`run` normally prints one start line and one result block; `ask` prints only the final answer.
+To restore old progress/live-output defaults, use `--progress -v`; use `--log` for full transcripts.
+
+`diff` and `result` compare content with a baseline taken at task start, including an initially
+dirty git tree or a non-git hash manifest. In a shared work directory, the delta describes edits
+during this task's lifetime. It cannot prove which concurrent agent authored an edit. The overlap
+warnings make shared-file edits visible; declare disjoint ownership or use isolated worktrees.
+Declared `--owns` scopes reported paths. Start status/hashes live in `.baseline.json`, with
+private text in `.baseline.files/` (2 MiB/file, 16 MiB/task); large/binary hashes remain comparable
+without line counts. Final deltas are frozen in `.changes.json`. `.history.jsonl` contains
+allowlisted redacted control metadata, never prompt bodies. Common VCS/dependency/cache/build
+directories, progress artifacts, `.agent*` and the state subtree are ignored by manifests.
+
+| Native task operation | Wrapper operation |
+|---|---|
+| Ask for a quick answer | `ask TEXT`, answer-only output and task exit code |
+| Launch a tracked worker | `run TEXT` or implicit `neoxider TEXT`; retain harness tracking |
+| Send / interrupt | `send NAME TEXT` / `send NAME --now TEXT` |
+| Observe progress | `peek NAME`, `watch NAME`, `top --once` |
+| Review edits / completion | `diff NAME`, `result NAME --json` |
+| Stop / resume saved context | `stop NAME`, `restart NAME`; process-tree termination preserves edits |
 
 ## Control foreign workers like native subagents
 
@@ -242,7 +303,7 @@ edits; tell the agent to inspect them before continuing. Stop uses process-tree 
 it cannot undo writes, guarantee graceful native cancellation or guarantee a tool finished cleanly.
 
 `stop NAME...` is idempotent and sets `⏹ stopped` with reason `stopped by orchestrator`, keeping
-the session ID, log, inbox and `PROGRESS.<task>.md`. `stop --all-mine` uses the same ownership as
+the session ID, retained answer/digest, inbox and any opt-in `PROGRESS.<task>.md`. `stop --all-mine` uses the same ownership as
 `pending`/`wait`; keep `AGENT_PARENT` consistent across launch and control calls, or use
 `AGENT_ORCHESTRATOR_ID` when parent ownership is absent. Without ownership `--all-mine` refuses.
 `restart NAME`
@@ -286,7 +347,7 @@ $env:AGENT_PARENT = 'review-wave'
 & $SK send audit --now "Focus on the parser"
 & $SK stop audit
 & $SK restart audit
-& $SK completion powershell | Out-String | Invoke-Expression
+& $SK completion powershell --install
 ```
 
 Keep `run` / `reply` / `send` foreground commands inside the harness's tracked background
@@ -726,14 +787,14 @@ model had already produced before a mid-turn provider failure is not lost; a tur
 agent message ever appeared gets a short, clean marker instead of a raw JSON dump.
 
 **Durable checkpoint (survives shutdown).** After every step a `<name>.md` is generated — a
-human-readable markdown file: a header (state/engine/session/dir/changed files/resume command) + the
-whole thread. Plus the codex/claude/kimi sessions themselves live on disk, so even
-after a reboot the task continues via `agent.sh send <name> "continue"` (`reply` is an alias). By default the agent also
+human-readable markdown summary of state/engine/session/dir/changed files/resume command and
+the retained final answer. Provider sessions themselves live on disk, so even
+after a reboot the task continues via `agent.sh send <name> "continue"` (`reply` is an alias). With `--progress` or `AGENT_PROGRESS=1` the agent also
 maintains its own **per-task** `PROGRESS.<task>.md` in the working directory (Summary/TL;DR, checklist,
 step-by-step log with findings, conclusions) and reads it on resume — resumable after a crash and
 readable by an orchestrator without re-running the agent. The filename is keyed by task name so several
-agents sharing one working directory never clobber each other's progress. Pass `--no-progress` to
-disable it for trivial one-shots. (Tip: add `PROGRESS.*.md` to the project's `.gitignore`.)
+agents sharing one working directory never clobber each other's progress. Progress is off by
+default; `--no-progress` remains accepted without a warning.
 
 **"Agent asked a question" detection.** If the last lines of output look like a question, `state=waiting`
 and the wrapper prints `⏳ the agent appears to have ASKED a question — reply: agent.sh reply <name> "..."`.
@@ -819,15 +880,14 @@ cache. The directory also holds multi-megabyte orphaned `..codex-global-state.js
 if `codex doctor` matters to you, clean those leftovers by hand (that directory is your environment,
 not the wrapper's).
 
-**"One thread per task" model**: every `run` creates a `<name>.log` (full transcript) and a `<name>.meta`
-(engine/model/dir/session). All `reply` calls are APPENDED to that same `<name>.log` with headers
-`========== [run|reply] ... ==========`, so the whole dialogue can be read as a single file by both you
-and the user. `reply <name>` fetches the session id and directory from meta by itself — there's no need
-to specify `-C`.
+**"One identity per task" model**: every `run` retains metadata (engine/model/dir/session), final
+answer, compact digest, baseline and inbox. Raw provider output is a bounded ephemeral tail;
+`--log` retains the full transcript across run/reply turns. `reply <name>` fetches the session
+ID and directory from metadata by itself — there's no need to specify `-C`.
 
 It can be run in the background (`run_in_background`) — stdin is closed in the script, so the agent
 won't hang waiting for input. While the agent is working in the background — watch it via
-`agent.sh peek -f <name>`; `log -f` remains available for the full transcript.
+`agent.sh watch <name>` or `peek -f`; `log -f` follows the available raw tail.
 NEVER call `codex exec` without `</dev/null` outside this wrapper.
 
 Gotchas (verified):
@@ -836,7 +896,7 @@ Gotchas (verified):
   session).
 - `reply <name>` does its own `cd` into the task's directory from meta (the resume session's cwd = the
   process's cwd).
-- Give the task a meaningful name via `-t` — otherwise the name will be `task-<timestamp>`.
+- Give coordinated tasks a stable name via `-t`; otherwise a prompt slug and four-character ID are generated.
 
 ## Model selection
 
@@ -862,7 +922,7 @@ passes through unchanged, so `-m gpt-5.5` reaches the older model on demand.
 The 5.6 family (`sol`/`luna`/`terra`) requires **codex-cli >= 0.144** (older CLIs get a 400
 "requires a newer version of Codex"); update with `npm install -g @openai/codex@latest`.
 
-**Claude** (`-e claude`, **the default engine**):
+**Claude** (`-e claude`; chosen when configured or selected by installed-engine detection):
 
 | Alias | Model / effort | When |
 |---|---|---|

@@ -9,8 +9,12 @@ use `$SK = './agent.ps1'`. Linux/macOS use `./agent.sh` with the same command ar
 
 ```powershell
 $env:AGENT_PARENT = 'my-wave'
-& $SK run -e opencode -t audit -C D:/Git/Project "Review the current diff"
+& $SK ask "Explain the project in two sentences"
+& $SK brief --outcome "Review the current diff" --owns "src/**" --not-touch "providers/**" --return "Findings with file references" | & $SK run -e opencode -t audit --owns "src/**" -
+& $SK top --once
 & $SK peek audit
+& $SK diff audit --stat
+& $SK result audit --json
 & $SK send audit "Include the test changes"
 & $SK stop audit
 & $SK restart audit
@@ -24,18 +28,53 @@ Cancelling that tracked `wait` stops the detached fan workers it owns and record
 No shell background tricks are needed.
 
 Use `& $SK help [COMMAND]` or `& $SK COMMAND --help` for the full reference. Commands are
-`run`/`ask`, `fan`, `send`/`reply`, `stop`, `restart`, `peek`, `log`, `last`/`result`, `pending`,
+implicit `run`/`ask`, `brief`, `fan`, `send`/`reply`, `stop`, `restart`, `peek`/`watch`,
+`top`/`dashboard`, `diff`, `log`, `last`/`result`, `pending`,
 `wait`, `status`, `list`, `clean`/`prune`, `doctor`, `provider-info`, `test-api`, `gui`,
-`openai-server`, `completion` and `help`. `ask` aliases `run`, `result` aliases `last`, and
-`prune` aliases `clean`. `provider-info ENGINE` returns one provider's diagnostic JSON.
+`openai-server`, `config`, `completion` and `help`. `ask` prints only the final answer and returns
+the task exit code. `result NAME --json` returns a structured report (state, answer, changed
+files, duration, known usage/cost and control history); `last` prints the answer. `prune` aliases
+`clean`. `provider-info ENGINE` returns one provider's diagnostic JSON.
 
 Task options include `-e ENGINE -m MODEL -f EFFORT -C DIR -t NAME -P PARENT`.
 Use `--prompt-file FILE` instead of TEXT for `run`/`ask`/`send`/`reply`/`restart`.
-Set `-P` or `AGENT_PARENT` consistently for ownership. Progress is on (`-p` compatibility
-flag); `--no-progress` disables it. `--no-terse`/`--verbose` suppress the terse directive;
+Set `-P` or `AGENT_PARENT` consistently for orchestrator ownership. `--owns "glob,glob"`
+records file ownership; `--strict-owns` refuses running declared overlaps. Progress is off;
+`--progress` / `AGENT_PROGRESS=1` opts in. `--no-progress` remains accepted silently.
+`-p FILE` reads a prompt; trailing `-p` or `-p` followed by another option enables progress.
+Ambiguous old `-p TEXT` gives a fix to use `--progress TEXT`. `--no-terse` suppresses concision;
+`-v` / `--verbose` streams output. `--log` keeps full raw logs, `--notify` requests optional notifications;
 `--terminal` explicitly permits a visible provider console. `wait --poll SEC` controls its
 report interval, `clean --dry-run` equals `clean -n`, and `completion powershell|bash|zsh`
-prints shell completion. The bridge's `openai-server -p PORT` uses `-p` for its port.
+prints shell completion; add `--install` to install it once. The bridge's `openai-server -p PORT`
+uses `-p` for its port. `config get|set|list` manages engine/model/effort defaults in
+`%APPDATA%/neoxider-agents/config.json` or `~/.config/neoxider-agents/config.json`
+(`XDG_CONFIG_HOME` respected, `AGENT_CONFIG` overrides the file). Keys are engine, model and effort.
+
+Directory defaults to cwd; names default to a prompt slug and collision-checked four-character ID.
+Explicit flags override `AGENT_ENGINE` / `AGENT_MODEL` / `AGENT_EFFORT`, then config.
+Choosing a different engine skips configured model/effort. Local detection prefers installed
+Claude, otherwise the first installed provider.
+`run` prints one start line and one result block, so track the invocation in your harness.
+The wrapper creates no project files by default. State lives under `AGENT_CLI_LOGS`
+(default `~/.claude/agent-cli-logs`): metadata/session, final `.answer`, redacted compact digest,
+baseline/history, original prompt and durable inbox. Raw `.log` is a 2 MiB tail with a 24-hour
+TTL (`AGENT_LOG_MAX_BYTES`, `AGENT_LOG_TTL_HOURS`); cleanup is lazy on the next CLI/GUI state
+read, without a background deletion daemon. Default fan stdout is discarded; only `--log`
+creates a `.launcher.log`.
+`--log` / `AGENT_KEEP_LOGS=1` skips TTL pruning. `clean` removes settled raw logs immediately.
+Controls, results and activity continue working after pruning. Provider-native sessions remain
+in provider storage; `--progress` is the only wrapper-requested project checkpoint.
+
+Review `diff NAME` / `diff NAME --stat` while a worker runs, then `result NAME --json` when settled.
+Baselines preserve the initial dirty tree and also work outside git. A delta in a shared
+directory describes changes during the task's lifetime; concurrent authorship cannot be proven.
+Warnings flag observed shared-file edits. Use disjoint ownership or isolated worktrees.
+Declared `--owns` scopes reported paths. `.baseline.json` retains start status/hashes;
+`.baseline.files/` keeps private text (2 MiB/file, 16 MiB/task). Large/binary files keep hashes
+but no line counts. `.changes.json` freezes final deltas; `.history.jsonl` stores redacted
+control metadata without prompts. See the [storage table](README.md#defaults-and-files) for
+all artifacts and ignored directories.
 
 | Action | Native task contract | neoxider contract |
 |---|---|---|
@@ -45,6 +84,8 @@ prints shell completion. The bridge's `openai-server -p PORT` uses `-p` for its 
 | Change direction | Keep the worker identity | `send NAME --now TEXT` interrupts and resumes inside the existing wrapper |
 | Launcher cancelled | No abandoned worker | Job Object / process group kills descendants; recovery reports `launcher stopped` |
 | Recover | Continue saved context | `restart NAME`, or `restart NAME --fresh` for a new session |
+| Quick answer | Final output and task exit code | `ask TEXT` |
+| Observe / review | Wave activity and changed files | `top --once`, `watch NAME`, `diff NAME --stat`, `result NAME --json` |
 
 ### Python core and migration
 
@@ -124,13 +165,13 @@ always wins.
 
 **Engine quick facts (verified 2026-07-09):**
 - **codex** — opt in with `-e codex`; the 5.6 family needs **codex-cli >= 0.144**. Watch usage limits (`agent.sh doctor`). Runs are launched with `--ignore-user-config`: `~/.codex/config.toml` (owned by the ChatGPT desktop app) hangs codex's tool router on the very first shell command. Need one of its MCP servers back → `AGENT_CODEX_MCP="unityMCP=http://127.0.0.1:8040/mcp"`.
-- **claude** — default engine, `opus5` by default; `sonnet`, legacy `opus`, and `haiku` are explicit alternatives.
+- **claude** — configurable/detected engine, `opus5` by default within that provider; `sonnet`, legacy `opus`, and `haiku` are explicit alternatives.
 - **kimi** — `k3` by default (`kimi-code/k3`); `k3-256k`, `coding`, and `highspeed` are verified alternatives; supports named-task resume.
 - **opencode** — works via `--auto`. Free-tier aliases resolve to real ids (`-m free`, `-m ox`, …); raw `provider/model` still passes through. `ollama` and `zai` are disabled in `~/.config/opencode/opencode.json` as of 2026-08-24 — Ollama's cloud DeepSeek 403s without a paid subscription, and the local one is 8B.
 - **gemini** — needs `GEMINI_API_KEY` (Google sign-in is geo-blocked for some accounts); unavailable until a key is set.
 
-**Token economy (already on by default):** `--terse` (concise output) and per-task `PROGRESS.<task>.md` are
-on by default. Add `--no-terse` for exploratory work, `--no-progress` for throwaway one-shots. The
+**Token economy:** `--terse` (concise output) is on by default; per-task `PROGRESS.<task>.md` is
+opt-in with `--progress`. Add `--no-terse` for exploratory work. The
 biggest lever is still model/effort — drop to `spark`/`haiku`/`-f low` for easy work.
 
 ---

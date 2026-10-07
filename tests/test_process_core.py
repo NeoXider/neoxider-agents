@@ -18,7 +18,7 @@ from neoxider_agents import process
 
 class ProcessTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-core/process") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core-process"
+        base = Path("D:/Temp/agents-ux/process") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core-process"
         base.mkdir(parents=True, exist_ok=True)
         self.temporary = tempfile.TemporaryDirectory(dir=str(base))
         self.work = Path(self.temporary.name)

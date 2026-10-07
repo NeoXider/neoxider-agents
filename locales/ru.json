@@ -39,7 +39,7 @@
   "form.auto": "авто",
   "form.prompt": "prompt",
   "form.prompt_placeholder": "сделай ровно это…",
-  "form.progress": "вести PROGRESS.md (-p)",
+  "form.progress": "вести прогресс задачи (--progress)",
   "form.terminal": "открыть в терминале (видно живой чат)",
   "form.run": "▶ запустить",
   "limits.title": "Лимиты",

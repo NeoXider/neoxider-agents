@@ -70,7 +70,7 @@ class Aliases(unittest.TestCase):
             get_provider("../codex")
 
     def test_custom_plugin(self):
-        base = Path("D:/Temp/agents-core/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
+        base = Path("D:/Temp/agents-ux/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temp:
             folder = Path(temp) / "fixture"
@@ -82,14 +82,14 @@ class Aliases(unittest.TestCase):
 
 class Commands(unittest.TestCase):
     def setUp(self):
-        self.environment = patch.dict(os.environ, {"CODEX_HOME": "D:/Temp/agents-core/providers/codex-home"}, clear=True)
+        self.environment = patch.dict(os.environ, {"CODEX_HOME": "D:/Temp/agents-ux/providers/codex-home"}, clear=True)
         self.environment.start()
         self.addCleanup(self.environment.stop)
 
     def command(self, engine, session="", chat_only=False):
         with patch("neoxider_agents.providers.executable", return_value=[engine]):
             # Plugin binds executable at import, so load inside the patch.
-            return get_provider(engine).command("model", "high", "D:/Temp/agents-core/providers", session, chat_only)
+            return get_provider(engine).command("model", "high", "D:/Temp/agents-ux/providers", session, chat_only)
 
     def test_codex_prompt_from_stdin(self):
         args, _ = self.command("codex")
@@ -150,7 +150,7 @@ class Commands(unittest.TestCase):
 
     def test_opencode_directory_explicit(self):
         args, _ = self.command("opencode", "ses_old")
-        self.assertEqual(args[args.index("--dir") + 1], "D:/Temp/agents-core/providers")
+        self.assertEqual(args[args.index("--dir") + 1], "D:/Temp/agents-ux/providers")
 
     def test_opencode_respects_config(self):
         with patch.dict(os.environ, {"OPENCODE_CONFIG_CONTENT": '{"small_model":"custom"}'}):
@@ -172,7 +172,7 @@ class Commands(unittest.TestCase):
         with patch("neoxider_agents.providers.executable", side_effect=FileNotFoundError("fixture Kimi CLI missing")):
             provider = get_provider("kimi")
             with self.assertRaisesRegex(FileNotFoundError, "Kimi CLI missing"):
-                provider.command("kimi-code/k3", "", "D:/Temp/agents-core/providers")
+                provider.command("kimi-code/k3", "", "D:/Temp/agents-ux/providers")
 
     def test_gemini_safe_chat_mode(self):
         args, env = self.command("gemini", chat_only=True)
@@ -197,7 +197,7 @@ class Commands(unittest.TestCase):
 
 class NativeLaunchers(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-core/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
+        base = Path("D:/Temp/agents-ux/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=base)
         self.addCleanup(self.temp.cleanup)
@@ -223,7 +223,7 @@ class NativeLaunchers(unittest.TestCase):
 
 class Filters(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-core/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
+        base = Path("D:/Temp/agents-ux/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=base)
         self.addCleanup(self.temp.cleanup)
@@ -394,7 +394,7 @@ class Classification(unittest.TestCase):
 
 class ACPTransport(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-core/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
+        base = Path("D:/Temp/agents-ux/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=base)
         self.addCleanup(self.temp.cleanup)
@@ -480,7 +480,7 @@ for line in sys.stdin:
 def prove_defects():
     """Plant source defects in isolated copies and demand the targeted test fail."""
     import shutil
-    base = Path("D:/Temp/agents-core/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
+    base = Path("D:/Temp/agents-ux/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
     base.mkdir(parents=True, exist_ok=True)
     defects = [
         ("providers/codex/provider.py", '"": "gpt-5.6-terra"', '"": "wrong-default"', "Aliases.test_codex_default"),

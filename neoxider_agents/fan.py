@@ -25,13 +25,16 @@ def fan(store, base, prompts, opts):
         for key, flag in (("engine", "-e"), ("model", "-m"), ("effort", "-f"), ("dir", "-C"), ("parent", "-P")):
             if key in opts:
                 argv += [flag, opts[key]]
-        for flag in ("--no-progress", "--no-terse", "--verbose", "--terminal"):
+        for flag in ("--no-progress", "--no-terse", "--verbose", "--terminal", "--progress", "--log", "--notify", "--strict-owns", "-v"):
             if opts.get(flag):
                 argv.append(flag)
+        if opts.get("owns"):
+            argv += ["--owns", opts["owns"]]
         prompt_file = store.path(name, ".fan.prompt")
         atomic_write(prompt_file, prompt)
         argv += ["--prompt-file", str(prompt_file)]
-        output = open(store.path(name, ".launcher.log"), "wb")
+        keep_output = opts.get("--log") or os.environ.get("AGENT_KEEP_LOGS") == "1"
+        output = open(store.path(name, ".launcher.log"), "wb") if keep_output else open(os.devnull, "wb")
         try:
             process = subprocess.Popen([sys.executable, str(ROOT / "agent.py"), *argv], stdin=subprocess.DEVNULL,
                                        env={**os.environ, "AGENT_DETACHED": "1", "AGENT_LAUNCHER_PID": ""},
@@ -45,7 +48,7 @@ def fan(store, base, prompts, opts):
     for name, process, stamp in launched:
         while store.read(name).get("pid") != str(process.pid):
             if process.poll() is not None:
-                raise ValueError("fan: task %s failed before publishing its owner; see %s" % (name, store.path(name, ".launcher.log")))
+                raise ValueError("fan: task %s failed before publishing its owner; use neoxider status %s (or --log to retain launcher output)" % (name, name))
             if time.monotonic() >= deadline:
                 kill_tree(process.pid, stamp=stamp)
                 raise ValueError("fan: task %s did not publish its owner within 15s" % name)

@@ -15,7 +15,7 @@ import openai_server as bridge
 
 class CoreBridgeTailTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-core/entries") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core"
+        base = Path("D:/Temp/agents-ux/entries") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=str(base))
         self.addCleanup(self.temp.cleanup)
@@ -67,7 +67,7 @@ class CoreBridgeTailTests(unittest.TestCase):
 
 class CoreBridgeLivePromptTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-core/entries") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core"
+        base = Path("D:/Temp/agents-ux/entries") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=str(base))
         self.addCleanup(self.temp.cleanup)

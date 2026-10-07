@@ -26,7 +26,7 @@ def hidden():
 @unittest.skipUnless(os.name == "nt" and POWERSHELL, "Windows PowerShell required")
 class NativeEntryTests(unittest.TestCase):
     def setUp(self):
-        scratch = Path("D:/Temp/agents-core/entries")
+        scratch = Path("D:/Temp/agents-ux/entries")
         scratch.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=str(scratch))
         self.addCleanup(self.temp.cleanup)
@@ -164,7 +164,7 @@ class NativeEntryTests(unittest.TestCase):
 @unittest.skipUnless(os.name == "nt" and POWERSHELL, "Windows PowerShell required")
 class NativeCoreIntegrationTests(unittest.TestCase):
     def setUp(self):
-        scratch = Path("D:/Temp/agents-core/entries")
+        scratch = Path("D:/Temp/agents-ux/entries")
         scratch.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="native-core-", dir=str(scratch))
         self.addCleanup(self.temp.cleanup)
