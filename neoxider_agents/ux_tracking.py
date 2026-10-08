@@ -399,6 +399,14 @@ def _explicit_changes(store, name, meta, state):
     return file_changes(store, name, meta.get("dir", ""), freeze=settled and not cache.is_file(), frozen=settled)
 
 
+def _limit_object(meta, state):
+    """A `limit` object exists ONLY for state=limited; every other state is untouched."""
+    if state != "limited":
+        return {}
+    from .providers import parse_limit_reset
+    return {"limit": {"hit": True, "resets": _redact(parse_limit_reset(meta.get("reason", "")))}}
+
+
 def collect_result(store, name):
     meta = store.read(name)
     if not meta:
@@ -408,7 +416,7 @@ def collect_result(store, name):
         answer = store.path(name, ".answer").read_text(encoding="utf-8")
     except OSError:
         answer = last_output(store.path(name, ".log"))
-    stopped = stop_block(store, name, meta) if state == "stopped" else None
+    stopped = stop_block(store, name, meta) if state in ("stopped", "limited") else None
     changes = _explicit_changes(store, name, meta, state)
     baseline = read_baseline(store, name)
     warning = store.read(name).get("baseline_warning", "")
@@ -438,7 +446,8 @@ def collect_result(store, name):
                 baseline_partial=bool(baseline.get("partial")), baseline_warning=warning,
                 duration_sec=max(0, round((end or time.time()) - start, 3)) if start else None,
                 usage=usage, tokens=tokens, cost_usd=cost, history=history,
-                overlaps=overlaps(store, name, [entry["path"] for entry in changes]), attribution=ATTRIBUTION)
+                overlaps=overlaps(store, name, [entry["path"] for entry in changes]), attribution=ATTRIBUTION,
+                **_limit_object(meta, state))
 
 
 def result(store, name, opts=None):
@@ -453,6 +462,9 @@ def result(store, name, opts=None):
               (name, data["state"], data["exit_code"], data["duration_sec"], len(data["changed_files"])))
         answer = data["stop_report"] or data["final_answer"]
         print(answer, end="" if answer.endswith("\n") else "\n")
+        if data.get("limit"):
+            from .providers import format_limit_hit
+            print(format_limit_hit(name, data["engine"], data["model"], data["limit"]["resets"]))
         if data["overlaps"]:
             print("warning: shared files with " + ", ".join(entry["task"] for entry in data["overlaps"]), file=sys.stderr)
     store.seen(name)

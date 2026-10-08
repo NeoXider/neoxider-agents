@@ -336,11 +336,15 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             from activity import redact
             reason = redact(reason)
             block = record_stop(store, name, by or "watchdog", reason, 126, "limited", answer, turn.last_activity)
+            from .providers import limit_line
+            marker = limit_line(name, provider.engine, model + ("-" + effort if effort else ""), reason)
             if quiet_answer:
                 print_answer(store, name)
                 print("neoxider: task=%s limited; %s" % (name, reason), file=sys.stderr)
+                print(marker, file=sys.stderr)
             else:
                 print("".join(notes) + block, end="", flush=True)
+                print(marker, flush=True)
             render_md(store, name)
             finish_notification(store, name, notify)
             return 126

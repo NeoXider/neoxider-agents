@@ -8,6 +8,7 @@ from threading import Event
 from .state import Lock, MARK, last_output, log_offset, output_chunks, tail, valid_name
 from .lifecycle import effective
 from .reporting import stop_block
+from .providers import limit_line, parse_limit_reset
 
 ICONS = {"running": "▶", "idle": "▷", "done": "✔", "waiting": "⏳", "error": "✖", "stalled": "⚠", "limited": "⛔", "silent": "◌", "stopped": "⏹", "orphaned": "⚠"}
 
@@ -31,6 +32,9 @@ def task_list(store, limit=20):
         detail = meta.get("reason", "")
         if state == "orphaned":
             detail = "orphaned provider alive, launcher dead; stop " + name
+        if state == "limited":
+            resets = parse_limit_reset(meta.get("reason", ""))
+            detail = ('resets="%s"' % resets) + ("; " + detail if detail else "")
         queue = len(store.inbox(name))
         detail += ("; " if detail else "") + "%s undelivered message(s); %s" % (queue, activity_text(store, name, meta))
         print("%-2s %-24s %-8s %-9s %-13s %-6s %-6s %-8s %s" % (
@@ -62,7 +66,10 @@ def status(store, name):
     if state == "orphaned":
         print("   ⚠ orphaned provider alive, launcher dead; neoxider stop " + name)
     if state in ("error", "limited", "silent", "stopped", "stalled"):
-        print("   reason=" + meta.get("reason", "launcher stopped"))
+        reason = meta.get("reason", "launcher stopped")
+        if state == "limited":
+            reason += '  resets="%s"' % parse_limit_reset(meta.get("reason", ""))
+        print("   reason=" + reason)
     if meta.get("timeout"):
         print("   ⏱ killed by the step watchdog after %ss (AGENT_TIMEOUT_SEC)" % meta["timeout"])
     if state == "stopped":
@@ -79,8 +86,11 @@ def last(store, name, result=False):
     if not store.read(name):
         raise ValueError("no such task: " + name)
     state = effective(store, name)
-    if state == "stopped" or (result and store.path(name, ".stop").is_file()):
-        print(stop_block(store, name), end="")
+    meta = store.read(name)
+    if state in ("stopped", "limited") or (result and store.path(name, ".stop").is_file()):
+        print(stop_block(store, name, meta), end="")
+        if state == "limited":
+            print(limit_line(name, meta.get("engine", ""), meta.get("model", ""), meta.get("reason", "")))
     else:
         from .logs import print_answer
         print_answer(store, name)
@@ -119,7 +129,7 @@ def pending(store, strict=False):
     return 3 if count and strict else 0
 
 
-def wait(store, names, timeout=0, poll=5):
+def wait(store, names, timeout=0, poll=5, strict=False):
     if not names:
         names = [name for name, meta, _ in store.scan() if mine(meta) and effective(store, name, meta) in ("running", "idle")]
     for name in names:
@@ -140,7 +150,7 @@ def wait(store, names, timeout=0, poll=5):
                 store.update(name, wait_pid=os.getpid(), wait_start=pid_stamp(os.getpid()), wait_token=token)
                 watched.append(name)
     try:
-        return _wait(store, names, timeout, poll)
+        return _wait(store, names, timeout, poll, strict)
     except BaseException:
         from .lifecycle import stop
         for name in watched:
@@ -160,7 +170,7 @@ def wait(store, names, timeout=0, poll=5):
                 pass
 
 
-def _wait(store, names, timeout, poll):
+def _wait(store, names, timeout, poll, strict=False):
     from .runtime import pipe_closed
     started = time.monotonic()
     settled = set()
@@ -198,7 +208,13 @@ def _wait(store, names, timeout, poll):
             last(store, name, result=True)
         else:
             print("(no log for %s)" % name)
-    print("WAIT_DONE tasks=%s rc=%s" % (len(names), code))
+    settled_states = [effective(store, name) for name in names]
+    ok = sum(1 for state in settled_states if state in ("done", "waiting"))
+    limited = sum(1 for state in settled_states if state == "limited")
+    failed = len(names) - ok - limited
+    if strict and code == 0 and (limited + failed) > 0:
+        code = 3
+    print("WAIT_DONE tasks=%s rc=%s ok=%s limited=%s failed=%s" % (len(names), code, ok, limited, failed))
     return code
 
 

@@ -18,7 +18,7 @@ COMMANDS = {
     "last": "[NAME]", "result": "[NAME] [--json]", "status": "[NAME]", "list": "[LIMIT]",
     "top": "[--once] [--json] [--interval SECONDS]", "dashboard": "(alias for top)",
     "diff": "NAME [--stat|--names] (changes since the task baseline)",
-    "pending": "[--strict]", "wait": "[NAME...] [--timeout SECONDS] [--poll SECONDS]",
+    "pending": "[--strict]", "wait": "[NAME...] [--timeout SECONDS] [--poll SECONDS] [--strict]",
     "clean": "[--all] [--purge] [-n|--dry-run]", "prune": "[--all] [--purge] [-n|--dry-run]",
     "doctor": "[--deep|--json]", "provider-info": "ENGINE",
     "test-api": "--base-url URL --goal TEXT [--out F] [-e ENGINE] [-m MODEL] [-f EFFORT] [-C DIR] [-t NAME]",
@@ -81,6 +81,7 @@ def parse(command, argv):
         switches.add("--all-mine")
     if command == "wait":
         operands.update({"--timeout": "timeout", "--poll": "poll"})
+        switches.add("--strict")
     if command == "pending":
         switches.add("--strict")
     if command in ("clean", "prune"):
@@ -210,7 +211,7 @@ def dispatch(command, opts, args, store):
             return views.pending(store, opts.get("--strict", False))
         if command == "wait":
             poll = integer(opts.get("poll", os.environ.get("AGENT_WAIT_POLL", 5)), "wait: --poll", 5)
-            return views.wait(store, args, integer(opts.get("timeout", os.environ.get("AGENT_WAIT_TIMEOUT", 0)), "wait: --timeout"), max(0.1, poll))
+            return views.wait(store, args, integer(opts.get("timeout", os.environ.get("AGENT_WAIT_TIMEOUT", 0)), "wait: --timeout"), max(0.1, poll), strict=bool(opts.get("--strict")))
         return views.clean(store, opts)
     if command in ("last", "result", "status", "log", "peek", "watch", "diff"):
         if len(args) > 1:

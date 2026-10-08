@@ -8,6 +8,9 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- Report provider usage limits consistently everywhere a task result is read: `last`/`result`
+  print the STOPPED block for `limited` tasks (an empty answer is never silent again), and
+  `status`/`list` show a parsed `resets="…"` next to the reason.
 - Bound task baselines to Git's tracked/unignored candidates or a fallback scan capped at
   20000 files and 512 MiB, with a 30-second snapshot budget and configurable limits.
   Skip Unity caches, reuse unchanged baseline hashes, fingerprint files above 8 MiB, and
@@ -26,6 +29,13 @@ All notable changes to this project are documented here. Format follows
   structured `result`, `watch` and optional hidden desktop notifications.
 - GUI retained-answer/title/activity fallbacks after raw-log pruning; explicit limited/silent
   states and failure reasons; existing queue and authenticated stop/send controls preserved.
+- Canonical usage-limit reporting: a limited task (`state=limited`, exit 126) ends
+  `run`/`reply`/`restart`, each `wait` per-task section and `last`/`result` with a final
+  `LIMIT_HIT task=<name> engine=<engine> model=<model> resets="<text>"` line
+  (`resets` parsed from `try again at` / `resets in` / `retry after` / `available again`,
+  else `unknown`); `result --json` gains a `limit` object only for limited tasks.
+  `wait` prints `WAIT_DONE tasks=N rc=R ok=a limited=b failed=c` and accepts `--strict`
+  (exit 3 when limited+failed > 0 and rc would otherwise be 0).
 
 ### Changed
 

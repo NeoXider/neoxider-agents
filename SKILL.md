@@ -194,8 +194,10 @@ Get-Content -Raw prompt.txt | & $SK -            # stdin; Unicode and long text
 & $SK pending [--strict]                         # unread results / tasks needing attention; strict exits 3
 & $SK status fix-readme                          # state, last activity/age, queued messages, changed files
 & $SK wait name-a name-b                         # BLOCK until named tasks settle, then print each final answer;
-                                                      # includes inbox drain; stopped = settled (exit 130)
-                                                      # exit 2 = --timeout hit while still running
+                                                       # includes inbox drain; stopped = settled (exit 130)
+                                                       # exit 2 = --timeout hit while still running
+                                                       # summary: WAIT_DONE tasks=N rc=R ok=a limited=b failed=c
+                                                       # --strict returns 3 when limited+failed > 0 and rc == 0
 & $SK wait --timeout 3600                        # no names = watch ALL currently-running tasks (whole wave); default poll 5s
 & $SK wait name-a --poll 2                       # report polling interval in seconds; internal control remains responsive
 & $SK list                                       # table: state / engine / model / age / files / session
@@ -333,7 +335,10 @@ Structured Codex/OpenCode/Claude/Kimi streams are summarized; plain text gets a 
 `status`/`list` show last activity kind/age and queued count using a cheap log tail. If the owning
 wrapper dies, an inbox is reported as `N undelivered message(s)`; recover with
 `send --flush NAME` or `restart NAME`. `pending` flags these and stopped tasks as needing
-attention. `wait` settles stopped tasks with exit 130 and prints `WAIT_DONE rc=130`. `clean` protects undelivered messages
+attention. `wait` settles stopped tasks with exit 130 and prints
+`WAIT_DONE tasks=N rc=R ok=a limited=b failed=c` (ok = done/waiting, limited = state limited,
+failed = everything else settled); `wait --strict` returns 3 when limited+failed > 0 and rc
+would otherwise be 0 (same convention as `pending --strict`). `clean` protects undelivered messages
 unless `--all`/`--purge` explicitly overrides that protection.
 
 Resume support is a provider capability: Claude/Codex/Kimi/OpenCode support it; Gemini does
@@ -392,7 +397,8 @@ If the launcher is gone, `stop` prints the retained block itself. `status`, `pen
 and `result` expose the stopped result. Killing only the PowerShell launcher is detected across
 the `py.exe` intermediary, so its Python/provider tree cannot remain active. Watchdog blocks
 use `by=watchdog` and their actual deadline/silence reason, retaining exit 124/125. Provider
-failures retain exit 126 and the provider's reason. `send --now` keeps the original wrapper
+failures retain exit 126 and the provider's reason, plus a trailing
+`LIMIT_HIT task=… engine=… model=… resets="…"` marker line. `send --now` keeps the original wrapper
 alive and adds `↻ INTERRUPTED+RESUMED` to its completion output.
 
 ### Python core and migration
@@ -792,6 +798,21 @@ labels the task `limited` instead of a bare `error`. opencode's own stderr is re
 like silent hangs. Known gap: an engine that prints a limit error WITHOUT the tag and then hangs
 instead of exiting (opencode's historical failure mode; never observed for claude/gemini) is ended by
 `AGENT_SILENCE_SEC` as `silent`, not `limited` — the message is in the log.
+
+**Usage limits — what the orchestrator sees.** A limited task is `state=limited exit=126` and
+every place a task result is read says so explicitly. The last line of `run`/`reply`/`restart`
+output for a limited task is the canonical marker
+`LIMIT_HIT task=<name> engine=<engine> model=<model> resets="<text>"`, where `resets` is parsed
+conservatively from the provider's reason (`try again at <date/time>`, `resets in <…>`,
+`retry after <…>`, `available again <…>`; otherwise `resets=unknown`) and redacted like the
+reason itself. The same line is the last line of the `wait` per-task section and of
+`last`/`result` for a limited task (`last`/`result` also print the STOPPED block there, so a
+limited task with an empty answer is never silent). `status` and `list` show `resets="…"` next
+to the reason, and `result --json` gains a `limit` object (`{"hit": true, "resets": "…"}`) only
+for limited tasks — no other keys change. The tool NEVER silently switches engine/model on a
+limit: `reply`/`restart` on the same task retries the same engine/model and will hit the same
+limit until it resets. Warning: piping `agent.sh run … | tail/head` hides `run`'s exit code in
+the pipeline — match on the printed `LIMIT_HIT` line, or check `status NAME`/`${PIPESTATUS[0]}`.
 
 **A partial answer survives a failed turn.** When a run ends for ANY reason — success, provider
 limit/failure, the silence watchdog, the timeout, or a crash — `agent.sh last <name>` still returns the

@@ -222,7 +222,7 @@ Command reference (native PowerShell/cmd: `neoxider`; POSIX: `./agent.sh`):
 | `last`, `status`, `list` | `[NAME]` for final answer/status; `list [LIMIT]` defaults to 20 |
 | `top`, `dashboard`, `watch` | `top [--once] [--json]`; `watch NAME` follows digest and status |
 | `diff`, `result` | `diff NAME [--stat or --names]`; `result NAME [--json]` returns structured completion |
-| `pending`, `wait` | `pending [--strict]`; `wait [NAME...] [--timeout SEC] [--poll SEC]` |
+| `pending`, `wait` | `pending [--strict]`; `wait [NAME...] [--timeout SEC] [--poll SEC] [--strict]` |
 | `clean`, `prune` | `[--all] [--purge] [-n or --dry-run]`; `prune` aliases `clean` |
 | `doctor`, `provider-info` | `doctor [--json or --deep]`; `provider-info ENGINE` prints one provider's diagnostic JSON |
 | `test-api` | `--base-url URL --goal TEXT [--out FILE] [task options]` |
@@ -459,6 +459,26 @@ When upgrading, let old launchers settle or stop them before switching to the co
 installation, including its helpers. Do not replace an executing `agent.sh` in place. Wrappers
 already running before the upgrade cannot auto-drain newly queued messages; their inbox remains
 visible, and `send --flush NAME` delivers it after the old turn settles.
+
+### Usage limits
+
+A provider usage/rate limit, quota exhaustion, auth expiry or unavailable model ends the task
+immediately as `state=limited` with exit 126 and the provider's own message in `reason=`.
+Every place a task result is read says so explicitly: the last output line of
+`run`/`reply`/`restart`, of each `wait` per-task section, and of `last`/`result` for a limited
+task is the canonical marker
+`LIMIT_HIT task=<name> engine=<engine> model=<model> resets="<text>"`.
+`resets` is parsed conservatively from the reason (`try again at <date/time>`,
+`resets in <…>`, `retry after <…>`, `available again <…>`, else `resets=unknown`) and redacted.
+`last`/`result` also print the STOPPED block for limited tasks, so an empty answer is never
+silent; `status`/`list` show `resets="…"` next to the reason; `result --json` gains a `limit`
+object (`{"hit": true, "resets": "…"}`) only for limited tasks. `wait` prints
+`WAIT_DONE tasks=N rc=R ok=a limited=b failed=c` (`rc=0` still means "all settled", `rc=2`
+timeout); `wait --strict` returns 3 when limited+failed > 0 and rc would otherwise be 0.
+The tool NEVER silently switches engine/model: `reply`/`restart` on the same task retries the
+same engine/model and hits the same limit until it resets. Warning: piping
+`agent.sh run … | tail/head` hides `run`'s exit code in the pipeline — match on the printed
+`LIMIT_HIT` line, or check `status NAME` / `${PIPESTATUS[0]}`.
 
 ---
 

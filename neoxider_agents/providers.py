@@ -11,6 +11,12 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 ENGINES = ("codex", "claude", "kimi", "opencode", "gemini")
 FAILURE = re.compile(r"usage limit|rate.?limit|quota exceeded|insufficient (quota|credit)|payment required|requires a newer version of|unrecognized_model|issue with the selected model|model[^.?!]*(not found|unavailable|unknown)|unauthoriz|invalid api key|authentication (failed|error)|token expired|session expired|not logged in|please (run|log ?in)", re.I)
+RESET_PATTERNS = (
+    re.compile(r"try again at ([^.;\n]+)", re.I),
+    re.compile(r"resets?\s+in\s+(\d+(?:\.\d+)?\s*(?:ms|milliseconds?|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d))", re.I),
+    re.compile(r"retry\s+after\s+(\d+(?:\.\d+)?\s*(?:ms|milliseconds?|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d))", re.I),
+    re.compile(r"available again ([^.;\n]+)", re.I),
+)
 CONFLICT = re.compile(r"thread-store conflict|already has an active writer|code\s+-32600", re.I)
 TRANSIENT = re.compile(r"stream error|Failed to execute|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|fetch failed|network error|overloaded|Bad Gateway|Service Unavailable|Gateway Time-?out|HTTP (502|503|504)|status[ =:]+(502|503|504)", re.I)
 
@@ -165,6 +171,26 @@ def failure_reason(text, live=False):
 
 def provider_failure_reason(text, live=False):
     return failure_reason(text, live)
+
+
+def parse_limit_reset(text):
+    """Conservatively extract a provider-limit reset hint; "unknown" when absent."""
+    for pattern in RESET_PATTERNS:
+        match = pattern.search(text or "")
+        if match:
+            return " ".join(match.group(1).split()).replace('"', "'") or "unknown"
+    return "unknown"
+
+
+def format_limit_hit(name, engine, model, resets):
+    """Canonical machine-greppable usage-limit marker (resets must already be redacted)."""
+    return 'LIMIT_HIT task=%s engine=%s model=%s resets="%s"' % (name, engine, model, resets)
+
+
+def limit_line(name, engine, model, reason):
+    """Canonical LIMIT_HIT marker for a limited task; secrets are redacted."""
+    from activity import redact
+    return format_limit_hit(name, engine, model, redact(parse_limit_reset(reason or "")))
 
 
 def is_transient_failure(text):

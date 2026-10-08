@@ -45,7 +45,10 @@ records file ownership; `--strict-owns` refuses running declared overlaps. Progr
 Ambiguous old `-p TEXT` gives a fix to use `--progress TEXT`. `--no-terse` suppresses concision;
 `-v` / `--verbose` streams output. `--log` keeps full raw logs, `--notify` requests optional notifications;
 `--terminal` explicitly permits a visible provider console. `wait --poll SEC` controls its
-report interval, `clean --dry-run` equals `clean -n`, and `completion powershell|bash|zsh`
+report interval, `wait --timeout SEC` bounds it (exit 2 on timeout), and `wait --strict`
+returns 3 when any watched task ended limited/failed and rc would otherwise be 0;
+the summary line reads `WAIT_DONE tasks=N rc=R ok=a limited=b failed=c`.
+`clean --dry-run` equals `clean -n`, and `completion powershell|bash|zsh`
 prints shell completion; add `--install` to install it once. The bridge's `openai-server -p PORT`
 uses `-p` for its port. `config get|set|list` manages engine/model/effort defaults in
 `%APPDATA%/neoxider-agents/config.json` or `~/.config/neoxider-agents/config.json`
@@ -189,6 +192,7 @@ poll `agent.sh list` / `status <name>`:
 | `waiting` (`⏳`) | the agent asked a question | `agent.sh send NAME "…"` (`reply` also works) |
 | `stalled` (`⚠`) | the process is gone (reboot/kill) | inspect edits, then `restart NAME` or `send --flush NAME` |
 | `stopped` (`⏹`) | orchestrator stopped the process tree; session and edits remain | `agent.sh restart NAME "…"` |
+| `limited` (`⛔`, exit 126) | provider usage/rate limit, quota, auth expiry or unavailable model | last line is `LIMIT_HIT task=… engine=… model=… resets="…"`; same engine/model will hit it again until it resets |
 | `error` + `⏱ killed by the step watchdog` | it hit the deadline | re-scope the task, or re-run with a bigger `AGENT_TIMEOUT_SEC` |
 
 The CLI and the web panel compute this identically, so the two never contradict each other. When diagnosing foreign CLI execution on a new machine or after an upgrade, use
