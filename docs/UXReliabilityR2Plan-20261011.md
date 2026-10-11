@@ -83,3 +83,53 @@ FINAL tests: `python -m unittest discover -s tests -p test_diagnostics_bounds.py
 Свежий bounded inventory root после source-freeze: настоящий `doctor --json` завершился exit 0 за 8.3039148 s; OpenCode1.18.27 state ok, Codex ok с limits null/Unknown, Gemini/Kimi ok, Claude не logged in с partial local usage. Receipts `D:/Temp/agents-ux/r2-junction-20261011/root-doctor.json` и `root-doctor.stderr.txt`. Первое перенаправление не запустило doctor из-за отсутствующей temp-директории; последующий реальный вызов отдельный. Это текущая доступность CLI, не остаток квоты или качество модели; повторный doctor без изменения состояния не нужен.
 
 Повторная проверка разрешённого residual fixture PID66172 перед возможным exact Stop-Process не нашла этот PID, его отсутствовавшего parent43204 или children. Последующий scoped scan по control fixture command также пуст. Stop-Process не выполнялся; причина завершения неизвестна. Исторический leftover сохраняется как concern контрольного lifecycle, текущих fixture helpers на этой проверке не найдено.
+
+## R2-E — Codex recoverable retry не должен завершать CODE task
+
+Статус: **план и controlled regression; production source scope подтверждается root до записи**. Все AI launchers завершены. J/H исходники не меняются. Единственный текущий native reliability lead исполняет уже назначенную задачу, новых native нет; крайняя необходимость — CLI CODE заблокирован подтверждённой классификацией recoverable event.
+
+Факт: task mvp1011-codex-asset-skill закончил provider через43s на JSON `type=error`, message `Reconnecting... 2/5 (stream disconnected before completion: tls handshake eof)`. Это начало собственного повторения CLI, не терминальное исчерпание пяти попыток. Short probe был OK; account quota38% used не исчерпана. TLS/network сами этим исправлением не устраняются.
+
+### Реальный Core2 call graph и нужный exact scope
+
+`providers/codex/provider.py:30–59` строит прямой `codex exec ... --json`. `neoxider_agents/runtime.py:134` вызывает Provider.command, затем Popen через existing spawn. JSON проходит `neoxider_agents/output.py:291–292`: любой Codex error/turn.failed вызывает `_error` (218–222), который выставляет provider_error и печатает AGENT_PROVIDER_ERROR. Runtime210–211 немедленно убивает собственное tree с126. Bash `providers/codex/provider.sh` содержит аналогичную логику, но **не находится в текущем agent.ps1/Core2 launch path**. Исправить только .sh недостаточно.
+
+Предлагаемый scope для root: `neoxider_agents/output.py` только Codex event branch и маленький приватный classifier; `providers/codex/provider.sh` только аналогичный Codex parser для legacy parity, если root включит; новый `tests/test_codex_retry_signals.py`; статус/этот amendment в `docs/UXReliabilityR2Plan-20261011.md`. Existing `tests/test_providers_core.py` читается/запускается для compatibility, его assertions не меняются. Не менять Runtime/lifecycle/OpenCode/shared routing, provider settings/credentials, H/J source или другие test files.
+
+### Узкое решение
+
+Только Codex `type=error` с точным retry-status prefix Reconnecting... n/m, валидными конечными positive attempt/count и явно recoverable transport body становится диагностикой; не выставляет provider_error и не печатает fatal marker. Учитывать последний retry n=m как ещё исполняемую попытку: успешный final после неё допустим. `turn.failed` всегда terminal. Без retry prefix обычный TLS error не становится безопасным. Auth/quota/429/context/model errors остаются fatal даже если обёрнуты retry-status строкой; проверить permanent markers до исключения. Unknown shapes оставляют прежнее fatal поведение, а не молчаливый skip.
+
+Диагностика остаётся в raw/activity/log. Existing watchdog whole/silence/control и финальный process exit code сохраняются. Если CLI после recoverable сообщений завершился nonzero, это error/nonzero, не success и не выдуманная quota/reset; terminal error event остаётся fatal. Это не общий signals framework и не разрешение игнорировать все provider errors. Legacy single-quoted embedded Python не должен получить apostrophe, иначе Bash script сломается.
+
+### Проверка до/после
+
+Новый `tests/test_codex_retry_signals.py` использует существующий OutputFilter и реальный `runtime.Turn` с controlled Python child (engine=codex), isolated D:/Temp fixture Store. Child пишет exact retry JSON, ждёт дольше watchdog poll, потом пишет normal agent_message RECOVERED_OK и exit0. BEFORE должен дать126/не дойти до controlled receipt; AFTER —0, final answer intact, без AGENT_PROVIDER_ERROR. Не использовать AI/network для этого regression.
+
+Negative cases: quota/auth/context error; wrapped permanent marker; malformed retry counters/body; terminal turn.failed; retry followed by exhausted nonzero exit; retry then stuck helper → existing watchdog124 и owned process cleanup. Existing test_providers_core сохраняет inline sessions, large answers, real fatal markers и остальные engines. Если legacy .sh разрешён, проверить именно его embedded parser теми же streams, без фактического Codex API.
+
+Команды: `python -m unittest discover -s tests -p test_codex_retry_signals.py`; `python -m unittest discover -s tests -p test_providers_core.py`; Bash syntax check только изменённого provider.sh при разрешении; scoped `git diff --check`, hashes/source-final и root полный diff. Реальный CLI CODE повтор только после root source acceptance. Не лечить TLS/proxy/квоту этим parser fix и не менять R2-O pending/state work.
+
+Root уточнил окончательный boundary R2-E перед production patch: только 0 < attempt < max диагностический, attempt=max (5/5) остаётся fatal по существующему контракту. Это явный выбор root заменяет предложенное выше допущение последней retry-попытки. Scope принят: только `neoxider_agents/output.py` Codex branch/local classifier, новый `tests/test_codex_retry_signals.py` и этот план. Bash legacy provider.sh не меняется, defect там остаётся documented concern. Existing test_providers_core.py только запускается, не редактируется.
+
+Controlled BEFORE реально выполнен на текущем Core2: новый suite8 cases,6 failures,2.012 s, exit1. Delayed recover child получил126 вместо0 и не дошёл до RECOVERED_OK; retry+hang получил126 вместоwatchdog124; retry+nonzero получил126 вместо7; terminal flow не дождался настоящего turn.failed. Permanent quota/unknown/other-engine cases сохранились. Source Python direct OutputFilter подтверждён, поэтому .sh-only patch не исправил бы текущий путь. Затем тестовый boundary приведён к явному root5/5 решению; owned fixture pipe cleanup добавлен в тест без изменения Runtime.
+
+### R2-E — окончательная передача source-final
+
+Изменены только разрешённые `neoxider_agents/output.py`, новый `tests/test_codex_retry_signals.py` и этот план. Root согласовал 0<attempt<max для exact observed TLS reconnect notice;5/5 остаётся fatal. Любые другие shapes/transport messages, quota/auth/context и turn.failed сохраняют прежний fatal путь. Diagnostic попадает в raw/activity/log, без AGENT_PROVIDER_ERROR и без подавления последующего terminal/nonzero результата. Runtime/lifecycle/OpenCode/providers и H/J файлы не изменены. Bash legacy parser дефект остаётся отдельным concern.
+
+Последний `python -m unittest discover -s tests -p test_codex_retry_signals.py`: **8/8 PASS**,3.144s, exit0. Controlled live Turn действительно дождался receipt+RECOVERED_OK после retry; hang сохранилwatchdog124; exhausted nonzero сохранил7 безquota; quota/terminalerror остановились126. Boundary feedcases проверили1/5,2/5 positive и0/5,5/5,6/5,2/0/permanentwrapped/unknown negatives; OpenCode fatal unchanged. Последний `python -m unittest discover -s tests -p test_providers_core.py`: **78/78 PASS**,1.805s, exit0; файл не изменён.
+
+Первый patch не имел importre, tests выявилиNameError; import добавлен и повторныеfocused tests прошли. Не скрывать этот промежуточный failure или выдавать его за source-final. Scoped diffcheck exit0. J source reporting94408…/baseline test4212… unchanged. AI/network не вызывались regression; source заморожен для полного root review, реальная CODE task возобновляется только после принятия. TLS/proxy/квота не исправлены этим изменением. Receipt `D:/Temp/agents-ux/r2-codex-retry-20261011/source-final.json`.
+
+### Исправление boundary по первичному исходнику Codex0.160.0
+
+Root сверил и native lead независимо прочёл [responses_retry.rs тега rust-v0.160.0](https://raw.githubusercontent.com/openai/codex/rust-v0.160.0/codex-rs/core/src/responses_retry.rs). notify_stream_error для retry_count/max_retries вызывается до sleep и возврата Ok, включая retry_count=max_retries. После исчерпания возможно переключение WebSocket→HTTPS со сбросом счётчика. Поэтому прежнее root5/5fatal указание ошибочно и заменено: **0<attempt<=max** диагностический для exact TLS retry notice. Исчерпание подтверждается terminal turn.failed/эксплицитной terminal ошибкой или nonzero process exit, не одним счётчиком. Wall watchdog остаётся прежним и не продлевается.
+
+До изменения production comparison добавляется настоящий delayed5/5→RECOVERED_OK test; прежний код должен получить126. Дополнительный negative test передаёт turn.failed с тем же exact2/5 body и требуетfatal. Invalid6/5/permanentwrap/unknown shapes остаютсяfatal. Production scope по дополнительному grant только один comparison `<`→`<=`; шаблон сообщения не расширяется, legacy .sh не меняется. Ожидаемый окончательный test suite9, фактические counts будут записаны после запуска.
+
+### R2-E — окончательный boundary и результаты после первичного уточнения
+
+Последний `python -m unittest discover -s tests -p test_codex_retry_signals.py -v`: **9/9 PASS**, 4.019 s, exit 0. Новый настоящий child с last notice5/5 действительно дошёл до RECOVERED_OK и controlled receipt; до `<=` получил126, отдельный BEFORE1case FAIL0.249s. Дополнительный negative turn.failed с тем же exact2/5 body осталсяfatal. Existing compatibility `test_providers_core.py`: **78/78 PASS**, 1.641 s, exit 0. Публичная CLI retry semantics подтверждена primary source URL выше; wall watchdog неизменен, бессрочный retry не разрешён.
+
+Окончательный source-final заменяет промежуточный8case manifest; предыдущий JSON сохранён отдельно как source-final-eight-case.json. Новые hashes и counts в `D:/Temp/agents-ux/r2-codex-retry-20261011/source-final.json`. Source снова заморожен для root diff/independent tests. Старое5/5fatal правило отмечено ошибочным; Runtime/OpenCode/legacy parser и H/J не менялись. Это восстановление правильного client retry protocol, не устранение TLS/network failure и не доказательство успешного CODE delivery.

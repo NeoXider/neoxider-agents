@@ -1,6 +1,7 @@
 """Bounded in-process JSONL output filters and activity capture."""
 from collections import OrderedDict, deque
 import json
+import re
 import os
 from pathlib import Path
 import time
@@ -26,6 +27,13 @@ def error_text(value):
         except (ValueError, AttributeError):
             pass
     return " ".join(str(value or "").split())
+
+
+def _codex_retry_notice(message):
+    """Only an in-progress, bounded Codex TLS reconnect notice is nonterminal."""
+    match = re.fullmatch(r"Reconnecting\.\.\. ([1-9][0-9]{0,8})/([1-9][0-9]{0,8}) "
+                         r"\(stream disconnected before completion: tls handshake eof\)", message)
+    return bool(match and int(match.group(1)) <= int(match.group(2)))
 
 
 class OutputFilter:
@@ -289,7 +297,12 @@ class OutputFilter:
                 if item.get("type") == "agent_message" and item.get("text") is not None:
                     self._set_answer(item["text"])
             elif tag in ("error", "turn.failed"):
-                self._error(event.get("error") or event.get("message"), output)
+                value = event.get("error") or event.get("message")
+                message = error_text(value)
+                if tag == "error" and _codex_retry_notice(message):
+                    output.append("[codex] retry: " + message + "\n")
+                else:
+                    self._error(value, output)
         elif self.engine == "opencode":
             self._session(event.get("sessionID"), output)
             if tag == "text":
