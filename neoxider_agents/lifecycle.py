@@ -214,6 +214,7 @@ def run(store, name, prompt, opts, fresh=False):
             resolved["_generation"] = uuid.uuid4().hex
             store.update(name, owns=opts.get("owns", ""), strict_owns=int(bool(opts.get("--strict-owns"))),
                          generation=resolved["_generation"], state="running", engine=resolved["engine"],
+                         resolved_model=model, effort=effort, model=model + ("-" + effort if effort else ""),
                          dir=resolved["dir"], pid=os.getpid(), pid_start=pid_stamp(os.getpid()),
                          winpid=os.getpid() if os.name == "nt" else "")
         if not fresh:

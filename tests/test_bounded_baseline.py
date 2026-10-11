@@ -122,6 +122,109 @@ class BoundedBaselineTests(unittest.TestCase):
         self.assertIn('wall time', result.reason)
         self.assertEqual(result, {})
 
+    def test_scoped_git_never_opens_unowned_files_or_consumes_their_budget(self):
+        self.put('owned/input.txt')
+        for number in range(100):
+            self.put('unowned/%d.dat' % number)
+        candidates = ['unowned/%d.dat' % number for number in range(100)] + ['owned/input.txt']
+        original = Path.open
+        def checked(path, *args, **kwargs):
+            self.assertNotIn('unowned', path.parts)
+            return original(path, *args, **kwargs)
+        with mock.patch.object(reporting, '_git_listed_files', return_value=candidates), \
+                mock.patch.object(Path, 'open', checked), \
+                mock.patch.dict(os.environ, AGENT_BASELINE_MAX_FILES='1'):
+            result = reporting.snapshot(self.work, owns='owned/input.txt')
+        self.assertEqual(set(result), {'owned/input.txt'})
+        self.assertFalse(result.partial)
+
+    def test_scoped_fallback_prunes_unrelated_subtrees_and_handles_partial_prefix(self):
+        self.put('src/feature/nested/a.py')
+        self.put('src/other/keep.txt')
+        self.put('unowned/never.txt')
+        original = reporting.os.walk
+        visited = []
+        def walk(*args, **kwargs):
+            for parent, dirs, files in original(*args, **kwargs):
+                visited.append(Path(parent).relative_to(self.work).as_posix())
+                yield parent, dirs, files
+        with mock.patch.object(reporting, '_git_listed_files', return_value=None), \
+                mock.patch.object(reporting.os, 'walk', walk):
+            result = reporting.snapshot(self.work, owns='src/fea?ure/*.py')
+        self.assertEqual(set(result), {'src/feature/nested/a.py'})
+        self.assertNotIn('unowned', visited)
+        self.assertNotIn('src/other', visited)
+
+    def test_scoped_snapshot_accepts_absolute_unicode_backslash_and_missing_paths(self):
+        path = self.put('owned/данные.txt')
+        self.put('elsewhere.txt')
+        for owns in (str(path), 'owned\\данные.txt,owned/new.txt', './owned/../owned/данные.txt'):
+            result = reporting.snapshot(self.work, owns=owns)
+            self.assertEqual(set(result), {'owned/данные.txt'})
+            self.assertFalse(result.partial)
+        self.assertEqual(reporting.snapshot(self.work, owns=str(self.base / 'outside.txt')), {})
+
+    def test_scoped_partial_counts_only_owned_candidates(self):
+        for n in range(4): self.put('owned/%d.txt' % n)
+        self.put('other.txt')
+        candidates = ['owned/%d.txt' % n for n in range(4)] + ['other.txt']
+        with mock.patch.object(reporting, '_git_listed_files', return_value=candidates), \
+                mock.patch.dict(os.environ, AGENT_BASELINE_MAX_FILES='1'):
+            result = reporting.snapshot(self.work, owns='owned/*.txt')
+        self.assertTrue(result.partial)
+        self.assertEqual(result.not_tracked, 3)
+
+    def test_scoped_git_excludes_linked_ancestor_without_reading_outside_root(self):
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'secret.txt').write_text('outside', encoding='utf-8')
+        link = self.work / 'owned'
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            self.skipTest('directory symlink unavailable: %s' % error)
+        with mock.patch.object(reporting, '_git_listed_files', return_value=['owned/secret.txt']), \
+                mock.patch.object(Path, 'open', side_effect=AssertionError('linked content opened')):
+            result = reporting.snapshot(self.work, owns='owned/*')
+        self.assertEqual(result, {})
+        self.assertTrue(result.partial)
+        self.assertEqual(result.reason, 'linked ancestor excluded')
+
+    def test_scoped_zero_budget_is_partial_not_complete_empty(self):
+        self.put('owned.txt')
+        with mock.patch.object(reporting, '_git_listed_files', return_value=['owned.txt']), \
+                mock.patch.dict(os.environ, AGENT_BASELINE_BUDGET_SEC='0'):
+            result = reporting.snapshot(self.work, owns='owned.txt')
+        self.assertTrue(result.partial)
+        self.assertEqual(result, {})
+        self.assertIsNone(result.not_tracked)
+
+    def test_scoped_guard_rejects_linked_ancestor_even_without_os_symlink_permission(self):
+        self.put('owned/secret.txt')
+        original = Path.is_symlink
+        def linked(path):
+            return path == self.work / 'owned' or original(path)
+        with mock.patch.object(reporting, '_git_listed_files', return_value=['owned/secret.txt']), \
+                mock.patch.object(Path, 'is_symlink', linked), \
+                mock.patch.object(Path, 'open', side_effect=AssertionError('linked content opened')):
+            result = reporting.snapshot(self.work, owns='owned/*')
+        self.assertEqual(result, {})
+        self.assertTrue(result.partial)
+        self.assertEqual(result.reason, 'linked ancestor excluded')
+
+    def test_scoped_git_never_follows_outside_traversal_candidate(self):
+        outside = self.base / 'outside.txt'
+        outside.write_text('private', encoding='utf-8')
+        with mock.patch.object(reporting, '_git_listed_files', return_value=['../outside.txt']), \
+                mock.patch.object(Path, 'open', side_effect=AssertionError('outside file opened')):
+            result = reporting.snapshot(self.work, owns='../outside.txt')
+        self.assertEqual(result, {})
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows ownership casing')
+    def test_scoped_windows_ownership_matches_case_insensitively(self):
+        self.put('Owned/Mixed.txt')
+        self.assertEqual(set(reporting.snapshot(self.work, owns='owned/MIXED.TXT')), {'Owned/Mixed.txt'})
+
     def test_fallback_byte_limit_marks_partial_before_opening_file(self):
         self.put('large.dat', b'x' * 100)
         with mock.patch.dict(os.environ, AGENT_BASELINE_MAX_BYTES='50'), \

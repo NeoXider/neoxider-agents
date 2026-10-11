@@ -79,6 +79,64 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(self.store.path("task", ".baseline.json").read_bytes(), before)
         self.assertEqual(reporting.changed_files(self.store, "task", self.work), ["a.py"])
 
+    def test_scoped_baseline_roundtrip_preserves_original_scope_and_content_detection(self):
+        path = self.put('owned/a.txt', 'old')
+        removed = self.put('owned/remove.txt', 'delete')
+        self.put('unowned.txt', 'before')
+        self.seed(owns='owned/*')
+        baseline = reporting.read_baseline(self.store, 'task')
+        self.assertEqual(baseline['owns'], 'owned/*')
+        self.assertEqual(set(baseline['files']), {'owned/a.txt', 'owned/remove.txt'})
+        stamp = path.stat()
+        path.write_text('new', encoding='utf-8')
+        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        removed.unlink()
+        self.put('owned/new.txt', 'new file')
+        self.put('unowned.txt', 'changed')
+        changes = reporting.file_changes(self.store, 'task', self.work)
+        self.assertEqual({item['path']: item['status'] for item in changes}, {
+            'owned/a.txt': 'modified', 'owned/remove.txt': 'deleted', 'owned/new.txt': 'added'})
+        self.store.update('task', owns='*')
+        # Follow-ups cannot retroactively invent an unowned start snapshot.
+        reporting.begin_snapshot(self.store, 'task', self.work)
+        self.assertEqual(reporting.read_baseline(self.store, 'task')['owns'], 'owned/*')
+        self.assertEqual(reporting.changed_files(self.store, 'task', self.work),
+                         ['owned/a.txt', 'owned/new.txt', 'owned/remove.txt'])
+
+    def test_old_v2_baseline_without_scope_remains_whole_workspace(self):
+        self.put('a.txt', 'old')
+        self.put('b.txt', 'old')
+        self.seed()
+        baseline = reporting.read_baseline(self.store, 'task')
+        baseline.pop('owns')
+        atomic_write(self.store.path('task', '.baseline.json'), json.dumps(baseline))
+        self.put('b.txt', 'new')
+        self.assertEqual(reporting.changed_files(self.store, 'task', self.work), ['b.txt'])
+
+    def test_force_with_different_scope_does_not_reuse_unowned_baseline(self):
+        self.put('a.txt', 'old')
+        self.put('b.txt', 'old')
+        self.seed(owns='a.txt')
+        self.store.update('task', owns='b.txt')
+        reporting.begin_snapshot(self.store, 'task', self.work, force=True)
+        baseline = reporting.read_baseline(self.store, 'task')
+        self.assertEqual(baseline['owns'], 'b.txt')
+        self.assertEqual(set(baseline['files']), {'b.txt'})
+
+    def test_new_run_publishes_resolved_provider_before_start_snapshot(self):
+        from neoxider_agents import lifecycle
+        provider = mock.Mock(engine='fixture')
+        resolved = dict(engine='fixture', dir=self.work.as_posix(), owns='owned.txt')
+        def snapshot(*args, **kwargs):
+            meta = self.store.read('launch')
+            self.assertEqual(meta.get('resolved_model'), 'verified-model')
+            self.assertEqual(meta.get('effort'), 'high')
+            self.assertEqual(meta['owns'], 'owned.txt')
+        with mock.patch.object(lifecycle, 'preflight', return_value=(resolved, provider, 'verified-model', 'high', '')), \
+                mock.patch.object(lifecycle, 'begin_snapshot', side_effect=snapshot), \
+                mock.patch.object(lifecycle, 'execute', return_value=0):
+            self.assertEqual(lifecycle.run(self.store, 'launch', 'work', dict(owns='owned.txt')), 0)
+
     def test_new_run_force_replaces_baseline(self):
         self.put("a.py", "old\n")
         self.seed()
@@ -322,8 +380,11 @@ class TrackingTests(unittest.TestCase):
     def test_declared_scope_excludes_disjoint_workers_changes(self):
         self.put("one.py", "old one\n")
         self.put("two.py", "old two\n")
-        self.seed("one", owns="one.py")
-        self.seed("two", owns="two.py")
+        # Older unscoped baselines still require report-time ownership filtering.
+        self.seed("one")
+        self.seed("two")
+        self.store.update("one", owns="one.py")
+        self.store.update("two", owns="two.py")
         self.put("one.py", "new one\n")
         self.put("two.py", "new two\n")
         self.assertEqual(reporting.changed_files(self.store, "one", self.work), ["one.py"])
@@ -465,14 +526,14 @@ class TrackingTests(unittest.TestCase):
 
 
 DEFECTS = [
-    ("hash-stat-regression", "reporting.py", 'return (initial.get("sha256"), initial.get("type")) != (current.get("sha256"), current.get("type"))', 'return initial.get("size") != current.get("size")', "test_hash_detects_same_size_same_timestamp_write"),
-    ("mtime-false-positive", "reporting.py", 'return (initial.get("sha256"), initial.get("type")) != (current.get("sha256"), current.get("type"))', 'return initial != current', "test_metadata_only_change_is_not_content_change"),
+    ("hash-stat-regression", "reporting.py", 'return (initial.get("sha256"), initial.get("type"), bool(initial.get("fingerprint"))) != (current.get("sha256"), current.get("type"), bool(current.get("fingerprint")))', 'return initial.get("size") != current.get("size")', "test_hash_detects_same_size_same_timestamp_write"),
+    ("mtime-false-positive", "reporting.py", 'return (initial.get("sha256"), initial.get("type"), bool(initial.get("fingerprint"))) != (current.get("sha256"), current.get("type"), bool(current.get("fingerprint")))', 'return initial != current', "test_metadata_only_change_is_not_content_change"),
     ("send-baseline-reset", "reporting.py", 'if baseline.is_file() and not force:', 'if False:', "test_baseline_preserved_across_followups"),
     ("fresh-keeps-baseline", "reporting.py", 'if baseline.is_file() and not force:', 'if baseline.is_file():', "test_new_run_force_replaces_baseline"),
-    ("dirty-git-status-lost", "reporting.py", 'git_status=_git_status(directory)', 'git_status=None', "test_dirty_git_start_recorded_and_diffed_against_dirty_content"),
+    ("dirty-git-status-lost", "reporting.py", 'git_status=_git_status(directory, max(0, _limit("AGENT_BASELINE_BUDGET_SEC", SNAPSHOT_SECONDS) - (time.monotonic() - started)))', 'git_status=None', "test_dirty_git_start_recorded_and_diffed_against_dirty_content"),
     ("legacy-baseline-dropped", "reporting.py", 'return initial != ([current["size"], current["mtime_ns"]] if current else None)', 'return True', "test_legacy_stat_baseline_remains_readable"),
     ("progress-counted", "reporting.py", 'if name.startswith("PROGRESS.") and name.endswith(".md") or name.startswith(".agent") or ignored(path):', 'if name.startswith(".agent") or ignored(path):', "test_runtime_dirs_and_progress_are_ignored"),
-    ("state-self-counted", "reporting.py", 'files=snapshot(directory, (store.root,), capture)', 'files=snapshot(directory, (), capture)', "test_state_directory_inside_work_is_excluded"),
+    ("state-self-counted", "reporting.py", 'files = snapshot(directory, (store.root,), capture, previous=previous.get("files"), owns=owns)', 'files = snapshot(directory, (), capture, previous=previous.get("files"), owns=owns)', "test_state_directory_inside_work_is_excluded"),
     ("baseline-text-unbounded", "reporting.py", 'TEXT_LIMIT = 2 * 1024 * 1024', 'TEXT_LIMIT = 8 * 1024 * 1024', "test_baseline_text_is_bounded"),
     ("baseline-total-unbounded", "reporting.py", 'or len(data) > remaining[0]', '', "test_baseline_total_text_budget"),
     ("line-counts-zero", "reporting.py", 'entry.update(insertions=additions, deletions=removals)', 'entry.update(insertions=0, deletions=0)', "test_added_deleted_modified_line_counts"),
@@ -488,6 +549,8 @@ DEFECTS = [
     ("nested-ownership-lost", "ux_tracking.py", 'os.path.join(str(Path(directory).resolve()), pattern)', 'os.path.join("/ignored", pattern)', "test_ownership_same_glob_different_dirs_is_disjoint"),
     ("shared-file-warning-lost", "ux_tracking.py", 'for conflict in overlaps(store, name, names):', 'for conflict in []:', "test_overlap_warning_for_concurrent_shared_file"),
     ("ownership-scope-lost", "reporting.py", 'return owned_paths(store, name, directory, names) if scope else names', 'return names', "test_declared_scope_excludes_disjoint_workers_changes"),
+    ("baseline-scope-not-retained", "reporting.py", 'owns=baseline.get("owns", "")', 'owns=""', "test_scoped_baseline_roundtrip_preserves_original_scope_and_content_detection"),
+    ("start-provider-identity-hidden", "lifecycle.py", 'resolved_model=model, effort=effort, model=model + ("-" + effort if effort else ""),', '', "test_new_run_publishes_resolved_provider_before_start_snapshot"),
     ("lifetimes-ignored", "ux_tracking.py", 'if ours_end < other_start or other_end < ours_start:', 'if False:', "test_overlap_excludes_disjoint_task_lifetimes"),
     ("owner-filter-lost", "ux_tracking.py", 'if not mine(meta):', 'if False:', "test_dashboard_filters_owner_and_shows_queue_usage"),
     ("queue-count-lost", "ux_tracking.py", 'queued=len(store.inbox(name))', 'queued=0', "test_dashboard_filters_owner_and_shows_queue_usage"),

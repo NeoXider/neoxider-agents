@@ -2,6 +2,24 @@
 
 ## Bounded baselines and orphan reads
 
+### Сканирование области владения (2026-10-11)
+
+Явный `--owns` теперь ограничивает хеширование start/delta snapshot, а также пути
+в отчёте. Git-кандидаты фильтруются до чтения файлов; вне Git обход отсекает поддеревья
+вне буквальных префиксов ownership и сохраняет прежний fnmatch (`*` может пересекать
+разделители пути). Scope сохраняется в baseline v2 и переживает follow-up. Старые
+baseline без scope сравнивают весь workspace. Forced новый baseline с другим scope
+не переиспользует старую область. Partial count относится к scoped кандидатам;
+незавершённая фильтрация сообщает неизвестное число оставшихся. Обычный delta scan
+по-прежнему хеширует маленькие файлы и обнаруживает восстановленный timestamp.
+
+Scoped tracking доказывает только assigned files, даже при `scope=False`; история
+ненаблюдавшегося workspace не восстанавливается. Интегратор независимо читает полный
+Git diff. Git enumeration и start Git-status остаются bounded subprocess operations.
+Dashboard по-прежнему использует shared whole-workspace scan: ускорение GUI этим
+изменением не заявлено. Start metadata публикует actual resolved model/effort до
+baseline. Provider failure, process lifetime, retries и budgets здесь не меняются.
+
 Git working trees enumerate candidates with one hidden, timeout-bounded
 `git ls-files -z --cached --others --exclude-standard` call per snapshot. This includes dirty
 tracked and unignored untracked files while excluding ignored Unity/dependency trees.

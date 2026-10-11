@@ -59,7 +59,16 @@ def _git_listed_files(root, timeout=SNAPSHOT_SECONDS):
     return None
 
 
-def snapshot(directory, excluded=(), capture=None, previous=None):
+def _ownership_patterns(root, owns):
+    """Use the same fnmatch language as reported ownership, within this root."""
+    def normalize(value):
+        value = os.path.normpath(os.path.join(str(root), value)).replace("\\", "/")
+        return value.casefold() if os.name == "nt" else value
+    return [normalize(pattern.strip().replace("\\", "/"))
+            for pattern in (owns or "").split(",") if pattern.strip()]
+
+
+def snapshot(directory, excluded=(), capture=None, previous=None, owns=""):
     """Bounded candidate scan; optional stat reuse is for rebuilding baselines only.
 
     Delta scans rehash small files so restored timestamps still detect content edits.
@@ -72,12 +81,38 @@ def snapshot(directory, excluded=(), capture=None, previous=None):
     size_cap = _limit("AGENT_BASELINE_SIZE_CAP_BYTES", 8 * 1024 * 1024, True)
     root = Path(directory).resolve()
     excluded = tuple(os.path.normcase(str(Path(path).resolve())) for path in excluded)
+    patterns = _ownership_patterns(root, owns)
+
+    def normalized(path):
+        value = str(path).replace("\\", "/")
+        return value.casefold() if os.name == "nt" else value
+
+    def selected(path):
+        return not patterns or any(fnmatch.fnmatchcase(normalized(path), pattern) for pattern in patterns)
+
+    prefixes = [pattern[:min((pattern.find(char) for char in "*?[" if char in pattern), default=len(pattern))].rstrip("/")
+                for pattern in patterns]
+
+    def descend(path):
+        value = normalized(path).rstrip("/") + "/"
+        # The prefix may end inside a directory component (src/fe?/*.py).
+        # Keep that subtree conservatively; only selected files are hashed.
+        return not patterns or any(prefix.startswith(value) or value.startswith(prefix) for prefix in prefixes)
 
     def ignored(path):
         value = os.path.normcase(str(path))
         return any(value == item or value.startswith(item + os.sep) for item in excluded)
 
     candidates = _git_listed_files(root, max(0, deadline - time.monotonic()))
+    if candidates is not None and patterns:
+        scoped = []
+        for relative in candidates:
+            if time.monotonic() >= deadline:
+                result.partial, result.reason, result.not_tracked = True, "wall time budget exhausted", None
+                break
+            if selected(root / relative):
+                scoped.append(relative)
+        candidates = scoped
     result.source = "git" if candidates is not None else "walk"
     maximum = _limit("AGENT_BASELINE_MAX_FILES", 200000 if candidates is not None else WALK_FILE_LIMIT, True)
     byte_limit = _limit("AGENT_BASELINE_MAX_BYTES", WALK_BYTE_LIMIT, True)
@@ -96,7 +131,7 @@ def snapshot(directory, excluded=(), capture=None, previous=None):
             for index, relative in enumerate(candidates):
                 if time.monotonic() >= deadline:
                     result.partial, result.reason = True, "wall time budget exhausted"
-                    result.not_tracked = len(candidates) - index
+                    result.not_tracked = None if result.not_tracked is None else len(candidates) - index
                     return
                 path = root / relative
                 # Reject traversal and symlink ancestors (the final link itself is safe).
@@ -110,7 +145,8 @@ def snapshot(directory, excluded=(), capture=None, previous=None):
                 yield path
         else:
             for parent, dirs, files in os.walk(str(root), onerror=walk_error):
-                dirs[:] = [d for d in dirs if d not in FALLBACK_IGNORED_DIRS and not ignored(Path(parent) / d)]
+                dirs[:] = [d for d in dirs if d not in FALLBACK_IGNORED_DIRS
+                           and not ignored(Path(parent) / d) and descend(Path(parent) / d)]
                 if time.monotonic() >= deadline:
                     result.partial, result.reason, result.not_tracked = True, "wall time budget exhausted", None
                     return
@@ -118,7 +154,9 @@ def snapshot(directory, excluded=(), capture=None, previous=None):
                     if time.monotonic() >= deadline:
                         result.partial, result.reason, result.not_tracked = True, "wall time budget exhausted", None
                         return
-                    yield Path(parent) / name
+                    path = Path(parent) / name
+                    if selected(path):
+                        yield path
 
     seen = 0
     total = 0
@@ -129,7 +167,7 @@ def snapshot(directory, excluded=(), capture=None, previous=None):
         if seen >= maximum or time.monotonic() >= deadline:
             result.partial = True
             result.reason = "file limit exhausted" if seen >= maximum else "wall time budget exhausted"
-            result.not_tracked = max(0, len(candidates) - seen) if candidates is not None else None
+            result.not_tracked = max(0, len(candidates) - seen) if candidates is not None and result.not_tracked is not None else None
             break
         seen += 1
         try:
@@ -210,7 +248,9 @@ def begin_snapshot(store, name, directory, force=False):
     if baseline.is_file() and not force:
         return
     previous = read_baseline(store, name)
-    if previous.get("directory") != Path(directory).resolve().as_posix():
+    owns = store.read(name).get("owns", "")
+    if (previous.get("directory") != Path(directory).resolve().as_posix()
+            or previous.get("owns", "") != owns):
         previous = {}
     folder = store.path(name, ".baseline.files")
     if store.root.resolve() not in folder.resolve().parents:
@@ -238,10 +278,11 @@ def begin_snapshot(store, name, directory, force=False):
             remaining[0] -= len(data)
         entry["content"] = blob
 
-    files = snapshot(directory, (store.root,), capture, previous=previous.get("files"))
+    files = snapshot(directory, (store.root,), capture, previous=previous.get("files"), owns=owns)
     data = dict(version=2, directory=Path(directory).resolve().as_posix(), created_epoch=time.time(),
                 git_status=_git_status(directory, max(0, _limit("AGENT_BASELINE_BUDGET_SEC", SNAPSHOT_SECONDS) - (time.monotonic() - started))), files=files,
-                partial=files.partial, reason=files.reason, not_tracked=files.not_tracked, source=files.source)
+                partial=files.partial, reason=files.reason, not_tracked=files.not_tracked, source=files.source,
+                owns=owns)
     atomic_write(baseline, json.dumps(data, ensure_ascii=False))
     used = {entry.get("content") for entry in files.values()}
     # Old, very large baselines must not turn a bounded force/restart into an
@@ -329,7 +370,7 @@ def changed_files(store, name, directory, scope=True):
     if not baseline:
         return []
     initial = baseline.get("files", baseline)
-    current = snapshot(directory, (store.root,)) if directory and Path(directory).is_dir() else {}
+    current = snapshot(directory, (store.root,), owns=baseline.get("owns", "")) if directory and Path(directory).is_dir() else {}
     _warn_partial(store, name, baseline, current)
     names = sorted(key for key in _delta_keys(baseline, initial, current) if _different(initial.get(key), current.get(key)))
     return owned_paths(store, name, directory, names) if scope else names
@@ -349,7 +390,7 @@ def file_changes(store, name, directory, freeze=False, frozen=True):
     if not baseline:
         return []
     initial = baseline.get("files", baseline)
-    current = snapshot(directory, (store.root,)) if directory and Path(directory).is_dir() else {}
+    current = snapshot(directory, (store.root,), owns=baseline.get("owns", "")) if directory and Path(directory).is_dir() else {}
     _warn_partial(store, name, baseline, current)
     result = []
     for key in owned_paths(store, name, directory, _delta_keys(baseline, initial, current)):
