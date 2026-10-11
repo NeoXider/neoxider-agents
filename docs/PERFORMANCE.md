@@ -2,6 +2,25 @@
 
 ## Bounded baselines and orphan reads
 
+### Ограниченный doctor (R2-H, 2026-10-11)
+
+`doctor` и public `provider-info` выполняют resolution/local scan/network/version/auth
+в отдельных helper trees через existing `process.spawn`/Windows Job Objects/POSIX groups.
+Default whole deadline15s, perprovider10s (`AGENT_DOCTOR_TIMEOUT_SEC` и
+`AGENT_DOCTOR_PROVIDER_TIMEOUT_SEC`); deadline включает запуск/чтение. Cleanup margin
+до0.4s наhelper (reap+stdoutEOF), пятьhelper дают до2s сверхwalldeadline в худшемслучае.
+Ни ThreadPoolExecutor context join, ни зависший plugin resolver не блокируют весьdoctor.
+Stdout+stderr каждогоhelper ограничены256KiB; неполный/malformed/error result получает
+state error/timeout и Unknown availability/limits, rawauthstderr не публикуется.
+Healthy engines сохраняются. JSON inventory exit0 сам по себе не означает healthyroute:
+caller проверяет engine state/availability; unknown quota не показывается как0%.
+
+Claude optional transcript estimate:1.5s/1024files/16MiB с partial observed-count marker.
+Codex latestsession inventory:1.5s/2048paths, только8latesttails; если inventory partial,
+limits Unknown, stale subset не выдаётсяза latest. Эти cooperative budgets не заменяют
+hardhelperdeadline: stuck filesystem/DNS/HTTP завершаются вместе с ownedhelper tree.
+Diagnostic helpers не AIagents, не меняют routing/taskstate и не создают сервис/daemon.
+
 ### Сканирование области владения (2026-10-11)
 
 Явный `--owns` теперь ограничивает хеширование start/delta snapshot, а также пути

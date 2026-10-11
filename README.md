@@ -197,6 +197,17 @@ side effect); `neoxider gui [port]` opens the panel; everything else passes stra
 
 ## Native task controls
 
+### Ограниченная проверка окружения
+
+`doctor --json` и `provider-info ENGINE` имеют whole15s/perprovider10s deadlines
+(env `AGENT_DOCTOR_TIMEOUT_SEC`, `AGENT_DOCTOR_PROVIDER_TIMEOUT_SEC`) плюс до0.4scleanup
+наhelper. Resolution/localusage/network изолированы в ownedhiddenprocess trees.
+Healthy engines сохраняются при зависании другого. Timeout/error не означает
+«не установлен» или нулевую квоту: соответствующие данные остаются Unknown.
+JSON inventory с exit0 не подтверждает рабочий model/tool route; проверяйте `state`
+и выполняйте отдельную bounded tool-пробу. `--deep` остаётся opt-in и не вызывает
+AIprovider за пределами прежнего diagnostic workflow.
+
 | Action | Native task contract | neoxider contract |
 |---|---|---|
 | Start / resume | Tracked job completes with its answer | `run`, `reply` and `send` block; track the invocation in your harness |

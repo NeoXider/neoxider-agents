@@ -7,6 +7,9 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import tempfile
+from threading import Event
 
 ROOT = Path(__file__).resolve().parent.parent
 ENGINES = ("codex", "claude", "kimi", "opencode", "gemini")
@@ -88,11 +91,166 @@ def executable(engine):
 
 def capture(argv, timeout=8):
     try:
+        deadline = float(os.environ.get("AGENT_DIAGNOSTIC_DEADLINE", "inf"))
+        timeout = min(timeout, max(0.001, deadline - time.monotonic()))
+    except ValueError:
+        pass
+    if os.environ.get("AGENT_DIAGNOSTIC_HELPER") == "1":
+        return _diagnostic_capture(argv, timeout)
+    try:
         process = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, timeout=timeout, **hidden_options())
         return process.returncode, process.stdout.decode("utf-8", "replace").strip()
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except OSError:
         return 1, ""
+
+
+def diagnostic_pipe_read(stream):
+    """Read only ready bytes; no background reader or buffered blocking close."""
+    fd = stream.fileno()
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from .windows import _declare, HANDLE, w
+        available = w.DWORD()
+        peek = _declare("PeekNamedPipe", [HANDLE, ctypes.c_void_p, w.DWORD, ctypes.c_void_p,
+                                          ctypes.POINTER(w.DWORD), ctypes.c_void_p], w.BOOL)
+        if not peek(msvcrt.get_osfhandle(fd), None, 0, None, ctypes.byref(available), None):
+            error = ctypes.get_last_error()
+            if error in (109, 232, 233):
+                return b""
+            raise OSError(error, "diagnostic pipe query failed")
+        return os.read(fd, min(4096, available.value)) if available.value else None
+    import select
+    ready, unused, unused = select.select([fd], [], [], 0)
+    return os.read(fd, 4096) if ready else None
+
+
+def drain_diagnostic_pipe(stream, data, limit, deadline):
+    while time.monotonic() < deadline:
+        block = diagnostic_pipe_read(stream)
+        if not block:
+            return ""
+        remaining = limit - len(data)
+        data.extend(block[:max(0, remaining)])
+        if len(block) > remaining:
+            return "output exceeded limit"
+    return "deadline exceeded"
+
+
+def close_diagnostic_tree(tree):
+    """Always close the pipe, even when containment/reaping reports an error."""
+    from .process import kill_tree, pid_alive, pid_stamp
+    deadline = time.monotonic() + 0.4
+    owned = {}
+    problem = ""
+    current = pid_stamp(tree.pid)
+    if not current or current == tree.stamp:
+        try:
+            if os.name == "nt":
+                from .windows import processes
+                rows = processes()
+            else:
+                from .process import _posix_rows
+                rows = _posix_rows()
+        except Exception:
+            rows = []
+            problem = "diagnostic descendant inventory failed"
+        parents = {tree.pid}
+        for unused in rows:
+            added = {pid for pid, parent, unused_value in rows if parent in parents and pid not in parents}
+            if not added:
+                break
+            parents.update(added)
+        for pid, parent, unused_value in rows:
+            same_group = False
+            if os.name != "nt":
+                try:
+                    same_group = os.getpgid(pid) == tree.pid
+                except OSError:
+                    pass
+            if pid in parents or same_group:
+                stamp = pid_stamp(pid)
+                if stamp:
+                    owned[pid] = stamp
+    try:
+        try:
+            tree.close()
+        except Exception:
+            problem = "diagnostic containment cleanup failed"
+            try:
+                kill_tree(tree.pid, stamp=tree.stamp, job_name=tree.job_name)
+            except Exception:
+                pass
+        try:
+            tree.process.wait(timeout=0.2)
+        except Exception:
+            problem = "diagnostic process cleanup incomplete"
+            try:
+                kill_tree(tree.pid, stamp=tree.stamp, job_name=tree.job_name)
+            except Exception:
+                pass
+            try:
+                tree.process.wait(timeout=max(0, min(0.2, deadline - time.monotonic())))
+            except Exception:
+                pass
+        sleeper = Event()
+        while owned and time.monotonic() < deadline:
+            owned = {pid: stamp for pid, stamp in owned.items() if pid_alive(pid, stamp)}
+            if owned:
+                sleeper.wait(min(0.01, max(0, deadline - time.monotonic())))
+        if owned:
+            problem = "diagnostic descendants cleanup incomplete"
+    finally:
+        try:
+            if tree.process.stdout:
+                try:
+                    tree.process.stdout.close()
+                except Exception:
+                    problem = "diagnostic stdout cleanup incomplete"
+                    try:
+                        tree.process.stdout.raw.close()
+                    except Exception:
+                        pass
+        finally:
+            try:
+                tree.close()
+            except Exception:
+                problem = "diagnostic containment cleanup incomplete"
+    return problem
+
+
+def _diagnostic_capture(argv, timeout):
+    """Bound CLI output inside the diagnostic helper, before it becomes JSON."""
+    from .process import spawn
+    data, sleeper = bytearray(), Event()
+    deadline = time.monotonic() + timeout
+    with tempfile.TemporaryDirectory(prefix="neoxider-version-"):
+        tree = spawn(argv, os.devnull)
+        problem = ""
+        try:
+            while True:
+                problem = drain_diagnostic_pipe(tree.process.stdout, data, 128 * 1024, deadline)
+                if problem or tree.process.poll() is not None:
+                    break
+                sleeper.wait(min(0.02, max(0, deadline - time.monotonic())))
+            code = tree.process.returncode
+        finally:
+            # Drain a completed parent's buffered bytes before closing its inherited pipe.
+            try:
+                if not problem:
+                    problem = drain_diagnostic_pipe(tree.process.stdout, data, 128 * 1024, deadline)
+            except (OSError, ValueError):
+                problem = "diagnostic output read failed"
+            finally:
+                cleanup = close_diagnostic_tree(tree)
+        if problem or cleanup:
+            if "deadline" in problem:
+                raise TimeoutError("diagnostic CLI deadline exceeded")
+            raise RuntimeError("diagnostic CLI output or cleanup failed")
+        return code or 0, bytes(data).decode("utf-8", "replace").strip()
 
 
 class BaseProvider:
@@ -109,10 +267,16 @@ class BaseProvider:
     def doctor(self):
         try:
             base = executable(self.engine)
-        except (OSError, ValueError):
+        except FileNotFoundError:
             return {"engine": self.engine, "version": "NOT_FOUND", "available": False,
                     "login": "", "limits": None, "note": ""}
-        _, version = capture(base + ["--version"])
+        except (OSError, ValueError):
+            return {"engine": self.engine, "version": "?", "available": None,
+                    "login": "", "limits": None, "state": "error", "note": "executable resolution failed"}
+        code, version = capture(base + ["--version"])
+        if code or not version:
+            return {"engine": self.engine, "version": "?", "available": None, "login": "", "limits": None,
+                    "state": "timeout" if code == 124 else "error", "note": "CLI version probe did not succeed"}
         return {"engine": self.engine, "version": version.splitlines()[0] if version else "?",
                 "available": True, "login": "", "limits": None,
                 "note": "No CLI limits endpoint for this provider."}

@@ -16,6 +16,80 @@ from neoxider_agents.providers import CONFLICT, executable, failure_reason, get_
 
 
 class Aliases(unittest.TestCase):
+    def test_version_failure_does_not_claim_cli_is_healthy_or_missing(self):
+        from neoxider_agents.providers import BaseProvider
+        provider = BaseProvider()
+        provider.engine = "fixture"
+        with patch("neoxider_agents.providers.executable", return_value=["fixture.exe"]), \
+                patch("neoxider_agents.providers.capture", return_value=(124, "")):
+            info = provider.doctor()
+        self.assertIsNone(info["available"])
+        self.assertEqual(info["state"], "timeout")
+
+    def test_diagnostic_capture_caps_cli_output_before_provider_json(self):
+        from neoxider_agents.providers import capture
+        with patch.dict(os.environ, {"AGENT_DIAGNOSTIC_HELPER": "1"}):
+            with self.assertRaises(RuntimeError):
+                capture([sys.executable, "-c", "print('x' * (150 * 1024))"], timeout=2)
+
+    def test_claude_auth_malformed_result_is_unknown_not_logged_out(self):
+        provider = get_provider("claude")
+        module = sys.modules[type(provider).__module__]
+        from neoxider_agents.providers import BaseProvider
+        with patch.object(BaseProvider, "doctor", return_value=dict(engine="claude", available=True, version="fixture")), \
+                patch.object(module, "executable", return_value=["fixture.exe"]), \
+                patch.object(module, "capture", return_value=(1, "invalid")):
+            info = provider.doctor()
+        self.assertEqual(info["state"], "error")
+        self.assertEqual(info["login"], "")
+        self.assertIsNone(info["limits"])
+
+    def test_codex_preserves_the_unknown_version_failure_reason(self):
+        provider = get_provider('codex')
+        from neoxider_agents.providers import BaseProvider
+        with patch.object(BaseProvider, 'doctor', return_value=dict(engine='codex', available=None,
+                         version='?', state='error', note='CLI version probe did not succeed')):
+            info = provider.doctor()
+        self.assertEqual(info['state'], 'error')
+        self.assertEqual(info['note'], 'CLI version probe did not succeed')
+
+    def test_codex_incomplete_inventory_does_not_advertise_stale_session_limits(self):
+        provider = get_provider("codex")
+        with patch("glob.iglob", return_value=iter(["fixture"] * 2100)), \
+                patch("os.path.getmtime", return_value=1):
+            self.assertIsNone(provider._limits())
+
+    def test_claude_transcript_inventory_is_bounded_and_marked_partial(self):
+        provider = get_provider("claude")
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "transcript.jsonl"
+            path.write_text('', encoding='utf-8')
+            with patch("glob.iglob", return_value=iter([str(path)] * 1100)), \
+                    patch.object(Path, "home", return_value=Path(folder)):
+                limits, usage, note = provider._usage("fixture", {})
+        self.assertTrue(usage["partial"])
+        self.assertIn("Partial scan", note)
+        self.assertIsNone(limits)
+
+    def test_claude_oversized_transcript_does_not_exceed_the_byte_budget(self):
+        import io
+        provider = get_provider("claude")
+        consumed = [0]
+        class Input(io.BytesIO):
+            def readline(self, size=-1):
+                data = super().readline(size)
+                consumed[0] += len(data)
+                return data
+        with tempfile.TemporaryDirectory() as folder:
+            with patch("glob.iglob", return_value=iter([str(Path(folder) / "one.jsonl")])), \
+                    patch("os.path.getmtime", return_value=__import__('time').time()), \
+                    patch("builtins.open", return_value=Input(b'x' * (20 * 1024 * 1024))), \
+                    patch.object(Path, "home", return_value=Path(folder)):
+                limits, usage, note = provider._usage("fixture", {})
+        self.assertTrue(usage['partial'])
+        self.assertLessEqual(consumed[0], 16 * 1024 * 1024)
+        self.assertIsNone(limits)
+
     def test_codex_default(self):
         self.assertEqual(get_provider("codex").resolve(), ("gpt-5.6-terra", "medium"))
 

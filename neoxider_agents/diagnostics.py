@@ -7,9 +7,107 @@ import secrets
 import sys
 import time
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
+import tempfile
+from threading import Event
 from pathlib import Path
-from .providers import get_provider, provider_info
+from .providers import ROOT, get_provider, provider_info, drain_diagnostic_pipe, close_diagnostic_tree
+
+DOCTOR_SECONDS = 15.0
+PROVIDER_SECONDS = 10.0
+OUTPUT_BYTES = 256 * 1024
+
+
+def _seconds(key, default):
+    try:
+        value = float(os.environ.get(key, default))
+        return value if 0 < value < float("inf") else default
+    except (ValueError, OverflowError):
+        return default
+
+
+def _unknown(engine, state, note):
+    return dict(engine=engine, version="?", available=None, login="", limits=None,
+                state=state, note=note)
+
+
+def bounded_probes(engines, command=None):
+    """Isolate resolution, filesystem and network work in owned diagnostic trees."""
+    from .process import spawn
+    from activity import redact
+    whole = _seconds("AGENT_DOCTOR_TIMEOUT_SEC", DOCTOR_SECONDS)
+    per = _seconds("AGENT_DOCTOR_PROVIDER_TIMEOUT_SEC", PROVIDER_SECONDS)
+    deadline = time.monotonic() + whole
+    active, results = {}, {}
+    sleeper = Event()
+
+    def finish(engine, failure=None, read_error=None):
+        tree, buffer, unused = active[engine]
+        problem = read_error or ""
+        try:
+            if not failure and not problem:
+                problem = drain_diagnostic_pipe(tree.process.stdout, buffer, OUTPUT_BYTES, deadline)
+        except (OSError, ValueError):
+            problem = "diagnostic output read failed"
+        finally:
+            try:
+                cleanup = close_diagnostic_tree(tree)
+            finally:
+                active.pop(engine, None)
+        if cleanup:
+            results[engine] = _unknown(engine, "error", cleanup)
+            return
+        if failure:
+            results[engine] = _unknown(engine, "timeout", failure)
+        elif problem:
+            results[engine] = _unknown(engine, "error", problem)
+        elif tree.process.returncode:
+            results[engine] = _unknown(engine, "error", "diagnostic helper exited unsuccessfully")
+        else:
+            try:
+                payload = json.loads(buffer.decode("utf-8"))
+                if not isinstance(payload, dict) or payload.get("engine", engine) != engine:
+                    raise ValueError("unexpected diagnostic result")
+                results[engine] = json.loads(redact(json.dumps(payload, ensure_ascii=False)))
+            except (ValueError, UnicodeError):
+                results[engine] = _unknown(engine, "error", "diagnostic helper returned invalid JSON")
+
+    with tempfile.TemporaryDirectory(prefix="neoxider-doctor-") as folder:
+        prompt = os.devnull
+        try:
+            for engine in engines:
+                if time.monotonic() >= deadline:
+                    results[engine] = _unknown(engine, "timeout", "whole doctor deadline exceeded")
+                    continue
+                started = time.monotonic()
+                env = dict(os.environ, AGENT_DIAGNOSTIC_HELPER="1",
+                           AGENT_DIAGNOSTIC_DEADLINE=str(min(deadline, started + per)),
+                           PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+                argv = command(engine) if command else [sys.executable, str(ROOT / "agent.py"), "provider-info", engine]
+                try:
+                    tree = spawn(argv, prompt, str(ROOT), env)
+                    active[engine] = (tree, bytearray(), min(deadline, started + per))
+                except (OSError, ValueError, RuntimeError):
+                    results[engine] = _unknown(engine, "error", "diagnostic helper could not start")
+            while active:
+                now = time.monotonic()
+                for engine, (tree, buffer, until) in list(active.items()):
+                    if now >= until:
+                        finish(engine, "whole doctor deadline exceeded" if now >= deadline else "provider diagnostic deadline exceeded")
+                    else:
+                        try:
+                            problem = drain_diagnostic_pipe(tree.process.stdout, buffer, OUTPUT_BYTES, until)
+                        except (OSError, ValueError):
+                            problem = "diagnostic output read failed"
+                        if problem:
+                            finish(engine, read_error=problem)
+                        elif tree.process.poll() is not None:
+                            finish(engine)
+                if active:
+                    sleeper.wait(min(0.02, max(0, deadline - time.monotonic())))
+        finally:
+            for engine in list(active):
+                finish(engine, "diagnostic supervisor cancelled")
+    return [results[engine] for engine in engines]
 
 
 def epoch(value):
@@ -42,7 +140,7 @@ def windows(info):
 
 def normalize(info, engine):
     if not isinstance(info, dict):
-        info = dict(version="ERROR", available=False, login="", limits=None, note="probe returned invalid JSON")
+        info = _unknown(engine, "error", "probe returned invalid JSON")
     info.setdefault("engine", engine)
     limits = info.get("limits")
     if isinstance(limits, dict):
@@ -51,6 +149,11 @@ def normalize(info, engine):
         for row in buckets:
             row["resets_at"] = epoch(row.get("resets_at"))
     login = (info.get("login") or "").lower()
+    if info.get("state") in ("timeout", "error"):
+        return info
+    if info.get("available") is None:
+        info.update(state="error", available=None, limits=None, note="diagnostic availability unknown")
+        return info
     info["state"] = ("not_installed" if not info.get("available") else "not_logged_in"
                      if any(word in login for word in ("required", "not logged", "logged out")) else "ok")
     return info
@@ -60,7 +163,9 @@ def render(results, deep_engines, deep, generated):
     lines = ["=== engines (CLI) ==="]
     for row in results:
         engine = row["engine"]
-        if row["state"] == "not_installed":
+        if row["state"] in ("timeout", "error"):
+            lines.append("  %-9s %s (health/limits unknown: %s)" % (engine, row["state"], row.get("note", "")))
+        elif row["state"] == "not_installed":
             lines.append("  %-9s -    (not in PATH)" % engine)
         else:
             lines.append("  %-9s ok   %s" % (engine, row.get("version") or "?"))
@@ -75,7 +180,11 @@ def render(results, deep_engines, deep, generated):
             lines += ["=== %s rate limits (%s) ===" % (row["engine"], source),
                       "  plan: " + str((row.get("limits") or {}).get("plan_type") or "?")]
             for window in live:
-                used = float(window.get("used_percent") or window.get("utilization") or 0)
+                used_value = window.get("used_percent", window.get("utilization"))
+                if used_value is None:
+                    lines.append("  %-9s utilization unknown" % (window.get("label") or "window"))
+                    continue
+                used = float(used_value)
                 size = max(0, min(10, int(used // 10)))
                 minutes = window.get("window_minutes")
                 label = "?" if not minutes else "%sd" % (minutes // 1440) if minutes % 1440 == 0 else "%sh" % (minutes // 60) if minutes % 60 == 0 else "%sm" % minutes
@@ -102,28 +211,35 @@ def doctor(store, opts, args, single=False):
         raise ValueError("doctor: unexpected argument '" + args[0] + "'")
     if opts.get("--deep") and opts.get("--json"):
         raise ValueError("doctor: --deep and --json cannot be combined")
-    engines = list(provider_info())
     if single:
         if len(args) != 1:
             raise ValueError("provider-info needs ENGINE")
-        print(json.dumps(get_provider(args[0]).doctor(), ensure_ascii=False))
+        if os.environ.get("AGENT_DIAGNOSTIC_HELPER") == "1":
+            provider = get_provider(args[0])
+            try:
+                data = provider.doctor()
+            except TimeoutError:
+                data = _unknown(args[0], "timeout", "provider diagnostic timed out")
+            except (OSError, ValueError, RuntimeError):
+                data = _unknown(args[0], "error", "provider diagnostic failed")
+            if not isinstance(data, dict):
+                data = _unknown(args[0], "error", "provider returned invalid diagnostic data")
+            data["_doctor_deep"] = args[0] == "codex" or callable(getattr(provider, "doctor_deep", None))
+        else:
+            data = bounded_probes(args)[0]
+            data.pop("_doctor_deep", None)
+        print(json.dumps(data, ensure_ascii=False))
         return 0
-    deep_engines = []
-    for engine in engines:
-        provider = get_provider(engine)
-        if engine == "codex" or callable(getattr(provider, "doctor_deep", None)):
-            deep_engines.append(engine)
-
-    def probe(engine):
-        try:
-            return get_provider(engine).doctor()
-        except (OSError, ValueError, RuntimeError) as error:
-            return dict(engine=engine, available=False, version="ERROR", note=str(error), limits=None)
-    with ThreadPoolExecutor(max_workers=max(1, len(engines))) as pool:
-        results = list(pool.map(probe, engines))
+    engines = list(provider_info())
+    results = bounded_probes(engines)
+    deep_engines = [engine for engine, row in zip(engines, results)
+                    if row.pop("_doctor_deep", engine == "codex")]
     results = [normalize(row, engine) for row, engine in zip(results, engines)]
     generated = time.time()
     raw = render(results, deep_engines, opts.get("--deep"), generated)
+    raw += "=== diagnostic budgets: whole %.3fs / provider %.3fs / cleanup <=0.4s per helper ===\n" % (
+        _seconds("AGENT_DOCTOR_TIMEOUT_SEC", DOCTOR_SECONDS),
+        _seconds("AGENT_DOCTOR_PROVIDER_TIMEOUT_SEC", PROVIDER_SECONDS))
     if opts.get("--json"):
         print(json.dumps(dict(generated_at=generated, engines=results, raw=raw, deep_engines=deep_engines), ensure_ascii=False))
         return 0
@@ -135,8 +251,9 @@ def doctor(store, opts, args, single=False):
         if row["engine"] not in deep_engines:
             continue
         engine = row["engine"]
-        if not row.get("available"):
-            print("  %s shell: —    (%s not in PATH)" % (engine, engine))
+        if not row.get("available") or row.get("state") in ("timeout", "error"):
+            reason = "health not verified" if row.get("state") in ("timeout", "error") else "%s not in PATH" % engine
+            print("  %s shell: —    (%s)" % (engine, reason))
             continue
         directory = store.root / ("doctor-" + engine)
         directory.mkdir(exist_ok=True)

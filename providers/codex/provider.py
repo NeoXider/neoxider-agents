@@ -111,9 +111,13 @@ class Provider(BaseProvider):
 
     def doctor(self):
         info = super().doctor()
-        info["note"] = ""
         if info["available"]:
-            _, login = capture(executable(self.engine) + ["login", "status"])
+            info["note"] = ""
+            code, login = capture(executable(self.engine) + ["login", "status"])
+            if code and not re.search(r"not logged in|logged out|login required", login, re.I):
+                info.update(state="timeout" if code == 124 else "error", login="", limits=None,
+                            note="Authentication status unknown: CLI probe failed")
+                return info
             info["login"] = login.splitlines()[0] if login else ""
             info["limits"] = self._limits()
         return info
@@ -122,9 +126,26 @@ class Provider(BaseProvider):
     def _limits():
         import glob
         import json
+        import heapq
+        import time
         from neoxider_agents.state import tail
         root = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-        files = sorted(glob.iglob(str(root / "sessions/**/*.jsonl"), recursive=True), key=os.path.getmtime)[-8:]
+        deadline = min(time.monotonic() + 1.5, float(os.environ.get("AGENT_DIAGNOSTIC_DEADLINE", "inf")))
+        recent = []
+        scanned = 0
+        for path in glob.iglob(str(root / "sessions/**/*.jsonl"), recursive=True):
+            if time.monotonic() >= deadline or scanned >= 2048:
+                return None  # An incomplete inventory cannot establish the newest session.
+            scanned += 1
+            try:
+                row = (os.path.getmtime(path), path)
+            except OSError:
+                continue
+            if len(recent) < 8:
+                heapq.heappush(recent, row)
+            elif row > recent[0]:
+                heapq.heapreplace(recent, row)
+        files = [path for unused, path in sorted(recent)]
 
         def find(value):
             if isinstance(value, dict):
@@ -137,6 +158,8 @@ class Provider(BaseProvider):
             return None
         limits = None
         for path in files:
+            if time.monotonic() >= deadline:
+                return None
             for line in tail(path, 1048576).splitlines():
                 if '"rate_limits"' in line:
                     try:

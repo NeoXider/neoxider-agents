@@ -58,3 +58,15 @@ CHANGED: настоящий file list. VERIFY OUTPUT: commands/return codes/obse
 - `git diff --check`: exit0. Actual Unity workspace read-only scope `Docs/Tasks/FleetBriefs20261011/*.md`: 3files, baseline0.339656s, delta0.221038s, freeze0.240613s, partial=false, zero changes. Receipt: `D:/Temp/agents-ux/r1-20261011/unity-owned-docs-readonly.json`. Это конкретный narrow-scope measurement, не GUI parity или большой общий benchmark.
 
 Остаются R2/R3, actual free-provider write/tool probe, настоящее вложенное делегирование и GUI/control/lifetime acceptance. Успех R1 их не заменяет.
+
+## Открытая security-задача R2-J: Windows junction boundary
+
+Root принял exact следующий security scope, отдельно от уже frozen R1: **только** `neoxider_agents/reporting.py`, `tests/test_bounded_baseline.py`; source write запрещён, пока текущие CLI launchers работают. Имеется фактическое reproduction, поэтому это не гипотетическая безопасность.
+
+Controlled native probe в отдельном OS-temp fixture: work/linked — NTFS junction к соседнему outside внутри того же безопасного fixture. До удаления проверены resolved paths внутри этого fixture; sensitive bytes не использовались. `is_symlink=false`, `is_junction=true`; и Git-candidate snapshot, и fallback walk вернули `linked/probe.txt` за intended work boundary. Receipt `D:/Temp/agents-ux/r1-20261011/junction-review.json`. Это прежняя shared snapshot проблема, не доказательство того, что текущие narrow plain-MD jobs её вызывают.
+
+Решение R2-J: расширить existing linked-directory guard на junction, проверяя `Path.is_junction` где доступно; Python3.8-compatible stdlib fallback только для mount-point reparse tag. Не запрещать произвольные cloud reparse points. Тот же guard применяется и к Git ancestor checks, и к fallback directory descent; excluded relevant linked subtree делает view partial/unknown, чтобы не объявлять unseen deletions. Scope/byte/time budgets и ordinary hash detection сохраняются.
+
+Positive acceptance: ordinary owned file в workspace читается/изменяется/удаляется как прежде; cloud-placeholder tag без mount-point не объявляется junction. Negative: actual controlled OS-temp junction с outside-workspace file не читается при Git/fallback; stat-tag fallback проверяется без зависимости от privilege/version; symlink existing regressions сохраняются. До recursive fixture cleanup resolved base обязан оставаться внутри initial OS-temp root; junction сначала удаляется как link, outside proof bytes сохраняются до конца проверки. Команда: `python -m unittest discover -s tests -p test_bounded_baseline.py` плюс targeted guard/mutation proof и actual fixture receipt. Root review source-final + publication отдельно.
+
+R1 checkpoint доказывает scoped hashing/early provider identity, а не все виды filesystem links, GUI или native parity. R2-J **NotDone**, исправление на диске ещё отсутствует.

@@ -49,7 +49,7 @@ class Contracts(unittest.TestCase):
             def doctor(self):
                 return copy.deepcopy(rows[self.engine])
         output = io.StringIO()
-        with patch.object(diagnostics, "provider_info", return_value={key: {} for key in rows}), patch.object(diagnostics, "get_provider", side_effect=Provider), contextlib.redirect_stdout(output):
+        with patch.object(diagnostics, "provider_info", return_value={key: {} for key in rows}), patch.object(diagnostics, "bounded_probes", return_value=[copy.deepcopy(row) for row in rows.values()]), contextlib.redirect_stdout(output):
             code = diagnostics.doctor(self.store, {"--json": True}, [])
         self.assertEqual(code, 0)
         return json.loads(output.getvalue())
@@ -90,7 +90,7 @@ class Contracts(unittest.TestCase):
             print("unfiltered provider error", file=sys.stderr)
             return 124
         output = io.StringIO()
-        with patch.dict(os.environ, {"AGENT_TIMEOUT_SEC": "900", "AGENT_CHAT_ONLY": "0"}), patch.object(diagnostics, "provider_info", return_value={"codex": {}}), patch.object(diagnostics, "get_provider", return_value=Provider()), patch.object(lifecycle, "run", side_effect=run), contextlib.redirect_stdout(output):
+        with patch.dict(os.environ, {"AGENT_TIMEOUT_SEC": "900", "AGENT_CHAT_ONLY": "0"}), patch.object(diagnostics, "provider_info", return_value={"codex": {}}), patch.object(diagnostics, "bounded_probes", return_value=[Provider().doctor()]), patch.object(lifecycle, "run", side_effect=run), contextlib.redirect_stdout(output):
             code = diagnostics.doctor(self.store, {"--deep": True}, [])
             self.assertEqual(os.environ["AGENT_TIMEOUT_SEC"], "900")
             self.assertEqual(os.environ["AGENT_CHAT_ONLY"], "0")
