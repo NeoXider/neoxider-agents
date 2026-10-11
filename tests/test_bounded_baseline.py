@@ -1,12 +1,16 @@
 """Offline bounded baseline regressions; scratch and provider state stay isolated."""
 import contextlib
 import io
+import hashlib
+import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -189,6 +193,173 @@ class BoundedBaselineTests(unittest.TestCase):
         self.assertEqual(result, {})
         self.assertTrue(result.partial)
         self.assertEqual(result.reason, 'linked ancestor excluded')
+
+    def junction_fixture(self):
+        """A real junction to this test's own sibling, removed as a link only."""
+        outside = self.base / 'outside'
+        outside.mkdir()
+        secret = outside / 'secret.txt'
+        secret.write_bytes(b'controlled outside fixture\n')
+        link = self.work / 'linked'
+        self.assertEqual(link.parent.resolve(), self.work.resolve())
+        self.assertEqual(outside.parent.resolve(), self.base.resolve())
+        from neoxider_agents.process import hidden_kwargs
+        made = subprocess.run(['cmd.exe', '/d', '/c', 'mklink', '/J', str(link), str(outside)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, **hidden_kwargs())
+        if made.returncode:
+            self.skipTest('junction creation unavailable: %s' % made.stderr.decode('utf-8', 'replace'))
+        def cleanup():
+            self.assertEqual(link.parent.resolve(), self.work.resolve())
+            self.assertEqual(outside.parent.resolve(), self.base.resolve())
+            self.assertEqual(link.resolve(), outside.resolve())
+            self.assertEqual(link.lstat().st_reparse_tag, stat.IO_REPARSE_TAG_MOUNT_POINT)
+            os.rmdir(link)  # Windows removes the junction itself, never its target tree.
+            self.assertTrue(secret.is_file())
+            self.assertEqual(secret.read_bytes(), b'controlled outside fixture\n')
+        self.addCleanup(cleanup)
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.lstat().st_reparse_tag, stat.IO_REPARSE_TAG_MOUNT_POINT)
+        return link, outside
+
+    def guarded_junction_snapshot(self, route, legacy=False):
+        link, outside = self.junction_fixture()
+        owned = self.put('owned/input.txt', b'owned file\n')
+        self.put('normal/nested.txt', b'normal nested file\n')
+        opened, escaped = [], []
+        original = Path.open
+        def guarded(path, *args, **kwargs):
+            resolved = path.resolve()
+            if self.work.resolve() not in resolved.parents:
+                escaped.append(path.relative_to(self.work).as_posix())
+                raise AssertionError('snapshot tried to open outside owned workspace: %s' % path)
+            opened.append(path.relative_to(self.work).as_posix())
+            return original(path, *args, **kwargs)
+        candidates = ['linked/secret.txt', 'owned/input.txt', 'normal/nested.txt'] if route == 'git' else None
+        result = None
+        try:
+            with mock.patch.object(reporting, '_git_listed_files', return_value=candidates), \
+                    mock.patch.object(Path, 'open', guarded), \
+                    mock.patch.object(Path, 'is_junction', None, create=True) if legacy else contextlib.nullcontext():
+                result = reporting.snapshot(self.work)
+            self.assertEqual(set(result), {'owned/input.txt', 'normal/nested.txt'})
+            self.assertEqual(result['owned/input.txt']['sha256'], hashlib.sha256(b'owned file\n').hexdigest())
+            self.assertEqual(result.source, route)
+            self.assertTrue(result.partial)
+            self.assertIsNone(result.not_tracked)
+            self.assertIn('linked', result.reason)
+            self.assertEqual(escaped, [])
+        finally:
+            print('[junction-fixture] ' + json.dumps(dict(route=route, legacy=legacy,
+                  junction=str(link), target=str(outside), opened=opened, escaped=escaped,
+                  partial=getattr(result, 'partial', None), keys=list(result) if result is not None else None)))
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows directory junction')
+    def test_git_junction_blocks_outside_bytes_but_hashes_owned_files(self):
+        self.guarded_junction_snapshot('git')
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows directory junction')
+    def test_walk_junction_blocks_outside_bytes_but_hashes_owned_files(self):
+        self.guarded_junction_snapshot('walk')
+
+    @unittest.skipUnless(os.name == 'nt', 'Python 3.8 junction fallback on Windows')
+    def test_git_junction_without_new_path_api_still_blocks_outside_bytes(self):
+        self.guarded_junction_snapshot('git', legacy=True)
+
+    @unittest.skipUnless(os.name == 'nt', 'Python 3.8 junction fallback on Windows')
+    def test_walk_junction_without_new_path_api_still_blocks_outside_bytes(self):
+        self.guarded_junction_snapshot('walk', legacy=True)
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows directory junction')
+    def test_unowned_junction_does_not_make_scoped_snapshot_partial(self):
+        self.junction_fixture()
+        self.put('owned/input.txt')
+        for candidates in (None, ['linked/secret.txt', 'owned/input.txt']):
+            with mock.patch.object(reporting, '_git_listed_files', return_value=candidates):
+                result = reporting.snapshot(self.work, owns='owned/*')
+            self.assertEqual(set(result), {'owned/input.txt'})
+            self.assertFalse(result.partial)
+
+    @unittest.skipUnless(os.name == 'nt', 'real Windows directory junction')
+    def test_replacing_owned_directory_with_junction_keeps_delta_unknown(self):
+        _, outside = self.junction_fixture()
+        source = self.put('owned/input.txt')
+        self.store.update('task', owns='owned/*')
+        reporting.begin_snapshot(self.store, 'task', self.work)
+        source.unlink()
+        source.parent.rmdir()
+        os.rename(self.work / 'linked', self.work / 'owned')
+        # Restore the fixture link name before its verified cleanup runs.
+        self.addCleanup(lambda: os.rename(self.work / 'owned', self.work / 'linked'))
+        original = Path.open
+        def guarded(path, *args, **kwargs):
+            self.assertFalse(outside.resolve() in path.resolve().parents, 'outside bytes opened')
+            return original(path, *args, **kwargs)
+        err = io.StringIO()
+        with mock.patch.object(Path, 'open', guarded), contextlib.redirect_stderr(err):
+            self.assertEqual(reporting.changed_files(self.store, 'task', self.work), [])
+            self.assertEqual(reporting.file_changes(self.store, 'task', self.work), [])
+        self.assertIn('current snapshot partial:', err.getvalue())
+        self.assertIn('current snapshot partial:', self.store.read('task')['baseline_warning'])
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows cloud reparse tag')
+    def test_non_mountpoint_cloud_tag_keeps_owned_bytes_readable(self):
+        cloud = self.work / 'cloud'
+        self.put('cloud/input.txt', b'cloud owned bytes\n')
+        original = Path.lstat
+        def cloud_stat(path):
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_reparse_tag=0x9000001A) if path == cloud else original(path)
+        for api in (None, lambda path: False):
+            for candidates in (None, ['cloud/input.txt']):
+                with mock.patch.object(Path, 'is_junction', api, create=True), \
+                        mock.patch.object(Path, 'lstat', cloud_stat), \
+                        mock.patch.object(reporting, '_git_listed_files', return_value=candidates):
+                    result = reporting.snapshot(self.work, owns='cloud/*')
+                self.assertEqual(set(result), {'cloud/input.txt'})
+                self.assertEqual(result['cloud/input.txt']['sha256'], hashlib.sha256(b'cloud owned bytes\n').hexdigest())
+                self.assertFalse(result.partial)
+
+    def test_unverifiable_directory_marks_partial_without_opening_its_bytes(self):
+        bad = self.work / 'bad'
+        self.put('bad/input.txt')
+        self.put('good.txt')
+        original_stat, original_open = Path.lstat, Path.open
+        def denied(path):
+            if path == bad:
+                raise PermissionError('controlled directory verification failure')
+            return original_stat(path)
+        def guarded(path, *args, **kwargs):
+            self.assertNotIn(bad, path.parents, 'unverifiable directory opened')
+            return original_open(path, *args, **kwargs)
+        for candidates in (None, ['bad/input.txt', 'good.txt']):
+            # Force the legacy tag path so the injected lstat error is observable.
+            with mock.patch.object(Path, 'is_junction', None, create=True), \
+                    mock.patch.object(Path, 'lstat', denied), \
+                    mock.patch.object(Path, 'open', guarded), \
+                    mock.patch.object(reporting, '_git_listed_files', return_value=candidates):
+                if os.name != 'nt':
+                    with mock.patch.object(Path, 'is_symlink', side_effect=PermissionError('controlled verification failure')):
+                        result = reporting.snapshot(self.work)
+                else:
+                    result = reporting.snapshot(self.work)
+            self.assertEqual(set(result), {'good.txt'})
+            self.assertTrue(result.partial)
+            self.assertIsNone(result.not_tracked)
+            self.assertEqual(result.reason, 'directory verification failed')
+
+    def test_git_deleted_owned_directory_is_a_known_deletion_not_unknown(self):
+        source = self.put('owned/input.txt')
+        self.store.update('task', owns='owned/*')
+        with mock.patch.object(reporting, '_git_listed_files', return_value=['owned/input.txt']):
+            reporting.begin_snapshot(self.store, 'task', self.work)
+            source.unlink()
+            source.parent.rmdir()
+            result = reporting.snapshot(self.work, owns='owned/*')
+            self.assertFalse(result.partial)
+            self.assertEqual(result, {})
+            self.assertEqual(reporting.changed_files(self.store, 'task', self.work), ['owned/input.txt'])
+            details = reporting.file_changes(self.store, 'task', self.work)
+        self.assertEqual(len(details), 1)
+        self.assertEqual(details[0]['status'], 'deleted')
 
     def test_scoped_zero_budget_is_partial_not_complete_empty(self):
         self.put('owned.txt')

@@ -68,6 +68,24 @@ def _ownership_patterns(root, owns):
             for pattern in (owns or "").split(",") if pattern.strip()]
 
 
+def _linked_directory(path):
+    """Reject directory redirects, not unrelated Windows/cloud reparse tags."""
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction is not None and is_junction():
+        return True
+    # Path.is_junction was added after Python 3.8. lstat has exposed this
+    # Windows tag since 3.8; inspect the tag instead of rejecting every reparse.
+    if os.name != "nt":
+        return False
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False  # A removed normal parent is a known deletion, not partial.
+    return getattr(info, "st_reparse_tag", 0) == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", 0xA0000003)
+
+
 def snapshot(directory, excluded=(), capture=None, previous=None, owns=""):
     """Bounded candidate scan; optional stat reuse is for rebuilding baselines only.
 
@@ -120,7 +138,7 @@ def snapshot(directory, excluded=(), capture=None, previous=None, owns=""):
 
     def safe_parent(parent):
         if parent not in safe_parents:
-            safe_parents[parent] = not parent.is_symlink() and safe_parent(parent.parent)
+            safe_parents[parent] = not _linked_directory(parent) and safe_parent(parent.parent)
         return safe_parents[parent]
 
     def walk_error(error):
@@ -134,19 +152,39 @@ def snapshot(directory, excluded=(), capture=None, previous=None, owns=""):
                     result.not_tracked = None if result.not_tracked is None else len(candidates) - index
                     return
                 path = root / relative
-                # Reject traversal and symlink ancestors (the final link itself is safe).
+                # Reject traversal and linked ancestors (the final symlink itself is safe).
                 if Path(relative).is_absolute() or ".." in Path(relative).parts:
                     continue
                 if any(part in IGNORED_DIRS for part in Path(relative).parts[:-1]):
                     continue
-                if not safe_parent(path.parent):
+                try:
+                    safe = safe_parent(path.parent)
+                except OSError:
+                    result.partial, result.reason, result.not_tracked = True, "directory verification failed", None
+                    continue
+                if not safe:
                     result.partial, result.reason, result.not_tracked = True, "linked ancestor excluded", None
                     continue
                 yield path
         else:
             for parent, dirs, files in os.walk(str(root), onerror=walk_error):
-                dirs[:] = [d for d in dirs if d not in FALLBACK_IGNORED_DIRS
-                           and not ignored(Path(parent) / d) and descend(Path(parent) / d)]
+                descend_dirs = []
+                for name in dirs:
+                    if time.monotonic() >= deadline:
+                        result.partial, result.reason, result.not_tracked = True, "wall time budget exhausted", None
+                        return
+                    child = Path(parent) / name
+                    if name in FALLBACK_IGNORED_DIRS or ignored(child) or not descend(child):
+                        continue
+                    try:
+                        if _linked_directory(child):
+                            result.partial, result.reason, result.not_tracked = True, "linked directory excluded", None
+                            continue
+                    except OSError:
+                        result.partial, result.reason, result.not_tracked = True, "directory verification failed", None
+                        continue
+                    descend_dirs.append(name)
+                dirs[:] = descend_dirs
                 if time.monotonic() >= deadline:
                     result.partial, result.reason, result.not_tracked = True, "wall time budget exhausted", None
                     return
