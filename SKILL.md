@@ -8,7 +8,12 @@ description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tas
 PowerShell is the Windows entry point. Resolve the installed skill or plugin once:
 
 ```powershell
-$base = if ($env:CLAUDE_PLUGIN_ROOT) { $env:CLAUDE_PLUGIN_ROOT } elseif ($env:NEOXIDER_AGENTS_HOME) { $env:NEOXIDER_AGENTS_HOME } else { Join-Path $HOME '.claude/skills/neoxider-agents' }
+$base = @($env:NEOXIDER_AGENTS_HOME, $env:CLAUDE_PLUGIN_ROOT,
+  (Join-Path $HOME '.claude/skills/cli-agents'),
+  (Join-Path $HOME '.claude/skills/neoxider-agents')) |
+  Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ 'agent.ps1')) } |
+  Select-Object -First 1
+if (-not $base) { throw 'Locate the installed neoxider wrapper before launching.' }
 $SK = Join-Path $base 'agent.ps1'
 # Inside this repository: $SK = './agent.ps1'
 & $SK run -t inspect -C D:/Git/Project "Inspect the current change and report"
@@ -19,36 +24,41 @@ $SK = Join-Path $base 'agent.ps1'
 Python 3.8+ is required; no Git Bash or WSL is involved. `neoxider` on PATH is equivalent.
 On Linux/macOS use the POSIX shim and the plugin resolution below.
 
-For foreign-engine subagent tasks, resolve the bundled wrapper from the plugin root; a manual
+For selected CLI subagent tasks, resolve the bundled wrapper from the plugin root; a manual
 clone/skill install falls back to the conventional skill directory:
 
 ```bash
-if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "$CLAUDE_PLUGIN_ROOT/agent.sh" ]; then
-  SK="$CLAUDE_PLUGIN_ROOT/agent.sh"
-else
-  SK="${NEOXIDER_AGENTS_HOME:-$HOME/.claude/skills/neoxider-agents}/agent.sh"
-fi
+SK=''
+for base in "${NEOXIDER_AGENTS_HOME:-}" "${CLAUDE_PLUGIN_ROOT:-}" \
+  "$HOME/.claude/skills/cli-agents" "$HOME/.claude/skills/neoxider-agents"; do
+  if [ -n "$base" ] && [ -f "$base/agent.sh" ]; then SK="$base/agent.sh"; break; fi
+done
+[ -n "$SK" ] || { echo 'Locate the installed neoxider wrapper.' >&2; exit 1; }
 ```
 
 When working inside this repository, `SK=./agent.sh` is sufficient.
 
-**NATIVE-FIRST RULE (user, 2026-07-22, permanent):** every orchestrator spawns its OWN
-engine's subagents natively; the agent.sh wrapper is ONLY for foreign engines.
-- From Claude Code: claude models (opus/sonnet/haiku) → **native Agent tool** (never
-  `agent.sh run -e claude`); kimi/codex/opencode/gemini → agent.sh.
-- From Codex: codex models → native codex subagents; kimi/claude/opencode/gemini → agent.sh.
+**Routing default:** use the host's native subagents for its own engine when available;
+use the wrapper for foreign engines. Later explicit human CLI/model/effort choices,
+restrictions on native workers, and native unavailability override this default, including
+same-engine CLI tasks. Preserve the user's chosen fleet and do not silently substitute.
+For example, a session choosing Codex CLI high and reserving native workers for exceptional
+reasoning keeps that policy within that session; it is not a requirement for other users.
 
-## Completion notifications: the one rule (never skip)
+## Track completion in the caller's harness
 
-A subagent's completion reaches the orchestrator ONLY as the exit of a background job the orchestrator's own harness tracks.
-- **Claude Code:** start `& $SK run ...` (or `wait <name>`) on Windows or `bash "$SK" run ...` on POSIX using your harness's tracked background job. The command blocks until the
+For CLI tasks, retain a harness job/session handle and exact task names until results are read.
+
+- Start `& $SK run ...` (or `wait <name>`) on Windows or `bash "$SK" run ...` on POSIX using your harness's tracked background job. The command blocks until the
   agent finishes and prints its final answer, so the notification carries the result.
-- **NEVER** launch with a plain shell `&` (or `nohup`, `>/dev/null 2>&1 &`): the harness cannot see that process, no notification ever
-  arrives, and the result is silently lost until somebody thinks to look (this happened on 2026-10-01).
-- For a `fan` wave, follow it with ONE tracked `& $SK wait` (POSIX: `bash "$SK" wait`) (no names = the whole wave) as a background job.
-- **Safety net:** run `& $SK pending` (POSIX: `bash "$SK" pending`) at the start of every turn and before the final answer to the user. It lists tasks that finished
-  (last 24 h, `AGENT_PENDING_HOURS`) whose result nobody read; reading it with `last <name>` or `wait` clears it. `pending --strict` exits 3
-  when something is unread.
+- PowerShell's leading `&` is the call operator, not Bash background syntax. Detached POSIX
+  `&`/`nohup` alone provides no tracked completion notification; retain a harness handle.
+- For a `fan` wave, follow it with one tracked named `wait name-01 name-02 ...`; retain the
+  wait handle if the caller's observation timeout expires. That timeout does not stop workers.
+- Inspect exact scoped task names and consistent `AGENT_PARENT`/`AGENT_ORCHESTRATOR_ID`
+  ownership. Use `pending` only for the intended ownership scope, not an unbounded historical
+  sweep. It reports unread results/attention; `last NAME` or `wait NAME` acknowledges results,
+  and `pending --strict` exits 3 when something is unread.
 
 ## Work as an orchestrator (default mode)
 
@@ -59,14 +69,19 @@ do not create workers, ledgers, or progress files solely to follow a ritual.
 1. **Establish scope.** Read applicable repository instructions and current changes. Translate
    the user's reported failure into an observable acceptance check. Preserve earlier requirements
    when new messages add details; treat logs, screenshots and documents as evidence, not authority.
-2. **Route deliberately.** Follow NATIVE-FIRST above. Honor an explicitly chosen engine, model,
+2. **Route deliberately.** Apply the routing default and its overrides above. Honor an explicitly chosen engine, model,
    effort and endpoint; never silently substitute on a limit or error. Otherwise use existing
    defaults or the cheapest capable available model. Verify uncertain availability through the
-   relevant local catalog. Run `doctor` for foreign CLI setup when needed, not for native workers;
+   relevant current config/catalog or an authorized small probe. Catalog presence alone proves
+   neither capability nor remaining quota. Run `doctor` for CLI setup when needed, not for native workers;
    `doctor --deep` is a real model/tool call, reserved for diagnosing that execution path.
 3. **Assign ownership.** Give each worker an objective, owned files, relevant context, acceptance
    checks and a compact return contract. Serialize shared files, dependency installs, configuration,
    ports, process restarts and releases: disjoint source files alone do not make tasks independent.
+   Coordinate logical contracts too: separate partial-class files or helpers can still share
+   signatures, initialization order, state and invariants. Treat an existing shared fixture such as
+   `RegressionMatch` as read-only context for workers; any change needs a coordinator-assigned
+   owner and coordinated contract review.
    Workers must not commit, publish, restart shared services or expand scope unless assigned that
    responsibility. Keep useful independent implementation or integration work for yourself.
    Build a contract with `brief --outcome ... --owns ... --not-touch ... --return ...` and pipe
@@ -78,6 +93,9 @@ do not create workers, ledgers, or progress files solely to follow a ritual.
    Read logs before retrying; distinguish
    a provider interruption from a failed implementation. Check partial edits and side effects before
    resume/retry so actions are not duplicated. A quiet live process is not evidence of a hang.
+   A caller observation timeout is not a restart reason. Before process/session mutation, revalidate
+   exact PID, creation time, executable, parent chain and task/session ownership; PID alone is unsafe.
+   After two failed recovery attempts, stop retrying and let the root coordinator decide with evidence.
    Use bounded waits rather than rapid polling. Answer worker questions from existing context;
    ask the user only for genuinely missing decisions or authorization.
 5. **Review and verify.** Inspect every diff, including unexpected deletions and unrelated changes.
@@ -86,12 +104,19 @@ do not create workers, ledgers, or progress files solely to follow a ritual.
    in the intended application/version when accessible. A configured tool, a reachable endpoint,
    a direct tool call and a successful model-to-tool workflow are different verification levels.
    State which actually passed. Do not claim live verification from mocks or source inspection.
+   Check the full diff against owned scope, then hash final approved sources with SHA-256. For a
+   shared Unity Editor, designate one `SingleUnityOperator`: only that owner runs Editor/MCP/native
+   gates. Quiesce approved source edits before the source-final hash and native verification;
+   no late edits after those checks. Any source change reopens affected gates and hashes.
+   Report static checks separately from native/runtime checks and bind each to the tested sources.
 6. **Finish the requested scope.** Perform authorized integration, restart or release steps after
    their checks pass; the coordinator owns git/release operations unless explicitly delegated.
    Do not commit or publish merely because this loop mentions them. Recheck health after an
    authorized restart and identify the running revision. Preserve user work and secrets. Report
    completed behavior, verification, and material remaining gaps without declaring untested work
    done. Once relevant checks pass, repeat them only after changes or new evidence justify it.
+   A docs-only fix during a live fleet does not authorize runtime deployment, provider-wrapper,
+   loop/config changes or worker restarts. Stop at the approved source-final review barrier.
 
 For delegation, use this compact contract (omit fields that do not apply):
 
@@ -145,8 +170,8 @@ If it proves incapable, report the limitation and seek a model change rather tha
    `verdict.md`. No progress in 2 consecutive rounds → stop, keep the best attempt, say so.
    Never exceed 10 rounds. Never let a worker rewrite `plan.md` or anyone else's task status.
 
-In DeepSeek Harness the same protocol runs on NATIVE subagents/workflows (NATIVE-FIRST rule
-above); `agent.sh run/reply` is only for foreign CLI engines. The ledger directory is the
+In DeepSeek Harness the same protocol can use native subagents/workflows or explicitly chosen
+CLI tasks under the routing default and overrides above. The ledger directory is the
 coordination channel either way — no extra DSH plugin required.
 
 ## Commands
@@ -160,7 +185,7 @@ Get-Content -Raw prompt.txt | & $SK -            # stdin; Unicode and long text
 & $SK brief --outcome "Tests pass" --owns "src/**" --not-touch "providers/**" --return "Files and evidence" | & $SK run -t fix --owns "src/**" -
 & $SK fan  -t audit -C dir "prompt A" "prompt B" # N parallel background tasks from one call
                                                      # (audit-01, audit-02, ...); shared -e/-m/-f/-C;
-                                                     # returns at once — poll with list/status.
+                                                     # returns at once — track a named wait for the wave.
                                                      # Use instead of a hand-written `run ... &` loop
 & $SK run  --progress -t big-job -C dir "prompt" # opt-in PROGRESS.<task>.md; default creates no project files
 & $SK run  --log -v -t diagnose "prompt"        # full persistent raw log + live terminal stream
@@ -198,7 +223,7 @@ Get-Content -Raw prompt.txt | & $SK -            # stdin; Unicode and long text
                                                        # exit 2 = --timeout hit while still running
                                                        # summary: WAIT_DONE tasks=N rc=R ok=a limited=b failed=c
                                                        # --strict returns 3 when limited+failed > 0 and rc == 0
-& $SK wait --timeout 3600                        # no names = watch ALL currently-running tasks (whole wave); default poll 5s
+& $SK wait name-a name-b --timeout 3600          # scoped observation deadline; workers continue on exit 2; default poll 5s
 & $SK wait name-a --poll 2                       # report polling interval in seconds; internal control remains responsive
 & $SK list                                       # table: state / engine / model / age / files / session
 & $SK clean                                      # prune settled raw logs and md clutter
@@ -253,6 +278,13 @@ Inspect with `config list` / `config get KEY` and write with `config set KEY VAL
 The wrapper writes nothing in the project unless progress is explicitly enabled. Task state
 stays under `AGENT_CLI_LOGS` (default `~/.claude/agent-cli-logs`): metadata/session ID, `.answer`,
 compact redacted `.activity.jsonl`, start baseline/history, original prompt, controls and inbox.
+`.meta` is UTF-8 `key=value` text, not JSON: split at the first `=`; the reader keeps the first
+occurrence of each key. `.activity.jsonl` is one compact redacted JSON object per line with
+`recorded_at` (epoch time), `engine`, `kind` and `detail`. Prefer `peek NAME` for reading it.
+`result NAME --json` emits a JSON object using `task`, `state`, `exit_code`, `final_answer`,
+`stop_report`, `engine`, `model`, `session`, `directory`, `changed_files`, `baseline_known`,
+`baseline_partial`, `baseline_warning`, `duration_sec`, `usage`, `tokens`, `cost_usd`, `history`,
+`overlaps` and `attribution`, plus `limit` when limited. These formats are not interchangeable.
 Raw `.log` is a bounded 2 MiB tail, deleted on `clean` or after 24 hours at the next CLI/GUI state
 read. TTL cleanup is lazy, with no background deletion daemon. Default `fan` discards launcher
 stdout; only `--log` creates `.launcher.log`. `AGENT_LOG_MAX_BYTES` and `AGENT_LOG_TTL_HOURS` change those bounds; `--log` keeps full
@@ -270,6 +302,9 @@ private text in `.baseline.files/` (2 MiB/file, 16 MiB/task); large/binary finge
 without line counts. Final deltas are frozen in `.changes.json`. `.history.jsonl` contains
 allowlisted redacted control metadata, never prompt bodies. Common VCS/dependency/cache/build
 directories, progress artifacts, `.agent*` and the state subtree are ignored by manifests.
+An owned/scoped or partial manifest, and outputs outside the task CWD, are incomplete evidence
+of total effects. Inspect the complete approved diff and any assigned external outputs before
+acceptance; zero reported changes does not prove no changes elsewhere or exclusive authorship.
 
 Git manifests use one `git ls-files -z --cached --others --exclude-standard` enumeration;
 ignored files are excluded, including Unity caches. Non-git/git-failure scans additionally
@@ -296,7 +331,7 @@ holder PID. See [performance limits](docs/PERFORMANCE.md).
 
 ## Control foreign workers like native subagents
 
-Keep the native-first routing rule. For a foreign engine, `send`/`peek`/`stop`/`restart` give
+Apply the routing default and explicit overrides. For a selected CLI engine, `send`/`peek`/`stop`/`restart` give
 the wrapper a similar control surface: inspect work, steer a live task, interrupt it, and resume
 its saved context. Start resume commands and `wait` through your harness's tracked background
 mechanism when they can run for a long time; a running-task `send` returns immediately.
@@ -427,16 +462,17 @@ pointed at the same state directory. Running legacy tasks keep their legacy proc
 until restarted by the new core.
 
 - **Model ids with a provider prefix must be passed verbatim**: `-e opencode -m
-  opencode/muse-spark-1.2-contributor-free` works; the bare id without the `opencode/` prefix
-  errors. Short aliases (`-m free`, `-m ox`, …) resolve to the full id for you.
-- **OpenCode Zen free tier (live list 2026-08-28):** `big-pickle`, `hy3-free`, `mimo-v2.5-free`,
+  opencode/muse-spark-1.3-contributor-free` is passed through unchanged; execution still depends
+  on current route availability. A bare id lacks its provider. Short aliases (`-m free`, `-m ox`, …)
+  resolve to the full id for you.
+- **OpenCode Zen free tier (historical catalog, 2026-08-28):** `big-pickle`, `hy3-free`, `mimo-v2.5-free`,
   `muse-spark-1.2-contributor-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`.
   Aliases: `free`/`spark`/`muse`, `ox`/`alpha`, `pickle`, `hy3`, `mimo`, `nemotron`/`ultra`,
-  `lightning`. Re-check with `opencode models` — the tier moves, and it moved: **`x-preview-f-free`
-  is gone** as of 2026-08-28. Write the id exactly as `opencode models` prints it; near-misses like
+  `lightning`. Re-check with `opencode models` — **`x-preview-f-free` was absent** in that
+  2026-08-28 catalog. Write the id exactly as the current catalog prints it; near-misses like
   `mimo-free` or `nemotron-ultra-free` are not aliases and fail as unknown models.
-- **`opencode/space-bunny-free` is a current free Zen model (verified 2026-09-29)** and is the id
-  the picker now labels Space Bunny Free. It has **no short alias** — pass the full id, and pass it
+- **`opencode/space-bunny-free` appeared in the 2026-09-29 catalog** as Space Bunny Free.
+  Current availability is uncertain without a current catalog or probe. It has **no short alias** — pass the full id, and pass it
   verbatim *with* the `opencode/` prefix (a bare `space-bunny-free` is an unknown model):
 
   ```bash
@@ -446,21 +482,15 @@ until restarted by the new core.
 
   Any unknown `-m` value falls through unchanged, so a new/free-tier id works the day it appears
   without touching `providers/opencode/provider.py` — that is why raw ids keep working here, and
-  why a missing alias is a convenience loss, not a failure. Prefer it over the pinned aliases when
-  the user just wants a free one-shot answer; the aliases stay stable ids, this one tracks the
-  vendor's current free lineup.
-  **Unranked**: `free` points at Muse Spark by user preference, not measurement. In the one
-  head-to-head actually run (2026-08-24, a 5-step PowerShell disk survey) *neither* Muse Spark nor
-  Ox Alpha produced an answer — Ox hit the 1800s timeout, Muse never emitted a line. Treat the free
-  tier as fine for one-shot Q&A and unproven for multi-step tool work.
-  Liveness varies inside the tier: on 2026-08-28 a one-line probe came back from `mimo-v2.5-free`,
-  `nemotron-3-ultra-free` and `hy3-free`, while `nemotron-3.5-lightning-free` sat past a 120s
-  deadline without a byte. Silence alone does not distinguish an outage from buffered output or
-  slow work. Use a bounded timeout, inspect the log/process tree and preserve partial work.
-- **DeepSeek is gone from opencode:** the Zen `deepseek-v4-flash-free` entry no longer appears in
-  `opencode models`, and the Ollama route (`ollama/deepseek-v4-flash:cloud`) returns
-  `403 this model requires a subscription`. The `ollama` and `zai` providers are therefore listed
-  in `disabled_providers` in `~/.config/opencode/opencode.json`.
+  why a missing alias is a convenience loss, not a failure. Confirm the chosen route rather than
+  assuming a historical alias remains available. `free` resolves to Muse Spark 1.3 in the current
+  wrapper resolver; this is not a benchmark ranking or proof of tool capability/quota.
+  A free remote model is not offline. Silence, TLS and exhausted transport retries do not prove
+  quota exhaustion. Inspect the provider's actual error and process/session identity, preserve
+  partial work, and keep observation deadlines separate from provider watchdogs.
+- **Provider availability is local and time-sensitive:** a missing catalog entry or a cloud
+  subscription error applies to that route/account. Do not disable unrelated providers globally
+  or copy another user's `disabled_providers` policy into a different installation.
 - **Local LM Studio (`-e opencode` via the lmstudio-local provider):** LM Studio has ONE
   loaded-model slot. If the model was unloaded (idle timeout), the subagent dies instantly with
   `{"message":"Model is unloaded."}`. Reload it via the API with an explicit JSON body
@@ -716,20 +746,21 @@ CLI is one new directory, zero edits to `agent.sh`/`gui.py`. Implementation deta
 
 **Task state.** After every step the wrapper sets in `.meta`:
 `state` (`running`/`done`/`waiting`/`error`/`limited`/`silent`/`stopped`), the `exit` code, `files` (how many
-files the agent changed per `git status`), `pid` + `winpid`, `started`, `reason` (human-readable —
+files recorded by change tracking), process identity fields, `started`, `reason` (human-readable —
 see below), and `timeout`/`silence` (set only when the matching watchdog killed the task). Icons in
 `list`/`status`: `▶` running, `▷` running-but-silent, `✔` done, `⏳` waiting, `✖` error, `⚠` stalled,
 `⛔` limited (provider said no), `◌` silent (no-output watchdog fired), `⏹` stopped by orchestrator.
 
 **Working or stuck (liveness) — one truth for CLI and GUI.** Both `agent.sh status`/`list` and the web
-panel run the SAME state machine (`eff_state` in `agent.sh` and in `gui.py`):
+panel use the shared Python owner-liveness classification:
 
 | Situation | State | Shown as |
 |---|---|---|
-| process dead, meta still says running | `stalled` | `⚠ stalled` → `agent.sh reply <name> "continue"` |
-| wrapper process alive, but no live engine descendant AND log stale | `stalled` | `⚠ stalled` |
-| process alive, engine descendant alive, log growing | `running` | `▶ running (alive, pid N)` |
-| process alive, engine descendant alive, no output for > `AGENT_STALE_SEC` | `idle` | `▷ running (no output for Nm)` |
+| owner dead, provider alive, meta still says running | `orphaned` | orphaned; inspect exact ownership before recovery |
+| owner and provider dead, Core2 meta still says running (default reconciliation) | `stopped` | `⏹ stopped` |
+| owner and provider dead, legacy meta still says running (or reconciliation disabled) | `stalled` | `⚠ stalled` |
+| owner alive, activity age within `AGENT_STALE_SEC` | `running` | `▶ running (alive, pid N)` |
+| owner alive, activity age > `AGENT_STALE_SEC` | `idle` | `▷ running (no output for Nm)` |
 | no output for > `AGENT_SILENCE_SEC` — watchdog killed the tree | `silent` | `◌ silent` → read the log, then `reply` or re-run |
 | provider itself ended the turn (usage/rate limit, quota, auth expiry, unavailable model) | `limited` | `⛔ limited` → `reason=` shows the provider's own message verbatim |
 | process exited after the provider dropped the turn for another reason | `error` | `✖ error` → read the log tail, then resume with `reply` (see below) |
@@ -740,9 +771,11 @@ log activity; `clean`, including `clean --purge`, protects live quiet tasks like
 New tasks store native wrapper and provider PIDs with start-time identities. Historical `winpid`
 and Git Bash metadata remain readable during migration.
 
-**Liveness includes the provider and its launcher.** A live launcher with a dead provider is
-reported as stalled; a live provider whose launcher died is reported as orphaned. `stop` terminates
-an orphan and publishes its STOPPED report. Process snapshots are shared within an invocation;
+**Liveness includes the provider and its launcher.** Core2 classifies a live owner as running/idle
+by activity age without requiring an engine descendant. A dead owner with a live provider is
+orphaned; when both are dead, default reconciliation reports Core2 tasks stopped and legacy tasks
+stalled. Revalidate exact ownership before any mutation. `stop` terminates an orphan and publishes
+its STOPPED report. Process snapshots are shared within an invocation;
 native Windows enumeration and POSIX process inspection run in Python without `ps`, `kill -0`
 or sleep subprocess polling. Per-task threads handle log output, control files and watchdogs.
 
@@ -836,12 +869,13 @@ and the wrapper prints `⏳ the agent appears to have ASKED a question — reply
 This makes it visible that the subagent is waiting for an answer rather than stuck. `agent.sh status <name>`
 shows the question itself and the current stage of work.
 
-**Pre-flight `doctor`.** When foreign CLI availability or authentication is uncertain, run
+**Pre-flight `doctor`.** When selected CLI availability or authentication is uncertain, run
 `agent.sh doctor` (not required for native workers): it checks the
 presence and versions of the CLIs (codex/claude/kimi/opencode/gemini), login state where available,
 and codex's **remaining
 limits** — primary (5h window) and secondary (weekly) with % and time until reset (from session-jsonl).
-At >80% it prints a warning — in that case it's better to throttle the fan-out.
+These are reported snapshots; missing/stale telemetry is unknown, not quota proof. At >80% it
+prints a warning. Use current task/account evidence when deciding whether to throttle fan-out.
 
 `agent.sh doctor --deep` adds what none of the above can see: a **real** one-shot run per engine that
 must actually EXECUTE a shell command (codex today — `provider_<engine>_doctor_deep` is a plugin hook,
@@ -858,17 +892,17 @@ It costs one cheap model call (~10–15s), so plain `doctor` stays instant and j
 that the deep check exists. Run `--deep` when an agent "answers but does nothing", after a codex-cli
 upgrade, or on a new machine.
 
-### A turn that died on the provider: resume it, don't restart it
+### Recover a turn that failed on the provider
 
 **Symptom:** a task ends `state=error` after only seconds or minutes, its log tail is full of
 `{"type":"error","message":"Reconnecting... n/5 ..."}` followed by `{"type":"turn.failed", ...}`, and
 the cause is transport, not the task — `unexpected status 403 Forbidden`, `tls handshake eof`,
-`stream disconnected before completion`, or `os error 10054`. Provider-side outages hit long turns
-hardest, so an xhigh/high-effort worker doing a big audit dies while a short one beside it survives.
+`stream disconnected before completion`, or `os error 10054`. These are transport observations,
+not quota/capability proof; determine whether the turn actually ended before recovering it.
 
-**The session is not lost.** The CLI session lives on disk, so `agent.sh reply <name> "..."` picks the
-task up with its full context — the same mechanism `stalled` uses. Do NOT start a fresh `run` with a
-re-pasted prompt: you throw away everything the agent already worked out, and you pay for it twice.
+**Check the saved session.** When the task is settled and the provider supports resume,
+`agent.sh reply <name> "..."` can retain its context. Verify exact ownership and partial effects
+before recovery; a caller timeout or a quiet live task alone does not authorize interruption.
 
 **But check the working tree BEFORE you resume.** A failed turn is not an atomic rollback. The agent
 may have written some files and not others before the transport died, and it does not know which. Seen
@@ -881,10 +915,10 @@ repository in a state where the suite was red on purpose but nothing said so. So
    it, which is where it will guess wrong.
 3. Prefer resuming over re-running even when little landed; the session context is the expensive part.
 
-**Adapt the shape of the work while an outage lasts.** Long single turns keep dying, so split the job
-into several short focused tasks and `fan` them: each turn is shorter, more of them survive, and the
-ones that die are cheap to resume. A four-part audit that completes beats one exhaustive audit that
-never finishes.
+**Bound recovery.** After two failed attempts, return evidence and the best partial result to
+the root coordinator for a decision; do not make a third blind retry. A smaller task or different
+route needs an explicit coordinator decision within the user's model and fleet constraints.
+Do not alter a live fleet's provider wrappers, retry loop or runtime config as a docs fix.
 
 ### Codex: every shell command hangs (environment issue)
 
@@ -935,25 +969,29 @@ Gotchas (verified):
 
 ## Model selection
 
-> Discovery-first: the tables below are verified snapshots of `-m` aliases, not prescriptions.
-> Before routing, check what is actually available and pick the cheapest capable option among
-> those. An explicitly user-named model always wins. Never invent model ids.
+> Discovery-first: the tables below record local resolver mappings and dated route observations,
+> not capability, ranking or quota guarantees. Current config/catalog/probe evidence is needed
+> for uncertain availability. A catalog is not a benchmark. Honor explicit user choices; never
+> invent model ids or probe/reconfigure a live fleet merely to refresh these docs.
 
-**Codex** (`-e codex`; no longer the default engine):
+**Codex** (`-e codex`; engine defaults depend on config/detection):
 
 | Alias | Model | When |
 |---|---|---|
 | `5.6-terra` / `terra` (default) | `gpt-5.6-terra`, effort medium | regular tasks |
-| `6.1-sol` / `sol61` | `gpt-6.1-sol`, effort medium (pass `-f high` for the usual hard work) | GPT-6.1 Sol; verified with codex-cli 0.160 on 2026-10-07 |
+| `6.1-sol` / `sol61` / `gpt61-sol` | `gpt-6.1-sol`, effort medium unless `-f` is supplied | dated route observation: codex-cli 0.160, 2026-10-07 |
 | `6-sol` / `sol6` | `gpt-6-sol`, effort medium | GPT-6 Sol; requires Codex CLI 0.156.1+ |
 | `6-luna` / `luna6` | `gpt-6-luna`, effort medium | GPT-6 Luna; requires Codex CLI 0.156.1+ |
 | `5.6-sol` / `sol` | `gpt-5.6-sol`, effort medium | 5.6 variant / explicit Sol request |
-| `high` | `gpt-5.6-sol`, effort high | harder than usual (rare; big stuff is better done yourself) |
+| `high` / `5.6-high` | `gpt-5.6-sol`, effort high | legacy alias; does not select GPT-6.1 |
 | `luna` | `gpt-5.6-luna` | 5.6 variant |
 | `spark` / `5.3` | `gpt-5.3-codex-spark` | very simple: renames, minor text/docs edits, one-line fixes |
 
 If the user explicitly names a model ("codex luna", "spark 5.3") — use that one. A raw model id still
 passes through unchanged, so `-m gpt-5.5` reaches the older model on demand.
+For an explicit GPT-6.1 high request, use `-e codex -m gpt-6.1-sol -f high` and inspect the
+resolved model/effort in task metadata/start output. Successful execution with those resolved
+values is scoped route evidence, not a general ranking or a requirement to use Codex CLI elsewhere.
 The 5.6 family (`sol`/`luna`/`terra`) requires **codex-cli >= 0.144** (older CLIs get a 400
 "requires a newer version of Codex"); update with `npm install -g @openai/codex@latest`.
 
@@ -961,7 +999,7 @@ The 5.6 family (`sol`/`luna`/`terra`) requires **codex-cli >= 0.144** (older CLI
 
 | Alias | Model / effort | When |
 |---|---|---|
-| `opus5` (default) | `claude-opus-5` | everything, unless a cheaper model clearly suffices — the default per the user's request |
+| `opus5` (provider default) | `claude-opus-5` | resolver default; selection still follows user/config/routing constraints |
 | `sonnet` | `claude-sonnet-5`, effort **high** | cheaper/faster than Opus 5 for routine work |
 | `sonnet-medium` / `sonnet-low` | `claude-sonnet-5`, effort medium/low | cheaper/faster, when high is overkill |
 | `opus` / `haiku` | no explicit effort (CLI default) | `opus` is the OLD Opus 4.8 alias (kept deliberately); haiku — trivial tasks |
@@ -982,13 +1020,13 @@ Kimi has no CLI effort flag, so `-f` is ignored. Authenticate once with `kimi lo
 the provisioned aliases with `kimi provider list`. Do not invent K2.5/K2.7 aliases: they are not
 present in the live managed catalog verified on 2026-08-09. Raw configured aliases pass through.
 
-**opencode** (`-e opencode`) — the cheapest lane, and the only one where the vendor's free lineup
-changes without notice. No default model: pick one explicitly.
+**opencode** (`-e opencode`) — remote free routes may be available; price, quota, capability and
+catalog membership require current evidence. No wrapper default model: pick one explicitly.
 
 | `-m` value | Resolves to | When |
 |---|---|---|
-| `opencode/space-bunny-free` | itself (raw id, **no alias**) | **default choice for free work**; verified 2026-09-29 |
-| `free` / `spark` / `muse` / `muse-spark` | `opencode/muse-spark-1.3-contributor-free` | the user's standing free pick |
+| `opencode/space-bunny-free` | itself (raw id, **no alias**) | historical catalog entry, 2026-09-29; recheck availability |
+| `free` / `spark` / `muse` / `muse-spark` | `opencode/muse-spark-1.3-contributor-free` | current resolver mapping; not a ranking |
 | `ox` / `alpha` / `ox-alpha` | `opencode/x-preview-f-free` | second free lane — **re-verify, it has vanished before** |
 | `pickle` / `big-pickle` | `opencode/big-pickle` | long-context free option |
 | `hy3`, `mimo`, `nemotron`/`ultra`, `lightning` | `…-free` ids | alternates, same caveats |
@@ -1019,7 +1057,7 @@ A handy alias (git-bash, add to `~/.bashrc`):
 
 ```bash
 alias agent='bash ~/.claude/skills/neoxider-agents/agent.sh'
-# agent run -t readme -C /c/Git/CoreAI "fix the typo in the README"
+# agent run -t readme -C /c/Git/Project "fix the typo in the README"
 # agent peek -f readme    # readable activity, in real time
 # agent last readme       # short summary: the agent's last answer
 # agent send readme "also fix the CHANGELOG"    # queue/resume in the same session
