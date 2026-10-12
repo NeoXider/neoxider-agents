@@ -35,6 +35,18 @@ Use `AGENT_GUI_TEST_ROOT=D:/Temp/agents-ux/gui-proof` for isolated GUI fixtures.
 disposable source copies and failures live under `D:/Temp/agents-ux/`. The benchmark
 separately proves its budget gates.
 
+## Model discovery and effort picker
+
+```powershell
+python -m unittest discover -s tests -p test_model_catalog.py -v
+node tests/test_models.js
+```
+
+These offline checks cover allowlisted catalogue parsing, unknown modes, bounded native
+capture/cleanup, explicit probe forwarding/no fallback/no retry, error classification,
+GUI model ID compatibility and stale responses during provider switching. Live catalogue
+and `probe` commands are separate explicit checks and may consume provider quota.
+
 ## Frontend toast suite
 
 ```bash

@@ -3,7 +3,7 @@ _neoxider() {
     local state_directory="${AGENT_CLI_LOGS:-$HOME/.claude/agent-cli-logs}" item
     local -a commands tasks models
     local previous="$words[CURRENT-1]" engine='' i
-    commands=(run ask fan send reply stop restart peek watch top dashboard diff log last result pending wait status list clean prune doctor provider-info test-api gui openai-server completion config brief help)
+    commands=(run ask fan send reply stop restart peek watch top dashboard diff log last result pending wait status list clean prune doctor models probe provider-info test-api gui openai-server completion config brief help)
     for ((i=2; i<CURRENT-1; i++)); do [[ "$words[i]" == -e || "$words[i]" == --engine ]] && engine="$words[i+1]"; done
     case "$engine" in
         codex) models=(6-sol 6-luna sol luna terra spark gpt-6.1-sol);;
@@ -20,7 +20,7 @@ _neoxider() {
     elif [[ "$previous" == --effort || "$previous" == -f && "$words[2]" != peek && "$words[2]" != watch && "$words[2]" != log ]]; then
         compadd minimal low medium high xhigh max
     elif [[ "$PREFIX" == -* ]]; then
-        compadd -- -e -m -f -C -t -P -p -v -n -l --help --debug --engine --model --effort --dir --task --parent --prompt-file --timeout --poll --progress --no-progress --no-terse --verbose --terminal --log --owns --strict-owns --notify --now --flush --fresh --all-mine --all --purge --dry-run --strict --raw --deep --json --once --interval --stat --names --base-url --goal --out --outcome --not-touch --return --context-file --install --profile --lan --localhost --token --api-key
+        compadd -- -e -m -f -C -t -P -p -v -n -l --help --debug --engine --model --effort --dir --task --parent --prompt-file --timeout --poll --progress --no-progress --no-terse --verbose --terminal --log --owns --strict-owns --notify --now --flush --fresh --all-mine --all --purge --dry-run --strict --raw --deep --refresh --provider --standard --json --once --interval --stat --names --base-url --goal --out --outcome --not-touch --return --context-file --install --profile --lan --localhost --token --api-key
     elif (( CURRENT == 2 )); then
         _describe 'command' commands
     elif [[ "$words[2]" == completion ]]; then

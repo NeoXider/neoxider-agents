@@ -35,6 +35,38 @@ job through your orchestrator's harness to receive completion notifications. Fro
 shell use `neoxider peek fix-readme`, `neoxider stop fix-readme` or `neoxider restart fix-readme`.
 Without installing PATH, use `.\agent.ps1` or `.\bin\neoxider.cmd`.
 
+### Models, reasoning modes and a bounded availability check
+
+```powershell
+neoxider models -e opencode --provider opencode --json
+neoxider models -m muse --json
+neoxider models --refresh -m opencode/space-bunny-free
+neoxider probe -m muse -f xhigh -t muse-check --timeout 200 --json
+neoxider probe -m muse -f xhigh -t muse-standard --standard --json
+```
+
+`models` reads OpenCode's verbose catalogue: IDs, reasoning/tool/image capabilities,
+token limits, advertised input/output cost and model-specific variant names. It makes no
+inference about remaining quota, availability or model quality. Empty variants mean
+**unknown modes**. Other engines expose configured IDs only. The GUI's run and bridge forms
+use model-specific modes; generic provider hints are labelled `unverified`.
+
+`probe` makes one explicit OpenCode `Reply OK` call through the tracked harness, with all
+tools disabled in the bundled chat-only profile and an empty temporary working directory.
+It requires a model, preserves its alias resolution and requested effort, never substitutes
+another model, and disables retries. Timeout defaults to 200 seconds (range 1–600).
+The JSON result separates forwarded effort from effective effort, which stays unknown when
+the provider does not report it. Status distinguishes `ok`, `limited`, `auth-error`,
+`model-error`, `route-rejected`, `route-mismatch`, `timeout`, `silent`, `empty`,
+`unexpected-answer` and `provider-error`.
+Success verifies a chat response; it does not verify tool execution or remaining quota.
+Use a fresh task name for each probe. The call may consume provider quota or credits;
+catalogue discovery and normal GUI refresh never run a model probe automatically.
+If OpenCode rejects the custom chat-only profile, `route-rejected` describes that route,
+not the model's remaining quota. Separately select `--standard` to check ordinary OpenCode
+in an empty workspace with tools available. The profile never changes automatically.
+Use the modes returned by your current catalogue; the examples are not a permanent mode list.
+
 ### Defaults and files
 
 | Setting | Default | Change it |

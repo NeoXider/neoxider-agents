@@ -11,6 +11,20 @@ reference, model-alias tables, the question-detection heuristic, and known trade
 — it's the canonical operating manual and takes precedence over this file if anything
 here goes stale.
 
+## Model discovery and explicit probes
+
+Use `neoxider models -e opencode --provider opencode --json` for advertised capabilities,
+limits, cost and model-specific reasoning variants; empty variants mean unknown modes.
+Configured IDs/provider hints do not prove availability, remaining quota or model quality.
+Use `neoxider probe -m muse -f xhigh -t muse-check --timeout 200 --json` for one tracked
+OpenCode chat-only `Reply OK` call with tools disabled, no retry and no fallback model.
+Use a fresh task name. A probe can consume provider quota/credits; never run paid probes
+automatically. Forwarded effort and effective reasoning are distinct; unreported effective
+effort remains unknown. A custom-profile `route-rejected` error is not a quota claim.
+Explicit `--standard` checks ordinary OpenCode with tools available, still in an empty directory;
+no automatic profile fallback. Discover current modes before choosing one.
+See the canonical [SKILL.md](SKILL.md) for status and GUI behavior.
+
 ## Quick reference
 
 ```powershell

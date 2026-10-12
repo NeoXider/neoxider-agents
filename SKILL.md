@@ -37,6 +37,7 @@ done
 ```
 
 When working inside this repository, `SK=./agent.sh` is sufficient.
+For a plugin-root-only installation, the resolved POSIX wrapper is `$CLAUDE_PLUGIN_ROOT/agent.sh`.
 
 **Routing default:** use the host's native subagents for its own engine when available;
 use the wrapper for foreign engines. Later explicit human CLI/model/effort choices,
@@ -59,6 +60,33 @@ For CLI tasks, retain a harness job/session handle and exact task names until re
   ownership. Use `pending` only for the intended ownership scope, not an unbounded historical
   sweep. It reports unread results/attention; `last NAME` or `wait NAME` acknowledges results,
   and `pending --strict` exits 3 when something is unread.
+
+## Discover models and check the requested route
+
+```powershell
+& $SK models -e opencode --provider opencode --json
+& $SK models -m muse --json
+& $SK probe -m muse -f xhigh -t muse-check --timeout 200 --json
+& $SK probe -m muse -f xhigh -t muse-standard --standard --json
+```
+
+`models` returns CLI-advertised capabilities, limits, cost and per-model reasoning variants.
+Empty variants mean unknown modes; configured provider effort hints are not model evidence.
+Other engines currently expose configured IDs only. GUI mode pickers show advertised modes
+when known and label generic hints `unverified`. Catalogue presence proves no availability,
+remaining quota or quality ranking.
+
+`probe` currently supports OpenCode, using its bundled tool-free chat profile by default. It requires an
+explicit model, uses a fresh tracked task and empty temporary directory, forwards the chosen
+effort, sends `Reply OK` once, and never retries or selects a fallback. Default timeout 200s,
+allowed range 1–600s. An explicit call can consume quota or credits. Report `status`, full
+model ID and `effort_forwarded`; `effective_effort` is unknown unless independently reported.
+Success proves a chat response, not tool execution or remaining quota. Check failure status
+and task logs before a separately authorized fallback. A `route-rejected` error on the custom
+profile proves neither a quota limit nor model unavailability. `--standard` explicitly selects
+ordinary OpenCode in the empty directory with tools available; no automatic profile fallback.
+Discover actual modes first; the example's `xhigh` is not a permanent provider-wide default.
+No automatic GUI/model catalogue probe.
 
 ## Work as an orchestrator (default mode)
 

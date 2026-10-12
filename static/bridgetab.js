@@ -20,17 +20,19 @@ async function syncBridgeModels() {
   $("#brg-model").placeholder = p.resolved_label
     ? t("form.auto") + " → " + p.resolved_label
     : p.default_model ? t("form.auto") + " (" + p.default_model + ")" : t("form.auto");
-  const eff = $("#brg-effort");
-  const efforts = p.efforts || [];
-  eff.innerHTML = `<option value="">${t("form.auto")}</option>` + efforts.map(f => `<option value="${f}">${f}</option>`).join("");
-  eff.disabled = !efforts.length;
+  syncModelEfforts("brg");
   try {
     const d = await jget("/api/models?engine=" + encodeURIComponent(e));
     if (requestId !== syncBridgeModels.requestId || $("#brg-engine").value !== e) return;
     setBridgeModelOptions(d.models || []);
+    modelDetails[e] = d.details || [];
+    syncModelEfforts("brg");
   } catch (err) {
-    if (requestId === syncBridgeModels.requestId && $("#brg-engine").value === e)
+    if (requestId === syncBridgeModels.requestId && $("#brg-engine").value === e) {
       setBridgeModelOptions(p.models || []);
+      modelDetails[e] = [];
+      syncModelEfforts("brg");
+    }
   }
 }
 

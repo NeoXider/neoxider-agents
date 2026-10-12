@@ -236,6 +236,20 @@ IS the tool-call protocol may behave differently than it would on a real provide
 `/health` for `session_active` and `POST /v1/reset` between unrelated suites — one process
 serves one conversation at a time.
 
+## Model discovery and explicit probes
+
+Use `neoxider models -e opencode --provider opencode --json` for advertised capabilities,
+limits, cost and model-specific reasoning variants; empty variants mean unknown modes.
+Configured IDs/provider hints do not prove availability, remaining quota or model quality.
+Use `neoxider probe -m muse -f xhigh -t muse-check --timeout 200 --json` for one tracked
+OpenCode chat-only `Reply OK` call with tools disabled, no retry and no fallback model.
+Use a fresh task name. A probe can consume provider quota/credits; never run paid probes
+automatically. Forwarded effort and effective reasoning are distinct; unreported effective
+effort remains unknown. A custom-profile `route-rejected` error is not a quota claim.
+Explicit `--standard` checks ordinary OpenCode with tools available, still in an empty directory;
+no automatic profile fallback. Discover current modes before choosing one.
+See the canonical [SKILL.md](SKILL.md) for status and GUI behavior.
+
 ## Rules for using this tool as a subagent orchestrator
 
 Follow the ownership, routing and verification loop in [SKILL.md](SKILL.md). Delegate only

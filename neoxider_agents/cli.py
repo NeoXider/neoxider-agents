@@ -21,6 +21,8 @@ COMMANDS = {
     "pending": "[--strict]", "wait": "[NAME...] [--timeout SECONDS] [--poll SECONDS] [--strict]",
     "clean": "[--all] [--purge] [-n|--dry-run]", "prune": "[--all] [--purge] [-n|--dry-run]",
     "doctor": "[--deep|--json]", "provider-info": "ENGINE",
+    "models": "[-e ENGINE] [--provider ID] [-m MODEL] [--refresh] [--json]",
+    "probe": "[-e opencode] -m MODEL [-f EFFORT] [-t NAME] [--timeout SECONDS] [--standard] [--json]",
     "test-api": "--base-url URL --goal TEXT [--out F] [-e ENGINE] [-m MODEL] [-f EFFORT] [-C DIR] [-t NAME]",
     "gui": "[PORT] [--lan] [--localhost] [--token SECRET]",
     "openai-server": "[-e ENGINE] [-m MODEL] [-f EFFORT] [-p PORT] [--api-key SECRET] (see openai_server.py --help)",
@@ -88,6 +90,15 @@ def parse(command, argv):
         switches.update(("--all", "--purge", "-n", "--dry-run"))
     if command == "doctor":
         switches.update(("--deep", "--json"))
+    if command in ("models", "probe"):
+        operands.update({"-e": "engine", "--engine": "engine", "-m": "model", "--model": "model"})
+        switches.add("--json")
+        if command == "models":
+            operands["--provider"] = "provider"
+            switches.add("--refresh")
+        else:
+            operands.update({"-f": "effort", "--effort": "effort", "-t": "name", "--task": "name", "--timeout": "timeout"})
+            switches.add("--standard")
     result, args, ended = {}, [], False
     iterator = iter(argv)
     while True:
@@ -235,6 +246,9 @@ def dispatch(command, opts, args, store):
     if command in ("doctor", "provider-info"):
         from .diagnostics import doctor
         return doctor(store, opts, args, command == "provider-info")
+    if command in ("models", "probe"):
+        from .model_catalog import command as model_command
+        return model_command(command, opts, args, store)
     from . import lifecycle
     if command == "stop":
         if opts.get("--all-mine"):

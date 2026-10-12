@@ -1,7 +1,38 @@
 /* Entry point: run/reply actions, the model+effort picker, the cached/refreshable limits
    panel, and final wiring. Loaded last -- everything else is already defined by this point. */
 
-function syncModels() {
+const modelDetails = {};
+
+function syncModelEfforts(prefix) {
+  const engine = $("#" + prefix + "-engine").value;
+  const model = $("#" + prefix + "-model").value.trim();
+  const provider = PROVIDERS[engine] || {};
+  const details = (modelDetails[engine] || []).find(item => item.id === model);
+  const advertised = details && details.effort_source === "cli-advertised";
+  const modes = advertised ? details.efforts : (provider.efforts || []);
+  const select = $("#" + prefix + "-effort");
+  const previous = select.value;
+  select.replaceChildren(...["", ...modes].map(mode => {
+    const option = document.createElement("option");
+    option.value = mode;
+    option.textContent = mode ? mode + (advertised ? "" : " (unverified)") : t("form.auto");
+    return option;
+  }));
+  select.value = modes.includes(previous) ? previous : "";
+  select.disabled = !modes.length;
+  select.title = advertised ? "Modes advertised by this model; effective execution needs a probe."
+    : "This model does not advertise modes. Provider hints are unverified; availability and quota are unknown.";
+  const info = $("#" + prefix + "-model-info");
+  if (info) {
+    const caps = (details && details.capabilities) || {};
+    info.textContent = details ? `context: ${(details.limits || {}).context ?? "unknown"} · reasoning: ${caps.reasoning ?? "unknown"} · tools: ${caps.toolcall ?? "unknown"} · free: ${details.free_advertised ?? "unknown"} · availability: unprobed`
+      : "Model metadata unknown; availability and quota are unprobed.";
+  }
+}
+
+async function syncModels() {
+  const requestId = (syncModels.requestId || 0) + 1;
+  syncModels.requestId = requestId;
   const e = $("#f-engine").value;
   const p = PROVIDERS[e] || {};
   $("#models").replaceChildren(...(p.models || []).map(model => {
@@ -11,18 +42,24 @@ function syncModels() {
   }));
   $("#f-model").placeholder = p.resolved_label ? t("form.auto") + " → " + p.resolved_label : p.default_model ? t("form.auto") + " (" + p.default_model + ")" : t("form.auto");
 
-  const effSel = $("#f-effort");
-  const efforts = p.efforts || [];
-  if (efforts.length) {
-    effSel.innerHTML =
-      `<option value="">${t("form.auto")}${p.default_effort ? " (" + p.default_effort + ")" : ""}</option>` +
-      efforts.map(f => `<option value="${f}">${f}</option>`).join("");
-    effSel.disabled = false;
-  } else {
-    effSel.innerHTML = `<option value="">${t("form.auto")}</option>`;
-    effSel.disabled = true;
-  }
+  syncModelEfforts("f");
   loadProvider();
+  try {
+    const data = await jget("/api/models?engine=" + encodeURIComponent(e));
+    if (requestId !== syncModels.requestId || $("#f-engine").value !== e) return;
+    modelDetails[e] = data.details || [];
+    $("#models").replaceChildren(...(data.models || []).map(model => {
+      const option = document.createElement("option");
+      option.value = String(model);
+      return option;
+    }));
+    syncModelEfforts("f");
+  } catch (err) {
+    if (requestId === syncModels.requestId && $("#f-engine").value === e) {
+      modelDetails[e] = [];
+      syncModelEfforts("f");
+    }
+  }
 }
 
 async function submitRun() {
@@ -188,8 +225,10 @@ $("#btn-add-project").addEventListener("click", () => openBrowse("add-project"))
 $("#btn-reply").addEventListener("click", sendReply);
 $("#btn-pick-field").addEventListener("click", () => openBrowse("pick-field"));
 $("#f-engine").addEventListener("change", syncModels);
+$("#f-model").addEventListener("input", () => syncModelEfforts("f"));
 $("#btn-run").addEventListener("click", submitRun);
 $("#brg-engine").addEventListener("change", syncBridgeModels);
+$("#brg-model").addEventListener("input", () => syncModelEfforts("brg"));
 $("#btn-pick-bridge").addEventListener("click", () => openBrowse("pick-bridge"));
 $("#btn-brg-start").addEventListener("click", submitBridgeStart);
 $("#btn-brg-refresh").addEventListener("click", refreshBridgeTab);

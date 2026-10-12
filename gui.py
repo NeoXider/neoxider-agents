@@ -1095,28 +1095,21 @@ def doctor_text(force=False):
         hit = _CACHE.get("doctor")
         return (hit["value"]["raw"], True) if hit else ("", True)
 
+def engine_model_details(engine, force=False):
+    """Read-only advertised metadata. A discovery failure is explicit, never availability."""
+    from neoxider_agents.model_catalog import catalogue
+    try:
+        payload, unused = _cached("model-details:" + engine, lambda: catalogue(engine), force)
+        return payload
+    except (OSError, ValueError, RuntimeError, TimeoutError):
+        return {"engine": engine, "source": "configured", "discovery_state": "error",
+                "note": "Discovery failed; configured hints only, modes and availability unknown.",
+                "models": [{"id": model, "efforts": [], "effort_source": "unknown", "availability": "unprobed"}
+                           for model in (PROVIDERS.get(engine) or {}).get("models", [])]}
+
+
 def engine_models(engine, force=False):
-    """Selectable model ids for a provider. opencode exposes a rich dynamic catalog
-    (provider/model across every configured backend) via `opencode models` -- surface it so
-    the bridge form can offer real choices instead of a blank free-text box. Other engines
-    fall back to the static list in provider.json. Cached (60s) since `opencode models` shells
-    out to the CLI."""
-    static = list((PROVIDERS.get(engine) or {}).get("models") or [])
-    if engine != "opencode":
-        return static
-    def compute():
-        # Resolve npm command shims without requiring Bash on Windows.
-        try:
-            p = subprocess.run(_bridge_runtime._cli_command("opencode", "models"), capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=20, cwd=HERE,
-                               **_hidden_windows_kwargs())
-            got = [l.strip() for l in (p.stdout or "").splitlines()
-                   if l.strip() and "/" in l and " " not in l.strip()]
-            return got or static
-        except Exception:
-            return static
-    models, _ = _cached("models:" + engine, compute, force)
-    return models
+    return [model["id"] for model in engine_model_details(engine, force)["models"]]
 
 def codex_limits():
     """primary/secondary codex rate-limits only, via the same provider-info plugin path
@@ -1909,7 +1902,10 @@ class H(BaseHTTPRequestHandler):
             if eng not in PROVIDERS:
                 return self._send(400, json.dumps({"error": "unknown provider"}))
             force = (q.get("force") or ["0"])[0] == "1"
-            self._send(200, json.dumps({"engine": eng, "models": engine_models(eng, force)}))
+            details = engine_model_details(eng, force)
+            self._send(200, json.dumps({"engine": eng, "models": [model["id"] for model in details["models"]],
+                                        "details": details["models"], "source": details["source"],
+                                        "note": details["note"], "discovery_state": details.get("discovery_state", "ok")}))
         elif u.path == "/api/locales":
             self._send(200, json.dumps({"locales": list_locales()}))
         elif u.path == "/api/wait":
