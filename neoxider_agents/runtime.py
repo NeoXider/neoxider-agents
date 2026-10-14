@@ -92,6 +92,17 @@ def retry_wait(turn, delay):
             signal.signal(sig, old)
 
 
+
+def child_lineage(name):
+    """Environment the provider process passes on to anything it launches.
+
+    A `neoxider run` started from inside this task's agent reads AGENT_PARENT as its parent
+    (lifecycle.execute), so subagent trees of any depth are recorded without the agent having
+    to remember `-P`. `stop --all-mine` / `pending` inside the agent then mean "my children".
+    AGENT_TASK names the task itself for tools that only need the current task.
+    """
+    return {"AGENT_PARENT": name, "AGENT_TASK": name}
+
 class Turn:
     def __init__(self, store, name, provider, model, effort, directory, session, prompt, terminal=False):
         self.store, self.name = store, name
@@ -191,6 +202,7 @@ class Turn:
                                                session=self.session, chat_only=os.environ.get("AGENT_CHAT_ONLY") == "1")
         env = dict(private_env if profile_root else os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1",
                    PWD=self.directory, AGENT_ACTIVITY_FILE=str(self.store.path(self.name, ".activity.jsonl")), AGENT_TASK=self.name)
+        env.update(child_lineage(self.name))
         env.update(overrides)
         signals = {}
         for key in ("SIGTERM", "SIGHUP", "SIGINT", "SIGBREAK"):

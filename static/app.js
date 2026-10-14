@@ -1,7 +1,7 @@
 /* Entry point: run/reply actions, the model+effort picker, the cached/refreshable limits
    panel, and final wiring. Loaded last -- everything else is already defined by this point. */
 
-const modelDetails = {};
+const modelDetails = {}; // engine -> /api/models details (new-task form, API tab, composer.js)
 
 function syncModelEfforts(prefix) {
   const engine = $("#" + prefix + "-engine").value;
@@ -95,55 +95,6 @@ async function submitRun() {
   }
 }
 
-async function sendReply() {
-  const a = $("#answer").value;
-  if (!a.trim() || !SEL || !CURRENT_TASKS.has(SEL)) {
-    if (SEL && !CURRENT_TASKS.has(SEL)) clearDeletedSelection();
-    return;
-  }
-  const btn = $("#btn-reply");
-  const old = btn.innerHTML;
-  btn.disabled = true;
-  btn.innerHTML = spin();
-  const task = SEL, submission = beginMessageSubmission(task);
-  try {
-    const r = await jpost("/api/task/send", { task, message: a, message_id: submission.id, terminal: $("#r-term").checked });
-    if (r.error) {
-      toast("error", t("toast.reply_not_sent"), r.error);
-      return;
-    }
-    if (r.message_id !== submission.id) throw new Error("Submission outcome unknown; poll the UUID without resending");
-    submission.phase = "started";
-    toast("info", t("fleet.submission_started"), messageSubmissionText(submission));
-    if (SEL === task && taskSubmissions.get(task) === submission) $("#answer").value = "";
-    setTimeout(refresh, 600);
-  } catch (err) {
-    surfaceApiError(err);
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = old;
-  }
-}
-
-async function stopTask(taskName, btn) {
-  if (!CURRENT_TASKS.has(taskName)) return;
-  btn.disabled = true;
-  try {
-    const result = await jpost("/api/task/stop", { task: taskName });
-    if (result.ok) {
-      toast("success", taskName, t("toast.task_stopped"));
-      await refresh();
-    }
-  } catch (err) {
-    surfaceApiError(err);
-  } finally {
-    btn.disabled = false;
-  }
-}
-$("#answer").addEventListener("keydown", e => {
-  if (e.ctrlKey && e.key === "Enter") sendReply();
-});
-
 /* ---------- limits panel (for the selected provider); cached server-side, with a manual
    refresh button that bypasses the cache. Never blanks the panel while refreshing -- keeps
    showing the last-known-good data with a small inline spinner until new data arrives. ---------- */
@@ -211,7 +162,14 @@ async function loadProvider(force) {
 async function onLocaleChanged() {
   if (fleetController && fleetController.active) await fleetController.refresh();
   syncModels();
-  if (SEL) { lastLog = ""; await refresh(); }
+  lastTreeHtml = "";
+  if (!SEL) await refresh();
+  if (SEL) {
+    lastLog = "";
+    const task = CURRENT_TASKS.get(SEL);
+    if (task) { fillComposerModels(task); renderOutbox(task.name); }
+    await refresh();
+  }
   if (typeof syncBridgeModels === "function" && $("#brg-engine") && $("#brg-engine").options.length) {
     await syncBridgeModels();
     if (localStorage.getItem("agentgui_tab") === "bridge") await refreshBridgeTab();
@@ -230,7 +188,6 @@ document.querySelectorAll(".tabbtn[data-tab]").forEach(button =>
     if (fleetController) fleetController.activate(button.dataset.tab === "fleet");
   }));
 $("#btn-add-project").addEventListener("click", () => openBrowse("add-project"));
-$("#btn-reply").addEventListener("click", sendReply);
 $("#btn-pick-field").addEventListener("click", () => openBrowse("pick-field"));
 $("#f-engine").addEventListener("change", syncModels);
 $("#f-model").addEventListener("input", () => syncModelEfforts("f"));
@@ -249,6 +206,7 @@ document.querySelectorAll("[data-close-modal]").forEach(button =>
 
 (async function init() {
   await initI18n();
+  initThemeToggle();
   updateHistBadge();
   await refresh(); // awaited once so CWD/ENGINES/PROVIDERS are populated before the API tab reads them
   loadProvider();
@@ -275,13 +233,7 @@ document.querySelectorAll("[data-close-modal]").forEach(button =>
 
   setInterval(refresh, 3000);
   setInterval(() => { if (fleetController && fleetController.active) fleetController.refresh(); }, 3000);
-  setInterval(async () => {
-    const task = SEL;
-    if (task && taskSubmissions.has(task)) {
-      const text = await pollMessageSubmission(task);
-      if (SEL === task && $("#chat-submission")) $("#chat-submission").textContent = text;
-    }
-  }, 3000);
+  setInterval(pollOutbox, 3000);
   setInterval(() => loadProvider(), 15000);
   // keep the bridge list fresh (health/session) only while that tab is visible
   setInterval(() => { if (localStorage.getItem("agentgui_tab") === "bridge") refreshBridgeTab(); }, 4000);

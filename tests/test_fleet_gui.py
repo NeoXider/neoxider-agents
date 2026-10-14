@@ -233,6 +233,32 @@ class FleetHTTPTests(unittest.TestCase):
             spawn.assert_called_with(["restart", "one"], terminal=False)
             self.assertEqual(self.request("POST", "/api/task/resume", {"task": "one", "terminal": "yes"})[0], 400)
 
+    def test_chat_send_carries_client_uuid_now_and_next_turn_model_effort(self):
+        uuid_hex = "0123456789abcdef0123456789abcdef"
+        with patch.object(gui, "spawn") as spawn:
+            code, result, _, _ = self.request("POST", "/api/task/send", {
+                "task": "one", "message": "follow-up", "message_id": uuid_hex, "now": True,
+                "model": "opencode/big-pickle", "effort": "high"})
+            self.assertEqual((code, result["message_id"], result["accepted"]), (200, uuid_hex, False))
+            args = spawn.call_args.args[0]
+            self.assertEqual(args[:5], ["send", "one", "--now", "--message-id", uuid_hex])
+            self.assertEqual(args[5:9], ["-m", "opencode/big-pickle", "-f", "high"])
+            self.assertNotIn("follow-up", args)  # text travels in the private prompt file
+            self.assertEqual(self.request("POST", "/api/task/resume",
+                                          {"task": "one", "model": "sonnet", "effort": "low"})[0], 200)
+            spawn.assert_called_with(["restart", "one", "-m", "sonnet", "-f", "low"], terminal=False)
+            spawn.reset_mock()
+            for bad in ({"model": "--dangerous"}, {"effort": "a b"}, {"message_id": "not-a-uuid"}):
+                body = dict({"task": "one", "message": "x"}, **bad)
+                self.assertEqual(self.request("POST", "/api/task/send", body)[0], 400)
+            spawn.assert_not_called()
+
+    def test_dialog_limit_query_is_validated(self):
+        self.assertEqual(self.request("GET", "/api/dialog?task=one&limit=-1")[0], 400)
+        code, payload, _, _ = self.request("GET", "/api/dialog?task=one&limit=60")
+        self.assertEqual(code, 200)
+        self.assertIn("pending", payload)
+
     def test_summary_and_event_json_are_byte_bounded_without_skipping_events(self):
         for index in range(6):
             self.events.emit("one", kind="large", data={"text": "x" * 120000, "index": index})

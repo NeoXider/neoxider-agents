@@ -272,7 +272,8 @@ def send(store, ref, text, opts):
                     print("[agent.sh] inbox empty: " + name)
                     return 0
                 store.update(name, state="running", core_version="2", exit="", engine=resolved["engine"], session=session,
-                             parent=opts.get("parent", store.read(name).get("parent", "")),
+                             parent=checked_parent(store, name, opts.get("parent", store.read(name).get("parent", "")),
+                                                    store.read(name).get("parent", "")),
                              pid=os.getpid(), pid_start=pid_stamp(os.getpid()),
                              winpid=os.getpid() if os.name == "nt" else "", generation=resolved["_generation"],
                              owns=resolved.get("owns", ""), dir=resolved["dir"])
@@ -328,6 +329,43 @@ def release_delivery(store, name, delivered, generation, outcome):
         return receipts
 
 
+def checked_parent(store, name, parent, fallback="", limit=256):
+    """Parent to record for task NAME, refusing self-parenting and loops.
+
+    A child inherits AGENT_PARENT from the agent that launched it, so a task that restarts
+    itself (or a descendant that targets an ancestor) would otherwise write a parent chain
+    that leads back to NAME. Such a parent is replaced by FALLBACK (normally the parent already
+    recorded) when that one is safe, else dropped (the task becomes a root). An unrelated loop
+    further up, a missing parent or an unreadable meta is left as recorded.
+    """
+    parent = (parent or "").strip()
+    if not parent:
+        return ""
+    if parent == name or _leads_to(store, name, parent, limit):
+        fallback = (fallback or "").strip()
+        if fallback and fallback != parent and fallback != name and not _leads_to(store, name, fallback, limit):
+            return fallback
+        return ""
+    return parent
+
+
+def _leads_to(store, name, parent, limit):
+    seen, cur = set(), parent
+    for _ in range(limit):
+        if cur == name:
+            return True
+        if not cur or cur in seen:
+            return False
+        seen.add(cur)
+        try:
+            # Plain meta read: walking ancestors must not trigger store.read()'s pruning.
+            from .state import read_meta
+            cur = (read_meta(store.path(cur, ".meta")) or {}).get("parent", "")
+        except (OSError, ValueError):
+            return False
+    return False
+
+
 def execute(store, name, opts, provider, model, effort, session, prompt, resume, delivered):
     from .process import pid_stamp
     from .providers import failure_reason
@@ -346,7 +384,9 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
                  pid=os.getpid(), winpid=os.getpid() if os.name == "nt" else "", pid_start=pid_stamp(os.getpid()),
                  session=session, session_log_offset=offset if not resume else old.get("session_log_offset", "0"),
                  detached=int(os.environ.get("AGENT_DETACHED") == "1"), wait_pid="", wait_start="", wait_token="",
-                 started=now(), started_epoch=started_epoch, parent=opts.get("parent", os.environ.get("AGENT_PARENT", old.get("parent", ""))),
+                 started=now(), started_epoch=started_epoch,
+                 parent=checked_parent(store, name, opts.get("parent", os.environ.get("AGENT_PARENT", old.get("parent", ""))),
+                                       old.get("parent", "")),
                  orchestrator=os.environ.get("AGENT_ORCHESTRATOR_ID", old.get("orchestrator", "")), last_send_error="", timeout="", silence="",
                  provider_pid="", provider_start="", job_name="")
     store.update(name, progress=int(bool(progress_on)), verbose=int(bool(verbose)), keep_logs=int(bool(keep_logs)),

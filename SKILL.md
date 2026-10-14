@@ -219,6 +219,29 @@ training, no extra plugin. Which model: you choose it yourself from what is avai
 in step 2 above). Keep one model for the whole ledger; an explicit user selection still wins.
 If it proves incapable, report the limitation and seek a model change rather than silently substituting.
 
+## How to manage agents (orchestrator checklist)
+
+- **Always catch the exit code.** Never pipe `run`/`wait` through `tail`/`head`/`grep` without
+  `set -o pipefail` (or `${PIPESTATUS[0]}`; PowerShell: `$LASTEXITCODE` right after the call).
+  When in doubt, read `result NAME --json` (`state`, `exit_code`). The stop/finish block ends with a
+  machine line `OUTCOME task=NAME state=STATE exit=N` -- match on it, not on prose.
+- **Run in a tracked background job.** Start `run` as a background task of your own harness and
+  wait on it (or `wait NAME`), so its exit is observed; do not fire-and-forget.
+- **Narrow tasks for weak/free models.** Give them one small objective, a time budget ("stop after
+  ~20 minutes and report"), and ask them to write the result to a file after every step, so a
+  timeout still leaves usable output. Free routes are weaker on long browser-driven tasks; pick a
+  stronger model for those, a cheap one for mechanical edits.
+- **Restart instead of re-running.** If a worker drifts or stalls, `restart NAME "narrower task"`
+  (same session, keeps context) rather than a fresh `run` that redoes the work.
+- **Launch in a narrow folder.** `-C` the smallest directory that contains the owned files: the
+  change-attribution snapshot is taken of that tree, so a narrow folder starts faster.
+- **Verify by files, not by the report.** Check the worker's result through `diff NAME`, the files
+  or tracker it was supposed to update and your own checks; its final message is a claim.
+- **Subagents of subagents are tracked automatically.** Every provider process gets
+  `AGENT_PARENT=<its task>` (and `AGENT_TASK`), so a `neoxider run` started from inside a worker
+  records that worker as its parent; the GUI shows the whole tree. `stop --all-mine` inside a worker
+  therefore means "my children".
+
 ## Ledger mode (single hard task, GVS5H-style)
 
 1. **Init.** `mkdir -p .ledger/<task>` and seed it (stubs in `ledger/` at the skill root —
@@ -798,11 +821,32 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
 **GUI (`agent.sh gui`).** A lightweight local web control panel (python-stdlib, zero
 dependencies): project→subagents tree, chat with each agent, launching new tasks, provider
 limits and `doctor` — one GUI covers all providers, shared `LOGDIR`, safe alongside CLI-launched
-tasks (paths are normalized, meta writes are locked). An **"API" tab** starts/stops
+tasks (paths are normalized, meta writes are locked).
+
+- **Tree.** Orchestrator → subagent → its subagents, any depth, built from each task's `parent`
+  (`-P`, or automatically `AGENT_PARENT` = the launching task, see "How to manage agents").
+  Click ▸ (or ←/→) to collapse/expand; expansion and the selected task survive reloads. Each
+  parent shows subtree counters (total · ● running · ! errors), each row a state dot. A filter box
+  (name/model/state text) plus a state filter (active / attention / errors / done) keeps the
+  ancestors of every match. Keyboard: ↑/↓ move, →/← expand/enter or collapse/go to parent,
+  Home/End, Enter selects. A deleted parent shows the child as a root with `↑ parent`; a parent
+  loop is cut and marked ↻.
+- **Chat.** The whole dialog (task prompt, your messages, assistant text, system notes, queued
+  inbox messages, the outcome of a finished task), paged from the end: "load earlier" or scroll to
+  the top for 30 more steps. It auto-scrolls only when you are already at the bottom ("↓ new
+  messages" otherwise). Tool calls are one line (name · short argument · ✓/✗ exit code · duration);
+  click for full input/output (long output: "show all"). Thinking is hidden behind a thin marker;
+  open one, or toggle all with 💭. Everything shown passes the secret redactor.
+- **Sending.** The box under the chat: Enter sends, Shift+Enter is a new line. Each message gets a
+  stable UUID; the outbox shows accepted / delivered / acknowledged from persisted receipts
+  (unknown stays unknown — never resend automatically). "interrupt & send" = `send --now` for a
+  running task. Model / effort pickers (from the model catalog) apply to the next turn
+  (`send|restart -m -f`); Stop and Resume (`restart`) sit next to them.
+- **Theme.** ◐/☀/☾ in the header: follow the system, light, dark. An **"API" tab** starts/stops
 `openai-server` bridges from the browser — pick provider+model+port (default opencode/big-pickle),
 get a running-bridges list with live `/health`, inline per-bridge request logs, a copy-`/v1`-URL
 button and a stop button (no CLI needed). Task status is conveyed by the
-activity/topic emoji (✅⏳❌⚠️📖✏️🔧💭🐛🧪…) plus strikethrough for finished tasks. Stable
+activity/topic emoji (✅⏳❌⚠️📖✏️🔧💭🐛🧪…) plus a state dot. Stable
 port: CLI arg > `$AGENT_GUI_PORT` > `8765`; re-running `gui` while one is up just opens the
 browser.
 

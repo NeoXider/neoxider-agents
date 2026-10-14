@@ -78,6 +78,10 @@ requested receipt, including receipts older than the compact Fleet item tail.
 Missing receipt evidence stays pending/unknown, even if another receipt or previous
 task answer/exit is successful. Resume also reports pending
 launcher creation, rather than completed resumption.
+Since 2026-10-14 `send` and `resume` also accept optional `model` / `effort`
+(validated model-id text, never option-like) forwarded as `-m` / `-f` for the next turn,
+and the Tasks-tab composer (see [GUI.md](GUI.md)) keeps a per-task outbox polling each
+UUID's receipt.
 
 Run, send and the legacy reply route transport text through a unique private UTF-8
 file using `--prompt-file FILE --`; message/prompt text never enters the launch argv.

@@ -5,17 +5,20 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agent · subagents</title>
 <link rel="icon" type="image/png" href="/static/favicon.png">
+<meta name="color-scheme" content="dark light">
 <link rel="stylesheet" href="/static/style.css">
+<script src="/static/theme.js"></script>
 </head>
 <body>
 <header>
   <h1><img src="/static/favicon.png" alt="" class="logo"> <a href="https://github.com/NeoXider/neoxider-agents" target="_blank" rel="noopener" title="neoxider-agents by NeoXider">Neoxider</a></h1>
   <span class="pill" id="cwd"></span>
   <span class="sp"></span>
-  <select id="lang-picker" style="width:auto"></select>
+  <select id="lang-picker" style="width:auto" aria-label="Language"></select>
+  <button class="icon" id="btn-theme" type="button" aria-label="Theme">◐</button>
   <button id="btn-doctor">🩺 <span data-i18n="header.doctor">doctor · all limits</span></button>
   <button class="icon" id="btn-history" data-i18n-title="header.history" title="notification history">🔔<span class="pill" id="hist-badge" style="display:none;position:absolute;top:-4px;right:-4px;background:var(--accent);color:#04101f;border:none"></span></button>
-  <button class="mini" id="btn-refresh">⟳</button>
+  <button class="mini" id="btn-refresh" data-i18n-title="header.refresh" title="refresh" aria-label="refresh">⟳</button>
 </header>
 <div class="tabbar">
   <button class="tabbtn on" data-tab="tasks" data-i18n="tabs.tasks">Tasks</button>
@@ -25,24 +28,48 @@
 
 <div class="tabview on" id="tabview-tasks">
 <main>
-  <!-- LEFT: project → subagent tree -->
+  <!-- LEFT: project → subagent tree (any depth) -->
   <div id="left">
     <div class="hd"><span style="flex:1" data-i18n="tree.title">Projects · subagents</span>
+      <button class="mini ghost" id="btn-tree-expand" data-i18n-title="tree.expand_all" title="expand all" aria-label="expand all">⊞</button>
+      <button class="mini ghost" id="btn-tree-collapse" data-i18n-title="tree.collapse_all" title="collapse all" aria-label="collapse all">⊟</button>
       <button class="mini" id="btn-add-project" data-i18n-title="tree.add_project" title="open/add a project folder">📂＋</button></div>
-    <div id="tree"></div>
+    <div class="treefilter">
+      <input id="tree-filter" type="search" data-i18n-placeholder="tree.filter_placeholder" placeholder="filter tasks…" aria-label="filter tasks" autocomplete="off">
+      <select id="tree-state" aria-label="state filter">
+        <option value="" data-i18n="tree.state_all">all</option>
+        <option value="active" data-i18n="tree.state_active">active</option>
+        <option value="attention" data-i18n="tree.state_attention">attention</option>
+        <option value="errors" data-i18n="tree.state_errors">errors</option>
+        <option value="done" data-i18n="tree.state_done">done</option>
+      </select>
+    </div>
+    <div id="tree" role="tree" aria-label="subagent tree"></div>
   </div>
   <div class="resizer" id="rez-left"></div>
 
-  <!-- CENTER: chat -->
+  <!-- CENTER: chat + composer -->
   <div id="center">
     <div id="chead"><span class="empty" style="margin:0" data-i18n="chat.select_prompt">← select a subagent</span></div>
-    <div id="chat"><div class="empty"><span data-i18n="chat.empty_title">No task selected.</span><br><span data-i18n="chat.empty_hint">You can start a new one on the right.</span></div></div>
-    <div id="replybar" style="display:none">
-      <textarea id="answer" data-i18n-placeholder="chat.answer_placeholder" placeholder="answer the agent / message… (Ctrl+Enter)"></textarea>
-      <div class="rcol">
-        <span id="chat-submission" role="status"></span>
-        <label class="chk"><input type="checkbox" id="r-term"> <span data-i18n="chat.terminal">terminal</span></label>
+    <div class="chatwrap">
+      <div id="chat" role="log" aria-live="off" tabindex="0"><div class="empty"><span data-i18n="chat.empty_title">No task selected.</span><br><span data-i18n="chat.empty_hint">You can start a new one on the right.</span></div></div>
+      <button id="chat-jump" class="mini" hidden data-i18n="chat.jump_latest">↓ new messages</button>
+    </div>
+    <div id="replybar" hidden>
+      <div id="outbox" hidden aria-live="polite"></div>
+      <div class="composer">
+        <textarea id="answer" rows="1" data-i18n-placeholder="chat.answer_placeholder" placeholder="message the agent… (Enter to send, Shift+Enter for a new line)" aria-label="message"></textarea>
         <button class="primary" id="btn-reply"><span data-i18n="chat.send_message">Send message</span></button>
+      </div>
+      <div class="ctools">
+        <label class="chk" id="r-now-wrap" data-i18n-title="composer.now_hint" title="interrupt the current turn and deliver now (send --now)"><input type="checkbox" id="r-now"> <span data-i18n="composer.now">interrupt &amp; send</span></label>
+        <select id="r-model" aria-label="model for the next turn" data-i18n-title="composer.model_hint" title="model for the next turn"></select>
+        <select id="r-effort" aria-label="effort for the next turn" data-i18n-title="composer.effort_hint" title="thinking effort for the next turn"></select>
+        <label class="chk"><input type="checkbox" id="r-term"> <span data-i18n="chat.terminal">terminal</span></label>
+        <span class="sp"></span>
+        <span id="chat-submission" role="status"></span>
+        <button class="danger mini" id="btn-stop-task" hidden data-i18n="chat.stop">Stop</button>
+        <button class="mini" id="btn-resume-task" hidden data-i18n="composer.resume">Resume</button>
       </div>
     </div>
   </div>
@@ -174,12 +201,14 @@
 <script src="/static/util.js"></script>
 <script src="/static/i18n.js"></script>
 <script src="/static/toast.js"></script>
+<script src="/static/tasktree.js"></script>
 <script src="/static/tree.js"></script>
 <script src="/static/chat.js"></script>
 <script src="/static/modals.js"></script>
 <script src="/static/splitters.js"></script>
 <script src="/static/bridgetab.js"></script>
 <script src="/static/fleet.js"></script>
+<script src="/static/composer.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

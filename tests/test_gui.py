@@ -433,7 +433,8 @@ class ParseDialogTests(unittest.TestCase):
         self.assertEqual(st["ts"], "2026-08-12 10:00:00")
         self.assertEqual(st["prompt"], "fix the tests")
         self.assertEqual([b["type"] for b in st["blocks"]], ["text"])
-        self.assertIn("session id: 019ff", st["blocks"][0]["text"])  # chrome kept as text
+        # launcher chrome (session id / activity echoes) is not part of the conversation
+        self.assertNotIn("session id: 019ff", st["blocks"][0]["text"])
         self.assertIn("Done, all green.", st["blocks"][0]["text"])
 
     def test_leading_blank_line_creates_no_phantom_step(self):
@@ -600,7 +601,8 @@ class DialogPayloadTests(unittest.TestCase):
         self.assertEqual(pf["steps"][0]["prompt"], "step 0")
 
     def test_default_payload_caps_huge_blocks_full_does_not(self):
-        big = "x" * (gui._DIALOG_BLOCK_CAP + 500)
+        # prose, not one opaque run: a long unbroken token is masked by the secret redactor
+        big = ("word " * (gui._DIALOG_BLOCK_CAP // 5 + 100)).strip()
         log = ("\n========== [run] 2026-08-12 10:00:00 | e ==========\n"
                "> PROMPT:\np\n---------- output ----------\n" + big + "\n")
         self._write_task("t3", log)
@@ -1887,7 +1889,7 @@ class RetainedTaskTests(unittest.TestCase):
         self.assertEqual(payload["steps"][0]["blocks"][0]["text"], "a newer longer answer")
 
     def test_retained_answer_obeys_default_payload_cap(self):
-        answer = "a" * (gui._DIALOG_BLOCK_CAP + 1)
+        answer = ("abc " * (gui._DIALOG_BLOCK_CAP // 4 + 1)).strip()
         self.write(".answer", answer)
         block = gui.dialog_payload("retained")["steps"][0]["blocks"][0]
         self.assertTrue(block["truncated"])
@@ -2283,6 +2285,250 @@ class GuiLoggingTests(unittest.TestCase):
             gui.subprocess.run = orig_run
             if orig_os_name != "nt":
                 os.name = orig_os_name
+
+
+class SubagentTreeTests(unittest.TestCase):
+    """resolve_tree() annotates /api/tasks rows for the subagent tree: any depth, loops cut,
+    rows whose parent is not a task shown as roots (never dropped, never an endless walk)."""
+
+    @staticmethod
+    def rows(pairs):
+        return gui.resolve_tree([{"name": n, "parent": p} for n, p in pairs])
+
+    def by_name(self, pairs):
+        return {r["name"]: r for r in self.rows(pairs)}
+
+    def test_depth_four_chain_nests_under_each_parent(self):
+        r = self.by_name([("orch", ""), ("sub", "orch"), ("subsub", "sub"), ("d3", "subsub"), ("d4", "d3")])
+        self.assertEqual([r[n]["depth"] for n in ("orch", "sub", "subsub", "d3", "d4")], [0, 1, 2, 3, 4])
+        self.assertEqual(r["d4"]["tree_parent"], "d3")
+        self.assertEqual(r["orch"]["tree_parent"], "")
+        self.assertFalse(any(x["parent_missing"] or x["parent_cycle"] for x in r.values()))
+
+    def test_cycle_is_cut_at_smallest_member_and_self_parent_is_a_root(self):
+        r = self.by_name([("x", "y"), ("y", "x"), ("z", "y"), ("s", "s")])
+        self.assertEqual(r["x"]["tree_parent"], "")       # lexically smallest member of x<->y
+        self.assertTrue(r["x"]["parent_cycle"])
+        self.assertEqual(r["y"]["tree_parent"], "x")
+        self.assertEqual(r["z"]["depth"], 2)
+        self.assertEqual(r["s"]["tree_parent"], "")
+        self.assertTrue(r["s"]["parent_cycle"])
+
+    def test_orphan_with_deleted_parent_is_a_root_with_hint(self):
+        r = self.by_name([("child", "deleted-task"), ("grandchild", "child")])
+        self.assertEqual(r["child"]["tree_parent"], "")
+        self.assertTrue(r["child"]["parent_missing"])
+        self.assertEqual(r["child"]["depth"], 0)
+        self.assertEqual(r["grandchild"]["depth"], 1)
+
+    def test_very_deep_chain_needs_no_recursion(self):
+        pairs = [("n0", "")] + [("n%d" % i, "n%d" % (i - 1)) for i in range(1, 5000)]
+        r = self.by_name(pairs)
+        self.assertEqual(r["n4999"]["depth"], 4999)
+
+    def test_list_tasks_carries_tree_fields(self):
+        scratch = tempfile.mkdtemp()
+        orig = gui.LOGDIR
+        try:
+            gui.LOGDIR = scratch
+            for name, parent in (("root", ""), ("kid", "root"), ("lost", "gone")):
+                with open(os.path.join(scratch, name + ".meta"), "w", encoding="utf-8") as f:
+                    f.write("state=done\nparent=%s\n" % parent)
+            rows = {t["name"]: t for t in gui.list_tasks()}
+            self.assertEqual(rows["kid"]["tree_parent"], "root")
+            self.assertTrue(rows["lost"]["parent_missing"])
+        finally:
+            gui.LOGDIR = orig
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+class ChatParseToolAndThinkingTests(unittest.TestCase):
+    """Chat data: tool calls carry name/arg/result plus status and exit code (the client shows
+    them collapsed to one line); thinking stays a separate block (hidden by default)."""
+
+    def blocks(self, *events):
+        return gui.parse_output_blocks("\n".join(json.dumps(e) for e in events))
+
+    def test_codex_started_then_completed_updates_one_block_with_exit_code(self):
+        b = self.blocks(
+            {"type": "item.started", "item": {"id": "i1", "type": "command_execution", "command": "pytest -q"}},
+            {"type": "item.completed", "item": {"id": "i0", "type": "reasoning", "text": "plan the fix"}},
+            {"type": "item.completed", "item": {"id": "i1", "type": "command_execution", "command": "pytest -q",
+                                                "aggregated_output": "1 failed", "exit_code": 2, "status": "failed"}},
+            {"type": "item.completed", "item": {"id": "i2", "type": "agent_message", "text": "One test fails."}})
+        self.assertEqual([x["type"] for x in b], ["tool", "thinking", "text"])
+        self.assertEqual((b[0]["name"], b[0]["arg"], b[0]["result"], b[0]["status"], b[0]["code"]),
+                         ("exec", "pytest -q", "1 failed", "error", 2))
+
+    def test_running_tool_is_marked_running(self):
+        b = self.blocks({"type": "item.started", "item": {"id": "i9", "type": "command_execution", "command": "sleep 5"}})
+        self.assertEqual(b[0]["status"], "running")
+
+    def test_opencode_parts_text_tool_reasoning_and_error(self):
+        b = self.blocks(
+            {"type": "step_start", "part": {"type": "step-start"}},
+            {"type": "reasoning", "part": {"type": "reasoning", "text": "think first"}},
+            {"type": "tool_use", "part": {"type": "tool", "tool": "read", "callID": "c1",
+                                          "state": {"status": "completed", "input": {"filePath": "a.py"},
+                                                    "output": "print(1)", "time": {"start": 1000, "end": 1250}}}},
+            {"type": "tool_use", "part": {"type": "tool", "tool": "bash", "callID": "c2",
+                                          "state": {"status": "error", "input": {"command": "false"}, "error": "exit 1"}}},
+            {"type": "text", "part": {"type": "text", "text": "Read it."}},
+            {"type": "step_finish", "part": {"type": "step-finish"}})
+        self.assertEqual([x["type"] for x in b], ["thinking", "tool", "tool", "text"])
+        self.assertEqual(b[1]["name"], "read")
+        self.assertIn("a.py", b[1]["arg"])
+        self.assertEqual((b[1]["status"], b[1]["dur_ms"]), ("ok", 250))
+        self.assertEqual((b[2]["status"], b[2]["result"]), ("error", "exit 1"))
+        self.assertEqual(b[3]["text"], "Read it.")
+
+    def test_claude_tool_result_matches_by_id_and_flags_errors(self):
+        b = self.blocks(
+            {"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "x"}}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "t2", "content": [{"type": "text", "text": "no such file"}], "is_error": True},
+                {"type": "tool_result", "tool_use_id": "t1", "content": "a\nb"}]}})
+        self.assertEqual([x["type"] for x in b], ["thinking", "tool", "tool"])
+        self.assertEqual((b[1]["status"], b[1]["result"]), ("ok", "a\nb"))
+        self.assertEqual((b[2]["status"], b[2]["result"]), ("error", "no such file"))
+
+    def test_launcher_activity_lines_are_not_chat_text(self):
+        b = gui.parse_output_blocks("[agent-activity] text hi\n[opencode] activity: step_start\nreal answer")
+        self.assertEqual(b, [{"type": "text", "text": "real answer"}])
+
+
+class ChatPayloadHistoryTests(unittest.TestCase):
+    """dialog_payload: the whole history is pageable (limit grows from the end), every string
+    is redacted, queued inbox messages and the outcome of a finished task are included."""
+
+    def setUp(self):
+        self.scratch = tempfile.mkdtemp()
+        self._orig = gui.LOGDIR
+        gui.LOGDIR = self.scratch
+        gui._DIALOG_CACHE.clear()
+
+    def tearDown(self):
+        gui.LOGDIR = self._orig
+        gui._DIALOG_CACHE.clear()
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def write(self, name, log, meta="engine=codex\nmodel=sol\nstate=done\nexit=0\n"):
+        with open(os.path.join(self.scratch, name + ".log"), "w", encoding="utf-8") as f:
+            f.write(log)
+        with open(os.path.join(self.scratch, name + ".meta"), "w", encoding="utf-8") as f:
+            f.write(meta)
+
+    def test_limit_pages_from_the_end_and_has_more(self):
+        log = "".join("\n========== [reply] 2026-08-12 10:%02d:00 | e ==========\n> ANSWER:\nmsg %d\n"
+                      "---------- output ----------\nanswer %d\n" % (i, i, i) for i in range(50))
+        self.write("t", log)
+        p = gui.dialog_payload("t", limit=40)
+        self.assertEqual((len(p["steps"]), p["offset"], p["has_more"]), (40, 10, True))
+        self.assertEqual(p["steps"][-1]["prompt"], "msg 49")
+        p = gui.dialog_payload("t", limit=500)
+        self.assertEqual((len(p["steps"]), p["has_more"]), (50, False))
+
+    def test_secrets_are_redacted_in_prompt_and_tool_io(self):
+        secret = "sk-" + "A1b2C3d4" * 6
+        event = {"type": "item.completed", "item": {"id": "1", "type": "command_execution",
+                                                    "command": "export OPENAI_API_KEY=" + secret,
+                                                    "aggregated_output": "token=" + secret, "exit_code": 0}}
+        self.write("s", "\n========== [run] 2026-08-12 10:00:00 | e ==========\n> PROMPT:\nuse key " + secret +
+                   "\n---------- output ----------\n" + json.dumps(event) + "\n")
+        dumped = json.dumps(gui.dialog_payload("s"))
+        self.assertNotIn(secret, dumped)
+        self.assertIn("REDACTED", dumped)
+
+    def test_pending_inbox_messages_and_outcome(self):
+        self.write("q", "\n========== [run] 2026-08-12 10:00:00 | e ==========\n> PROMPT:\ngo\n"
+                        "---------- output ----------\nworking\n",
+                   meta="engine=codex\nmodel=sol\nstate=error\nexit=3\nreason=provider failed\n")
+        os.makedirs(os.path.join(self.scratch, "q.inbox"))
+        with open(os.path.join(self.scratch, "q.inbox", "2.msg"), "w", encoding="utf-8") as f:
+            f.write("second follow-up")
+        p = gui.dialog_payload("q")
+        self.assertEqual([(m["sequence"], m["text"]) for m in p["pending"]], [(2, "second follow-up")])
+        self.assertEqual(p["outcome"]["state"], "error")
+        self.assertEqual(p["outcome"]["exit"], "3")
+        self.assertEqual(p["outcome"]["reason"], "provider failed")
+
+
+class ContinuationOptionTests(unittest.TestCase):
+    """send/resume may switch model/effort for the next turn; values become argv operands."""
+
+    def test_valid_and_empty(self):
+        self.assertEqual(gui.continuation_options({}), [])
+        self.assertEqual(gui.continuation_options({"model": "opencode/big-pickle", "effort": "high"}),
+                         ["-m", "opencode/big-pickle", "-f", "high"])
+
+    def test_option_like_or_odd_values_are_refused(self):
+        for bad in ("-rf", "--help", "a b", "x;y", 5, "m" * 300):
+            with self.assertRaises(ValueError):
+                gui.continuation_options({"model": bad})
+
+
+class SubagentLineageTests(unittest.TestCase):
+    """The provider process of task T passes AGENT_PARENT=T on, so a nested `neoxider run`
+    records T as its parent; a parent chain that would loop back is refused."""
+
+    def setUp(self):
+        sys.path.insert(0, REPO_ROOT)
+        from neoxider_agents.state import Store
+        from neoxider_agents import lifecycle, runtime
+        self.lifecycle, self.runtime = lifecycle, runtime
+        self.scratch = tempfile.mkdtemp()
+        self.store = Store(self.scratch)
+
+    def tearDown(self):
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+    def test_child_environment_names_the_task_as_parent(self):
+        self.assertEqual(self.runtime.child_lineage("orch-1"), {"AGENT_PARENT": "orch-1", "AGENT_TASK": "orch-1"})
+
+    def test_checked_parent_refuses_self_and_loops_keeps_safe_fallback(self):
+        cp = self.lifecycle.checked_parent
+        self.store.update("a", parent="")
+        self.store.update("b", parent="a")
+        self.store.update("c", parent="b")
+        self.assertEqual(cp(self.store, "d", "c"), "c")                # normal nesting
+        self.assertEqual(cp(self.store, "a", "a"), "")                 # self
+        self.assertEqual(cp(self.store, "a", "c"), "")                 # c -> b -> a: loop
+        self.assertEqual(cp(self.store, "c", "c", fallback="b"), "b")  # self-restart keeps old parent
+        self.assertEqual(cp(self.store, "x", "deleted-task"), "deleted-task")  # missing parent kept
+        self.assertEqual(cp(self.store, "x", "/root/orchestrator"), "/root/orchestrator")
+
+
+class SpawnLineageEnvTests(unittest.TestCase):
+    def setUp(self):
+        self.original_popen = gui.subprocess.Popen
+        self.calls = []
+        gui.subprocess.Popen = lambda argv, **kw: self.calls.append((argv, kw)) or types.SimpleNamespace(pid=1)
+        self.saved = {k: os.environ.get(k) for k in ("AGENT_TASK", "AGENT_PARENT")}
+
+    def tearDown(self):
+        gui.subprocess.Popen = self.original_popen
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_panel_started_inside_an_agent_does_not_file_user_actions_under_it(self):
+        os.environ["AGENT_TASK"] = "outer"
+        os.environ["AGENT_PARENT"] = "outer"
+        gui.spawn(["list"])
+        env = self.calls[-1][1]["env"]
+        self.assertNotIn("AGENT_PARENT", env)
+        self.assertNotIn("AGENT_TASK", env)
+
+    def test_explicit_orchestrator_parent_outside_agents_is_kept(self):
+        os.environ.pop("AGENT_TASK", None)
+        os.environ["AGENT_PARENT"] = "my-orchestrator"
+        gui.spawn(["list"])
+        self.assertEqual(self.calls[-1][1]["env"]["AGENT_PARENT"], "my-orchestrator")
 
 
 if __name__ == "__main__":

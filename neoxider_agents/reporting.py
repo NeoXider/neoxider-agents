@@ -500,11 +500,13 @@ def make_stop_block(store, name, data):
             "· ran %.1fs · last activity: %s\n"
             "· files changed by this agent (delta since start): %s%s\n"
             "· partial result: %s\n· session=%s\n"
-            "· resume: neoxider send %s \"...\" / neoxider restart %s\n") % (
+            "· resume: neoxider send %s \"...\" / neoxider restart %s\n"
+            "OUTCOME task=%s state=%s exit=%s\n") % (
                 name, data.get("stopped_by", "orchestrator"), data.get("stopped_at") or now(),
                 redact(data.get("reason") or "launcher stopped"), duration, digest,
                 files, " " + changed if changed else "", partial or "(none)",
-                store.session(name, data) or "(unavailable)", name, name)
+                store.session(name, data) or "(unavailable)", name, name,
+                name, data.get("state", "stopped"), data.get("exit", STOP_EXIT))
 
 
 def record_stop(store, name, by="orchestrator", reason="stopped by orchestrator", code=STOP_EXIT,

@@ -448,7 +448,53 @@ def list_tasks():
             "last_activity": _activity.summary(logp),
         })
     out.sort(key=lambda t: t["updated"] or 0, reverse=True)
-    return out
+    return resolve_tree(out)
+
+
+def resolve_tree(tasks):
+    """Annotate each task row for the subagent tree, in place, and return the list.
+
+    tree_parent    -- the parent to nest under ("" = a root), always an existing task;
+    parent_missing -- meta names a parent that is not a task here (deleted, pruned, or an
+                      external orchestrator id): the row is shown as a root with a hint;
+    parent_cycle   -- the row's parent chain loops back (A->B->A); the loop is cut at its
+                      lexically smallest member, which becomes a root;
+    depth          -- 0 for roots. Arbitrary depth; never recursion, never an endless walk."""
+    rows = {t["name"]: t for t in tasks}
+    up = {}
+    for t in tasks:
+        p = t.get("parent") or ""
+        t["parent_missing"] = bool(p) and p not in rows
+        t["parent_cycle"] = False
+        up[t["name"]] = p if p in rows and p != t["name"] else ""
+        t["parent_cycle"] = p == t["name"]
+    done = set()
+    for start in sorted(rows):
+        path, index, cur = [], {}, start
+        while cur and cur not in done and cur not in index:
+            index[cur] = len(path)
+            path.append(cur)
+            cur = up[cur]
+        if cur and cur in index:  # found a loop: path[index[cur]:]
+            loop = path[index[cur]:]
+            cut = min(loop)
+            up[cut] = ""
+            rows[cut]["parent_cycle"] = True
+        done.update(path)
+    depth = {}
+    for name in rows:
+        chain, cur = [], name
+        while cur and cur not in depth:
+            chain.append(cur)
+            cur = up[cur]
+        base = depth[cur] + 1 if cur else 0
+        for item in reversed(chain):
+            depth[item] = base
+            base += 1
+    for name, t in rows.items():
+        t["tree_parent"] = up[name]
+        t["depth"] = depth[name]
+    return tasks
 
 def list_dirs(path):
     try:
@@ -521,6 +567,7 @@ def fmt_dur(sec):
 _STEP_HDR = re.compile(r"^=+\s*\[(\w+)\]\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*\|\s*(.*?)\s*=+\s*$")
 _OUT_MARK = "---------- output ----------"
 _CODEX_MARKS = ("user", "codex", "thinking", "exec")
+_NOISE_LINE = re.compile(r"^(?:\[agent-activity\] |\[[a-z]+\] activity: |session id: \S+$)")
 
 def _ts_epoch(ts):
     try:
@@ -553,11 +600,40 @@ def _text_block(blocks, text):
     else:
         blocks.append({"type": "text", "text": text})
 
+def _tool(name, arg="", result="", status="", code=None, dur_ms=None, ident=None):
+    """One tool-call block. status: ok | error | running | "" (unknown); code: exit code."""
+    return {"type": "tool", "name": name or "tool", "arg": arg or "", "result": result or "",
+            "dur_ms": dur_ms, "status": status, "code": code, "id": ident}
+
+def _jtext(value):
+    if isinstance(value, str):
+        return value
+    if value in (None, ""):
+        return ""
+    return json.dumps(value, ensure_ascii=False)
+
 def _parse_jsonl(lines):
     """Structured JSONL streams. Returns None when nothing recognisable was found (caller then
-    tries the next format). Recognises codex `exec --json` events, kimi stream-json roles and
-    claude stream-json message envelopes; unknown event kinds are skipped, never fatal."""
-    blocks, recognized, last_tool = [], 0, None
+    tries the next format). Recognises codex `exec --json` events, opencode `run --format json`
+    parts, kimi stream-json roles and claude stream-json message envelopes; unknown event kinds
+    are skipped, never fatal. A tool call that has started but not finished yet is shown with
+    status "running" and completed in place when its result arrives."""
+    blocks, recognized, last_tool, by_id = [], 0, None, {}
+    def add_tool(block):
+        nonlocal last_tool
+        ident = block.get("id")
+        if ident and ident in by_id:  # item.completed for an item.started we already showed
+            by_id[ident].update({k: v for k, v in block.items() if v not in (None, "")})
+            last_tool = by_id[ident]
+            return last_tool
+        blocks.append(block)
+        if ident:
+            by_id[ident] = block
+        last_tool = block
+        return block
+    def close(target, result, status):
+        target["result"] = result
+        target["status"] = status
     for line in lines:
         s = line.strip()
         if not s or s[0] != "{":
@@ -569,13 +645,17 @@ def _parse_jsonl(lines):
         if not isinstance(o, dict):
             continue
         t = o.get("type")
+        part = o.get("part") if isinstance(o.get("part"), dict) else None
         # --- codex exec --json: {"type":"item.completed","item":{...}}
         if t in ("item.started", "item.completed") and isinstance(o.get("item"), dict):
             recognized += 1
-            if t != "item.completed":
-                continue
             it = o["item"]
             it_t = it.get("type")
+            ident = "codex:" + str(it.get("id")) if it.get("id") is not None else None
+            if t != "item.completed":
+                if it_t == "command_execution":
+                    add_tool(_tool("exec", it.get("command") or "", status="running", ident=ident))
+                continue
             if it_t == "agent_message":
                 _text_block(blocks, it.get("text") or "")
             elif it_t == "reasoning":
@@ -583,24 +663,60 @@ def _parse_jsonl(lines):
                 if txt.strip():
                     blocks.append({"type": "thinking", "text": txt.strip("\n")})
             elif it_t == "command_execution":
-                last_tool = {"type": "tool", "name": "exec", "arg": it.get("command") or "",
-                             "result": (it.get("aggregated_output") or "").strip("\n"),
-                             "dur_ms": None}
-                blocks.append(last_tool)
-            elif it_t in ("mcp_tool_call", "custom_tool_call"):
-                last_tool = {"type": "tool",
-                             "name": it.get("tool") or it.get("name") or it_t,
-                             "arg": json.dumps(it.get("arguments") or it.get("input") or "", ensure_ascii=False),
-                             "result": json.dumps(it.get("result") or it.get("output") or "", ensure_ascii=False),
-                             "dur_ms": None}
-                blocks.append(last_tool)
+                code = it.get("exit_code")
+                code = code if isinstance(code, int) and not isinstance(code, bool) else None
+                status = "error" if (code not in (None, 0) or it.get("status") == "failed") else "ok"
+                add_tool(_tool("exec", it.get("command") or "",
+                               (it.get("aggregated_output") or "").strip("\n"), status, code, ident=ident))
+            elif it_t in ("mcp_tool_call", "custom_tool_call", "web_search"):
+                failed = it.get("status") == "failed" or bool(it.get("error"))
+                add_tool(_tool(it.get("tool") or it.get("name") or it_t,
+                               _jtext(it.get("arguments") or it.get("input") or it.get("query")),
+                               _jtext(it.get("result") or it.get("output") or it.get("error")),
+                               "error" if failed else "ok", ident=ident))
             elif it_t == "file_change":
                 ch = it.get("changes") or []
                 arg = ", ".join(str(c.get("path") or "") for c in ch if isinstance(c, dict))
-                blocks.append({"type": "tool", "name": "file_change", "arg": arg,
-                               "result": "", "dur_ms": None})
-        elif t in ("thread.started", "turn.started", "turn.completed", "turn.failed"):
+                add_tool(_tool("file_change", arg, status="error" if it.get("status") == "failed" else "ok",
+                               ident=ident))
+            elif it_t == "error":
+                blocks.append({"type": "system", "text": str(it.get("message") or "error")})
+        elif t in ("thread.started", "turn.started", "turn.completed"):
             recognized += 1  # codex session chrome -- known, but nothing to render
+        elif t == "turn.failed":
+            recognized += 1
+            err = o.get("error")
+            msg = err.get("message") if isinstance(err, dict) else err
+            blocks.append({"type": "system", "text": "turn failed: " + str(msg or "unknown error")})
+        # --- opencode run --format json: {"type":"text"|"tool_use"|"reasoning"|..., "part":{...}}
+        elif part is not None and t in ("text", "tool_use", "reasoning", "step_start", "step_finish", "error"):
+            recognized += 1
+            if t == "text":
+                _text_block(blocks, part.get("text") or "")
+            elif t == "reasoning":
+                txt = part.get("text") or ""
+                if txt.strip():
+                    blocks.append({"type": "thinking", "text": txt.strip("\n")})
+            elif t == "tool_use":
+                state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                st = state.get("status")
+                status = {"completed": "ok", "error": "error", "running": "running", "pending": "running"}.get(st, "")
+                result = state.get("output") if st != "error" else (state.get("error") or state.get("output"))
+                tm = state.get("time") if isinstance(state.get("time"), dict) else {}
+                dur = None
+                if isinstance(tm.get("start"), (int, float)) and isinstance(tm.get("end"), (int, float)):
+                    dur = max(0, int(tm["end"] - tm["start"]))
+                add_tool(_tool(part.get("tool") or "tool", _jtext(state.get("input")), _jtext(result),
+                               status, dur_ms=dur,
+                               ident=("oc:" + str(part.get("callID"))) if part.get("callID") else None))
+            elif t == "error":
+                blocks.append({"type": "system", "text": _jtext(part.get("error") or part.get("message") or "error")})
+        elif t == "error":
+            recognized += 1
+            err = o.get("error") if o.get("error") is not None else o.get("message")
+            if isinstance(err, dict):
+                err = err.get("message") or (err.get("data") or {}).get("message") or json.dumps(err, ensure_ascii=False)
+            blocks.append({"type": "system", "text": str(err or "error")})
         # --- kimi stream-json: {"role":"assistant","content":...,"tool_calls":[...]}
         elif o.get("role") == "assistant":
             recognized += 1
@@ -614,27 +730,24 @@ def _parse_jsonl(lines):
                     elif c.get("type") == "thinking":
                         blocks.append({"type": "thinking", "text": (c.get("thinking") or "").strip("\n")})
                     elif c.get("type") == "tool_use":
-                        last_tool = {"type": "tool", "name": c.get("name") or "tool",
-                                     "arg": json.dumps(c.get("input") or "", ensure_ascii=False),
-                                     "result": "", "dur_ms": None}
-                        blocks.append(last_tool)
+                        add_tool(_tool(c.get("name"), _jtext(c.get("input")), status="running",
+                                       ident=("cl:" + c["id"]) if isinstance(c.get("id"), str) else None))
             elif isinstance(content, str):
                 _text_block(blocks, content)
             for tc in (o.get("tool_calls") or []):
                 fn = (tc or {}).get("function") or {}
-                last_tool = {"type": "tool", "name": fn.get("name") or "tool",
-                             "arg": str(fn.get("arguments") or ""), "result": "", "dur_ms": None}
-                blocks.append(last_tool)
+                add_tool(_tool(fn.get("name"), str(fn.get("arguments") or ""), status="running",
+                               ident=("km:" + tc["id"]) if isinstance((tc or {}).get("id"), str) else None))
         elif o.get("role") == "tool":
             recognized += 1
-            res = o.get("content")
-            if not isinstance(res, str):
-                res = json.dumps(res, ensure_ascii=False)
-            if last_tool is not None and not last_tool["result"]:
-                last_tool["result"] = res.strip("\n")
+            res = _jtext(o.get("content")).strip("\n")
+            target = by_id.get("km:" + o["tool_call_id"]) if isinstance(o.get("tool_call_id"), str) else None
+            if target is None and last_tool is not None and not last_tool["result"]:
+                target = last_tool
+            if target is not None:
+                close(target, res, "ok")
             else:
-                blocks.append({"type": "tool", "name": o.get("name") or "tool", "arg": "",
-                               "result": res.strip("\n"), "dur_ms": None})
+                blocks.append(_tool(o.get("name"), "", res, "ok"))
         elif o.get("role") in ("meta", "user", "system"):
             recognized += 1  # session hints / echoed input -- not rendered
         # --- claude stream-json envelope: {"type":"assistant","message":{"content":[...]}}
@@ -646,26 +759,29 @@ def _parse_jsonl(lines):
                     if not isinstance(c, dict):
                         continue
                     ct = c.get("type")
-                    if ct == "text":
+                    if ct == "text" and t == "assistant":
                         _text_block(blocks, c.get("text") or "")
                     elif ct == "thinking":
                         blocks.append({"type": "thinking", "text": (c.get("thinking") or "").strip("\n")})
                     elif ct == "tool_use":
-                        last_tool = {"type": "tool", "name": c.get("name") or "tool",
-                                     "arg": json.dumps(c.get("input") or "", ensure_ascii=False),
-                                     "result": "", "dur_ms": None}
-                        blocks.append(last_tool)
+                        add_tool(_tool(c.get("name"), _jtext(c.get("input")), status="running",
+                                       ident=("cl:" + c["id"]) if isinstance(c.get("id"), str) else None))
                     elif ct == "tool_result":
                         res = c.get("content")
-                        if not isinstance(res, str):
-                            res = json.dumps(res, ensure_ascii=False)
-                        if last_tool is not None and not last_tool["result"]:
-                            last_tool["result"] = res.strip("\n")
-            elif isinstance(content, str):
+                        if isinstance(res, list):  # [{"type":"text","text":...}, ...]
+                            res = "\n".join(str(x.get("text", "")) if isinstance(x, dict) else str(x) for x in res)
+                        res = _jtext(res).strip("\n")
+                        target = by_id.get("cl:" + c["tool_use_id"]) if isinstance(c.get("tool_use_id"), str) else None
+                        if target is None and last_tool is not None and not last_tool["result"]:
+                            target = last_tool
+                        if target is not None:
+                            close(target, res, "error" if c.get("is_error") else "ok")
+            elif isinstance(content, str) and t == "assistant":
                 _text_block(blocks, content)
         elif t in ("system", "result", "stream_event", "rate_limit_event"):
             recognized += 1
     return blocks if recognized else None
+
 
 def _parse_codex_plaintext(lines):
     """Legacy codex `exec` plaintext: bare marker lines user/codex/thinking/exec delimit blocks;
@@ -718,7 +834,9 @@ def parse_output_blocks(text):
         if any(l in _CODEX_MARKS for l in lines):
             return _parse_codex_plaintext(lines)
         blocks = []
-        _text_block(blocks, text)
+        # Launcher chrome (activity echoes) is not part of the conversation.
+        kept = [l for l in lines if not _NOISE_LINE.match(l)]
+        _text_block(blocks, "\n".join(kept) if any(l.strip() for l in kept) else text)
         return blocks
     except Exception:
         return [{"type": "text", "text": text}] if text else []
@@ -774,6 +892,9 @@ def parse_dialog(text, log_mtime=0, now=None):
 _DIALOG_BLOCK_CAP = 20000  # chars per block in the default (non-full) payload
 _DIALOG_STEP_LIMIT = 30    # steps in the default payload; full=1 lifts both caps
 _DIALOG_CACHE = {}         # single-slot: the panel views one task at a time
+_DIALOG_PAGE_CAP = 1000    # largest explicit ?limit= page ("load earlier" grows it by 30)
+_PENDING_CAP = 20          # queued inbox messages shown under the chat
+_PENDING_TEXT_CAP = 4000
 
 def dialog_payload(name, full=False, offset=None, limit=None):
     """Structured conversation for the chat tab. Default payload = the LAST
@@ -814,14 +935,15 @@ def dialog_payload(name, full=False, offset=None, limit=None):
                           "duration_s": None, "duration": ""}]
             except OSError:
                 pass
+        steps = _redact_steps(steps)
         _DIALOG_CACHE.clear()
         _DIALOG_CACHE["parsed"] = (key, steps)
     total = len(steps)
     if full:
         off, lim = 0, total
     else:
-        lim = limit if limit is not None else _DIALOG_STEP_LIMIT
-        off = offset if offset is not None else max(0, total - lim)
+        lim = max(1, min(int(limit), _DIALOG_PAGE_CAP)) if limit is not None else _DIALOG_STEP_LIMIT
+        off = max(0, min(int(offset), total)) if offset is not None else max(0, total - lim)
     out = []
     for i in range(off, min(total, off + lim)):
         st = dict(steps[i])
@@ -842,7 +964,60 @@ def dialog_payload(name, full=False, offset=None, limit=None):
             "model": meta.get("model", "?"), "total_steps": total, "offset": off,
             "has_more": off > 0, "steps": out, "now": now,
             "mtime": mtime or (answer_key[0] / 1000000000), "log_size": size,
-            "raw_log_available": bool(size)}
+            "raw_log_available": bool(size), "limit": lim,
+            "parent": meta.get("parent", ""), "pending": pending_messages(name),
+            "outcome": None if state in LIVE_STATES else {
+                "state": state, "exit": meta.get("exit", ""),
+                "reason": _activity.redact(meta.get("reason", ""))[:500]}}
+
+
+def _redact_steps(steps):
+    """Every string that reaches the chat pane goes through the shared secret redactor once,
+    when the parse is cached (not on every 3 s poll)."""
+    for st in steps:
+        st["prompt"] = _activity.redact(st.get("prompt") or "")
+        for b in st.get("blocks") or []:
+            for fld in ("text", "arg", "result"):
+                if isinstance(b.get(fld), str) and b[fld]:
+                    b[fld] = _activity.redact(b[fld])
+    return steps
+
+
+def pending_messages(name, cap=_PENDING_CAP):
+    """Messages still waiting in the task inbox (queued while it runs), oldest first, each
+    with its persisted receipt id/state when the journal has one. Text is redacted and capped."""
+    name = safe_task_name(name)
+    if name is None:
+        return []
+    box = os.path.join(LOGDIR, name + ".inbox")
+    if os.path.islink(box):
+        return []
+    try:
+        with os.scandir(box) as entries:
+            files = sorted((int(m.group(1)), entry.path, bool(m.group(2))) for entry in entries
+                           for m in [re.fullmatch(r"(\d+)\.msg(\.inflight)?", entry.name)]
+                           if m and entry.is_file(follow_symlinks=False))
+    except OSError:
+        return []
+    receipts = {}
+    if files:
+        view = _receipt_view(_StateStore(LOGDIR), name)
+        for item in view.get("items") or []:
+            receipts[item.get("sequence")] = item
+    out = []
+    for sequence, path, inflight in files[:cap]:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read(_PENDING_TEXT_CAP + 1)
+        except OSError:
+            continue
+        receipt = receipts.get(sequence) or {}
+        out.append({"sequence": sequence, "inflight": inflight,
+                    "text": _activity.redact(text[:_PENDING_TEXT_CAP]),
+                    "truncated": len(text) > _PENDING_TEXT_CAP,
+                    "id": receipt.get("id"), "receipt_state": receipt.get("state"),
+                    "delivery_status": receipt.get("delivery_status")})
+    return out
 
 def _hidden_windows_kwargs(new_process_group=False):
     """Popen/run kwargs that prevent Windows' default terminal from creating a visible tab."""
@@ -862,6 +1037,10 @@ def spawn(args, terminal=False, extra_env=None):
     kw = dict(cwd=HERE)
     child_env = os.environ.copy()
     child_env.pop("AGENT_LAUNCHER_PID", None)
+    if child_env.pop("AGENT_TASK", None):
+        # This panel was itself started from inside an agent task, whose AGENT_PARENT names
+        # that task. GUI actions are the user's own: never file them under that agent.
+        child_env.pop("AGENT_PARENT", None)
     if extra_env:
         child_env.update(extra_env)
     kw["env"] = child_env
@@ -948,6 +1127,23 @@ def run_sync(args, timeout=30):
         return "error: %s" % e
 
 
+_OPTION_VALUE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,199}")
+
+
+def continuation_options(data):
+    """Optional model/effort switch for the next turn (CLI `send|restart -m MODEL -f EFFORT`).
+    Values become argv operands, so they must look like model ids, never like options."""
+    args = []
+    for field, flag in (("model", "-m"), ("effort", "-f")):
+        value = data.get(field)
+        if value in (None, ""):
+            continue
+        if not isinstance(value, str) or not _OPTION_VALUE.fullmatch(value):
+            raise ValueError("invalid %s" % field)
+        args += [flag, value]
+    return args
+
+
 def control_task(data, action):
     """Validate the HTTP boundary; agent.sh remains the sole owner of sessions/process trees."""
     task = safe_task_name(data.get("task"))
@@ -956,12 +1152,16 @@ def control_task(data, action):
     if not task_exists(task):
         return 404, {"error": "task no longer exists"}
     if action in ("send", "resume"):
+        try:
+            choice = continuation_options(data)
+        except ValueError as exc:
+            return 400, {"error": str(exc)}
         if action == "resume":
             terminal = data.get("terminal", False)
             if not isinstance(terminal, bool):
                 return 400, {"error": "terminal must be a boolean"}
             try:
-                spawn(["restart", task], terminal=terminal)
+                spawn(["restart", task] + choice, terminal=terminal)
             except (OSError, ValueError):
                 return 500, {"error": "could not launch task resume"}
             return 200, {"ok": True, "launcher_started": True, "status": "pending"}
@@ -976,7 +1176,7 @@ def control_task(data, action):
         now, terminal = data.get("now", False), data.get("terminal", False)
         if not isinstance(now, bool) or not isinstance(terminal, bool) or not isinstance(data.get("progress", False), bool):
             return 400, {"error": "now and terminal must be booleans"}
-        args = ["send", task] + (["--now"] if now else []) + ["--message-id", identifier]
+        args = ["send", task] + (["--now"] if now else []) + ["--message-id", identifier] + choice
         if data.get("progress"):
             args.append("--progress")
         try:
@@ -2209,8 +2409,12 @@ class H(BaseHTTPRequestHandler):
             if name is None:
                 return
             full = (q.get("full") or ["0"])[0] == "1"
+            raw_limit = (q.get("limit") or [""])[0]
+            if raw_limit and not (raw_limit.isascii() and raw_limit.isdigit() and len(raw_limit) <= 6):
+                return self._send(400, json.dumps({"error": "limit must be a positive integer"}))
             try:
-                self._send(200, json.dumps(dialog_payload(name, full=full)))
+                self._send(200, json.dumps(dialog_payload(name, full=full,
+                                                          limit=int(raw_limit) if raw_limit else None)))
             except Exception as e:  # never blank the pane: fall back to the raw log as one step
                 self._send(200, json.dumps({"name": name, "state": "?", "engine": "?",
                                             "model": "?", "total_steps": 1, "offset": 0,

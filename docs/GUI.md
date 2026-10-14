@@ -31,12 +31,12 @@ override was established. The isolated acceptance profile does not test that fla
 A lightweight local web control panel (python-stdlib, zero dependencies): a
 project→subagents tree on the left, a chat with the agent (markdown + bubbles) in the center,
 launching a new task and the selected provider's limits on the right, a `doctor` button with all
-the limits. Status is conveyed by the activity/topic emoji (✅⏳❌⚠️📖✏️🔧💭🐛🧪…) plus
-strikethrough for finished tasks — no separate colored dot (that was a redundant third encoding
-of the same signal, removed).
+the limits. Status is conveyed by the activity/topic emoji (✅⏳❌⚠️📖✏️🔧💭🐛🧪…) plus a state
+dot with an accessible label (colour alone is not the only signal: the label/tooltip names the
+state); done tasks are struck through, other finished states dimmed.
 
 Files: `gui.py` (backend) + `gui.html` (thin shell) + `static/*.js`/`static/style.css` (modular
-frontend, one file per concern — tree/chat/modals/toasts/splitters/i18n/app) + `locales/*.json`.
+frontend, one file per concern — tasktree/tree/chat/composer/theme/modals/toasts/splitters/i18n/app) + `locales/*.json`.
 
 Phase 2B retention is independent of the raw transcript. Task cards retain the original prompt
 title from `.original.prompt`, queue count, compact digest activity and failure reason after
@@ -118,7 +118,7 @@ by default and forwards `--progress`, requesting `PROGRESS.<task>.md` only when 
   text. Stop accepts `{task}` and returns `{ok: true}` only after a successful CLI stop.
   Both reject malformed requests with 400 and missing tasks with 404; stop errors return 409
   and launch/timeout errors 500.
-- **Dialog chat view** (`GET /api/dialog?task=<name>[&full=1]`, parsed by `parse_dialog()` /
+- **Dialog chat view** (`GET /api/dialog?task=<name>[&full=1|&limit=N]`, parsed by `parse_dialog()` /
   `parse_output_blocks()` in `gui.py`, rendered by `static/chat.js`): the chat tab shows the available
   conversation tail, Claude-Code-style — `run`/`reply` steps in order with a separator
   line (kind · timestamp · duration), the full prompt of each step, and the step's output as
@@ -150,11 +150,68 @@ by default and forwards `--progress`, requesting `PROGRESS.<task>.md` only when 
   actually changed; the client likewise rebuilds `#chat` only on a real change (mtime/size/state/
   view-mode key), preserving scroll and expansions. `/api/thread` (raw log) and the SSE
   `/api/stream` are untouched — `bridgetab.js` still consumes them.
-- **Tree**: nesting by `parent` (see `-P`). A parent task → its subagents indented.
+- **Chat history, tool calls, thinking, queue (2026-10-14).** `/api/dialog` also takes
+  `&limit=N` (1..1000): the client starts at 30 steps and "load earlier" (button, or scrolling to the
+  top after the user has scrolled) grows the window by 30 while keeping the reading position
+  (`scrollTop += newHeight - oldHeight`). Auto-scroll happens only when the view was already at the
+  bottom; otherwise a "↓ new messages" button appears. The payload adds `pending` (inbox `N.msg`
+  files not yet delivered, oldest first, max 20, text redacted and capped at 4000 chars, with the
+  receipt id/state when the journal has one), `outcome` (`state`/`exit`/`reason` of a finished
+  task, rendered as a system note) and `parent`. Every prompt/text/tool string is passed through
+  `activity.redact()` once when the parse is cached. Tool blocks carry `status`
+  (`ok`/`error`/`running`/"") and `code` (exit code); the parser now also reads opencode
+  `run --format json` parts (`text`, `reasoning`, `tool_use` with `state.status/input/output/time`,
+  `error`), codex `item.started` (a call in progress, completed in place by `item.completed` with
+  `exit_code`) and claude `tool_result` matched by `tool_use_id` with `is_error`. A call still
+  "running" in a step that is no longer live is shown without a status. Launcher chrome lines
+  (`[agent-activity] …`, `[codex] activity: …`, `session id: …`) are dropped from raw-text output.
+  Collapsed tool rows show name · telling argument (for JSON input: `command`, `filePath`, `path`,
+  `pattern`, `url`, `query`, …) · ✓/✗ exit code · duration; the body (input / output, each clipped at
+  4000 chars with "show all") is built only when opened. Consecutive thinking blocks share one thin
+  "thinking hidden · show" marker and their text is not in the DOM until shown (per message via
+  `shownThoughts`, globally via 💭, persisted as `agentgui_show_thinking`). Long prompts are clipped
+  at 700 chars with "show all".
+- **Composer** (`static/composer.js`): Enter sends, Shift+Enter (or IME composition) inserts a new
+  line. `buildSendRequest()` is the exact `/api/task/send` body: `{task, message, message_id, terminal,
+  now, model?, effort?}`; `message_id` is a fresh 32-hex UUID per message (`beginMessageSubmission`
+  from fleet.js). `now` (= `send --now`) is only offered for a live task. The model select lists
+  the catalog (`/api/models?engine=<task engine>`), effort the model's advertised modes or the
+  provider hints; empty = keep. The server validates both against
+  `[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]{0,199}` (never option-like) and appends `-m/-f` to `send` or
+  `restart` (Resume = `POST /api/task/resume {task, terminal, model?, effort?}`). The outbox keeps the
+  last 20 messages per task and polls `/api/task/receipt` for each until acknowledged; a failed or
+  unknown outcome is shown as such and never resent.
+- **Tree** (`static/tasktree.js` = pure model, `static/tree.js` = view). Built from `parent` at any
+  depth: a child nests under its parent even when it runs in another project folder (a small folder
+  pill marks that); only roots are grouped by project. A parent that is not a task here (deleted,
+  pruned, or an external orchestrator id) leaves the child as a root with an `↑ parent` hint; a
+  parent loop (A→B→A, A→A) is cut at its lexically smallest member, marked ↻. Depth and subtree
+  counters (total / running / errors / waiting) are computed iteratively — no recursion. `gui.py
+  resolve_tree()` applies the same rules and adds `tree_parent`, `depth`, `parent_missing`,
+  `parent_cycle` to `/api/tasks` rows for API consumers. The view is a flat ARIA `tree`
+  (`treeitem` rows with `aria-level`/`aria-expanded`/`aria-selected`, roving `tabindex`) with
+  delegated click/keyboard handlers, so the 3 s refresh (which skips the DOM write when the HTML is
+  unchanged and restores focus otherwise) never loses state. Collapsed nodes, collapsed projects and
+  the selected task persist in `localStorage` (`agentgui_tree_collapsed`, `agentgui_proj_collapsed`,
+  `agentgui_sel`); selecting a task expands its ancestors. Filter: text over name/title/engine/model/
+  state/dir/parent plus a state select; matches keep their ancestors and force expansion.
   Projects = tasks ∪ explicitly registered ones via 📂＋ (even with 0 tasks, `projects.json` in `LOGDIR`).
   The active project is on top and expanded; each project has its own scroll (`max-height`), so a large
-  project (many tasks) doesn't push the others out of view. Scrollbars are custom-styled to match the
-  dark theme (`::-webkit-scrollbar`).
+  project (many tasks) doesn't push the others out of view. A narrow tree (container query, <340 px)
+  hides the engine/model pill first.
+- **How a child gets its parent.** `runtime.child_lineage()` puts `AGENT_PARENT=<task>` and
+  `AGENT_TASK=<task>` into every provider process environment, and `lifecycle.execute()` records
+  `-P` > `AGENT_PARENT` > the old parent. `lifecycle.checked_parent()` refuses a parent equal to the
+  task or whose chain leads back to it (falls back to the previously recorded parent when that one
+  is safe, else the task becomes a root); ancestors are read with a plain meta read (no pruning).
+  `gui.spawn()` drops `AGENT_PARENT` when the panel itself runs inside an agent task (`AGENT_TASK`
+  set), so tasks started from the panel are the user's, not that agent's.
+- **Theme** (`static/theme.js`, loaded in `<head>` to avoid a flash): CSS custom properties with a
+  dark base, `prefers-color-scheme: light` and an explicit `data-theme` (header button cycles
+  auto → light → dark, `agentgui_theme`). All colours in `style.css` are tokens (`--bg`, `--panel`,
+  `--sel`, `--bubble-user`, `--code-bg`, …); focus is a visible `:focus-visible` ring;
+  `prefers-reduced-motion` disables animations. Below 1100 px side panels narrow; below 760 px
+  the layout stacks.
 - **Path normalization**: the GUI and core (native Python) write the same
   path differently (`C:\Git\X` vs `C:/Git/X` vs `/c/Git/X`). `gui.py`'s `to_git_bash_path()` converts
   ANY path to unix-style (`/c/...`) at the moment it's sent to `-C` / saved to `projects.json` — otherwise
