@@ -93,12 +93,25 @@ def select_options(store, name, opts):
     return result
 
 
-def preflight(store, name, opts, resume):
+def preflight(store, name, opts, resume, session_override=None):
     from .providers import get_provider
     resolved = select_options(store, name, opts)
     provider = get_provider(resolved["engine"])
+    if opts.get("hard_cost_cap") is not None:
+        raise ValueError("hard billing caps are not enforceable by CLI providers; request refused")
+    if opts.get("--isolate-runtime") and provider.engine not in ("codex", "opencode"):
+        raise ValueError("unsupported provider runtime home: " + provider.engine)
+    profile_root = store.read(name).get("runtime_profile_root")
+    if profile_root:
+        from .runtime_profiles import RuntimeProfiles
+        profiles = RuntimeProfiles(profile_root)
+        manifest = profiles.validate(name)
+        if manifest["provider"] != provider.engine:
+            raise ValueError("retained runtime provider cannot change")
+        from .runtime import private_provider, pinned_argv
+        provider = private_provider(provider, profiles.environment(name, os.environ), pinned_argv(store.read(name), manifest))
     model, effort = provider.resolve(resolved["model"], resolved["effort"])
-    session = store.session(name) if resume else ""
+    session = (session_override if session_override is not None else store.session(name)) if resume else ""
     provider.command(model, effort, resolved["dir"], session=session, chat_only=os.environ.get("AGENT_CHAT_ONLY") == "1")
     if resume:
         if not provider.supports_resume:
@@ -107,6 +120,55 @@ def preflight(store, name, opts, resume):
             raise ValueError("could not find a session id (task '%s'); start fresh" % name)
         provider.prepare_resume(session, resolved["dir"])
     return resolved, provider, model, effort, session
+
+
+def inspect_recovery(store, name):
+    from .recovery import RecoveryStore
+    from .runtime_profiles import RuntimeProfiles
+    root = store.read(name).get("runtime_profile_root")
+    report = RecoveryStore(store.root / "recovery").inspect(store, name, RuntimeProfiles(root) if root else None)
+    import hashlib
+    raw = json.dumps(report, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("utf-8")
+    return dict(report, report_sha256=hashlib.sha256(raw).hexdigest())
+
+
+def reviewed_resume(store, name, opts):
+    if not (opts.get("--reviewed") or opts.get("reviewed_report_sha")):
+        return
+    if not opts.get("reviewed_report_sha"):
+        raise ValueError("reviewed resume requires --reviewed-report-sha from recovery inspection")
+    if opts.get("--fresh"):
+        raise ValueError("reviewed recovery never automatically replays the original assignment")
+    from .recovery import RecoveryStore
+    report = inspect_recovery(store, name)
+    report.pop("report_sha256")
+    RecoveryStore(store.root / "recovery").authorize_resume(opts["reviewed_report_sha"], report)
+
+
+def create_runtime(store, name, resolved, provider, model, effort):
+    if not resolved.get("--isolate-runtime"):
+        return
+    from .runtime_profiles import RuntimeProfiles
+    import hashlib
+    argv, _ = provider.command(model, effort, resolved["dir"])
+    paths = []
+    for value in argv:
+        path = Path(value)
+        if path.is_file():
+            paths.append(dict(path=str(path.resolve()), sha256=hashlib.sha256(path.read_bytes()).hexdigest()))
+        else:
+            break
+    if not paths or Path(paths[0]["path"]).suffix.lower() in (".cmd", ".bat", ".ps1"):
+        raise ValueError("isolated runtime requires a native unwrapped executable")
+    root = resolved.get("runtime_profile_root") or str(store.root / "runtime-profiles")
+    profiles = RuntimeProfiles(root)
+    profiles.create(name, provider.engine, paths[0]["path"],
+                    credential_env_keys=[key for key in resolved.get("credential_env_keys", "").split(",") if key])
+    store.update(name, runtime_profile_root=str(profiles.root), runtime_argv=json.dumps(paths, sort_keys=True))
+
+
+def queued_event(store, name, receipt):
+    store.lifecycle_event(name, "queued", dict(receipt_id=receipt["id"], sequence=receipt["sequence"]))
 
 
 def stop(store, name, by="orchestrator", reason="stopped by orchestrator"):
@@ -118,6 +180,7 @@ def stop(store, name, by="orchestrator", reason="stopped by orchestrator"):
     state = effective(store, name, meta)
     if state == "stopped" and meta.get("state") == "running":
         print(record_stop(store, name, by, reason), end="")
+        store.terminal_event(name)
         render_md(store, name)
         return 0
     if state not in ("running", "idle", "orphaned", "stalled"):
@@ -142,6 +205,7 @@ def stop(store, name, by="orchestrator", reason="stopped by orchestrator"):
     elif meta.get("pid"):
         kill_tree(meta["pid"], winpid=meta.get("winpid", ""), stamp="" if not meta.get("core_version") else meta.get("pid_start", ""))
     print(record_stop(store, name, by, reason), end="")
+    store.terminal_event(name)
     render_md(store, name)
     return 0
 
@@ -153,17 +217,26 @@ def send(store, ref, text, opts):
     provider = get_provider(resolved["engine"])
     if not provider.supports_resume:
         raise ValueError("engine '%s' cannot resume (supports_resume=false); start fresh" % resolved["engine"])
-    if not store.read(name):
-        store.update(name, engine=resolved["engine"], dir=resolved["dir"], session=ref)
+    if opts.get("message_id"):
+        from .message_receipts import valid_id
+        valid_id(opts["message_id"])
+    missing_meta = not store.read(name)
+    reviewed_resume(store, name, opts)
     with Lock(store.path(name, ".inbox")):
         state = effective(store, name)
         if state in ("running", "idle"):
             if opts.get("--flush"):
                 print("[agent.sh] %s running; inbox will drain after turn" % name)
                 return 0
-            if opts.get("--now") and not store.session(name):
-                raise ValueError("session id is not available yet; use send without --now to queue while the current turn starts")
-            sequence = store.enqueue_locked(name, text)
+            if opts.get("--now"):
+                if not store.session(name):
+                    raise ValueError("session id is not available yet; use send without --now to queue while the current turn starts")
+                if not store.read(name).get("core_version"):
+                    raise ValueError("send --now requires a Python owner; stop then send --flush for a legacy task")
+            preflight(store, name, opts, False)
+            receipt = store.enqueue_receipt_locked(name, text, opts.get("message_id"))
+            sequence = receipt["sequence"]
+            queued_event(store, name, receipt)
             from .ux_tracking import record_history
             record_history(store, name, "send", sequence=sequence, now=bool(opts.get("--now")), queued=True)
             if opts.get("--now"):
@@ -177,25 +250,33 @@ def send(store, ref, text, opts):
                     raise ValueError("send --now requires a Python owner; stop then send --flush for a legacy task")
             print("[agent.sh] queued (#%s) task=%s" % (sequence, name))
             return 0
-    resolved, provider, model, effort, session = preflight(store, name, opts, True)
+    if missing_meta:
+        resolved, provider, model, effort, session = preflight(store, name, opts, True, session_override=ref)
+    else:
+        resolved, provider, model, effort, session = preflight(store, name, opts, True)
+    reviewed_resume(store, name, opts)
     with Lock(store.path(name, ".owner"), timeout=0):
         from .ux_tracking import guard_ownership
         with Lock(store.root / "ownership"):
             guard_ownership(store, name, resolved["dir"], resolved.get("owns", ""), resolved.get("--strict-owns", False))
             from .process import pid_stamp
             resolved["_generation"] = uuid.uuid4().hex
-            store.update(name, state="running", pid=os.getpid(), pid_start=pid_stamp(os.getpid()),
-                         winpid=os.getpid() if os.name == "nt" else "", generation=resolved["_generation"],
-                         owns=resolved.get("owns", ""), dir=resolved["dir"])
-        with Lock(store.path(name, ".inbox")):
-            if not opts.get("--flush"):
-                sequence = store.enqueue_locked(name, text)
-                from .ux_tracking import record_history
-                record_history(store, name, "send", sequence=sequence, now=False, queued=False)
-            files, prompt = store.batch_locked(name)
-        if not files:
-            print("[agent.sh] inbox empty: " + name)
-            return 0
+            with Lock(store.path(name, ".inbox")):
+                if not opts.get("--flush"):
+                    receipt = store.enqueue_receipt_locked(name, text, opts.get("message_id"))
+                    queued_event(store, name, receipt)
+                    from .ux_tracking import record_history
+                    record_history(store, name, "send", sequence=receipt["sequence"], now=False, queued=False)
+                files, prompt = store.batch_locked(name, include_unknown=not opts.get("--pending-only"))
+                if not files:
+                    print("[agent.sh] inbox empty: " + name)
+                    return 0
+                store.update(name, state="running", core_version="2", exit="", engine=resolved["engine"], session=session,
+                             parent=opts.get("parent", store.read(name).get("parent", "")),
+                             pid=os.getpid(), pid_start=pid_stamp(os.getpid()),
+                             winpid=os.getpid() if os.name == "nt" else "", generation=resolved["_generation"],
+                             owns=resolved.get("owns", ""), dir=resolved["dir"])
+                store.begin_delivery_locked(name, files, resolved.get("_generation", ""))
         return execute(store, name, resolved, provider, model, effort, session, prompt, True, files)
 
 
@@ -211,6 +292,7 @@ def run(store, name, prompt, opts, fresh=False):
         from .ux_tracking import guard_ownership, record_history
         with Lock(store.root / "ownership"):
             guard_ownership(store, name, resolved["dir"], opts.get("owns", ""), opts.get("--strict-owns", False))
+            create_runtime(store, name, resolved, provider, model, effort)
             resolved["_generation"] = uuid.uuid4().hex
             store.update(name, owns=opts.get("owns", ""), strict_owns=int(bool(opts.get("--strict-owns"))),
                          generation=resolved["_generation"], state="running", engine=resolved["engine"],
@@ -234,6 +316,18 @@ def run(store, name, prompt, opts, fresh=False):
         return execute(store, name, resolved, provider, model, effort, "", prompt, False, [])
 
 
+def release_delivery(store, name, delivered, generation, outcome):
+    """Close a batch attempt without claiming delivery; the queued payload stays."""
+    if not delivered:
+        return []
+    with Lock(store.path(name, ".inbox")):
+        receipts = store.finish_delivery_locked(name, delivered, generation, delivered=False, outcome=outcome)
+        for receipt in receipts:
+            store.lifecycle_event(name, "delivery_unknown", dict(receipt_id=receipt["id"],
+                                  sequence=receipt["sequence"], revision=receipt["rev"]))
+        return receipts
+
+
 def execute(store, name, opts, provider, model, effort, session, prompt, resume, delivered):
     from .process import pid_stamp
     from .providers import failure_reason
@@ -247,15 +341,23 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
     notify = opts.get("--notify") or enabled(os.environ.get("AGENT_NOTIFY", "0"))
     offset = store.path(name, ".log").stat().st_size if store.path(name, ".log").exists() else 0
     store.update(name, core_version="2", generation=generation, state="running", exit="", reason="",
+                 event_integration="1",
                  engine=provider.engine, model=model + ("-" + effort if effort else ""), resolved_model=model, effort=effort, dir=opts["dir"],
                  pid=os.getpid(), winpid=os.getpid() if os.name == "nt" else "", pid_start=pid_stamp(os.getpid()),
                  session=session, session_log_offset=offset if not resume else old.get("session_log_offset", "0"),
                  detached=int(os.environ.get("AGENT_DETACHED") == "1"), wait_pid="", wait_start="", wait_token="",
                  started=now(), started_epoch=started_epoch, parent=opts.get("parent", os.environ.get("AGENT_PARENT", old.get("parent", ""))),
-                 orchestrator=os.environ.get("AGENT_ORCHESTRATOR_ID", old.get("orchestrator", "")), last_send_error="", timeout="", silence="")
+                 orchestrator=os.environ.get("AGENT_ORCHESTRATOR_ID", old.get("orchestrator", "")), last_send_error="", timeout="", silence="",
+                 provider_pid="", provider_start="", job_name="")
     store.update(name, progress=int(bool(progress_on)), verbose=int(bool(verbose)), keep_logs=int(bool(keep_logs)),
                  notify=int(bool(notify)), activity_epoch=started_epoch, finished_epoch="",
                  task_started_epoch=old.get("task_started_epoch") or started_epoch)
+    try:
+        store.path(name, ".answer").unlink()
+    except FileNotFoundError:
+        pass
+    store.update(name, failure_json="", partial_result="")
+    store.lifecycle_event(name, "born", dict(state="running", engine=provider.engine, session=session))
     begin_snapshot(store, name, opts["dir"])
     if not quiet_answer:
         hint = " (progress/log echo off; --progress/-v to enable)" if not progress_on and not verbose else ""
@@ -278,6 +380,7 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             code, output_filter, action, reason, by = turn.run()
         except (OSError, RuntimeError, ValueError) as error:
             code, output_filter, action, reason, by = 3, None, "failure", str(error), "watchdog"
+        turn_failure = getattr(turn, "failure", None)
         session = (output_filter.session if output_filter else "") or store.session(name)
         if session:
             store.update(name, session=session)
@@ -297,7 +400,12 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
         if action == "stop":
             state = "error" if code == 124 else "silent" if code == 125 else "stopped"
             code = code if code in (124, 125) else STOP_EXIT
+            from .diagnostics import classify_failure
+            from dataclasses import asdict
+            failure = classify_failure(reason, code, watchdog="timeout" if code == 124 else "silence" if code == 125 else "cancelled")
+            store.update(name, failure_json=json.dumps(asdict(failure)))
             block = record_stop(store, name, by or "orchestrator", reason, code, state, answer, turn.last_activity)
+            release_delivery(store, name, delivered, generation, "turn stopped before delivery: " + reason)
             if code == 124:
                 store.update(name, timeout=number_env("AGENT_TIMEOUT_SEC", 1800))
             if code == 125:
@@ -308,56 +416,87 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             else:
                 print("".join(notes) + block, end="", flush=True)
             render_md(store, name)
-            finish_notification(store, name, notify)
+            finish_completion(store, name, notify)
             return code
         if action == "interrupt":
             notes.append("↻ INTERRUPTED+RESUMED task=%s session=%s\n" % (name, session))
             code = 0
+            if delivered:
+                # The messages stay queued for redelivery; record an unknown attempt only.
+                release_delivery(store, name, delivered, generation, "interrupted; queued for redelivery")
             delivered = []
-        elif code and provider.retry_reason(retry_output, code, session) and retries < min(provider.retry_limit, number_env("AGENT_RETRIES", provider.retry_limit)):
+        elif not delivered and code and provider.retry_reason(retry_output, code, session) and retries < min(provider.retry_limit, number_env("AGENT_RETRIES", provider.retry_limit)):
             retries += 1
             with TailWriter(store.path(name, ".log"), keep_logs) as log:
                 log.write("[agent.sh] RETRY %s after %s\n" % (retries, provider.retry_reason(retry_output, code, session)))
             if not retry_wait(turn, number_env("AGENT_RETRY_DELAY", provider.retry_delay(retries))):
                 block = record_stop(store, name, turn.by or "orchestrator", turn.reason, STOP_EXIT, "stopped", answer, turn.last_activity)
+                release_delivery(store, name, delivered, generation, "stopped during retry wait: " + turn.reason)
                 if quiet_answer:
                     print_answer(store, name)
                     print("neoxider: task=%s stopped; use neoxider restart %s" % (name, name), file=sys.stderr)
                 else:
                     print("".join(notes) + block, end="", flush=True)
                 render_md(store, name)
-                finish_notification(store, name, notify)
+                finish_completion(store, name, notify)
                 return STOP_EXIT
             resume = bool(session)
             if resume:
                 provider.prepare_resume(session, opts["dir"])
             continue
-        elif (action == "failure" and code == 126) or (output_filter and output_filter.final_failure(code)):
+        elif (action == "failure") or (output_filter and output_filter.final_failure(code)):
             reason = reason or (output_filter.final_failure(code) if output_filter else failure_reason(answer))
             from activity import redact
             reason = redact(reason)
-            block = record_stop(store, name, by or "watchdog", reason, 126, "limited", answer, turn.last_activity)
+            from .diagnostics import classify_failure
+            from dataclasses import asdict, replace
+            # Parsed provider errors and the legacy provider-error watchdog are
+            # authoritative; generic failed output remains advisory.
+            provider_error = bool(output_filter and output_filter.provider_error) or (action == "failure" and code == 126)
+            failure = replace(turn_failure, exit_code=code) if turn_failure else classify_failure(
+                reason, code, source="provider_error" if provider_error else "raw")
+            limited = failure.blocking and failure.category == "quota"
+            state = "limited" if limited else "error"
+            code = 126 if limited else code or 3
+            store.update(name, failure_json=json.dumps(asdict(failure)))
+            block = record_stop(store, name, by or "watchdog", reason, code, state, answer, turn.last_activity)
+            release_delivery(store, name, delivered, generation, "turn failed before delivery: " + reason)
             from .providers import limit_line
-            marker = limit_line(name, provider.engine, model + ("-" + effort if effort else ""), reason)
+            marker = limit_line(name, provider.engine, model + ("-" + effort if effort else ""), reason) if limited else ""
             if quiet_answer:
                 print_answer(store, name)
-                print("neoxider: task=%s limited; %s" % (name, reason), file=sys.stderr)
-                print(marker, file=sys.stderr)
+                print("neoxider: task=%s %s; %s" % (name, state, reason), file=sys.stderr)
+                if marker:
+                    print(marker, file=sys.stderr)
             else:
                 print("".join(notes) + block, end="", flush=True)
-                print(marker, flush=True)
+                if marker:
+                    print(marker, flush=True)
             render_md(store, name)
-            finish_notification(store, name, notify)
-            return 126
+            finish_completion(store, name, notify)
+            return code
         with Lock(store.path(name, ".inbox")):
-            if code == 0 and action != "interrupt":
-                for path in delivered:
-                    path.unlink()
-            files, batch = store.batch_locked(name)
+            # Publish known completion before unlink. A crash leaves a matching queue
+            # entry that batch reconciliation can remove without a second invocation.
+            if code == 0 and action != "interrupt" and not answer.strip():
+                code = 3
+                reason = "provider returned an empty answer; inspect the working tree (changes may have landed)"
+            if delivered:
+                receipts = store.finish_delivery_locked(name, delivered, generation, delivered=(code == 0 and action != "interrupt"),
+                                             outcome="" if code == 0 else reason or "provider exited %s" % code)
+                for receipt in receipts:
+                    store.lifecycle_event(name, "delivered" if receipt["delivery_status"] == "delivered" else "delivery_unknown",
+                                          dict(receipt_id=receipt["id"], sequence=receipt["sequence"], revision=receipt["rev"]))
+            from .message_receipts import cleanup_completed_locked
+            cleanup_completed_locked(store, name)
+            files, batch = store.batch_locked(name, include_unknown=False)
             if files and code == 0 and turns < number_env("AGENT_INBOX_MAX_TURNS", 32) and session and provider.supports_resume:
                 delivered, prompt, resume = files, batch, True
                 turns += 1
+                store.begin_delivery_locked(name, delivered, generation, turn=turns)
                 continue
+            # Unknown attempts remain visible but require an explicit caller retry.
+            files = store.inbox(name)
             if code == 0 and not answer.strip():
                 code = 3
                 reason = "provider returned an empty answer; inspect the working tree (changes may have landed)"
@@ -365,7 +504,12 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             changes = file_changes(store, name, opts["dir"], freeze=True)
             names = [entry["path"] for entry in changes]
             state = "error" if code else "waiting" if files or looks_waiting(answer) else "done"
-            store.update(name, state=state, exit=code, reason=" ".join((reason or ("provider exited %s" % code if code else "%s undelivered message(s); send --flush %s" % (len(files), name) if files else "")).split()),
+            if code:
+                from .diagnostics import classify_failure
+                from dataclasses import asdict
+                failure = turn_failure or classify_failure(retry_output or reason, code)
+                store.update(name, failure_json=json.dumps(asdict(failure)))
+            store.terminal_event(name, state=state, exit=code, reason=" ".join((reason or ("provider exited %s" % code if code else "%s undelivered message(s); send --flush %s" % (len(files), name) if files else "")).split()),
                          files=len(names), changed_names=" | ".join(names))
         store.update(name, finished_epoch=time.time())
         if not quiet_answer:
@@ -378,11 +522,25 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
         if not quiet_answer:
             print("[agent.sh] %s task=%s exit=%s files=%s" % (state, name, code, len(names)))
         render_md(store, name)
-        finish_notification(store, name, notify)
+        finish_completion(store, name, notify)
         return code
 
 
+def finish_completion(store, name, notify):
+    """Publish core evidence before attempting optional housekeeping."""
+    meta = store.read(name)
+    if meta.get("terminal_intent") and json.loads(meta["terminal_intent"]).get("generation") == meta.get("generation"):
+        store.publish_events(name)
+    else:
+        store.terminal_event(name)
+    failure = store.read(name).get("failure_json")
+    if failure:
+        store.lifecycle_event(name, "error", dict(failure=json.loads(failure)))
+    finish_notification(store, name, notify)
+
+
 def finish_notification(store, name, notify):
+    """Best-effort digest/notification only; never creates core lifecycle events."""
     from .logs import record_digest
     meta = store.read(name)
     record_digest(store.path(name, ".activity.jsonl"), "end", "state=%s exit=%s" % (meta.get("state"), meta.get("exit")), meta.get("engine", ""))
@@ -398,6 +556,7 @@ def finish_notification(store, name, notify):
 def restart(store, ref, text, opts):
     name = store.resolve(ref)
     meta = store.read(name)
+    reviewed_resume(store, name, opts)
     if opts.get("--fresh"):
         if text:
             raise ValueError("--fresh replays the original prompt; omit TEXT")

@@ -1,5 +1,53 @@
 # Orchestrator prompt & model cheat-sheet
 
+## Integrated orchestration contracts (2026-10-14)
+
+The typed [Python SDK](docs/ORCHESTRATOR_API.md) and CLI share the
+[core lifecycle](docs/CORE_INTEGRATION.md): durable message UUIDs/receipts,
+parent events and named callback replay, reviewed recovery, optional retained
+Codex/OpenCode runtime profiles, and typed failure/cost/verification evidence.
+The [Fleet GUI](docs/FLEET_UI.md) reads the same receipts and event journals.
+The [native parity report](docs/NATIVE_PARITY_REPORT.md) is **DRAFT** pending
+Root security, final regression, live and remote gates.
+
+Acceptance means durable queue/journal persistence; delivery means successful
+invocation completion with a nonempty answer; acknowledgment requires explicit
+assistant evidence. None proves semantic application. SDK `subscribe(callback)`
+is ephemeral; `subscribe(callback, consumer="stable-parent")` persists event
+progress only after callback success. Reconnect with the same parent/consumer,
+then `attach(NAME)`. `wait_any(handles, timeout=30)` returns settled results;
+an observation timeout leaves workers running.
+
+```powershell
+neoxider send TASK --message-id 12345678-1234-4234-8234-123456789abc "Follow-up"
+neoxider receipt TASK --list --json
+neoxider receipt TASK 12345678-1234-4234-8234-123456789abc --json
+neoxider recovery TASK --json
+neoxider restart TASK --reviewed --reviewed-report-sha SHA "Continue reviewed work"
+```
+
+Reviewed resume refuses stale/incomplete evidence, unknown message attempts and
+unresolved external effects. Manual legacy restart/flush retains at-least-once
+retry risks. `run --isolate-runtime` (SDK `isolate_runtime=True`) is optional for
+Codex/OpenCode only; reuse the same profile on resume. Credentials require explicit
+`--credential-env-keys` / `credential_env_keys`; no authentication file is copied.
+A private unauthenticated profile is not evidence of a live provider route.
+
+Completed SDK process resources are reaped immediately on exit; lingering settled
+owned launchers are identity-checked and released within 300 seconds of observed
+settlement. Retain the task/session/profile/results for resume; no keepalive prompts.
+GUI-owned children are reaped on exit; visible terminal lifetime belongs to its host.
+`owns` remains a declaration/diff contract. Public ordinary-provider enforcement is
+false, and the independent outside-AAP escape baseline was rejected. Windows fixes
+remain under security review. Hosted-chat injection and hard billing caps remain
+unsupported. Provider exit zero is not tests/QA; estimates and reported usage are
+not confirmed billing. Free OpenCode routes were rate limited in this effort
+(historical); on 2026-10-14 OpenCode 1.18.27 SpaceBunny and Muse Spark 1.3
+each completed one measured file task (see the native parity report) — that
+exact case only, not all models or stable free quota. The human authorized
+Codex CLI fallback. Do not label a catalogue, launch, fixture
+or rate-limited call as live provider success.
+
 A ready-to-paste prompt for running a session as an **orchestrator** that delegates work to CLI
 subagents via `agent.sh` (neoxider), plus a matrix of which model fits which task.
 
@@ -192,7 +240,7 @@ poll `agent.sh list` / `status <name>`:
 | `waiting` (`⏳`) | the agent asked a question | `agent.sh send NAME "…"` (`reply` also works) |
 | `stalled` (`⚠`) | the process is gone (reboot/kill) | inspect edits, then `restart NAME` or `send --flush NAME` |
 | `stopped` (`⏹`) | orchestrator stopped the process tree; session and edits remain | `agent.sh restart NAME "…"` |
-| `limited` (`⛔`, exit 126) | provider usage/rate limit, quota, auth expiry or unavailable model | last line is `LIMIT_HIT task=… engine=… model=… resets="…"`; same engine/model will hit it again until it resets |
+| `limited` (`⛔`, exit 126) | authoritative provider usage/rate limit or quota evidence | last line is `LIMIT_HIT task=… engine=… model=… resets="…"`; same engine/model will hit it again until it resets |
 | `error` + `⏱ killed by the step watchdog` | it hit the deadline | re-scope the task, or re-run with a bigger `AGENT_TIMEOUT_SEC` |
 
 The CLI and the web panel compute this identically, so the two never contradict each other. When diagnosing foreign CLI execution on a new machine or after an upgrade, use

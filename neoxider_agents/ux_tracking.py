@@ -407,7 +407,7 @@ def _limit_object(meta, state):
     return {"limit": {"hit": True, "resets": _redact(parse_limit_reset(meta.get("reason", "")))}}
 
 
-def collect_result(store, name):
+def collect_result(store, name, verification_receipts=(), current_source_hash=None, cost_facts=(), cost_decision=None):
     meta = store.read(name)
     if not meta:
         raise ValueError("result: no such task '%s'; use neoxider list" % name)
@@ -416,6 +416,8 @@ def collect_result(store, name):
         answer = store.path(name, ".answer").read_text(encoding="utf-8")
     except OSError:
         answer = last_output(store.path(name, ".log"))
+    if state in ACTIVE:
+        answer = ""  # A previous turn's retained answer never describes this running turn.
     stopped = stop_block(store, name, meta) if state in ("stopped", "limited") else None
     changes = _explicit_changes(store, name, meta, state)
     baseline = read_baseline(store, name)
@@ -440,7 +442,7 @@ def collect_result(store, name):
                     pass
     except OSError:
         pass
-    return dict(task=name, state=state, exit_code=_number(meta.get("exit")), final_answer=answer, stop_report=stopped,
+    data = dict(task=name, state=state, exit_code=_number(meta.get("exit")), final_answer=answer, stop_report=stopped,
                 engine=meta.get("engine", ""), model=meta.get("model", ""), session=store.session(name, meta),
                 directory=meta.get("dir", ""), changed_files=changes, baseline_known=bool(read_baseline(store, name)),
                 baseline_partial=bool(baseline.get("partial")), baseline_warning=warning,
@@ -448,6 +450,20 @@ def collect_result(store, name):
                 usage=usage, tokens=tokens, cost_usd=cost, history=history,
                 overlaps=overlaps(store, name, [entry["path"] for entry in changes]), attribution=ATTRIBUTION,
                 **_limit_object(meta, state))
+    from .diagnostics import compact_result, FailureReport, CostFact
+    failure = FailureReport(**json.loads(meta["failure_json"])) if meta.get("failure_json") else None
+    facts = list(cost_facts)
+    if usage or cost is not None:
+        facts.append(CostFact(kind="provider_reported", amount=cost, currency="USD" if cost is not None else None,
+                     provenance="provider output for task " + name,
+                     measurement_window=(str(meta.get("task_started_epoch", "")), str(meta.get("finished_epoch", ""))),
+                     input_tokens=(usage or {}).get("input_tokens"), output_tokens=(usage or {}).get("output_tokens")))
+    data["diagnostics"] = compact_result(dict(data, scope_declared=owns_list(meta.get("owns", ""))),
+         receipts=verification_receipts, current_source_hash=current_source_hash, failure=failure,
+         cost_facts=facts, cost_decision=cost_decision)
+    data.update(tests_status=data["diagnostics"]["tests_status"], qa_status=data["diagnostics"]["qa_status"],
+                verification=data["diagnostics"].get("verification"), event_pending=meta.get("event_pending") == "1")
+    return data
 
 
 def result(store, name, opts=None):

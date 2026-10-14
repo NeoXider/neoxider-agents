@@ -10,6 +10,23 @@
   --dur-fast:.2s;   /* micro-interactions: hover, press, small state changes */
   --dur-modal:.3s;  /* modal/sheet reveal, within HIG's cited ~0.2-0.5s range */
 }
+/* Fleet shares the existing tab/security/API shell and has no terminal default. */
+.fleetwrap{padding:16px;overflow:auto;min-height:0;height:100%}
+.fleetfilters{display:flex;align-items:end;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.fleetfilters label{flex:1;min-width:180px;max-width:420px}
+.fleetfilters label span{display:block;color:var(--dim);margin-bottom:4px}
+#fleet-summary{display:flex;gap:8px;flex-wrap:wrap}
+.fleetlayout{display:grid;grid-template-columns:minmax(260px,1fr) minmax(300px,1fr);gap:16px;align-items:start}
+.fleetcard{margin-bottom:12px;overflow-wrap:anywhere}
+.fleetcard p{margin:6px 0}
+.fleetdetail{min-width:0;overflow-wrap:anywhere}
+#fleet-controls{display:flex;gap:8px;margin-bottom:12px}
+#fleet-send{margin-top:8px}
+#chat-submission{font-size:11px;color:var(--dim);overflow-wrap:anywhere;max-width:260px}
+.fleetattention{color:var(--wait)}
+.fleetevent{white-space:pre-wrap;border-bottom:1px solid var(--line);padding:6px 0}
+#fleet-events{max-height:55vh;overflow:auto}
+@media(max-width:800px){.fleetlayout{grid-template-columns:1fr}}
 *{box-sizing:border-box}
 /* respect the OS-level "reduce motion" preference (HIG: offer non-motion alternatives) */
 @media (prefers-reduced-motion:reduce){

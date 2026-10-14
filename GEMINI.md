@@ -47,6 +47,8 @@ $SK = './agent.ps1'
 & $SK top --once                             # orchestrator tasks; --json or dashboard alias
 & $SK diff <name> --stat                      # baseline delta; --names for paths only
 & $SK result <name> --json                    # structured completion report
+& $SK receipt <name> --list --json            # durable message UUIDs; receipt UUID --json for one
+& $SK recovery <name> --json                  # reviewed-resume inspection; restart --reviewed needs its report SHA
 & $SK brief --outcome "Tests pass" --owns "src/**" --not-touch "providers/**" --return "Files and evidence" | & $SK run -t fix --owns "src/**" -
 & $SK config list                            # config get KEY / config set KEY VALUE
 & $SK completion powershell --install       # task/flag/engine/model completion; also bash/zsh

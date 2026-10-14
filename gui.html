@@ -19,6 +19,7 @@
 </header>
 <div class="tabbar">
   <button class="tabbtn on" data-tab="tasks" data-i18n="tabs.tasks">Tasks</button>
+  <button class="tabbtn" data-tab="fleet" data-i18n="tabs.fleet">Fleet</button>
   <button class="tabbtn" data-tab="bridge" data-i18n="tabs.bridge">API</button>
 </div>
 
@@ -39,6 +40,7 @@
     <div id="replybar" style="display:none">
       <textarea id="answer" data-i18n-placeholder="chat.answer_placeholder" placeholder="answer the agent / message… (Ctrl+Enter)"></textarea>
       <div class="rcol">
+        <span id="chat-submission" role="status"></span>
         <label class="chk"><input type="checkbox" id="r-term"> <span data-i18n="chat.terminal">terminal</span></label>
         <button class="primary" id="btn-reply"><span data-i18n="chat.send_message">Send message</span></button>
       </div>
@@ -73,6 +75,34 @@
     </div>
   </div>
 </main>
+</div>
+
+<div class="tabview" id="tabview-fleet">
+  <div class="fleetwrap">
+    <div class="fleetfilters">
+      <label><span data-i18n="fleet.parent">Parent</span><select id="fleet-parent" aria-label="Parent filter"></select></label>
+      <label><span data-i18n="fleet.group">Project / group</span><select id="fleet-group" aria-label="Project / group filter"></select></label>
+      <button id="fleet-refresh" data-i18n="fleet.refresh">Refresh fleet</button>
+    </div>
+    <div id="fleet-summary" role="status"></div>
+    <p id="fleet-notice" class="subtitle"></p>
+    <div class="fleetlayout">
+      <div id="fleet-tasks" aria-label="Fleet tasks"></div>
+      <section class="box fleetdetail" aria-label="Selected task">
+        <h3 id="fleet-selected" data-i18n="fleet.select">Select a task</h3>
+        <div id="fleet-controls"></div>
+        <label for="fleet-message" data-i18n="fleet.message">Message</label>
+        <textarea id="fleet-message" rows="3"></textarea>
+        <button id="fleet-send" disabled data-i18n="fleet.send">Send message</button>
+        <p id="fleet-control-status" role="status"></p>
+        <h4 data-i18n="fleet.receipts">Persisted message receipts</h4>
+        <div id="fleet-receipts"></div>
+        <h4 data-i18n="fleet.events">Durable events</h4>
+        <p id="fleet-event-status" role="status"></p>
+        <div id="fleet-events"></div>
+      </section>
+    </div>
+  </div>
 </div>
 
 <div class="tabview" id="tabview-bridge">
@@ -149,6 +179,7 @@
 <script src="/static/modals.js"></script>
 <script src="/static/splitters.js"></script>
 <script src="/static/bridgetab.js"></script>
+<script src="/static/fleet.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

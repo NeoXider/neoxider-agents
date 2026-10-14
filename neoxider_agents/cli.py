@@ -29,6 +29,8 @@ COMMANDS = {
     "config": "get KEY | set KEY VALUE | list (keys: engine, model, effort)",
     "brief": "--outcome TEXT [--owns GLOBS] [--not-touch GLOBS] [--return TEXT] [--context-file FILE]",
     "completion": "[powershell|bash|zsh] [--install] [--profile FILE]", "help": "[COMMAND]"}
+COMMANDS.update({"receipt": "NAME [UUID] [--list] [--ack --evidence TEXT --source assistant] [--json]",
+                 "recovery": "NAME [--json] (capture actual evidence for reviewed resume)"})
 
 
 def usage(command=""):
@@ -58,7 +60,20 @@ def parse(command, argv):
         operands.update(COMMON)
         switches.update(SWITCHES)
     if command in ("reply", "send"):
-        switches.update(("--now", "--flush"))
+        switches.update(("--now", "--flush", "--pending-only"))
+        operands["--message-id"] = "message_id"
+    if command in ("reply", "send", "restart"):
+        operands["--reviewed-report-sha"] = "reviewed_report_sha"
+        switches.add("--reviewed")
+    if command in ("run", "ask", "fan", "test-api"):
+        switches.add("--isolate-runtime")
+        operands.update({"--runtime-profile-root": "runtime_profile_root",
+                         "--credential-env-keys": "credential_env_keys", "--hard-cost-cap": "hard_cost_cap"})
+    if command == "receipt":
+        switches.update(("--list", "--ack", "--json"))
+        operands.update({"--evidence": "evidence", "--source": "source"})
+    if command == "recovery":
+        switches.add("--json")
     if command == "restart":
         switches.add("--fresh")
     if command == "test-api":
@@ -201,6 +216,28 @@ def dispatch(command, opts, args, store):
     opts["terminal"] = opts.get("--terminal", False)
     if opts.get("-v"):
         opts["--verbose"] = True
+    if command == "receipt":
+        if not args or len(args) > 2:
+            raise ValueError("receipt: needs NAME [UUID]")
+        name = store.resolve(args[0])
+        if opts.get("--list") or len(args) == 1:
+            if opts.get("--ack"):
+                raise ValueError("receipt --ack needs UUID and explicit assistant evidence")
+            data = store.receipts(name)
+        elif opts.get("--ack"):
+            data = store.acknowledge_message(name, args[1], source=opts.get("source", "assistant"),
+                                             text=opts.get("evidence", ""))
+        else:
+            data = store.receipt(name, args[1])
+        print(json.dumps(data, ensure_ascii=False))
+        return 0
+    if command == "recovery":
+        if len(args) != 1:
+            raise ValueError("recovery: needs NAME")
+        from .lifecycle import inspect_recovery
+        report = inspect_recovery(store, store.resolve(args[0]))
+        print(json.dumps(report, ensure_ascii=False))
+        return 0
     if command in ("top", "dashboard"):
         if args:
             raise ValueError("top: remove extra arguments; use --once or --json")
@@ -315,6 +352,7 @@ def dispatch(command, opts, args, store):
         if not name:
             name, reservation = task_name(store, prompt)
         valid_name(name)
+        opts["name"] = name
         try:
             code = lifecycle.run(store, name, prompt, opts)
         finally:
@@ -383,6 +421,24 @@ def main(argv=None):
     except (BrokenPipeError, KeyboardInterrupt):
         raise
     except Exception as error:
+        if store:
+            # A storage/receipt failure after this wrapper became owner must never
+            # leave exit=0 or synthesize completion by treating owner death as success.
+            ref = opts.get("name") or (args[0] if args and command in ("send", "reply", "restart") else "")
+            meta = {}
+            try:
+                meta = store.read(ref) if ref else {}
+                if meta.get("pid") == str(os.getpid()) and meta.get("state") == "running":
+                    from .diagnostics import classify_failure
+                    from dataclasses import asdict
+                    failure = classify_failure(str(error), 1, source="wrapper")
+                    store.update(ref, failure_json=json.dumps(asdict(failure)))
+                    store.terminal_event(ref, state="error", exit=1, reason=failure.reason)
+                    store.lifecycle_event(ref, "error", dict(failure=asdict(failure)))
+            except (OSError, ValueError, RuntimeError):
+                if ref and meta.get("pid") == str(os.getpid()):
+                    store.update(ref, state="error", exit=1, event_pending=1,
+                                 event_error="terminal capture failed; recovery inspection required")
         if command in ("send", "reply", "restart") and store:
             ref = "" if command == "reply" and len(args) == 1 and not opts.get("prompt_file") and not opts.get("--flush") else args[0] if args else ""
             try:

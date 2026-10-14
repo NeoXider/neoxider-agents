@@ -70,9 +70,9 @@ async function submitRun() {
     dir: $("#f-dir").value.trim(),
     progress: $("#f-prog").checked,
     terminal: $("#f-term").checked,
-    prompt: $("#f-prompt").value.trim(),
+    prompt: $("#f-prompt").value,
   };
-  if (!body.prompt) {
+  if (!body.prompt.trim()) {
     toast("error", t("toast.empty_prompt_title"), t("toast.empty_prompt_text"));
     return;
   }
@@ -86,7 +86,7 @@ async function submitRun() {
       toast("error", t("toast.not_started"), r.error);
       return;
     }
-    toast("success", t("toast.task_started"), body.dir ? base(body.dir) : "");
+    toast("info", t("fleet.submission_started"), t("fleet.run_pending"));
     $("#f-prompt").value = "";
     setTimeout(refresh, 600);
   } finally {
@@ -96,8 +96,8 @@ async function submitRun() {
 }
 
 async function sendReply() {
-  const a = $("#answer").value.trim();
-  if (!a || !SEL || !CURRENT_TASKS.has(SEL)) {
+  const a = $("#answer").value;
+  if (!a.trim() || !SEL || !CURRENT_TASKS.has(SEL)) {
     if (SEL && !CURRENT_TASKS.has(SEL)) clearDeletedSelection();
     return;
   }
@@ -105,13 +105,17 @@ async function sendReply() {
   const old = btn.innerHTML;
   btn.disabled = true;
   btn.innerHTML = spin();
+  const task = SEL, submission = beginMessageSubmission(task);
   try {
-    const r = await jpost("/api/task/send", { task: SEL, message: a, terminal: $("#r-term").checked });
+    const r = await jpost("/api/task/send", { task, message: a, message_id: submission.id, terminal: $("#r-term").checked });
     if (r.error) {
       toast("error", t("toast.reply_not_sent"), r.error);
       return;
     }
-    $("#answer").value = "";
+    if (r.message_id !== submission.id) throw new Error("Submission outcome unknown; poll the UUID without resending");
+    submission.phase = "started";
+    toast("info", t("fleet.submission_started"), messageSubmissionText(submission));
+    if (SEL === task && taskSubmissions.get(task) === submission) $("#answer").value = "";
     setTimeout(refresh, 600);
   } catch (err) {
     surfaceApiError(err);
@@ -205,6 +209,7 @@ async function loadProvider(force) {
 /* re-render whatever's currently dynamic when the language changes (static text is handled by
    applyI18n()'s data-i18n scan; these bits build their own HTML strings with t() baked in) */
 async function onLocaleChanged() {
+  if (fleetController && fleetController.active) await fleetController.refresh();
   syncModels();
   if (SEL) { lastLog = ""; await refresh(); }
   if (typeof syncBridgeModels === "function" && $("#brg-engine") && $("#brg-engine").options.length) {
@@ -220,7 +225,10 @@ $("#btn-doctor").addEventListener("click", () => openDoctor());
 $("#btn-history").addEventListener("click", openHistory);
 $("#btn-refresh").addEventListener("click", refresh);
 document.querySelectorAll(".tabbtn[data-tab]").forEach(button =>
-  button.addEventListener("click", () => switchTab(button.dataset.tab)));
+  button.addEventListener("click", () => {
+    switchTab(button.dataset.tab);
+    if (fleetController) fleetController.activate(button.dataset.tab === "fleet");
+  }));
 $("#btn-add-project").addEventListener("click", () => openBrowse("add-project"));
 $("#btn-reply").addEventListener("click", sendReply);
 $("#btn-pick-field").addEventListener("click", () => openBrowse("pick-field"));
@@ -246,7 +254,7 @@ document.querySelectorAll("[data-close-modal]").forEach(button =>
   loadProvider();
 
   let savedTab = localStorage.getItem("agentgui_tab") || "tasks";
-  if (savedTab !== "tasks" && savedTab !== "bridge") savedTab = "tasks";  // migrate the removed "api" tab
+  if (!["tasks", "bridge", "fleet"].includes(savedTab)) savedTab = "tasks";
   if (!$("#brg-engine").options.length) {
     // default the bridge provider to opencode + big-pickle when present (its dynamic catalog is the point)
     $("#brg-engine").replaceChildren(...ENGINES.map(engine => {
@@ -263,8 +271,17 @@ document.querySelectorAll("[data-close-modal]").forEach(button =>
     syncBridgeModels();
   }
   switchTab(savedTab);
+  if (fleetController) fleetController.activate(savedTab === "fleet");
 
   setInterval(refresh, 3000);
+  setInterval(() => { if (fleetController && fleetController.active) fleetController.refresh(); }, 3000);
+  setInterval(async () => {
+    const task = SEL;
+    if (task && taskSubmissions.has(task)) {
+      const text = await pollMessageSubmission(task);
+      if (SEL === task && $("#chat-submission")) $("#chat-submission").textContent = text;
+    }
+  }, 3000);
   setInterval(() => loadProvider(), 15000);
   // keep the bridge list fresh (health/session) only while that tab is visible
   setInterval(() => { if (localStorage.getItem("agentgui_tab") === "bridge") refreshBridgeTab(); }, 4000);

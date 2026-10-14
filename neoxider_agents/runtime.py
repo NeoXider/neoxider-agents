@@ -9,6 +9,45 @@ from .state import Lock, atomic_write, MARK
 from .reporting import now
 
 
+def private_provider(provider, environment, executable_argv=None):
+    """Clone provider methods with a private environment; never change os.environ."""
+    import types
+    proxy = types.ModuleType("private_os")
+    proxy.__dict__.update(os.__dict__)
+    proxy.environ = dict(environment)
+    methods = {}
+    for cls in reversed(type(provider).__mro__):
+        for key, value in cls.__dict__.items():
+            static = isinstance(value, staticmethod)
+            function = value.__func__ if static else value
+            if not isinstance(function, types.FunctionType):
+                continue
+            namespace = dict(function.__globals__, os=proxy)
+            if executable_argv is not None:
+                namespace["executable"] = lambda engine: list(executable_argv)
+            copied = types.FunctionType(function.__code__, namespace, function.__name__,
+                                        function.__defaults__, function.__closure__)
+            copied.__kwdefaults__ = function.__kwdefaults__
+            methods[key] = staticmethod(copied) if static else copied
+    private_class = type("PrivateProvider", (type(provider),), methods)
+    clone = private_class.__new__(private_class)
+    clone.__dict__.update(provider.__dict__)
+    return clone
+
+
+def pinned_argv(meta, manifest):
+    import hashlib
+    from pathlib import Path
+    paths = json.loads(meta.get("runtime_argv") or "[]")
+    if not paths or paths[0]["path"] != manifest["executable"]["path"]:
+        raise ValueError("retained executable argv missing/mismatched")
+    for item in paths:
+        path = Path(item["path"])
+        if not path.is_absolute() or path.is_symlink() or path.stat().st_nlink > 1 or hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
+            raise ValueError("retained provider executable/script changed")
+    return [item["path"] for item in paths]
+
+
 def number_env(key, default):
     try:
         return max(0, float(os.environ.get(key, default)))
@@ -68,6 +107,7 @@ class Turn:
         self.last_activity = ""
         self.last_output_time = time.monotonic()
         self.tree = None
+        self.failure = None
         self.wake = threading.Event()
         self.last_meta_time = 0
         self.parent_pid = int(os.environ.get("AGENT_LAUNCHER_PID") or os.getppid())
@@ -99,9 +139,17 @@ class Turn:
     def _line(self, line, log, output_filter):
         if line.endswith("\r\n"):
             line = line[:-2] + "\n"
+        from .diagnostics import classify_failure
         if self.provider.engine in ("codex", "opencode", "kimi", "claude") and line.lstrip().startswith("{"):
             log.write(line)
-        for fragment in output_filter.feed(line):
+        fragments = output_filter.feed(line)
+        # Codex's parser owns the retry/terminal distinction. In particular, a
+        # Reconnecting 5/5 notice still announces an attempt, not its outcome.
+        if self.provider.engine != "codex" or output_filter.provider_error:
+            report = classify_failure(line, source="provider_stream", trusted=True)
+            if report.blocking:
+                self.failure = report
+        for fragment in fragments:
             log.write(fragment)
             if self.verbose:
                 print(fragment, end="", flush=True)
@@ -130,9 +178,18 @@ class Turn:
         from .heartbeat import ToolHeartbeat
         prompt_path = self.store.path(self.name, ".prompt")
         atomic_write(prompt_path, self.prompt)
-        argv, overrides = self.provider.command(self.model, self.effort, self.directory,
+        meta = self.store.read(self.name)
+        profile_root = meta.get("runtime_profile_root")
+        provider = self.provider
+        if profile_root:
+            from .runtime_profiles import RuntimeProfiles
+            profiles = RuntimeProfiles(profile_root)
+            manifest = profiles.validate(self.name)
+            private_env = profiles.environment(self.name, os.environ)
+            provider = private_provider(provider, private_env, pinned_argv(meta, manifest))
+        argv, overrides = provider.command(self.model, self.effort, self.directory,
                                                session=self.session, chat_only=os.environ.get("AGENT_CHAT_ONLY") == "1")
-        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1",
+        env = dict(private_env if profile_root else os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1",
                    PWD=self.directory, AGENT_ACTIVITY_FILE=str(self.store.path(self.name, ".activity.jsonl")), AGENT_TASK=self.name)
         env.update(overrides)
         signals = {}
@@ -162,6 +219,11 @@ class Turn:
                 signal.signal(sig, self._signal)
             self.store.update(self.name, provider_pid=self.tree.pid, provider_start=self.tree.stamp,
                               job_name=self.tree.job_name, control_event=getattr(control, "name", self.name))
+            if profile_root:
+                self.store.update(self.name, runtime_lease=json.dumps(dict(task=self.name,
+                    generation=meta.get("generation"), parent=meta.get("parent", ""),
+                    owner_pid=meta.get("pid"), owner_start=meta.get("pid_start"),
+                    provider_pid=self.tree.pid, provider_start=self.tree.stamp)))
             heartbeat = ToolHeartbeat(self.provider.engine, self.tree.pid)
             from .logs import TailWriter, enabled, record_digest
             with TailWriter(self.store.path(self.name, ".log"), enabled(self.store.read(self.name).get("keep_logs", "0"))) as log:
@@ -207,6 +269,8 @@ class Turn:
                     elif silence and time.monotonic() - self.last_output_time >= silence:
                         self.action, self.reason, self.by, code = "stop", "no output for %ss (AGENT_SILENCE_SEC)" % silence, "watchdog", 125
                         log.write("!! SILENT: " + self.reason + "\n")
+                    elif self.failure:
+                        self.action, self.reason, self.by, code = "failure", self.failure.reason, "watchdog", 126
                     elif output_filter.provider_error:
                         self.action, self.reason, self.by, code = "failure", output_filter.provider_error, "watchdog", 126
                     elif pipe_closed() or (own_meta.get("wait_pid") and not pid_alive(own_meta["wait_pid"], own_meta.get("wait_start", ""))) or (not os.environ.get("AGENT_DETACHED") and not pid_alive(self.parent_pid, parent_stamp)):

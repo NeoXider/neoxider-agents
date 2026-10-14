@@ -81,6 +81,7 @@ class CoreTests(unittest.TestCase):
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace", **hidden_kwargs())
         self.jobs.append((job, name))
         self.until(lambda: (self.work / "turn.1.started").exists())
+        self.until(lambda: self.store.read(name).get("provider_pid") and self.store.session(name))
         return job
 
     def release(self, turn):

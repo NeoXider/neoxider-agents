@@ -103,6 +103,48 @@ class LimitReportingTests(unittest.TestCase):
         self.assertIn("STOPPED task=lim-last", out)
         self.assertEqual(out.splitlines()[-1], limit_line("lim-last", "codex", "gpt-5", CODEX_REASON))
 
+    def test_legacy_provider_error_boundary_keeps_nonquota_categories_and_quiet_labels(self):
+        cases = [("AGENT_PROVIDER_ERROR: " + CODEX_REASON, "quota"),
+                 ("RangeError: Out of memory while checking rate limit", "provider_oom"),
+                 ("TLS certificate verify failed while checking quota exceeded", "tls"),
+                 ("HTTP 401 authentication failed while checking usage limit", "auth")]
+        for reason, category in cases:
+            with self.subTest(category=category):
+                class LegacyTurn:
+                    last_activity = "provider error"
+                    def __init__(self, *args, **kwargs):
+                        pass
+                    def run(self):
+                        return 126, None, "failure", reason, "watchdog"
+                name = "legacy-" + category
+                with mock.patch.object(lifecycle, "Turn", LegacyTurn):
+                    code, out, err = self.output(lifecycle.run, self.store, name, "do work",
+                        dict(engine="fixture", model="spark", effort="", dir=str(self.work), ask=True))
+                state = "limited" if category == "quota" else "error"
+                self.assertEqual(code, 126)
+                self.assertEqual(out, "")
+                self.assertIn("neoxider: task=%s %s;" % (name, state), err)
+                self.assertEqual("LIMIT_HIT" in err, category == "quota")
+                meta = self.store.read(name)
+                self.assertEqual(meta["state"], state)
+                failure = json.loads(meta["failure_json"])
+                self.assertEqual(failure["category"], category)
+                self.assertTrue(failure["blocking"])
+
+    def test_native_exit_126_alone_is_not_a_quota_boundary(self):
+        class NativeTurn:
+            last_activity = ""
+            def __init__(self, *args, **kwargs):
+                pass
+            def run(self):
+                return 126, None, None, "", ""
+        with mock.patch.object(lifecycle, "Turn", NativeTurn):
+            code, out, err = self.output(lifecycle.run, self.store, "native-126", "do work",
+                dict(engine="fixture", model="spark", effort="", dir=str(self.work)))
+        self.assertEqual(code, 126)
+        self.assertEqual(self.store.read("native-126")["state"], "error")
+        self.assertNotIn("LIMIT_HIT", out + err)
+
     def test_result_text_and_json_for_limited(self):
         self.seed("lim-result")
         code, out, err = self.output(ux.result, self.store, "lim-result", {})

@@ -1722,7 +1722,13 @@ class TaskControlRouteTests(unittest.TestCase):
         with open(os.path.join(self.scratch, "task-1.meta"), "w", encoding="utf-8") as f:
             f.write("engine=opencode\nstate=stopped\nsession=session-1\n")
         self.spawned, self.stopped = [], []
-        gui.spawn = lambda args, terminal=False: self.spawned.append((args, terminal))
+        self.transported = []
+        def fake_spawn(args, terminal=False):
+            self.spawned.append((args, terminal))
+            if "--prompt-file" in args:
+                with open(args[args.index("--prompt-file") + 1], "rb") as stream:
+                    self.transported.append(stream.read())
+        gui.spawn = fake_spawn
 
         def fake_run(args, **kw):
             self.stopped.append((args, kw))
@@ -1764,9 +1770,18 @@ class TaskControlRouteTests(unittest.TestCase):
         for now in (False, True):
             code, result = self._post("/api/task/send", {"task": "task-1", "message": "--help", "now": now})
             self.assertEqual(code, 200)
-            self.assertTrue(result["accepted"])
-            self.assertEqual(self.spawned[-1],
-                             (["send", "task-1"] + (["--now"] if now else []) + ["--", "--help"], False))
+            self.assertFalse(result["accepted"])
+            self.assertTrue(result["launcher_started"])
+            self.assertEqual(result["status"], "pending")
+            args, terminal = self.spawned[-1]
+            self.assertEqual(args[:2], ["send", "task-1"])
+            self.assertEqual("--now" in args, now)
+            self.assertEqual(args[args.index("--message-id") + 1], result["message_id"])
+            self.assertLess(args.index("--message-id"), args.index("--"))
+            self.assertNotIn("--help", args)
+            self.assertEqual(args[-1], "--")
+            self.assertFalse(terminal)
+            self.assertEqual(self.transported[-1], b"--help")
 
     def test_stop_uses_wrapper_and_waits_for_its_result(self):
         code, result = self._post("/api/task/stop", {"task": "task-1"})
@@ -1796,7 +1811,7 @@ class TaskControlRouteTests(unittest.TestCase):
                 with self.subTest(path=path, task=task):
                     code, _ = self._post(path, {"task": task, "message": "continue"})
                     self.assertEqual(code, 404 if task == "missing" else 400)
-        for message in (True, [], "", "a\0b", "x" * 30001):
+        for message in (True, [], "", "a\0b", "x" * (gui.PROMPT_BODY_CAP + 1)):
             self.assertEqual(self._post("/api/task/send", {"task": "task-1", "message": message})[0], 400)
         for field in ("now", "terminal"):
             self.assertEqual(self._post("/api/task/send", {"task": "task-1", "message": "go", field: "true"})[0], 400)

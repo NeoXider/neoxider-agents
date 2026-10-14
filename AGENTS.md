@@ -1,5 +1,53 @@
 # neoxider-agents — agent instructions
 
+## Integrated orchestration contracts (2026-10-14)
+
+The typed [Python SDK](docs/ORCHESTRATOR_API.md) and CLI share the
+[core lifecycle](docs/CORE_INTEGRATION.md): durable message UUIDs/receipts,
+parent events and named callback replay, reviewed recovery, optional retained
+Codex/OpenCode runtime profiles, and typed failure/cost/verification evidence.
+The [Fleet GUI](docs/FLEET_UI.md) reads the same receipts and event journals.
+The [native parity report](docs/NATIVE_PARITY_REPORT.md) is **DRAFT** pending
+Root security, final regression, live and remote gates.
+
+Acceptance means durable queue/journal persistence; delivery means successful
+invocation completion with a nonempty answer; acknowledgment requires explicit
+assistant evidence. None proves semantic application. SDK `subscribe(callback)`
+is ephemeral; `subscribe(callback, consumer="stable-parent")` persists event
+progress only after callback success. Reconnect with the same parent/consumer,
+then `attach(NAME)`. `wait_any(handles, timeout=30)` returns settled results;
+an observation timeout leaves workers running.
+
+```powershell
+& $SK send TASK --message-id 12345678-1234-4234-8234-123456789abc "Follow-up"
+& $SK receipt TASK --list --json
+& $SK receipt TASK 12345678-1234-4234-8234-123456789abc --json
+& $SK recovery TASK --json
+& $SK restart TASK --reviewed --reviewed-report-sha SHA "Continue reviewed work"
+```
+
+Reviewed resume refuses stale/incomplete evidence, unknown message attempts and
+unresolved external effects. Manual legacy restart/flush retains at-least-once
+retry risks. `run --isolate-runtime` (SDK `isolate_runtime=True`) is optional for
+Codex/OpenCode only; reuse the same profile on resume. Credentials require explicit
+`--credential-env-keys` / `credential_env_keys`; no authentication file is copied.
+A private unauthenticated profile is not evidence of a live provider route.
+
+Completed SDK process resources are reaped immediately on exit; lingering settled
+owned launchers are identity-checked and released within 300 seconds of observed
+settlement. Retain the task/session/profile/results for resume; no keepalive prompts.
+GUI-owned children are reaped on exit; visible terminal lifetime belongs to its host.
+`owns` remains a declaration/diff contract. Public ordinary-provider enforcement is
+false, and the independent outside-AAP escape baseline was rejected. Windows fixes
+remain under security review. Hosted-chat injection and hard billing caps remain
+unsupported. Provider exit zero is not tests/QA; estimates and reported usage are
+not confirmed billing. Free OpenCode routes were rate limited in this effort
+(historical); on 2026-10-14 OpenCode 1.18.27 SpaceBunny and Muse Spark 1.3
+each completed one measured file task (see the native parity report) — that
+exact case only, not all models or stable free quota. The human authorized
+Codex CLI fallback. Do not label a catalogue, launch, fixture
+or rate-limited call as live provider success.
+
 This repo is the Python `neoxider_agents/` core + native launchers + `gui.py`/`gui.html`: a non-interactive wrapper for launching
 and managing CLI coding subagents (Codex, Claude Code, Kimi Code, opencode, Gemini CLI) across a
 tracked task state and a redacted activity digest, plus an optional zero-dependency local web GUI.
@@ -33,6 +81,8 @@ $SK = './agent.ps1'
 & $SK top --once                             # orchestrator tasks; --json or dashboard alias
 & $SK diff <name> --stat                      # baseline delta; --names for paths only
 & $SK result <name> --json                    # structured completion report
+& $SK receipt <name> --list --json            # durable message UUIDs; receipt UUID --json for one
+& $SK recovery <name> --json                  # reviewed-resume inspection; restart --reviewed needs its report SHA
 & $SK brief --outcome "Tests pass" --owns "src/**" --not-touch "providers/**" --return "Files and evidence" | & $SK run -t fix --owns "src/**" -
 & $SK config list                            # config get KEY / config set KEY VALUE
 & $SK completion powershell --install       # task/flag/engine/model completion; also bash/zsh
@@ -121,9 +171,10 @@ A task that is alive but quiet longer than `AGENT_STALE_SEC` (300s, reporting
 only) is reported as `running (no output for Nm)` — the same wording in the CLI and the
 GUI, which share one liveness rule (the CLI additionally checks for a live ENGINE
 descendant under the wrapper pid before calling a quiet task `idle`, not just `stalled`).
-A provider-level failure (usage/rate limit, quota, auth expiry, unavailable model) ends
-the task immediately as `state=limited`, with the provider's own message in meta
-`reason=`. Only ENGINE output is scanned for it — the log after the last
+Authoritative provider quota/rate-limit evidence ends the task as `state=limited`
+(exit 126). Auth, unavailable-model, OOM, TLS and network failures remain distinct
+`error` categories, with the provider's message retained in meta `reason=`.
+Only ENGINE output is scanned for it — the log after the last
 `---------- output ----------` marker, never the echoed prompt/reply above it — and while
 the step is still running only the explicit `AGENT_PROVIDER_ERROR:` tag from the
 codex/kimi/opencode filters counts; the generic wording regex runs post-mortem (rc != 0)

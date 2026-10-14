@@ -165,6 +165,9 @@ async function loadThread(task) {
   if (collapseButton) collapseButton.addEventListener("click", () => setAllTools(false));
   $("#btn-think").addEventListener("click", toggleThinking);
   $("#replybar").style.display = "flex";
+  if ($("#chat-submission") && typeof taskSubmissions !== "undefined") {
+    $("#chat-submission").textContent = messageSubmissionText(taskSubmissions.get(task.name));
+  }
   $("#btn-reply").disabled = false;
   /* Rebuild #chat only when the log actually changed (mtime+size) or the view mode did —
      otherwise the DOM, the scroll position and every expansion stay exactly as they are. */

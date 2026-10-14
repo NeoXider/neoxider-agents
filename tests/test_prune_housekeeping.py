@@ -220,6 +220,32 @@ class HousekeepingTests(unittest.TestCase):
                 self.assertFalse(self.store.path(name, ".log").exists())
                 self.assertEqual(self.store.path(name, ".answer").read_text(), "ANSWER\n")
 
+    def test_optional_notification_does_not_create_core_terminal_events(self):
+        from neoxider_agents.lifecycle import finish_notification
+        with patch.object(self.store, "terminal_event") as terminal, \
+                patch.object(self.store, "publish_events") as replay:
+            finish_notification(self.store, "old", False)
+        terminal.assert_not_called()
+        replay.assert_not_called()
+
+    def test_core_terminal_persistence_failure_is_not_optional_housekeeping(self):
+        from neoxider_agents.lifecycle import finish_completion
+        with patch.object(self.store, "update", side_effect=denied("meta")), \
+                patch("neoxider_agents.lifecycle.finish_notification") as notification:
+            with self.assertRaises(PermissionError):
+                finish_completion(self.store, "old", True)
+        notification.assert_not_called()
+
+    def test_core_journal_failure_retains_pending_intent_and_original_answer(self):
+        from neoxider_agents.lifecycle import finish_completion
+        self.store.update("old", generation="journal-failure", parent="fixture-parent")
+        self.store.path("old", ".answer").write_text("ANSWER\n")
+        with patch("neoxider_agents.events.EventStore.emit", side_effect=denied("journal")):
+            finish_completion(self.store, "old", False)
+        self.assertEqual(self.store.read("old")["event_pending"], "1")
+        self.assertTrue(list(self.store.path("old", ".event-outbox").glob("*.json")))
+        self.assertEqual(self.store.path("old", ".answer").read_text(), "ANSWER\n")
+
 
 if __name__ == "__main__":
     unittest.main()

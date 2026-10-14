@@ -23,7 +23,7 @@ per-provider info (version/login/rate limits) is fetched by shelling out to
 `agent.sh provider-info <engine>` — the plugin's own provider.py owns that logic, gui.py
 does not hardcode any per-engine behavior.
 """
-import json, math, logging, os, re, sys, time, subprocess, socket, urllib.parse, urllib.request, glob, threading
+import json, math, logging, os, re, sys, time, subprocess, socket, urllib.parse, urllib.request, glob, threading, tempfile, shutil, uuid
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -31,6 +31,7 @@ import openai_server as _bridge_runtime
 import activity as _activity
 from neoxider_agents.logs import prune_task as _prune_task
 from neoxider_agents.state import Store as _StateStore
+from neoxider_agents import events as _events
 
 # Opt-in diagnostics, same convention as openai_server.py: quiet (WARNING) unless AGENT_LOG_LEVEL
 # says otherwise -- request lines at DEBUG, a bridge kill that could not go through at WARNING,
@@ -74,6 +75,14 @@ MAX_BODY_BYTES = 10 * 1024 * 1024
 DEFAULT_WAIT_TIMEOUT = 60.0
 WAIT_TIMEOUT_CAP = 300.0
 _PROJECTS_LOCK = threading.Lock()
+_SPAWN_LOCK = threading.Lock()
+_SPAWNED = {}  # Only Popen objects created here; never a foreign PID/terminal sweep.
+_PROMPT_FILES = {}  # Private file -> owned directory, transferred to the spawned waiter.
+PROMPT_BODY_CAP = 1024 * 1024
+FLEET_TASK_CAP = 200
+FLEET_SCAN_CAP = 2000
+FLEET_JSON_CAP = 512 * 1024
+EVENT_BODY_CAP = 4096
 
 _DEFAULT_PROVIDERS = {
     "codex":   {"label": "Codex", "models": ["5.5", "5.5-high", "spark"], "limits": "codex"},
@@ -864,7 +873,70 @@ def spawn(args, terminal=False, extra_env=None):
     else:
         kw.update(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         kw["start_new_session"] = True
-    return subprocess.Popen([PYTHON, SK] + args, **kw)
+    proc = subprocess.Popen([PYTHON, SK] + args, **kw)
+    with _SPAWN_LOCK:
+        cleanup = [_PROMPT_FILES.pop(value) for value in args if value in _PROMPT_FILES]
+    _track_spawn(proc, cleanup)
+    return proc
+
+
+def _track_spawn(proc, cleanup=()):
+    """Reap our own child at exit, without killing it or closing any user terminal.
+
+    The opted-in Windows console runs Python directly (no shell / NoExit). Console
+    lifetime belongs to Windows; reaping proves resource release, not tab closure.
+    """
+    if not callable(getattr(proc, "wait", None)):
+        return  # Lightweight historical test doubles are not processes.
+    with _SPAWN_LOCK:
+        _SPAWNED[id(proc)] = proc
+
+    def reap():
+        try:
+            proc.wait()
+        finally:
+            try:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+                # Popen owns its Windows handle. Dropping our reference releases it
+                # naturally; manually closing it races other legitimate wait/poll callers.
+            finally:
+                with _SPAWN_LOCK:
+                    _SPAWNED.pop(id(proc), None)
+                for directory in cleanup:
+                    shutil.rmtree(directory)
+    threading.Thread(target=reap, daemon=True, name="gui-child-reaper").start()
+
+
+def spawn_prompt(args, text, terminal=False):
+    """Keep UTF-8 text out of argv; delete only after the owned wrapper exits."""
+    directory = tempfile.mkdtemp(prefix="neoxider-gui-")
+    path = os.path.join(directory, "prompt.txt")
+    with _SPAWN_LOCK:
+        _PROMPT_FILES[path] = directory
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(text.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        return spawn(args + ["--prompt-file", path, "--"], terminal=terminal)
+    finally:
+        # Real spawn transfers ownership before its waiter starts. Failed launches and
+        # synchronous test doubles retain the registration and can clean up here.
+        with _SPAWN_LOCK:
+            unclaimed = _PROMPT_FILES.pop(path, None)
+        if unclaimed is not None or not os.path.exists(path):
+            shutil.rmtree(directory, ignore_errors=True)
+
+
+def prompt_text(value):
+    if not isinstance(value, str) or not value.strip() or "\0" in value:
+        raise ValueError("prompt/message must be nonempty UTF-8 text without NUL")
+    if len(value.encode("utf-8")) > PROMPT_BODY_CAP:
+        raise ValueError("prompt/message exceeds the 1 MiB UTF-8 body limit")
+    return value
 
 def run_sync(args, timeout=30):
     try:
@@ -883,24 +955,37 @@ def control_task(data, action):
         return 400, {"error": "invalid task name"}
     if not task_exists(task):
         return 404, {"error": "task no longer exists"}
-    if action == "send":
+    if action in ("send", "resume"):
+        if action == "resume":
+            terminal = data.get("terminal", False)
+            if not isinstance(terminal, bool):
+                return 400, {"error": "terminal must be a boolean"}
+            try:
+                spawn(["restart", task], terminal=terminal)
+            except (OSError, ValueError):
+                return 500, {"error": "could not launch task resume"}
+            return 200, {"ok": True, "launcher_started": True, "status": "pending"}
         message = data.get("message", data.get("answer"))
-        if not isinstance(message, str) or not message.strip() or "\0" in message:
-            return 400, {"error": "message must be nonempty text without NUL characters"}
         try:
-            if len(message.encode("utf-8")) > 20000:
-                return 400, {"error": "message exceeds the GUI command-line limit; use CLI --prompt-file"}
-        except UnicodeError:
-            return 400, {"error": "invalid message encoding"}
+            message = prompt_text(message)
+            identifier = data.get("message_id", uuid.uuid4().hex)
+            if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{32}", identifier):
+                raise ValueError("message_id must be a 32-character UUID hex string")
+        except (ValueError, UnicodeError):
+            return 400, {"error": "invalid message/UUID or message exceeds the 1 MiB UTF-8 body limit"}
         now, terminal = data.get("now", False), data.get("terminal", False)
-        if not isinstance(now, bool) or not isinstance(terminal, bool):
+        if not isinstance(now, bool) or not isinstance(terminal, bool) or not isinstance(data.get("progress", False), bool):
             return 400, {"error": "now and terminal must be booleans"}
-        args = ["send", task] + (["--now"] if now else []) + ["--", message.strip()]
+        args = ["send", task] + (["--now"] if now else []) + ["--message-id", identifier]
+        if data.get("progress"):
+            args.append("--progress")
         try:
-            spawn(args, terminal=terminal)
+            spawn_prompt(args, message, terminal=terminal)
         except (OSError, ValueError):
             return 500, {"error": "could not launch task send"}
-        return 200, {"ok": True, "accepted": True}
+        return 200, {"ok": True, "launcher_started": True, "status": "pending",
+                     "accepted": False, "message_id": identifier,
+                     "receipt_note": "Poll persisted receipts; launcher start is not durable acceptance."}
     try:
         result = subprocess.run([PYTHON, SK, "stop", task], capture_output=True, text=True,
                                 encoding="utf-8", errors="replace", timeout=30, cwd=HERE,
@@ -911,6 +996,231 @@ def control_task(data, action):
     if result.returncode != 0:
         return 409, {"error": "task stop failed; inspect task status"}
     return 200, {"ok": True}
+
+
+def _fleet_file(name, suffix, cap=65536):
+    """Read a bounded state sidecar, refusing links outside the state directory."""
+    path = os.path.join(LOGDIR, name + suffix)
+    root = os.path.realpath(LOGDIR)
+    if os.path.islink(path) or os.path.commonpath((root, os.path.realpath(path))) != root:
+        raise ValueError("unsafe fleet sidecar")
+    with open(path, "rb") as stream:
+        data = stream.read(cap + 1)
+    if len(data) > cap:
+        raise ValueError("fleet sidecar exceeds read limit")
+    return data.decode("utf-8")
+
+
+def _receipt_view(store, name, reference=None):
+    """Only persisted evidence counts. Unknown schemas/damage do not become zeros."""
+    unknown = {"status": "unavailable", "items": [], "counts": None, "omitted": None}
+    if not callable(getattr(store, "receipts", None)):
+        return unknown
+    try:
+        # The current API folds an entire journal. Bound that read before calling it.
+        path = store.path(name, ".receipts.jsonl")
+        if path.is_symlink() or (path.exists() and (not path.is_file() or path.stat().st_nlink > 1
+                                                   or path.stat().st_size > 2 * 1024 * 1024)):
+            raise ValueError("unsafe or oversized receipt journal")
+        inbox = store.path(name, ".inbox")
+        if inbox.is_symlink():
+            raise ValueError("unsafe receipt inbox")
+        records = store.receipts(name)
+        if callable(getattr(store, "torn_receipt_tail", None)) and store.torn_receipt_tail(name):
+            raise ValueError("incomplete receipt journal tail")
+        if not isinstance(records, list):
+            raise ValueError("unsupported receipt schema")
+        counts = {"accepted": 0, "delivered": 0, "acknowledged": 0}
+        items, seen = [], set()
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("unsupported receipt schema")
+            if type(record.get("schema")) is not int or record["schema"] != 1 or record.get("task") != name \
+                    or type(record.get("sequence")) is not int or record["sequence"] <= 0:
+                raise ValueError("unsupported receipt schema/binding")
+            for key in ("queued_epoch", "delivered_epoch", "acknowledged_epoch"):
+                stamp = record.get(key)
+                if type(stamp) not in (int, float) or not math.isfinite(stamp) or stamp < 0:
+                    raise ValueError("unsupported receipt evidence")
+            identifier, state = record.get("id"), record.get("state")
+            if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{32}", identifier) \
+                    or identifier in seen or state not in ("intent", "rolled_back", "accepted", "delivered", "acknowledged"):
+                raise ValueError("unsupported receipt identity/state")
+            seen.add(identifier)
+            delivery = record.get("delivery_status")
+            if delivery not in ("pending", "attempting", "unknown", "delivered"):
+                raise ValueError("unsupported receipt delivery state")
+            accepted = state in ("accepted", "delivered", "acknowledged")
+            if accepted and (not record["queued_epoch"] or not isinstance(record.get("digest"), str)
+                             or not re.fullmatch(r"sha256:[0-9a-f]{64}", record["digest"])):
+                raise ValueError("acceptance lacks persisted evidence")
+            delivered = accepted and bool(record.get("delivered_epoch"))
+            source = record.get("ack_source")
+            acknowledged = state == "acknowledged" and isinstance(source, str) \
+                and bool(re.fullmatch(r"assistant(?::[A-Za-z0-9_.:-]+)?", source)) \
+                and bool(record.get("acknowledged_epoch")) \
+                and bool(record.get("ack_digest") or record.get("ack_note"))
+            if (state == "acknowledged" and not acknowledged) or (state == "delivered" and not delivered) \
+                    or (delivery == "delivered" and not delivered):
+                raise ValueError("receipt lacks evidence")
+            counts["accepted"] += int(accepted)
+            counts["delivered"] += int(delivered)
+            counts["acknowledged"] += int(acknowledged)
+            if reference is not None and identifier != reference:
+                continue
+            items.append({"id": identifier, "sequence": record.get("sequence"), "state": state,
+                          "accepted": accepted, "delivered": delivered, "acknowledged": acknowledged,
+                          "delivery_status": delivery, "ack_source": source if acknowledged else None})
+        return {"status": "ok", "items": items[-24:], "counts": counts,
+                "omitted": max(0, len(items) - 24)}
+    except Exception:
+        # Deliberately omit journal contents/errors: those can include messages or secrets.
+        return dict(unknown, status="unavailable", error="Receipt journal corrupt, unsupported, oversized or unreadable; counts unknown.")
+
+
+def fleet_payload(parent=None, group=None, limit=100):
+    """Bounded, cached metadata only: never scan a workspace or launch a provider."""
+    from neoxider_agents.ux_tracking import globs_overlap
+    def absolute_pattern(directory, pattern):
+        # Lexical only: do not resolve/stat a project or reach a UNC/network share.
+        value = os.path.normpath(os.path.join(os.path.abspath(directory or HERE), pattern)).replace("\\", "/")
+        return value.casefold() if os.name == "nt" else value
+    if parent is not None:
+        _events.valid_parent(parent)
+    if group is not None and (not isinstance(group, str) or len(group) > 512):
+        raise ValueError("invalid group filter")
+    limit = min(_events.bounded_limit(limit), FLEET_TASK_CAP)
+    names, scanned, incomplete = [], 0, False
+    try:
+        with os.scandir(LOGDIR) as entries:
+            for entry in entries:
+                scanned += 1
+                if scanned > FLEET_SCAN_CAP:
+                    incomplete = True
+                    break
+                if entry.name.endswith(".meta") and not entry.is_symlink() and entry.is_file():
+                    name = safe_task_name(entry.name[:-5])
+                    if name:
+                        names.append(name)
+    except FileNotFoundError:
+        pass
+    store, rows, parents, groups = _StateStore(LOGDIR), [], set(), set()
+    now = time.time()
+    for name in sorted(names):
+        try:
+            meta = dict(line.split("=", 1) for line in _fleet_file(name, ".meta").splitlines() if "=" in line)
+        except (OSError, ValueError, UnicodeError):
+            incomplete = True
+            continue
+        par, directory = meta.get("parent", ""), meta.get("dir", "")
+        parents.add(par[:128])
+        groups.add(directory[:512])
+        if (parent is not None and par != parent) or (group is not None and directory != group):
+            continue
+        if len(rows) >= limit:
+            incomplete = True
+            continue
+        state = eff_state(meta, activity_mtime(name, meta), now)
+        paths = [path[:512] for path in meta.get("changed_names", "").split(" | ") if path]
+        owns = [pattern.strip()[:128] for pattern in meta.get("owns", "").split(",") if pattern.strip()]
+        try:
+            cost = float(meta["cost_usd"])
+            if not math.isfinite(cost) or cost < 0:
+                raise ValueError("invalid cost")
+        except (KeyError, TypeError, ValueError):
+            cost = None
+        rows.append({"name": name, "state": state, "parent": par[:128], "group": directory[:512],
+                     "engine": meta.get("engine", "unknown")[:64],
+                     "model_requested": (meta.get("model_requested", meta.get("requested_model")) or "")[:128] or None,
+                     "model_resolved": (meta.get("resolved_model") or "")[:128] or None,
+                     "model_legacy": meta.get("model", "")[:128],
+                     "cost": {"amount": cost, "currency": "USD" if cost is not None else None,
+                              "provenance": meta.get("cost_source", "Stored task cost_usd telemetry; billing unverified")[:200]
+                              if cost is not None else "unknown"},
+                     "delta": {"count": int(meta["files"]) if re.fullmatch(r"[0-9]{1,9}", meta.get("files", "")) and meta.get("delta_known") == "1" else None,
+                               "paths": paths[:16], "omitted": max(0, len(paths) - 16),
+                               "pending": meta.get("delta_pending") == "1", "source": "cached task metadata",
+                               "warning": _activity.redact(meta.get("baseline_warning", ""))[:240]},
+                     "owns": owns[:4], "owns_omitted": max(0, len(owns) - 4), "declared_overlap": [],
+                     "conflicts": [], "receipts": _receipt_view(store, name),
+                     "reason": _activity.redact(meta.get("reason", ""))[:240],
+                     "controls": {"send": True, "stop": state in LIVE_STATES,
+                                  "resume": state not in LIVE_STATES},
+                     "_paths": set(paths), "_meta": meta})
+    comparisons = 0
+    comparison_incomplete = any(row["owns_omitted"] or any(len(pattern.strip()) > 128
+                                for pattern in row["_meta"].get("owns", "").split(","))
+                                or len(row["_meta"].get("dir", "")) > 512 for row in rows)
+    for index, left in enumerate(rows):
+        for right in rows[index + 1:]:
+            comparisons += 1
+            if comparisons > 2000:
+                comparison_incomplete = True
+                break
+            # Declarations are possible overlaps, not write enforcement or authorship proof.
+            if left["state"] in LIVE_STATES and right["state"] in LIVE_STATES \
+                    and len(left["_meta"].get("dir", "")) <= 512 and len(right["_meta"].get("dir", "")) <= 512 and any(
+                    globs_overlap(absolute_pattern(left["_meta"].get("dir", ""), a.strip()),
+                                  absolute_pattern(right["_meta"].get("dir", ""), b.strip()))
+                    for a in left["_meta"].get("owns", "").split(",")[:4]
+                    for b in right["_meta"].get("owns", "").split(",")[:4]
+                    if a.strip() and b.strip() and len(a.strip()) <= 128 and len(b.strip()) <= 128):
+                for one, other in ((left, right), (right, left)):
+                    if len(one["declared_overlap"]) < 8:
+                        one["declared_overlap"].append(other["name"])
+            shared = left["_paths"] & right["_paths"] if left["_meta"].get("dir") == right["_meta"].get("dir") else set()
+            if shared:
+                for one, other in ((left, right), (right, left)):
+                    if len(one["conflicts"]) < 8:
+                        one["conflicts"].append({"task": other["name"], "paths": sorted(shared)[:8],
+                                                 "note": "Shared cached delta; authorship/timing unverified"})
+        if comparisons > 2000:
+            break
+    summary = {"active": 0, "done": 0, "attention": 0, "error": 0}
+    for row in rows:
+        row.pop("_paths")
+        row.pop("_meta")
+        state = row["state"]
+        bucket = "done" if state == "done" else "error" if state in ("error", "limited", "silent") \
+            else "active" if state in ("running", "idle") else "attention"
+        summary[bucket] += 1
+    payload = {"tasks": rows, "summary": summary, "summary_scope": "returned page",
+               "parents": sorted(parents)[:64], "groups": sorted(groups)[:64],
+               "incomplete": incomplete or len(parents) > 64 or len(groups) > 64,
+               "comparison_incomplete": comparison_incomplete,
+               "attribution": "Cached deltas and declared scopes do not prove authorship or enforce writes."}
+    while rows and len(json.dumps(payload).encode("utf-8")) > FLEET_JSON_CAP:
+        rows.pop()
+        payload["incomplete"] = True
+        # Recompute page counts after byte bounding; no discarded task remains counted.
+        summary.update({key: 0 for key in summary})
+        for row in rows:
+            state = row["state"]
+            summary["done" if state == "done" else "error" if state in ("error", "limited", "silent")
+                    else "active" if state in ("running", "idle") else "attention"] += 1
+    return payload
+
+
+def task_events_payload(task, after=None, limit=16, consumer=None):
+    if after is None:
+        after = {"task": task, "seq": 0}
+    if not isinstance(after, dict):
+        raise ValueError("after must be a task-bound cursor object")
+    after = {"task": task, "seq": _events.cursor_value(after, task)}
+    if consumer is not None:
+        if not isinstance(consumer, str):
+            raise ValueError("consumer must be text")
+        _events.valid_consumer(consumer)
+    store = _events.EventStore(LOGDIR)
+    page = store.read(task, after=after, limit=min(_events.bounded_limit(limit), 32)).to_dict()
+    if after["seq"] > page["head"]:
+        raise ValueError("event cursor is ahead of task head")
+    while page["events"] and len(json.dumps(page).encode("utf-8")) > FLEET_JSON_CAP:
+        page["events"].pop()
+        page["cursor"] = {"task": task, "seq": page["events"][-1]["seq"] if page["events"] else after["seq"]}
+        page["more"] = page["cursor"]["seq"] < page["head"]
+        page["truncated"] = True
+    return page
 
 # Doctor/provider-info both shell out to agent.sh, which is not cheap (subprocess + the
 # provider's own CLI --version/login calls) -- cache each by key with a short TTL so switching
@@ -1849,6 +2159,42 @@ class H(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"tasks": list_tasks(), "engines": ENGINES,
                                         "providers": PROVIDERS, "projects": load_projects(),
                                         "cwd": to_git_bash_path(os.getcwd())}))
+        elif u.path == "/api/fleet":
+            try:
+                result = fleet_payload((q.get("parent") or [None])[0],
+                                       (q.get("group") or [None])[0], (q.get("limit") or ["100"])[0])
+                self._send(200, json.dumps(result))
+            except (ValueError, OSError):
+                self._send(400, json.dumps({"error": "invalid fleet filter or unreadable state"}))
+        elif u.path == "/api/task/events":
+            name = H._task_from_query(self, q)
+            if name is None:
+                return
+            try:
+                raw = (q.get("after") or [None])[0]
+                if raw is not None and len(raw) > 512:
+                    raise ValueError("cursor too large")
+                after = json.loads(raw) if raw is not None else None
+                if raw is not None and not isinstance(after, dict):
+                    raise ValueError("after must be a task-bound cursor")
+                result = task_events_payload(name, after, (q.get("limit") or ["16"])[0],
+                                             (q.get("consumer") or [None])[0])
+                self._send(200, json.dumps(result))
+            except _events.EventError:
+                self._send(409, json.dumps({"error": "Durable event journal unreadable or corrupt; cursor unchanged."}))
+            except (ValueError, OSError, RecursionError):
+                self._send(400, json.dumps({"error": "invalid task-bound cursor, consumer or event page"}))
+        elif u.path == "/api/task/receipt":
+            name = H._task_from_query(self, q)
+            if name is None:
+                return
+            identifier = (q.get("message_id") or [""])[0]
+            if not re.fullmatch(r"[0-9a-f]{32}", identifier):
+                return self._send(400, json.dumps({"error": "invalid message UUID"}))
+            view = _receipt_view(_StateStore(LOGDIR), name, identifier)
+            self._send(200, json.dumps({"task": name, "message_id": identifier, "status": view["status"],
+                                       "receipt": view["items"][0] if view["items"] else None,
+                                       "error": view.get("error")}))
         elif u.path == "/api/providers":
             self._send(200, json.dumps({"providers": PROVIDERS}))
         elif u.path == "/api/browse":
@@ -1982,19 +2328,22 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionAbortedError, OSError):
             pass
 
-    def _read_json_object_body(self):
+    def _read_json_object_body(self, max_bytes=None):
         """Request body as a JSON object; answers 400/413 itself, None = caller must stop."""
         raw_len = (self.headers.get("Content-Length") or "").strip()
         if raw_len and not (raw_len.isascii() and raw_len.isdigit()):
             self._send(400, json.dumps({"error": "malformed Content-Length header"}))
             return None
+        if len(raw_len) > 10:
+            self._send(413, json.dumps({"error": "request body too large"}))
+            return None
         n = int(raw_len) if raw_len else 0
-        if n > MAX_BODY_BYTES:
+        if n > (MAX_BODY_BYTES if max_bytes is None else max_bytes):
             self._send(413, json.dumps({"error": "request body too large"}))
             return None
         try:
             data = json.loads(self.rfile.read(n) if n else b"{}")
-        except ValueError:
+        except (ValueError, RecursionError):
             self._send(400, json.dumps({"error": "invalid JSON body"}))
             return None
         if not isinstance(data, dict):
@@ -2006,13 +2355,38 @@ class H(BaseHTTPRequestHandler):
         if H._reject_mutation(self):
             return
         u = urllib.parse.urlparse(self.path)
-        data = self._read_json_object_body()
+        data = H._read_json_object_body(self, EVENT_BODY_CAP) if u.path == "/api/task/events/ack" \
+            else self._read_json_object_body()
         if data is None:
             return
-        if u.path == "/api/run":
-            prompt = (data.get("prompt") or "").strip()
-            if not prompt:
-                return self._send(400, json.dumps({"error": "empty prompt"}))
+        if u.path == "/api/task/events/ack":
+            name = safe_task_name(data.get("task"))
+            if name is None:
+                return self._send(400, json.dumps({"error": "invalid task name"}))
+            if not task_exists(name):
+                return self._send(404, json.dumps({"error": "task no longer exists"}))
+            try:
+                if set(data) != {"task", "consumer", "cursor"} or not isinstance(data.get("cursor"), dict):
+                    raise ValueError("ack requires task, consumer and task-bound cursor")
+                _events.cursor_value(data["cursor"], name)
+                if not isinstance(data["consumer"], str):
+                    raise ValueError("consumer must be text")
+                consumer = _events.valid_consumer(data["consumer"])
+                result = _events.EventStore(LOGDIR).ack(name, consumer, data["cursor"])
+                self._send(200, json.dumps(dict(result, cursor={"task": name, "seq": result["cursor"]})))
+            except _events.EventError:
+                self._send(409, json.dumps({"error": "Durable event journal unreadable or corrupt; acknowledgment refused."}))
+            except (ValueError, OSError):
+                self._send(400, json.dumps({"error": "invalid task-bound cursor, consumer or acknowledgment"}))
+        elif u.path == "/api/run":
+            try:
+                prompt = prompt_text(data.get("prompt"))
+            except (ValueError, UnicodeError):
+                return self._send(400, json.dumps({"error": "invalid prompt or prompt exceeds 1 MiB UTF-8 body limit"}))
+            for field in ("dir", "model", "effort"):
+                value = data.get(field)
+                if value is not None and (not isinstance(value, str) or "\0" in value or len(value) > 4096):
+                    return self._send(400, json.dumps({"error": "invalid run option"}))
             rdir = to_git_bash_path(data.get("dir") or "")
             task_name = data.get("name")
             parent_name = data.get("parent")
@@ -2033,30 +2407,19 @@ class H(BaseHTTPRequestHandler):
             if task_name:             args += ["-t", task_name]
             if parent_name:           args += ["-P", parent_name]
             if data.get("progress"): args += ["--progress"]
-            args.append(prompt)
-            spawn(args, terminal=terminal)
+            try:
+                spawn_prompt(args, prompt, terminal=terminal)
+            except (OSError, ValueError):
+                return self._send(500, json.dumps({"error": "could not launch task"}))
             if rdir:  # remember the project
                 register_project(rdir)
-            self._send(200, json.dumps({"ok": True}))
-        elif u.path in ("/api/task/send", "/api/task/stop"):
+            self._send(200, json.dumps({"ok": True, "launcher_started": True, "accepted": False, "status": "pending"}))
+        elif u.path in ("/api/task/send", "/api/task/stop", "/api/task/resume"):
             code, result = control_task(data, u.path.rsplit("/", 1)[1])
             self._send(code, json.dumps(result))
         elif u.path == "/api/reply":
-            task = (data.get("task") or "").strip()
-            answer = (data.get("answer") or "").strip()
-            if not task or not answer:
-                return self._send(400, json.dumps({"error": "task and answer required"}))
-            if safe_task_name(task) is None:
-                return self._send(400, json.dumps({"error": "invalid task name"}))
-            if not task_exists(task):
-                return self._send(404, json.dumps({"error": "task no longer exists"}))
-            terminal = data.get("terminal", False)
-            if not isinstance(terminal, bool):
-                return self._send(400, json.dumps({"error": "terminal must be a boolean"}))
-            args = ["reply", task, answer]
-            if data.get("progress"): args = ["reply", "--progress", task, answer]
-            spawn(args, terminal=terminal)
-            self._send(200, json.dumps({"ok": True}))
+            code, result = control_task(dict(data, message=data.get("answer")), "send")
+            self._send(code, json.dumps(result))
         elif u.path == "/api/project":
             d = to_git_bash_path((data.get("dir") or "").strip())
             if not d:

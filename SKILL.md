@@ -5,6 +5,54 @@ description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tas
 
 # CLI Subagents (Codex Orchestration)
 
+## Integrated orchestration contracts (2026-10-14)
+
+The typed [Python SDK](docs/ORCHESTRATOR_API.md) and CLI share the
+[core lifecycle](docs/CORE_INTEGRATION.md): durable message UUIDs/receipts,
+parent events and named callback replay, reviewed recovery, optional retained
+Codex/OpenCode runtime profiles, and typed failure/cost/verification evidence.
+The [Fleet GUI](docs/FLEET_UI.md) reads the same receipts and event journals.
+The [native parity report](docs/NATIVE_PARITY_REPORT.md) is **DRAFT** pending
+Root security, final regression, live and remote gates.
+
+Acceptance means durable queue/journal persistence; delivery means successful
+invocation completion with a nonempty answer; acknowledgment requires explicit
+assistant evidence. None proves semantic application. SDK `subscribe(callback)`
+is ephemeral; `subscribe(callback, consumer="stable-parent")` persists event
+progress only after callback success. Reconnect with the same parent/consumer,
+then `attach(NAME)`. `wait_any(handles, timeout=30)` returns settled results;
+an observation timeout leaves workers running.
+
+```powershell
+& $SK send TASK --message-id 12345678-1234-4234-8234-123456789abc "Follow-up"
+& $SK receipt TASK --list --json
+& $SK receipt TASK 12345678-1234-4234-8234-123456789abc --json
+& $SK recovery TASK --json
+& $SK restart TASK --reviewed --reviewed-report-sha SHA "Continue reviewed work"
+```
+
+Reviewed resume refuses stale/incomplete evidence, unknown message attempts and
+unresolved external effects. Manual legacy restart/flush retains at-least-once
+retry risks. `run --isolate-runtime` (SDK `isolate_runtime=True`) is optional for
+Codex/OpenCode only; reuse the same profile on resume. Credentials require explicit
+`--credential-env-keys` / `credential_env_keys`; no authentication file is copied.
+A private unauthenticated profile is not evidence of a live provider route.
+
+Completed SDK process resources are reaped immediately on exit; lingering settled
+owned launchers are identity-checked and released within 300 seconds of observed
+settlement. Retain the task/session/profile/results for resume; no keepalive prompts.
+GUI-owned children are reaped on exit; visible terminal lifetime belongs to its host.
+`owns` remains a declaration/diff contract. Public ordinary-provider enforcement is
+false, and the independent outside-AAP escape baseline was rejected. Windows fixes
+remain under security review. Hosted-chat injection and hard billing caps remain
+unsupported. Provider exit zero is not tests/QA; estimates and reported usage are
+not confirmed billing. Free OpenCode routes were rate limited in this effort
+(historical); on 2026-10-14 OpenCode 1.18.27 SpaceBunny and Muse Spark 1.3
+each completed one measured file task (see the native parity report) — that
+exact case only, not all models or stable free quota. The human authorized
+Codex CLI fallback. Do not label a catalogue, launch, fixture
+or rate-limited call as live provider success.
+
 PowerShell is the Windows entry point. Resolve the installed skill or plugin once:
 
 ```powershell
@@ -500,7 +548,10 @@ until restarted by the new core.
   2026-08-28 catalog. Write the id exactly as the current catalog prints it; near-misses like
   `mimo-free` or `nemotron-ultra-free` are not aliases and fail as unknown models.
 - **`opencode/space-bunny-free` appeared in the 2026-09-29 catalog** as Space Bunny Free.
-  Current availability is uncertain without a current catalog or probe. It has **no short alias** — pass the full id, and pass it
+  Measured 2026-10-14: one SpaceBunny and one Muse Spark 1.3 file task each completed
+  (OpenCode 1.18.27; see the native parity report) — that exact case only, not stable
+  free quota. Otherwise current availability is uncertain without a current catalog
+  or probe. It has **no short alias** — pass the full id, and pass it
   verbatim *with* the `opencode/` prefix (a bare `space-bunny-free` is an unknown model):
 
   ```bash
@@ -790,7 +841,7 @@ panel use the shared Python owner-liveness classification:
 | owner alive, activity age within `AGENT_STALE_SEC` | `running` | `▶ running (alive, pid N)` |
 | owner alive, activity age > `AGENT_STALE_SEC` | `idle` | `▷ running (no output for Nm)` |
 | no output for > `AGENT_SILENCE_SEC` — watchdog killed the tree | `silent` | `◌ silent` → read the log, then `reply` or re-run |
-| provider itself ended the turn (usage/rate limit, quota, auth expiry, unavailable model) | `limited` | `⛔ limited` → `reason=` shows the provider's own message verbatim |
+| authoritative provider usage/rate limit or quota evidence | `limited` | `⛔ limited` → `reason=` shows the provider's own message verbatim |
 | process exited after the provider dropped the turn for another reason | `error` | `✖ error` → read the log tail, then resume with `reply` (see below) |
 | explicitly stopped by the orchestrator | `stopped` | `⏹ stopped` → `restart NAME` to continue the saved session |
 
@@ -833,32 +884,22 @@ progress, not answer: `agent.sh log` shows them, `agent.sh last` and `status` st
 `session_id`, so claude tasks now resume with `--resume <id>` instead of falling back to `--continue`,
 which picked the wrong session whenever several tasks shared a directory.
 
-**Provider-level failures end the task immediately, not eventually.** A usage/rate limit, quota
-exhaustion, auth expiry, or an unavailable model (`The 'gpt-6-astra' model requires a newer version of
-Codex`) is the PROVIDER talking, not a crash — and used to sit invisible: the task kept showing
-`running` while codex's `--json` stream had already emitted `{"type":"error","message":"..."}` followed
-by `turn.failed`, and the only way to find out was grepping the raw log. Every bundled provider now
-surfaces this from its own stream and the task ends as `state=limited`, with the provider's own message
-— verbatim, including any reset time — in meta `reason=`, shown inline by `list` and `status` with no
-log to open. **What is scanned, and when.** Only the ENGINE's output: the part of the log after the last
-`---------- output ----------` line — never the run header or the echoed `> PROMPT:`/`> ANSWER:` text
-above it (an echoed line that happens to equal the marker is written with a trailing space, so a prompt
-cannot forge that boundary; `reply` appends its own echo + marker, so it is cut off by the same rule).
-While the step is still RUNNING, the 1-second watchdog trusts only the explicit `AGENT_PROVIDER_ERROR:`
-tag that the codex and kimi stream filters print the moment they see the provider's own error event
-(opencode tags its stderr rate-limit line the same way, but only once its CLI has exited); wording alone
-never ends a live step, because live there is no way to tell a provider banner from the model's own
-words — the previous behaviour scanned the log's tail from the first tick, prompt echo included, and on
-2026-09-10 a code-review prompt that mentioned "a rate limiter disabled in a place that also serves
-other groups" was killed two seconds in as `limited`, with that sentence reported as the provider's
-message. Once the step has FAILED (rc ≠ 0), a generic regex over the same engine-output window also
-recognises plain CLI error text — claude/gemini print theirs without a tag (`There's an issue with the
-selected model (...)`, `Not logged in`), kimi's `403 You've reached your monthly usage limit` — and
-labels the task `limited` instead of a bare `error`. opencode's own stderr is retained with an
-`[opencode]` prefix regardless, so auth/network/plugin failures stay diagnosable instead of looking
-like silent hangs. Known gap: an engine that prints a limit error WITHOUT the tag and then hangs
-instead of exiting (opencode's historical failure mode; never observed for claude/gemini) is ended by
-`AGENT_SILENCE_SEC` as `silent`, not `limited` — the message is in the log.
+**Provider failures retain distinct causes.** The integrated runtime classifies
+explicit provider error envelopes/markers at the stream boundary. Authoritative
+quota/rate-limit evidence becomes `state=limited`, exit 126 and `LIMIT_HIT`;
+auth, unavailable-model, OOM, TLS and network failures remain `error` categories.
+The provider reason is retained; raw/unstructured text is advisory, and a prompt,
+model answer or tool log discussing a rate limit is not quota authority.
+Only engine output after the current `---------- output ----------` boundary is
+considered; prompt/reply echoes above it cannot create provider failure evidence.
+A quiet provider without a usable failure envelope can still reach the distinct
+silence watchdog. Historical broad wording detection caused false `limited`
+results; current categories are exercised in the integrated fixture tests.
+Historical negative evidence: on 2026-09-10, the broad live wording scan killed a
+code-review prompt mentioning a rate limiter after two seconds, marking it `limited`.
+That was a false classification, not quota evidence.
+See [Core integration](docs/CORE_INTEGRATION.md#failure-cost-and-verification-evidence)
+and [diagnostics](docs/DIAGNOSTICS.md) for evidence provenance and uncertainty.
 
 **Usage limits — what the orchestrator sees.** A limited task is `state=limited exit=126` and
 every place a task result is read says so explicitly. The last line of `run`/`reply`/`restart`

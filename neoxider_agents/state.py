@@ -1,5 +1,6 @@
 """Legacy-compatible atomic task state, publication locks and bounded log access."""
 import os
+import json
 import re
 import shutil
 import time
@@ -18,8 +19,11 @@ def native_path(value):
 
 
 def valid_name(name):
-    if not NAME.fullmatch(name):
+    if not isinstance(name, str) or not NAME.fullmatch(name):
         raise ValueError("invalid task name '%s': use 1-128 ASCII letters/digits followed by letters, digits, '.', '_' or '-'" % name)
+    stem = name.split('.', 1)[0].upper()
+    if name.endswith('.') or re.fullmatch(r'(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])', stem):
+        raise ValueError("invalid task name '%s': reserved filename or trailing dot" % name)
     return name
 
 
@@ -31,11 +35,14 @@ def atomic_write(path, text):
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(text.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
         deadline = time.monotonic() + 2
         delay = 0.005
         while True:
             try:
                 os.replace(str(temporary), str(path))
+                sync_directory(path.parent)
                 break
             except PermissionError:
                 if os.name != "nt" or time.monotonic() >= deadline:
@@ -48,6 +55,17 @@ def atomic_write(path, text):
             temporary.unlink()
         except OSError:
             pass
+
+
+def sync_directory(path):
+    """Persist rename/unlink entries on platforms supporting directory fsync."""
+    if os.name == "nt":
+        return  # Windows does not expose directory fsync through the stdlib.
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def read_meta(path):
@@ -299,14 +317,18 @@ class Store:
         return data
 
     def update(self, name, **fields):
+        with Lock(self.path(name, ".meta")):
+            return self.update_locked(name, **fields)
+
+    def update_locked(self, name, **fields):
+        """Caller holds the .meta publication lock; never take it twice."""
         for key, value in fields.items():
             if not re.fullmatch(r"[A-Za-z0-9_-]+", key) or "\n" in str(value) or "\r" in str(value):
                 raise ValueError("metadata must contain single-line keys/values")
         path = self.path(name, ".meta")
-        with Lock(path):
-            data = read_meta(path)
-            data.update({key: str(value) for key, value in fields.items()})
-            atomic_write(path, "".join("%s=%s\n" % item for item in data.items()))
+        data = read_meta(path)
+        data.update({key: str(value) for key, value in fields.items()})
+        atomic_write(path, "".join("%s=%s\n" % item for item in data.items()))
         return data
 
     def scan(self):
@@ -362,20 +384,100 @@ class Store:
         except FileNotFoundError:
             return []
 
-    def enqueue_locked(self, name, text):
-        box = self.path(name, ".inbox")
-        box.mkdir(mode=0o700, exist_ok=True)
-        try:
-            sequence = int((box / "sequence").read_text())
-        except FileNotFoundError:
-            sequence = 0
-        sequence = max([sequence] + [int(p.stem) for p in self.inbox(name)]) + 1
-        atomic_write(box / ("%012d.msg" % sequence), text)
-        atomic_write(box / "sequence", str(sequence) + "\n")
-        return sequence
+    def enqueue_receipt(self, name, text, message_id=None):
+        with Lock(self.path(name, ".inbox")):
+            return self.enqueue_receipt_locked(name, text, message_id)
 
-    def batch_locked(self, name):
-        files = self.inbox(name)
+    def enqueue(self, name, text, message_id=None):
+        return self.enqueue_receipt(name, text, message_id)["sequence"]
+
+    def begin_delivery(self, name, paths, generation="", turn=0):
+        with Lock(self.path(name, ".inbox")):
+            return self.begin_delivery_locked(name, paths, generation, turn)
+
+    def finish_delivery(self, name, paths, generation="", delivered=False, outcome=""):
+        with Lock(self.path(name, ".inbox")):
+            return self.finish_delivery_locked(name, paths, generation, delivered, outcome)
+
+    def enqueue_locked(self, name, text, message_id=None):
+        """Queue one message and return its legacy int sequence (unchanged contract).
+
+        The caller holds the `.inbox` lock (as `lifecycle.send` does); receipts never
+        take that lock again.
+        """
+        return self.enqueue_receipt_locked(name, text, message_id)["sequence"]
+
+    def enqueue_receipt_locked(self, name, text, message_id=None):
+        """Queue one message and return its durable receipt. Caller holds the `.inbox` lock.
+
+        Acceptance is a transaction: intent snapshot, then the queue file, then the
+        accepted snapshot. A crash therefore leaves an intent that reconcile finishes
+        under the caller's UUID, or a rolled-back intent — never a receipt for a
+        message that was not persisted.
+        """
+        from . import message_receipts
+        return message_receipts.enqueue_locked(self, name, text, message_id=message_id,
+                                               generation=read_meta(self.path(name, ".meta")).get("generation", ""))
+
+    # Durable receipts: additive sidecars outside the .inbox glob (see message_receipts).
+    # The `*_locked` names assume the caller holds the `.inbox` lock; the plain names take it.
+    def receipts(self, name):
+        from . import message_receipts
+        return message_receipts.listing(self, name)
+
+    def receipt(self, name, ref):
+        from . import message_receipts
+        return message_receipts.receipt(self, name, ref)
+
+    def begin_delivery_locked(self, name, paths, generation="", turn=0):
+        from . import message_receipts
+        return message_receipts.begin_attempt_locked(self, name, message_receipts.sequences(paths),
+                                                     generation=generation, turn=turn)
+
+    def finish_delivery_locked(self, name, paths, generation="", delivered=False, outcome=""):
+        from . import message_receipts
+        return message_receipts.finish_attempt_locked(self, name, message_receipts.sequences(paths),
+                                                      generation=generation, delivered=delivered, outcome=outcome)
+
+    def reconcile_receipts(self, name):
+        from . import message_receipts
+        return message_receipts.reconcile(self, name)
+
+    def reconcile_receipts_locked(self, name):
+        from . import message_receipts
+        return message_receipts.reconcile_locked(self, name)
+
+    def repair_receipts(self, name):
+        from . import message_receipts
+        return message_receipts.repair(self, name)
+
+    def torn_receipt_tail(self, name):
+        from . import message_receipts
+        return message_receipts.torn_tail(self, name)
+
+    def acknowledge_message(self, name, ref, source="assistant", text="", note=""):
+        from . import message_receipts
+        return message_receipts.acknowledge(self, name, ref, source=source, text=text, note=note)
+
+    def acknowledge_message_locked(self, name, ref, source="assistant", text="", note=""):
+        from . import message_receipts
+        return message_receipts.acknowledge_locked(self, name, ref, source=source, text=text, note=note)
+
+    def mark_message_applied(self, name, ref, note=""):
+        from . import message_receipts
+        return message_receipts.mark_applied(self, name, ref, note=note)
+
+    def mark_message_applied_locked(self, name, ref, note=""):
+        from . import message_receipts
+        return message_receipts.mark_applied_locked(self, name, ref, note=note)
+
+    def batch_locked(self, name, include_unknown=True):
+        from . import message_receipts as mr
+        mr.reconcile_locked(self, name)
+        files = [path for path in self.inbox(name) if path.stem.isdigit()]
+        if not include_unknown:
+            files = [path for path in files if mr.receipt_locked(self, name, int(path.stem))["delivery_status"]
+                     not in (mr.UNKNOWN, mr.ATTEMPTING)]
         return files, "\n\n".join("Message #%s:\n%s" % (int(path.stem), path.read_text(encoding="utf-8")) for path in files)
 
     def seen(self, name):
@@ -383,3 +485,84 @@ class Store:
             self.path(name, ".seen").touch(mode=0o600)
         except OSError:
             pass
+
+    def stage_event(self, name, kind, data, event_id=None, meta=None):
+        """Capture an immutable publication intent before attempting the event append."""
+        from .events import check_payload, idempotency_key, valid_id
+        meta = self.read(name) if meta is None else meta
+        envelope = dict(task=name, generation=meta.get("generation", ""),
+                        parent=meta.get("parent", ""), kind=kind, data=check_payload(data))
+        envelope["event_id"] = valid_id(event_id) if event_id else idempotency_key(
+            name, envelope["generation"], envelope["parent"], kind, envelope["data"])
+        path = self.path(name, ".event-outbox") / (envelope["event_id"] + ".json")
+        with Lock(self.path(name, ".event-outbox")):
+            if path.exists():
+                existing = json.loads(path.read_text(encoding="utf-8"))
+                content = {key: value for key, value in existing.items() if key != "intent_order"}
+                if content != envelope:
+                    raise ValueError("event intent identity changed")
+                return existing
+            counter = self.path(name, ".event-sequence")
+            high = int(counter.read_text(encoding="ascii")) if counter.exists() else 0
+            for pending in path.parent.glob("*.json"):
+                row = json.loads(pending.read_text(encoding="utf-8"))
+                high = max(high, row["intent_order"])
+            if not 0 <= high < (1 << 63) - 1:
+                raise ValueError("event intent sequence is corrupt/exhausted")
+            envelope["intent_order"] = high + 1
+            raw = json.dumps(envelope, sort_keys=True, separators=(",", ":"))
+            atomic_write(path, raw)
+            atomic_write(counter, str(high + 1))
+        return envelope
+
+    def publish_events(self, name):
+        """Replay captured bytes, including terminal intents from earlier generations."""
+        from .events import EventStore
+        try:
+            with Lock(self.path(name, ".event-outbox")):
+                meta = self.read(name)
+                if meta.get("event_pending") == "1" and meta.get("terminal_intent"):
+                    intent = json.loads(meta["terminal_intent"])
+                    from .events import valid_id
+                    identifier = valid_id(intent["event_id"])
+                    target = self.path(name, ".event-outbox") / (identifier + ".json")
+                    if not target.exists():
+                        atomic_write(target, json.dumps(intent, sort_keys=True, separators=(",", ":")))
+                pending = [(json.loads(path.read_text(encoding="utf-8")), path)
+                           for path in self.path(name, ".event-outbox").glob("*.json")]
+                orders = [row["intent_order"] for row, _ in pending]
+                if any(type(value) is not int or not 0 < value < (1 << 63) for value in orders) or len(set(orders)) != len(orders):
+                    raise ValueError("event intent ordering is corrupt")
+                for envelope, path in sorted(pending, key=lambda row: row[0]["intent_order"]):
+                    if envelope.get("task") != name or path.stem != envelope.get("event_id"):
+                        raise ValueError("event outbox task/identity mismatch")
+                    EventStore(self.root).emit(**{key: value for key, value in envelope.items() if key != "intent_order"})
+                    path.unlink()
+                    sync_directory(path.parent)
+            self.update(name, event_pending=0, event_error="")
+            return True
+        except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+            from activity import redact
+            self.update(name, event_pending=1, event_error=redact(str(error))[:500])
+            return False
+
+    def lifecycle_event(self, name, kind, data, event_id=None):
+        self.stage_event(name, kind, data, event_id)
+        return self.publish_events(name)
+
+    def terminal_event(self, name, **fields):
+        """Terminal outcome and its captured event survive a publisher process crash."""
+        import hashlib
+        meta = dict(self.read(name), **{k: str(v) for k, v in fields.items()})
+        try:
+            answer = self.path(name, ".answer").read_bytes()
+        except FileNotFoundError:
+            answer = b""
+        payload = dict(state=meta.get("state", ""), exit_code=meta.get("exit", ""),
+                       session=meta.get("session", ""), answer_sha256=hashlib.sha256(answer).hexdigest(),
+                       files=meta.get("files", ""), tests_status="not_run", qa_status="not_run")
+        identifier = uuid.uuid5(uuid.NAMESPACE_URL, "neoxider:%s:%s:terminal" %
+                                (name, meta.get("generation", ""))).hex
+        intent = self.stage_event(name, "terminal", payload, identifier, meta)
+        self.update(name, **dict(fields, terminal_intent=json.dumps(intent, sort_keys=True), event_pending=1))
+        return self.publish_events(name)

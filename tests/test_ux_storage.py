@@ -233,6 +233,37 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(output.usage["cache_read_tokens"], 4)
         self.assertEqual(output.cost, 0.02)
 
+    def test_fast_structured_terminal_failure_preserves_native_code_and_typed_reason(self):
+        from contextlib import redirect_stdout, redirect_stderr
+        from neoxider_agents import lifecycle
+        from neoxider_agents.providers import get_provider
+        cases = [("quota exceeded", "quota", 7, 126),
+                 ("RangeError: Out of memory", "provider_oom", 7, 7),
+                 ("tls handshake eof", "tls", 7, 7),
+                 ("authentication failed", "auth", 7, 7),
+                 ("tls handshake eof", "tls", 0, 3)]
+        for reason, category, native_code, expected_code in cases:
+            with self.subTest(category=category, native_code=native_code):
+                parser = OutputFilter("codex", "task", self.logs)
+                parser.feed(json.dumps({"type": "turn.failed", "error": {"message": reason}}) + "\n")
+                class FastTurn:
+                    last_activity = "terminal provider error"
+                    def __init__(self, *args):
+                        pass
+                    def run(self):
+                        return native_code, parser, None, "", ""
+                out, err = io.StringIO(), io.StringIO()
+                with patch.object(lifecycle, "Turn", FastTurn), redirect_stdout(out), redirect_stderr(err):
+                    code = lifecycle.execute(self.store, "task", {"dir": str(self.work), "ask": True},
+                        get_provider("codex"), "model", "", "", "hello", False, [])
+                self.assertEqual(code, expected_code)
+                self.assertEqual(out.getvalue(), "")
+                self.assertEqual("LIMIT_HIT" in err.getvalue(), category == "quota")
+                self.assertEqual(self.store.path("task", ".answer").read_text(), "")
+                meta = self.store.read("task")
+                self.assertEqual(meta["state"], "limited" if category == "quota" else "error")
+                self.assertEqual(json.loads(meta["failure_json"])["category"], category)
+
     def test_auto_task_name_redacts_prompt_secrets(self):
         from neoxider_agents.cli import task_name
         name, reservation = task_name(self.store, "password=LEAKED_NAME inspect file")

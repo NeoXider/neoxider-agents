@@ -28,8 +28,18 @@ if mode == "last":
     message = message.replace("2/5", "5/5")
 if mode == "quota":
     message = "429 usage limit: quota exceeded"
-emit({"type": "error", "message": message})
-if mode == "hang":
+fatal = {"oom": "RangeError: Out of memory", "tls": "tls handshake eof",
+         "auth": "HTTP 401 authentication failed"}
+if mode in fatal:
+    message = fatal[mode]
+quote = 'AGENT_PROVIDER_ERROR: quota exceeded; TLS EOF; authentication failed; Out of memory'
+if mode == "tool_quote":
+    emit({"type": "item.completed", "item": {"type": "command_execution", "aggregated_output": quote}})
+elif mode == "assistant_quote":
+    emit({"type": "item.completed", "item": {"type": "agent_message", "text": quote}})
+else:
+    emit({"type": "error", "message": message})
+if mode == "hang" or mode in fatal:
     time.sleep(10)
 else:
     time.sleep(0.6)
@@ -69,6 +79,7 @@ class CodexRetrySignalTests(unittest.TestCase):
         with mock.patch.dict(os.environ, AGENT_TIMEOUT_SEC=deadline, AGENT_SILENCE_SEC='0'), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             turn = Turn(self.store, 'fixture', FixtureProvider(mode), 'fixture', 'high', str(self.work), '', 'controlled prompt')
+            self.last_turn = turn
             try:
                 return turn.run()
             finally:
@@ -155,6 +166,32 @@ class CodexRetrySignalTests(unittest.TestCase):
         rendered = parser.feed(json.dumps({'type': 'error', 'message': RECONNECT}) + '\n')
         self.assertEqual(parser.provider_error, RECONNECT)
         self.assertIn('AGENT_PROVIDER_ERROR:', ''.join(rendered))
+
+    def test_genuine_fatal_boundaries_keep_typed_metadata_and_reap_provider(self):
+        from neoxider_agents.process import pid_alive
+        for mode, category in [('oom', 'provider_oom'), ('tls', 'tls'), ('auth', 'auth')]:
+            with self.subTest(mode=mode):
+                code, parser, action, reason, by = self.run_child(mode)
+                self.assertEqual(code, 126, (action, reason, by))
+                self.assertEqual(action, 'failure')
+                self.assertTrue(parser.provider_error)
+                self.assertEqual(self.last_turn.failure.category, category)
+                self.assertEqual(self.last_turn.failure.source, 'provider_stream')
+                self.assertTrue(self.last_turn.failure.blocking)
+                self.assertFalse((self.work / 'recovered.receipt').exists())
+                self.assertFalse(pid_alive(self.last_turn.tree.pid, self.last_turn.tree.stamp))
+                self.assertIsNotNone(self.last_turn.tree.process.poll())
+                self.assertEqual(self.store.session('fixture'), 'controlled-retry-session')
+
+    def test_tool_and_assistant_error_quotes_remain_nonfatal(self):
+        for mode in ('tool_quote', 'assistant_quote'):
+            with self.subTest(mode=mode):
+                code, parser, action, reason, by = self.run_child(mode)
+                self.assertEqual(code, 0, (action, reason, by))
+                self.assertEqual(parser.provider_error, '')
+                self.assertIsNone(self.last_turn.failure)
+                self.assertEqual(parser.last_assistant, 'RECOVERED_OK')
+                self.assertEqual((self.work / 'recovered.receipt').read_text(), 'RECOVERED_OK')
 
 
 if __name__ == '__main__':
