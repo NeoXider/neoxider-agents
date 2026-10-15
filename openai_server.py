@@ -1,44 +1,57 @@
 #!/usr/bin/env python3
-"""OpenAI-compatible /v1/chat/completions bridge over a CLI subagent (claude/codex/kimi/opencode/gemini).
+"""OpenAI-compatible /v1/chat/completions bridge over CLI subagents (claude/codex/kimi/opencode/gemini).
 
 Run:   agent.sh openai-server -e claude -m sonnet -f high -p 8801
+       agent.sh openai-server -m codex/6-luna -m codex/6-sol -m claude/sonnet -p 8801
+       agent.sh openai-server start --detach -m codex/6-luna -p 0      (background; prints the port)
+       agent.sh openai-server list | stop <port|name|all> | check -m codex/6-luna
        (or directly: python openai_server.py -e codex -m spark -p 8802)
 
 Point any OpenAI-compatible client's base_url at this server (e.g. http://127.0.0.1:8801/v1) --
 including CoreAI's own COREAI_TEST_BASE_URL for the Game-Creation Benchmark -- and it drives the
-configured CLI agent as the LLM backend for every /v1/chat/completions call. One process = one
-fixed engine/model/effort; start several processes on different ports (and/or --dir) to compare
-providers/models/efforts side by side, or to run more than one at once.
+configured CLI agents as the LLM backend for every /v1/chat/completions call.
 
-THE SESSION MODEL -- one API process = one ongoing chat session, not a fresh agent every call:
-  - The bridge keeps the `messages` array from the previous call. When a new call's `messages`
-    is that exact array PLUS one or more new turns appended at the end (a deterministic, exact
-    prefix check -- not a guess), only the NEW turns are sent to the SAME underlying CLI session
-    via `agent.sh reply` (resume), instead of re-serializing the whole growing history into a
-    brand-new `agent.sh run` every time. This saves the resend cost of an ever-growing history
-    AND lets the underlying provider's own prompt caching (which keys on repeated message
-    structure) actually apply -- something a fresh mega-prompt every call could not benefit from.
-  - Any mismatch (edited/rolled-back history, a genuinely different conversation, first call
-    ever, or a dead/errored previous session) falls back SAFELY to a brand-new `agent.sh run`
-    with the full history -- never resumes onto a session that might disagree with the caller.
-  - Engines without CLI-level resume support (`opencode`, `gemini` -- see provider.json's
-    "supports_resume") always take the fresh-run path; there is no continuation to lose for them.
-  - Consequence: **one bridge process serves ONE conversation at a time**, not many concurrent
-    ones -- a lock serializes overlapping requests. This is the deliberate trade-off for the
-    token/latency win above; it is NOT a general-purpose multi-conversation server. If your
-    client only ever runs one conversation against a given port at a time (e.g. one benchmark
-    scenario end to end), this is a clean fit; do not point multiple unrelated conversations at
-    the same port expecting them to stay independent.
-  - `POST .../reset` clears the session (drops the remembered `messages`/task, wipes the scratch
-    working dir unless `--dir` was pinned) so the next call starts completely fresh.
-  - **Idle sessions expire** (`--session-ttl`, default 1800s = 30 minutes): a session that hasn't
-    been called in longer than that is treated exactly like a dead one -- the next call falls
-    back to a fresh run instead of resuming it. Mirrors how a real chat/API session would time
-    out rather than stay resumable forever, and keeps an abandoned conversation's context from
-    growing unbounded. `GET /health` reports `session_idle_seconds`/`session_ttl_seconds`.
-  - The session's working directory persists for the session's lifetime (unlike a one-shot
-    completion server that could safely use a disposable per-call temp dir) -- it is wiped and
-    recreated whenever a brand-new session starts, unless `--dir` pins a real project path.
+ROUTING -- one process can serve several engine/model routes:
+  - `-e X -m Y` (one model) is the historic single-route mode: every request is served by that
+    route whatever its `model` field says.
+  - Repeatable `-m engine/model[@effort]` (or `--models a,b`) configures several routes; the
+    request's `model` field selects one by id (`codex/6-luna`), label (`codex/GPT-6 Luna`) or a
+    unique bare alias (`6-luna`). The first route is the default. Multi-route bridges are strict by
+    default (an unknown model is a 404 `model_not_found`, never a silent substitution); a single
+    route is lenient (the default serves it) unless `--strict-models`. `--allow-any` additionally
+    accepts any `engine/model` of a known engine on demand (loopback binds only).
+  - Responses report the route's real label in `model` and its id in `neoxider_route`.
+  - The request's `reasoning_effort` (or `reasoning.effort`, or a `@effort` model suffix) picks the
+    effort per conversation, default `-f`; it is clamped to the levels provider.json advertises,
+    ignored by engines without effort, part of the session identity (route variant
+    `engine/model@effort`), and reported in the `neoxider` response object.
+
+THE SESSION MODEL -- a pool of independent conversations, each one an ongoing CLI session:
+  - Each conversation remembers its own `messages`, its own CLI task/session (task name, log, meta,
+    provider session id) and its own scratch working directory
+    (Temp/neoxider-openai-bridge/session-<port>-<id>). When a new call's `messages` is exactly a
+    known conversation's array PLUS one or more new turns (a deterministic prefix check, never a
+    guess), only the NEW turns are sent to THAT conversation's CLI session via `agent.sh reply`
+    (resume) -- saving the resend cost and keeping the provider's prompt cache warm.
+  - Anything else (edited/rolled-back history, a genuinely different conversation, a first call)
+    gets a NEW session with a fresh run of the full history. A new or different conversation never
+    overwrites, resumes or evicts another conversation's entry.
+  - Independent conversations run concurrently (`--max-concurrency`, per-engine `--engine-limit`,
+    a bounded queue with `--queue-timeout`); one conversation stays strictly sequential (a
+    per-session lock), so two turns of it never race.
+  - Sessions are evicted only by idle TTL (`--session-ttl`, default 1800s) or by the explicit
+    capacity bound (`--max-sessions`, LRU of IDLE sessions, never an active one); every eviction
+    is logged. `GET /health` lists the sessions (id, route, turns, idle seconds -- never content).
+  - `POST .../reset` drops every remembered session (or only one route's: body {"model": ...}).
+  - Engines without CLI-level resume support (`gemini`) always take the fresh-run path; their
+    conversation still keeps its own working directory between turns.
+
+ERRORS -- provider/CLI failures become OpenAI-style errors with a meaningful status:
+  {"error": {"message", "type", "code", "param": null, "retryable"}} -- 401/403 auth or tier
+  refusal (the provider's own text, e.g. an OpenCode FreeTierError), 402 billing, 429 rate/usage
+  limit (+Retry-After when known), 404 unknown model, 400 provider-rejected request, 502/503
+  provider crashed/unavailable, 504 timeout or stall. Non-retryable failures are never retried
+  inside the bridge. Each failure logs one `incident` line with the mapped status.
 
 WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backend:
   - First-token latency is a full CLI subprocess start (seconds), even in streaming mode.
@@ -61,11 +74,15 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
   - `usage` token counts are ESTIMATES (~4 chars/token, flagged with "neoxider_estimated": true)
     -- the wrapped CLIs don't expose real counts in a structured form. Good enough for cost
     panels/dashboards; not billing-grade.
-  - A completion whose CLI invocation came back empty or in an error state is retried
-    (`--retries`, default 1) before the bridge gives up -- a real OpenAI endpoint effectively
-    never returns an empty 200, and one transient CLI hiccup should not zero a whole scenario.
-    An unexpected bridge exception surfaces as an OpenAI-style {"error": ...} HTTP 500, never a
-    bare connection reset.
+  - A completion whose CLI invocation came back empty or with a transient failure (network,
+    crash, unknown error) is retried (`--retries`, default 1) before the bridge gives up -- a real
+    OpenAI endpoint effectively never returns an empty 200. Auth/billing/limit/model/bad-request
+    refusals and timeouts/stalls are NOT retried internally (the client gets the mapped error and a
+    `retryable` hint). An unexpected bridge exception surfaces as an OpenAI-style {"error": ...}
+    HTTP 500 with an incident id, never a bare connection reset.
+  - A stream watchdog (`--stall-timeout`, default 180s) aborts a CLI turn whose provider produced
+    no output for that long (the known "stream hangs with the process alive" quirk) -> 504; a
+    client that disconnects cancels its CLI run.
   - `content` is a clean answer for every bundled engine. codex's non-interactive `exec` mode
     otherwise mixes its own startup banner/session-id/error-log/"tokens used" chrome (and, on
     Windows, a cp866-mojibake OS-notification line) into the same stream as the answer, so the
@@ -76,10 +93,14 @@ WHAT THIS IS -- still a wire-compatible shim, NOT a low-latency native LLM backe
 Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is fully standalone
 (does not import gui.py) so the two servers can run/fail independently.
 """
-import argparse, atexit, base64, binascii, contextlib, glob, hashlib, ipaddress, json, logging, os, queue, re, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
+import argparse, atexit, base64, binascii, contextlib, glob, hashlib, ipaddress, json, logging, os, queue, re, select, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    # The core package and activity.redact live next to this file; a direct `python
+    # tests/...` run or an import by path must still resolve them.
+    sys.path.append(HERE)
 SK = os.path.join(HERE, "agent.py")
 PROVIDERS_DIR = os.path.join(HERE, "providers")
 LOGDIR = os.environ.get("AGENT_CLI_LOGS") or os.path.expanduser("~/.claude/agent-cli-logs")
@@ -88,10 +109,31 @@ LOGDIR = os.environ.get("AGENT_CLI_LOGS") or os.path.expanduser("~/.claude/agent
 # own file on a clean exit; the GUI prunes files whose port no longer answers /health.
 BRIDGES_DIR = os.path.join(LOGDIR, "bridges")
 # Random per-process identity, published in the registry file AND in GET /health so
-# gui.stop_bridge only ever kills the process it recorded.
+# gui.stop_bridge / `openai-server stop` only ever kill the process they recorded. A detached
+# start hands the child a pre-chosen id (AGENT_BRIDGE_INSTANCE_ID) so the parent can find its
+# registry entry even before it knows the port (--port 0).
 INSTANCE_ID = uuid.uuid4().hex[:12]
-# Cap on one request body; larger or malformed Content-Length gets 400/413.
+# Cap on one request body; larger or malformed Content-Length gets 400/413 (--max-request-mb).
 MAX_BODY_BYTES = 64 * 1024 * 1024
+STARTED_AT = time.time()
+
+
+class _RequestContext(threading.local):
+    """Per-thread request state: which route and pooled session the current CLI turn belongs to.
+
+    Every helper that used to read the single global SESSION/CFG engine reads these instead, so
+    concurrent conversations never share history, task state, scratch dir or native processes.
+    With no request bound (unit tests calling H._run directly) the helpers fall back to the
+    module-level SESSION and to a route built from CFG -- the historic single-session behaviour."""
+    session = None
+    route = None
+    cancel = None
+    task = None
+    last_run = None
+    effort = None  # the request's reasoning-effort decision, reported in the response metadata
+
+
+_CTX = _RequestContext()
 
 # Opt-in diagnostics: quiet (WARNING) unless AGENT_LOG_LEVEL says otherwise -- request lines at
 # DEBUG, infrastructure failures (provider config, registry writes) at WARNING. Payloads are
@@ -262,10 +304,14 @@ def read_meta(name):
 
 
 def session_scratch_dir():
-    """Path (not created) of the ONE stable working dir this bridge process's ongoing session
-    lives in -- fixed per port, so it's dedicated to this instance and never collides with
-    another bridge/task using the same LOGDIR."""
-    return os.path.join(tempfile.gettempdir(), "neoxider-openai-bridge", "session-%d" % CFG.port)
+    """Path (not created) of the stable working dir of the CURRENT conversation -- one per pooled
+    session (session-<port>-<session id>), so two conversations never share or wipe each other's
+    directory. Without a bound session (direct helper calls) it is the historic per-port path."""
+    base = os.path.join(tempfile.gettempdir(), "neoxider-openai-bridge")
+    session = getattr(_CTX, "session", None)
+    if session is not None and getattr(session, "id", None):
+        return os.path.join(base, "session-%d-%s" % (CFG.port, session.id))
+    return os.path.join(base, "session-%d" % CFG.port)
 
 
 def fresh_session_dir(wipe=True):
@@ -539,16 +585,84 @@ def _handle_sigterm(signum, _frame):
         raise SystemExit(128 + signum)
 
 
+# The core's own no-output watchdog (AGENT_SILENCE_SEC, set from --stall-timeout) normally ends a
+# wedged provider first and records state=silent. The bridge kills the step itself only when the
+# task files have not moved for this much longer -- a backstop for a wedged wrapper.
+STALL_GRACE_SECONDS = 30
+
+
+def _stall_seconds():
+    """--stall-timeout in seconds, 0 = disabled (also for test configs without the field)."""
+    try:
+        return max(0, int(getattr(CFG, "stall_timeout", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _task_progress(name):
+    """A cheap token that changes whenever the core records provider activity for task `name`."""
+    token = []
+    for suffix in (".log", ".meta", ".activity.jsonl"):
+        try:
+            stat = os.stat(os.path.join(LOGDIR, name + suffix))
+            token.append((stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            token.append(None)
+    return tuple(token)
+
+
 def _run_agent_process(args, timeout, env):
-    """Run an agent.sh step with an outer deadline that cannot orphan CLI grandchildren."""
+    """Run an agent.sh step with an outer deadline that cannot orphan CLI grandchildren.
+
+    Also aborts the whole tree when the HTTP client disconnected (_CTX.cancel) or the task made no
+    progress for --stall-timeout (+ grace). The outcome (exit code, stderr tail, which watchdog
+    fired) is kept in _CTX.last_run so the failure can be mapped to a precise HTTP error."""
     proc = _popen_process_tree(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, encoding="utf-8", errors="replace", cwd=HERE, env=env)
+    outcome = {"returncode": None, "stderr": "", "timed_out": False, "stalled": False,
+               "cancelled": False}
+    cancel = getattr(_CTX, "cancel", None)
+    task = getattr(_CTX, "task", None)
+    stall = _stall_seconds()
+    deadline = time.monotonic() + timeout
+    last_token, last_change = None, time.monotonic()
+    killed = False
+    stderr_text = ""
     try:
-        proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _terminate_process_tree(proc)
-    else:
-        _release_process_tree(proc)
+        while True:
+            try:
+                _stdout, stderr_text = proc.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            fired = None
+            if cancel is not None and cancel.is_set():
+                fired = "cancelled"
+            elif now >= deadline:
+                fired = "timed_out"
+            elif stall and task:
+                token = _task_progress(task)
+                if token != last_token:
+                    last_token, last_change = token, now
+                elif now - last_change >= stall + STALL_GRACE_SECONDS:
+                    fired = "stalled"
+            if fired:
+                outcome[fired] = True
+                killed = True
+                _terminate_process_tree(proc)
+                try:
+                    _stdout, stderr_text = proc.communicate(timeout=5)
+                except (subprocess.TimeoutExpired, OSError, ValueError):
+                    pass
+                break
+    finally:
+        if not killed:
+            _release_process_tree(proc)
+    outcome["returncode"] = proc.returncode
+    outcome["stderr"] = (stderr_text or "")[-4000:]
+    _CTX.last_run = outcome
+    return outcome
 
 
 def _chatonly_env():
@@ -566,9 +680,10 @@ def _chatonly_env():
     env.pop("AGENT_OPENCODE_IMAGE_PATHS", None)
     image_paths = getattr(_REQUEST_IMAGES, "paths", ())
     if image_paths and CFG is not None:
-        if CFG.engine == "codex":
+        engine = _route().engine
+        if engine == "codex":
             env["AGENT_CODEX_IMAGE_PATHS"] = "\n".join(image_paths)
-        elif CFG.engine == "opencode" and not _use_opencode_native():
+        elif engine == "opencode" and not _use_opencode_native():
             env["AGENT_OPENCODE_IMAGE_PATHS"] = "\n".join(image_paths)
     # The bridge owns request-level retries. Disable agent.sh's nested retry layer so one
     # configured retry cannot multiply into several provider invocations.
@@ -584,6 +699,12 @@ def _chatonly_env():
             env["AGENT_TIMEOUT_SEC"] = str(max(1, int(CFG.timeout) - 5))
         except (TypeError, ValueError):
             pass
+    # The stream watchdog: the core kills a provider that printed nothing for --stall-timeout
+    # seconds and records state=silent (mapped to a 504 "stalled"), instead of the turn hanging
+    # until the overall timeout with the process alive and idle.
+    stall = _stall_seconds()
+    if stall:
+        env["AGENT_SILENCE_SEC"] = str(stall)
     return env
 
 
@@ -620,6 +741,7 @@ def run_agent(engine, model, effort, workdir, prompt, name, timeout):
         args += ["-m", model]
     if effort:
         args += ["-f", effort]
+    _CTX.task, _CTX.last_run = name, None
     with _prompt_argument(prompt) as prompt_args:
         _run_agent_process(args + prompt_args, timeout, _chatonly_env())
     return last_output(read_log(name))
@@ -642,6 +764,7 @@ def reply_agent(engine, model, effort, workdir, name, answer, timeout):
         args += ["-f", effort]
     args += ["-C", to_git_bash_path(workdir), name]
     before = len(read_log(name))
+    _CTX.task, _CTX.last_run = name, None
     with _prompt_argument(answer) as answer_args:
         _run_agent_process(args + answer_args, timeout, _chatonly_env())
     after = read_log(name)
@@ -742,16 +865,31 @@ def _tail_task_log(name, proc, timeout, on_delta, start_size=0):
         consume(decoder.decode(data))
         return True
 
+    cancel = getattr(_CTX, "cancel", None)
+    stall = _stall_seconds()
+    last_growth = time.monotonic()
+    outcome = {"timed_out": False, "stalled": False, "cancelled": False}
     while True:
         alive = proc.poll() is None
         if drain():
+            last_growth = time.monotonic()
             continue
         if not alive:
             break
-        if not killed and time.time() > deadline:
-            _terminate_process_tree(proc)
-            killed = True
+        if not killed:
+            fired = None
+            if cancel is not None and cancel.is_set():
+                fired = "cancelled"
+            elif time.time() > deadline:
+                fired = "timed_out"
+            elif stall and time.monotonic() - last_growth >= stall + STALL_GRACE_SECONDS:
+                fired = "stalled"
+            if fired:
+                outcome[fired] = True
+                _terminate_process_tree(proc)
+                killed = True
         time.sleep(0.05)
+    _CTX.last_run = outcome
     consume(decoder.decode(b"", final=True))
     if candidate and in_output and not replayed and candidate != OUTPUT_MARKER:
         on_delta(candidate)
@@ -765,6 +903,7 @@ def run_agent_live(engine, model, effort, workdir, prompt, name, timeout, on_del
         args += ["-m", model]
     if effort:
         args += ["-f", effort]
+    _CTX.task, _CTX.last_run = name, None
     with _prompt_argument(prompt) as prompt_args:
         proc = _popen_process_tree(args + prompt_args, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, cwd=HERE, env=_stream_env())
@@ -787,6 +926,7 @@ def reply_agent_live(engine, model, effort, workdir, name, answer, timeout, on_d
     args += ["-C", to_git_bash_path(workdir), name]
     before_bytes = _log_size(name)
     before_text = len(read_log(name))
+    _CTX.task, _CTX.last_run = name, None
     with _prompt_argument(answer) as answer_args:
         proc = _popen_process_tree(args + answer_args, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, cwd=HERE, env=_stream_env())
@@ -998,7 +1138,7 @@ def opencode_native_complete(model, prompt, timeout, on_delta=None, workdir=None
 
 
 def _use_opencode_native():
-    return OPENCODE_NATIVE and CFG.engine == "opencode"
+    return OPENCODE_NATIVE and _route().engine == "opencode"
 
 
 # ======================================================================================
@@ -1014,8 +1154,20 @@ CLAUDE_NATIVE_TASK = "__claude_native__"
 _CL = {"proc": None, "queue": None, "lock": threading.RLock()}
 
 
+def _new_native_state():
+    return {"proc": None, "queue": None, "lock": threading.RLock()}
+
+
+def _cl():
+    """The persistent-claude state of the CURRENT conversation (each pooled session owns its own
+    process, so conversations never share a native context); the module-level _CL otherwise."""
+    session = getattr(_CTX, "session", None)
+    native = getattr(session, "native", None)
+    return native if native is not None else _CL
+
+
 def _use_claude_native():
-    return CLAUDE_NATIVE and CFG.engine == "claude"
+    return CLAUDE_NATIVE and _route().engine == "claude"
 
 
 def _claude_native_cmd():
@@ -1024,7 +1176,8 @@ def _claude_native_cmd():
     cmd = ("claude -p --verbose --input-format stream-json --output-format stream-json "
            "--include-partial-messages --strict-mcp-config --disable-slash-commands "
            "--tools ''")
-    resolved_model, resolved_effort, _label = resolve_claude_model(CFG.model, CFG.effort)
+    route = _route()
+    resolved_model, resolved_effort, _label = resolve_claude_model(route.model, route.effort)
     cmd += " --model " + shlex.quote(resolved_model)
     if resolved_effort:
         cmd += " --effort " + shlex.quote(resolved_effort)
@@ -1032,40 +1185,46 @@ def _claude_native_cmd():
 
 
 def claude_native_alive():
-    with _CL["lock"]:
-        p = _CL["proc"]
+    state = _cl()
+    with state["lock"]:
+        p = state["proc"]
         return p is not None and p.poll() is None
 
 
-def claude_native_kill():
-    with _CL["lock"]:
-        p = _CL["proc"]
+def _native_kill_state(state):
+    with state["lock"]:
+        p = state["proc"]
         # Keep the stale state visible until its container is disposed. An ensure racing this
         # kill cannot replace it early, and registry ownership makes repeated cleanup a no-op.
         _terminate_process_tree(p)
-        if _CL["proc"] is p:
-            _CL["proc"] = None
-            _CL["queue"] = None
+        if state["proc"] is p:
+            state["proc"] = None
+            state["queue"] = None
+
+
+def claude_native_kill():
+    _native_kill_state(_cl())
 
 
 def _claude_native_ensure():
     """Start (or reuse) the persistent claude process; a reader thread pumps stdout lines into
     a queue so turns can be awaited with a real timeout (blocking readline has none)."""
-    with _CL["lock"]:
-        current = _CL["proc"]
+    state = _cl()
+    with state["lock"]:
+        current = state["proc"]
         if current is not None and current.poll() is None:
             return
         if current is not None:
             # poll() only describes the wrapper. Its separate group/Job can still contain provider
             # children, so release that container before clearing state and spawning a replacement.
             _terminate_process_tree(current)
-        _CL["proc"] = None
-        _CL["queue"] = None
+        state["proc"] = None
+        state["queue"] = None
         q = queue.Queue()
         proc = _popen_process_tree(
             _cli_command(*shlex.split(_claude_native_cmd())),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", errors="replace", cwd=SESSION.get("dir") or None,
+            text=True, encoding="utf-8", errors="replace", cwd=_session().get("dir") or None,
         )
 
         def _pump(p=proc, q=q):
@@ -1078,16 +1237,36 @@ def _claude_native_ensure():
                 q.put(None)  # EOF sentinel
 
         threading.Thread(target=_pump, daemon=True).start()
-        _CL["proc"] = proc
-        _CL["queue"] = q
+        state["proc"] = proc
+        state["queue"] = q
+
+
+def _native_error_text(event):
+    """The provider's own words from an is_error result event (never the prompt)."""
+    for key in ("result", "error", "subtype"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+    errors = event.get("errors")
+    if isinstance(errors, list) and errors:
+        return "; ".join(str(item) for item in errors[:3])
+    return "native Claude turn reported an error"
 
 
 def claude_native_send(prompt, timeout, on_delta=None):
     """One turn against the persistent process: write a stream-json user message, read events
     until the matching "result". Forwards partial text deltas to on_delta when given. Returns
-    the final answer text ("" on failure -- caller decides whether to retry after a kill)."""
+    the final answer text ("" on failure -- caller decides whether to retry after a kill).
+
+    _CTX.last_run records why a turn failed: a stall (no event for --stall-timeout), the outer
+    timeout, a client disconnect, a dead process, or an is_error result with the provider's text
+    (auth/limit/model errors) -- so the caller maps it instead of returning it as content."""
+    _CTX.last_run = None
     _claude_native_ensure()
-    p, q = _CL["proc"], _CL["queue"]
+    state = _cl()
+    p, q = state["proc"], state["queue"]
     try:
         p.stdin.write(json.dumps(
             {"type": "user", "message": {"role": "user", "content": prompt}},
@@ -1095,16 +1274,32 @@ def claude_native_send(prompt, timeout, on_delta=None):
         p.stdin.flush()
     except OSError:
         claude_native_kill()
+        _CTX.last_run = {"error": "native Claude process refused input (it exited)"}
         return ""
     deadline = time.time() + max(30, timeout)
+    cancel = getattr(_CTX, "cancel", None)
+    stall = _stall_seconds()
+    last_event = time.monotonic()
     texts = []
-    while time.time() < deadline:
-        try:
-            line = q.get(timeout=max(0.5, deadline - time.time()))
-        except queue.Empty:
+    while True:
+        if cancel is not None and cancel.is_set():
+            claude_native_kill()
+            _CTX.last_run = {"cancelled": True}
+            return ""
+        if time.time() >= deadline:
+            _CTX.last_run = {"timed_out": True}
             break
+        if stall and time.monotonic() - last_event >= stall:
+            _CTX.last_run = {"stalled": True}
+            break
+        try:
+            line = q.get(timeout=max(0.05, min(0.5, deadline - time.time())))
+        except queue.Empty:
+            continue
+        last_event = time.monotonic()
         if line is None:  # process exited mid-turn
             claude_native_kill()
+            _CTX.last_run = {"error": "native Claude process exited mid-turn"}
             return ""
         line = line.strip()
         if not line:
@@ -1129,10 +1324,13 @@ def claude_native_send(prompt, timeout, on_delta=None):
                     texts.append(c["text"])
         elif typ == "result":
             final = o.get("result")
+            if o.get("is_error") is True and not looks_like_limit_banner(final):
+                _CTX.last_run = {"error": _native_error_text(o), "provider_error": True}
+                return ""
             if isinstance(final, str) and final.strip():
                 return final
             return "\n".join(texts)
-    # Timed out waiting for the result -- the process state is unknown; restart next call.
+    # Timed out / stalled waiting for the result -- the process state is unknown; restart next call.
     claude_native_kill()
     return ""
 
@@ -1142,9 +1340,10 @@ def _claude_native_raw(messages, tools, tool_choice, on_delta, can_retry, on_ret
     an extension of the previous messages sends ONLY the new turns to the SAME process (true
     resume, no re-boot); anything else restarts the process with the full history."""
     retry_ok = can_retry or (lambda: True)
-    with SESSION_LOCK:
-        prev = SESSION["messages"]
-        extension = (SESSION["task_name"] == CLAUDE_NATIVE_TASK
+    session = _session()
+    with _session_lock():
+        prev = session["messages"]
+        extension = (session["task_name"] == CLAUDE_NATIVE_TASK
                      and not session_expired()
                      and claude_native_alive()
                      and is_extension(prev, messages))
@@ -1155,14 +1354,21 @@ def _claude_native_raw(messages, tools, tool_choice, on_delta, can_retry, on_ret
             # A non-extension, expired session, or dead native process is a new security
             # boundary. Always wipe scratch state; fresh_session_dir itself preserves a pinned
             # operator --dir.
-            SESSION["dir"] = fresh_session_dir(wipe=True)
+            session["dir"] = fresh_session_dir(wipe=True)
             prompt = build_prompt(messages, tools, tool_choice)
         raw = ""
+        failure = None
         for attempt in range(CFG.retries + 1):
             raw = claude_native_send(prompt, CFG.timeout, on_delta if live else None)
             if raw.strip():
                 break
-            if attempt < CFG.retries and retry_ok():
+            failure = classify_failure_outcome(
+                "claude", outcome=getattr(_CTX, "last_run", None), raw_text=raw)
+            if isinstance(failure, ClientDisconnected):
+                session["task_name"] = None
+                session["last_activity"] = time.time()
+                raise failure
+            if attempt < CFG.retries and retry_ok() and failure.internal_retry:
                 print("[openai-bridge] claude native empty turn, retry %d/%d"
                       % (attempt + 1, CFG.retries), file=sys.stderr)
                 if on_retry is not None:
@@ -1171,18 +1377,15 @@ def _claude_native_raw(messages, tools, tool_choice, on_delta, can_retry, on_ret
                 prompt = build_prompt(messages, tools, tool_choice)  # resume impossible after a kill
                 time.sleep(1)
             else:
-                if live and not raw.strip() and not retry_ok():
-                    SESSION["task_name"] = None
-                    SESSION["last_activity"] = time.time()
-                    raise CompletionFailed("native Claude stream ended before completion")
                 break
         if not raw.strip():
-            SESSION["task_name"] = None
-            SESSION["last_activity"] = time.time()
-            raise CompletionFailed("native Claude invocation did not complete")
-        SESSION["task_name"] = CLAUDE_NATIVE_TASK
-        SESSION["messages"] = messages
-        SESSION["last_activity"] = time.time()
+            session["task_name"] = None
+            session["last_activity"] = time.time()
+            claude_native_kill()
+            raise failure or CompletionFailed("native Claude invocation did not complete")
+        session["task_name"] = CLAUDE_NATIVE_TASK
+        session["messages"] = messages
+        session["last_activity"] = time.time()
         return raw
 
 
@@ -1252,7 +1455,7 @@ def _content_text(content):
                 elif p.get("type") in ("image_url", "image"):
                     source = p.get("image_url") or p.get("image")
                     url = source.get("url", "") if isinstance(source, dict) else source
-                    image_engine = (CFG.engine if CFG is not None else "")
+                    image_engine = (_route().engine if CFG is not None else "")
                     if image_engine in ("codex", "opencode") and not _use_opencode_native() \
                             and isinstance(url, str) \
                             and url.lower().startswith("data:image/"):
@@ -1323,7 +1526,7 @@ def _lift_camera_tool_images(messages):
     their own image-lifting step ran. Keep a bounded image attachment for the CLI
     instead of letting the model receive an unreadable base64 paragraph.
     """
-    if CFG is None or getattr(CFG, "engine", None) not in ("codex", "opencode") \
+    if CFG is None or _route().engine not in ("codex", "opencode") \
             or _use_opencode_native():
         return messages
     converted = []
@@ -1359,7 +1562,8 @@ def _lift_camera_tool_images(messages):
 @contextlib.contextmanager
 def _bridge_images(messages):
     """Attach bounded request images to one CLI step and remove files afterwards."""
-    if CFG is None or CFG.engine not in ("codex", "opencode") or _use_opencode_native():
+    engine = _route().engine if CFG is not None else ""
+    if engine not in ("codex", "opencode") or _use_opencode_native():
         yield
         return
     images = _validated_bridge_images(messages)
@@ -1374,7 +1578,7 @@ def _bridge_images(messages):
             path = os.path.join(directory, "%02d-%s.%s" % (index, digest, extension))
             with open(path, "wb") as image_file:
                 image_file.write(raw)
-            paths.append(to_git_bash_path(path) if CFG.engine == "codex"
+            paths.append(to_git_bash_path(path) if engine == "codex"
                          else path.replace("\\", "/"))
         _REQUEST_IMAGES.paths = paths
         try:
@@ -2474,14 +2678,24 @@ class LiveToolCallEmitter:
 
 CFG = None  # set in main(); read by the request handler
 
-# The one ongoing session this bridge process serves (see the module docstring's "THE SESSION
-# MODEL"). SESSION_LOCK serializes every request that touches it -- by design, only one
-# conversation is ever in flight against a given bridge instance at a time.
+# The context-free default session: only direct helper calls (unit tests) use it. Every HTTP
+# request runs inside its own pooled Session bound to _CTX (see SessionPool), so one conversation
+# can never overwrite another's remembered history, CLI task or scratch directory.
 SESSION_LOCK = threading.Lock()
 SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
-REQUEST_LOCK = threading.Lock()
 ACTIVE_LOCK = threading.Lock()
 ACTIVE_REQUESTS = 0
+
+
+def _session():
+    """The conversation the current CLI turn belongs to (see _RequestContext)."""
+    session = getattr(_CTX, "session", None)
+    return session if session is not None else SESSION
+
+
+def _session_lock():
+    session = getattr(_CTX, "session", None)
+    return session.state_lock if session is not None else SESSION_LOCK
 
 
 class RequestValidationError(ValueError):
@@ -2489,6 +2703,58 @@ class RequestValidationError(ValueError):
         super().__init__(message)
         self.param = param
         self.status = status
+
+
+class BridgeError(RuntimeError):
+    """An OpenAI-style error with a meaningful HTTP status, never a bare 500.
+
+    `retryable` tells the CLIENT whether the same request can succeed later (a 429 after its
+    Retry-After, a 5xx); `internal_retry` tells the BRIDGE whether a silent re-run is worth it
+    (empty answers, crashes, network blips -- never auth/billing/limit/model/bad-request
+    refusals, and never timeouts/stalls, which already spent the request's time budget)."""
+    status = 500
+    error_type = "server_error"
+    code = "bridge_error"
+    retryable = False
+
+    def __init__(self, message="", status=None, error_type=None, code=None, retryable=None,
+                 retry_after=None, param=None, internal_retry=False):
+        super().__init__(message or "bridge request failed")
+        if status is not None:
+            self.status = status
+        if error_type is not None:
+            self.error_type = error_type
+        if code is not None:
+            self.code = code
+        if retryable is not None:
+            self.retryable = retryable
+        self.retry_after = retry_after
+        self.param = param
+        self.internal_retry = internal_retry
+
+    def payload(self, incident=None):
+        error = {"message": str(self), "type": self.error_type, "code": self.code,
+                 "param": self.param, "retryable": bool(self.retryable)}
+        if self.retry_after:
+            error["retry_after_seconds"] = int(self.retry_after)
+        if incident:
+            error["incident_id"] = incident
+        return {"error": error}
+
+    def headers(self):
+        return {"Retry-After": str(int(self.retry_after))} if self.retry_after else {}
+
+
+class CompletionFailed(BridgeError):
+    """Provider invocation exhausted retries without a usable completed answer."""
+    status = 502
+    error_type = "server_error"
+    code = "provider_failed"
+    retryable = True
+
+
+class ClientDisconnected(Exception):
+    """The HTTP client went away mid-turn; its CLI run was cancelled and nothing is written."""
 
 
 def _validate_content(content, param, allow_none=False):
@@ -2616,20 +2882,24 @@ def _canonical_assistant_message(text, tool_calls):
 def _record_completion(messages, text, tool_calls, resumable=True):
     """Remember exactly the visible transcript, including the response returned to the caller."""
     canonical = list(messages) + [_canonical_assistant_message(text, tool_calls)]
-    with SESSION_LOCK:
-        SESSION["messages"] = canonical
-        SESSION["last_activity"] = time.time()
+    session = _session()
+    with _session_lock():
+        session["messages"] = canonical
+        session["last_activity"] = time.time()
+        if isinstance(session, Session):
+            session.turns += 1
         if not resumable:
-            SESSION["task_name"] = None
+            session["task_name"] = None
             claude_native_kill()
 
 
 def _invalidate_resume_session(messages):
     """A disconnected caller cannot be assumed to have received the assistant turn."""
-    with SESSION_LOCK:
-        SESSION["messages"] = list(messages)
-        SESSION["task_name"] = None
-        SESSION["last_activity"] = time.time()
+    session = _session()
+    with _session_lock():
+        session["messages"] = list(messages)
+        session["task_name"] = None
+        session["last_activity"] = time.time()
         claude_native_kill()
 
 
@@ -2681,10 +2951,6 @@ class ProviderLimitError(Exception):
     -- the limit outlives any retry)."""
 
 
-class CompletionFailed(RuntimeError):
-    """Provider invocation exhausted retries without a usable completed answer."""
-
-
 # Deliberately narrow: the whole answer must BE the banner — short, at most two lines, and the
 # limit wording must appear right at the start (Claude's real banner opens with it). A short
 # answer that merely RELAYS or QUOTES a limit phrase mid-sentence stays a normal completion.
@@ -2709,9 +2975,10 @@ def _rough_tokens(s):
 
 
 def session_idle_seconds():
-    if not SESSION["task_name"]:
+    session = _session()
+    if not session["task_name"]:
         return None
-    return time.time() - SESSION["last_activity"]
+    return time.time() - session["last_activity"]
 
 
 def session_expired():
@@ -2723,15 +2990,1011 @@ def session_expired():
     return idle is None or idle > CFG.session_ttl
 
 
+# --------------------------------------------------------------------------------------------
+# Provider/CLI failure -> HTTP status. The core records every failed turn in the task meta:
+# state (error/limited/silent), exit (124 timeout, 125 silent, 126 provider failure) and
+# failure_json {category, reason}; `reason` is the provider's own (already redacted) error
+# payload, e.g. opencode's APIError JSON with statusCode 403 and a FreeTierError body.
+_STATUS_IN_TEXT_RE = re.compile(r"(?:status(?:[ _]?code)?|http)[\s\"'=:]+([1-5]\d\d)\b", re.I)
+_FORBIDDEN_RE = re.compile(r"forbidden|permission|not allowed|access denied|free[ _-]?tier|"
+                           r"can only be used from|not available in your|unsupported (?:country|region)",
+                           re.I)
+_BILLING_RE = re.compile(r"payment required|insufficient[ _-]?(?:credit|funds|balance)|billing|"
+                         r"credit balance|out of credits|top[ -]?up|add (?:more )?credits", re.I)
+_AUTH_RE = re.compile(r"unauthori[sz]ed|invalid[ _-]?api[ _-]?key|authentication (?:failed|error|"
+                      r"required)|not logged in|please (?:run /?)?log ?in|token (?:has )?expired|"
+                      r"session expired", re.I)
+_LIMIT_RE = re.compile(r"rate[ _-]?limit|ratelimit|too many requests|usage limit|quota|"
+                       r"hit your (?:session|usage|weekly) limit", re.I)
+_MODEL_RE = re.compile(r"model_not_found|unrecognized_model|unknown model|issue with the selected "
+                       r"model|model[^\n]{0,80}(?:not found|unavailable|does not exist|not supported)",
+                       re.I)
+_BAD_REQUEST_RE = re.compile(r"bad request|invalid_request|context[_ ]length|maximum context|"
+                             r"prompt is too long|request too large", re.I)
+_UNAVAILABLE_RE = re.compile(r"service unavailable|overloaded|temporarily unavailable", re.I)
+_NETWORK_RE = re.compile(r"econnreset|econnrefused|etimedout|eai_again|enotfound|socket hang up|"
+                         r"network error|connection (?:reset|refused)|fetch failed", re.I)
+_CLI_MISSING_RE = re.compile(r"CLI not found|is not recognized as an internal or external command|"
+                             r"No such file or directory", re.I)
+_RETRY_AFTER_RE = re.compile(
+    r"(?:retry[- _]after|resets?\s+in|reset\s+in|try again in|available again in|retry in)"
+    r"[\s\"':=]*((?:\d+(?:\.\d+)?\s*(?:ms|milliseconds?|seconds?|secs?|s|minutes?|mins?|m|hours?|"
+    r"hrs?|h|days?|d)?\s*,?\s*(?:and\s+)?){1,3})", re.I)
+_DURATION_PART_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z]*)", re.I)
+
+
+def _redact_text(text):
+    try:
+        from activity import redact
+        return redact(text)
+    except Exception:  # redaction is best-effort here; the core already redacted `reason`
+        return text
+
+
+def _retry_after_seconds(text):
+    """Seconds from "retry after 30s" / "resets in 2h 5m" / a Retry-After header in the payload."""
+    match = _RETRY_AFTER_RE.search(text or "")
+    if not match:
+        return None
+    total = 0.0
+    for number, unit in _DURATION_PART_RE.findall(match.group(1)):
+        unit = unit.lower()
+        scale = (0.001 if unit.startswith("ms") or unit.startswith("milli")
+                 else 60 if unit.startswith("m") else 3600 if unit.startswith("h")
+                 else 86400 if unit.startswith("d") else 1)
+        total += float(number) * scale
+    if total <= 0:
+        return None
+    return int(min(86400, max(1, round(total))))
+
+
+def _provider_error_details(reason):
+    """(message, http status, provider isRetryable, provider error type) from an error payload:
+    the opencode/AI-SDK APIError JSON, an OpenAI-style {"error": {...}} body, or plain text."""
+    found = {"message": "", "status": None, "retryable": None, "kind": ""}
+
+    def walk(value, depth=0):
+        if depth > 6:
+            return
+        if isinstance(value, str):
+            text = value.strip()
+            if text[:1] in "{[":
+                try:
+                    walk(json.loads(text), depth + 1)
+                except ValueError:
+                    pass
+            return
+        if isinstance(value, list):
+            for item in value[:5]:
+                walk(item, depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+        for key in ("statusCode", "status", "status_code", "code"):
+            number = value.get(key)
+            if isinstance(number, bool):
+                continue
+            if isinstance(number, str) and number.isdigit():
+                number = int(number)
+            if found["status"] is None and isinstance(number, int) and 100 <= number <= 599:
+                found["status"] = number
+        if found["retryable"] is None and isinstance(value.get("isRetryable"), bool):
+            found["retryable"] = value["isRetryable"]
+        kind = value.get("type")
+        if not found["kind"] and isinstance(kind, str) and kind and kind != "error":
+            found["kind"] = kind
+        message = value.get("message")
+        if not found["message"] and isinstance(message, str) and message.strip():
+            found["message"] = message.strip()
+        for key in ("data", "error", "responseBody", "body", "detail"):
+            if key in value:
+                walk(value[key], depth + 1)
+
+    walk(reason)
+    if not found["message"] and isinstance(reason, str):
+        found["message"] = reason.strip()
+    return found["message"], found["status"], found["retryable"], found["kind"]
+
+
+def _error_summary(engine, message, status=None, kind=""):
+    text = _redact_text(" ".join(str(message or "").split()))[:700]
+    extras = []
+    if status:
+        extras.append("provider HTTP %d" % status)
+    if kind and kind not in text:
+        extras.append(kind)
+    return "%s: %s%s" % (engine or "provider", text or "provider failure",
+                         " (%s)" % ", ".join(extras) if extras else "")
+
+
+def classify_failure_outcome(engine, meta=None, outcome=None, raw_text=""):
+    """Map one failed CLI turn to a BridgeError (or ClientDisconnected) -- see ERRORS above.
+
+    Inputs: the task meta the core wrote (state/exit/failure_json/reason), the bridge's own
+    run outcome (watchdog flags, wrapper stderr) and the answer text. Only provider/wrapper error
+    text is pattern-matched; the model's answer never is (except for the exact limit banner)."""
+    meta = meta or {}
+    outcome = outcome or {}
+    if outcome.get("cancelled"):
+        return ClientDisconnected("client disconnected; the CLI run was cancelled")
+    state = str(meta.get("state") or "")
+    exit_code = str(meta.get("exit") or "")
+    try:
+        failure = json.loads(meta.get("failure_json") or "{}")
+    except (TypeError, ValueError):
+        failure = {}
+    if not isinstance(failure, dict):
+        failure = {}
+    category = str(failure.get("category") or "")
+    reason = str(failure.get("reason") or meta.get("reason") or outcome.get("error") or "")
+    stderr = str(outcome.get("stderr") or "")
+    engine = engine or "provider"
+    if (outcome.get("stalled") or state == "silent" or exit_code == "125"
+            or category == "watchdog_silence"):
+        quiet = _stall_seconds() or meta.get("silence") or "the configured"
+        return CompletionFailed("%s produced no output for %s seconds (stream watchdog, --stall-timeout);"
+                           " its CLI process tree was stopped" % (engine, quiet),
+                           status=504, code="provider_stalled", retryable=True)
+    if outcome.get("timed_out") or exit_code == "124" or category == "watchdog_timeout":
+        return CompletionFailed("%s did not finish within --timeout %s seconds; its CLI process tree was"
+                           " stopped" % (engine, getattr(CFG, "timeout", "?")),
+                           status=504, code="provider_timeout", retryable=True)
+    message, status, provider_retryable, kind = _provider_error_details(reason)
+    if status is None:
+        found = _STATUS_IN_TEXT_RE.search(reason)
+        status = int(found.group(1)) if found else None
+    evidence = " ".join((reason, message, kind))
+    summary = _error_summary(engine, message or reason, status, kind)
+    retry_after = _retry_after_seconds(reason)
+
+    def error(http, code, error_type, retryable, internal=False):
+        return CompletionFailed(summary, status=http, error_type=error_type, code=code,
+                           retryable=retryable, retry_after=retry_after if http == 429 else None,
+                           internal_retry=internal and provider_retryable is not False)
+
+    billing = bool(_BILLING_RE.search(evidence))
+    if status == 401:
+        return error(401, "provider_auth_failed", "authentication_error", False)
+    if status == 402 or (billing and (status == 429 or category == "quota" or state == "limited")):
+        return error(402, "provider_billing", "insufficient_quota", False)
+    if status == 403:
+        return error(403, "provider_forbidden", "permission_error", False)
+    if status == 404 or (status in (400, 422) and _MODEL_RE.search(evidence)):
+        return error(404, "model_not_found", "invalid_request_error", False)
+    if status == 429 or state == "limited" or category == "quota":
+        return error(429, "rate_limit_exceeded", "rate_limit_error", True)
+    if status == 408 or status == 504:
+        return error(504, "provider_timeout", "server_error", True)
+    if status in (400, 413, 422):
+        return error(400, "provider_bad_request", "invalid_request_error", False)
+    if status in (503, 529):
+        return error(503, "provider_unavailable", "server_error", True, internal=True)
+    if status is not None and status >= 500:
+        return error(502, "provider_failed", "server_error", True, internal=True)
+    if category == "auth":
+        if _FORBIDDEN_RE.search(evidence):
+            return error(403, "provider_forbidden", "permission_error", False)
+        return error(401, "provider_auth_failed", "authentication_error", False)
+    if category == "model_unavailable":
+        return error(404, "model_not_found", "invalid_request_error", False)
+    if category in ("network", "tls"):
+        return error(503, "provider_unavailable", "server_error", True, internal=True)
+    if category == "transport":
+        if _UNAVAILABLE_RE.search(evidence):
+            return error(503, "provider_unavailable", "server_error", True, internal=True)
+        return error(502, "provider_failed", "server_error", True, internal=True)
+    if category == "provider_oom":
+        return error(502, "provider_crashed", "server_error", True, internal=True)
+    if category == "cancelled":
+        return error(503, "provider_cancelled", "server_error", True)
+    if _CLI_MISSING_RE.search(stderr):
+        return CompletionFailed(_error_summary(engine, stderr.strip().splitlines()[-1]),
+                           status=503, code="provider_unavailable", retryable=False)
+    if looks_like_limit_banner(raw_text):
+        return CompletionFailed(_error_summary(engine, raw_text.strip()), status=429,
+                           error_type="rate_limit_error", code="rate_limit_exceeded",
+                           retryable=True, retry_after=_retry_after_seconds(raw_text))
+    if reason:
+        if _FORBIDDEN_RE.search(evidence) and _AUTH_RE.search(evidence) is None:
+            return error(403, "provider_forbidden", "permission_error", False)
+        if _AUTH_RE.search(evidence):
+            return error(401, "provider_auth_failed", "authentication_error", False)
+        if billing:
+            return error(402, "provider_billing", "insufficient_quota", False)
+        if _LIMIT_RE.search(evidence):
+            return error(429, "rate_limit_exceeded", "rate_limit_error", True)
+        if _MODEL_RE.search(evidence):
+            return error(404, "model_not_found", "invalid_request_error", False)
+        if _BAD_REQUEST_RE.search(evidence):
+            return error(400, "provider_bad_request", "invalid_request_error", False)
+        if _NETWORK_RE.search(evidence) or _UNAVAILABLE_RE.search(evidence):
+            return error(503, "provider_unavailable", "server_error", True, internal=True)
+        return error(502, "provider_failed", "server_error", True, internal=True)
+    if state in ("", "done", "waiting") and not raw_text.strip():
+        return CompletionFailed("%s returned an empty answer" % engine, status=502,
+                           code="empty_completion", retryable=True, internal_retry=True)
+    detail = stderr.strip().splitlines()[-1] if stderr.strip() else ""
+    exit_text = exit_code or (str(outcome.get("returncode")) if outcome.get("returncode") else "")
+    return CompletionFailed(_error_summary(engine, detail or "the CLI turn failed (state=%s exit=%s)"
+                                      % (state or "unknown", exit_text or "?")),
+                       status=502, code="provider_failed", retryable=True, internal_retry=True)
+
+
+def _resume_failure(engine, name):
+    """After a failed `reply`: the mapped error when a fresh-run fallback would only repeat it
+    (auth/limit/model refusals, a stall/timeout, a cancelled client) -- else None (fall back)."""
+    outcome = getattr(_CTX, "last_run", None) or {}
+    meta = read_meta(name)
+    if (meta.get("state") not in ("error", "limited", "silent")
+            and not any(outcome.get(key) for key in ("cancelled", "stalled", "timed_out"))):
+        return None
+    failure = classify_failure_outcome(engine, meta, outcome)
+    if isinstance(failure, ClientDisconnected) or not failure.internal_retry:
+        return failure
+    return None
+
+
+def _log_incident(error, route=None, kind="provider"):
+    incident = uuid.uuid4().hex[:12]
+    LOG.warning("%s incident %s status=%s code=%s model=%s retryable=%s: %s", kind, incident,
+                getattr(error, "status", "?"), getattr(error, "code", "?"),
+                getattr(route, "id", "?"), getattr(error, "retryable", "?"),
+                " ".join(str(error).split())[:800])
+    return incident
+
+
+# --------------------------------------------------------------------------------------------
+# Routing: one process can serve several engine/model routes (see ROUTING in the docstring).
+ROUTES = []            # configured routes; ROUTES[0] is the default
+_DYNAMIC_ROUTES = {}   # --allow-any routes created on demand, keyed by lower-cased request id
+_ROUTES_LOCK = threading.Lock()
+_CFG_ROUTE = {}
+MAX_DYNAMIC_ROUTES = 32
+_ROUTE_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
+
+
+def route_id(engine, model="", effort=""):
+    """The id a client sends as `model`: engine/model[@effort]. A model id that already carries
+    its own provider segment (opencode's "opencode/x") is not double-prefixed."""
+    model = model or ""
+    if engine and model.startswith(engine + "/"):
+        base = model
+    else:
+        base = "%s/%s" % (engine, model or "default")
+    return base + ("@" + effort if effort else "")
+
+
+class Route:
+    """One routable engine/model/effort plus its live readiness for /health."""
+
+    def __init__(self, engine, model="", effort="", dynamic=False, variant_of=None):
+        self.engine = engine or ""
+        self.model = model or ""
+        self.effort = effort or ""
+        self.dynamic = dynamic
+        self.variant_of = variant_of  # the configured route a per-request reasoning effort derives from
+        self.variants = {}
+        self.id = route_id(self.engine, self.model, self.effort)
+        self._label = None
+        self._applied_effort = None
+        self._stats_lock = threading.Lock()
+        self.state = "unknown"
+        self.last_error = None
+        self.last_ok_at = None
+        self.requests = 0
+        self.failures = 0
+
+    @property
+    def label(self):
+        if self._label is None:
+            try:
+                self._label = model_label(self.engine, self.model, self.effort)
+            except ValueError:
+                self._label = self.id
+        return self._label
+
+    def keys(self):
+        label = self.label
+        keys = {self.id, label, route_id(self.engine, self.model)}
+        if self.effort and label.endswith(" (%s)" % self.effort):
+            keys.add(label[:-len(" (%s)" % self.effort)])
+        return {key.lower() for key in keys if key}
+
+    def bare_keys(self):
+        keys = {self.model} if self.model else set()
+        if self.model.startswith(self.engine + "/"):
+            keys.add(self.model[len(self.engine) + 1:])
+        return {key.lower() for key in keys if key}
+
+    def mark_probing(self):
+        with self._stats_lock:
+            self.state = "probing"
+
+    def mark_ok(self):
+        with self._stats_lock:
+            self.state, self.last_ok_at = "ok", time.time()
+            self.requests += 1
+
+    def mark_error(self, error):
+        with self._stats_lock:
+            self.state = "error"
+            self.requests += 1
+            self.failures += 1
+            self.last_error = {"status": getattr(error, "status", 500),
+                               "code": getattr(error, "code", "bridge_error"),
+                               "message": " ".join(str(error).split())[:500],
+                               "retryable": bool(getattr(error, "retryable", False)),
+                               "at": int(time.time())}
+
+    @property
+    def supports_effort(self):
+        return bool((PROVIDERS.get(self.engine) or {}).get("efforts"))
+
+    @property
+    def applied_effort(self):
+        """The effort the CLI actually receives: the configured/requested one, or the provider's
+        own default when none is set (codex: medium, claude sonnet: high) -- None when unknown."""
+        if self._applied_effort is None:
+            effort = self.effort
+            try:
+                if self.engine == "claude":
+                    effort = resolve_claude_model(self.model, self.effort)[1]
+                elif self.engine in PROVIDERS:
+                    from neoxider_agents.providers import get_provider
+                    effort = get_provider(self.engine).resolve(self.model, self.effort)[1]
+            except Exception:  # unknown/stub engine or alias: report what was configured
+                effort = self.effort
+            self._applied_effort = effort or ""
+        return self._applied_effort or None
+
+    def describe(self, default=False):
+        with self._stats_lock:
+            ready = {"ok": True, "error": False}.get(self.state)
+            return {"id": self.id, "label": self.label, "engine": self.engine,
+                    "model": self.model, "effort": self.effort, "default": default,
+                    "applied_effort": self.applied_effort if self.supports_effort else None,
+                    "effort_supported": self.supports_effort,
+                    "variant_of": self.variant_of.id if self.variant_of is not None else None,
+                    "dynamic": self.dynamic, "state": self.state, "ready": ready,
+                    "requests": self.requests, "failures": self.failures,
+                    "last_ok_at": int(self.last_ok_at) if self.last_ok_at else None,
+                    "last_error": dict(self.last_error) if self.last_error else None}
+
+
+def parse_model_spec(spec, effort=""):
+    """`engine/model[@effort]` -> Route, or None when `spec` does not start with a known engine.
+
+    `@effort` is split off only when it is one of that provider's advertised efforts. An OpenCode
+    Zen id written without its provider segment ("opencode/space-bunny-free") keeps it, because
+    `opencode run -m` needs provider/model; a bundled alias ("opencode/muse") stays an alias."""
+    spec = (spec or "").strip()
+    head, sep, rest = spec.partition("/")
+    if not sep or head not in PROVIDERS or not rest:
+        return None
+    model = rest
+    base, at, suffix = model.rpartition("@")
+    if at and base and suffix in (PROVIDERS[head].get("efforts") or ()):
+        model, effort = base, suffix
+    if head == "opencode" and "/" not in model and model not in (PROVIDERS[head].get("models") or ()):
+        model = "opencode/" + model
+    return Route(head, model, effort)
+
+
+def build_routes(engine, specs, effort="", engine_explicit=False):
+    """The configured routes, default first. One spec keeps the historic `-e X -m Y` meaning
+    exactly (the model goes to the CLI verbatim) unless it names its own engine; several specs
+    each select a route, and bare ones use `-e` (default codex)."""
+    if not specs:
+        return [Route(engine, "", effort)]
+    if len(specs) == 1:
+        parsed = parse_model_spec(specs[0], effort)
+        if parsed is None or (engine_explicit and (parsed.engine != engine or engine == "opencode")):
+            return [Route(engine, specs[0], effort)]
+        return [parsed]
+    routes, seen = [], set()
+    for spec in specs:
+        route = parse_model_spec(spec, effort) or Route(engine, spec, effort)
+        if route.id not in seen:
+            seen.add(route.id)
+            routes.append(route)
+    return routes
+
+
+def _cfg_route():
+    """The route equivalent of a historic single-model CFG (unit tests, imports by gui.py)."""
+    model = getattr(CFG, "model", "") or ""
+    if isinstance(model, list):
+        model = model[0] if model else ""
+    key = (getattr(CFG, "engine", "") or "", model, getattr(CFG, "effort", "") or "")
+    if _CFG_ROUTE.get("key") != key:
+        _CFG_ROUTE["key"], _CFG_ROUTE["route"] = key, Route(*key)
+    return _CFG_ROUTE["route"]
+
+
+def _routes():
+    return ROUTES or [_cfg_route()]
+
+
+def _all_routes():
+    with _ROUTES_LOCK:
+        dynamic = [route for key, route in _DYNAMIC_ROUTES.items() if key == route.id.lower()]
+    return _routes() + dynamic
+
+
+def _route():
+    """The route of the current CLI turn; the default route outside a request."""
+    route = getattr(_CTX, "route", None)
+    if route is not None:
+        return route
+    return _routes()[0]
+
+
+def _strict_models():
+    strict = getattr(CFG, "strict_models", None)
+    if strict is not None:
+        return bool(strict)
+    return len(_routes()) > 1 or bool(getattr(CFG, "allow_any", False))
+
+
+def _dynamic_route(spec):
+    """--allow-any: a route for any `engine/model` of a known engine, created on first use."""
+    route = parse_model_spec(spec)
+    if route is None or not _ROUTE_MODEL_RE.match(route.model) or route.model.startswith("-"):
+        return None
+    if route.engine == "claude":
+        try:
+            resolve_claude_model(route.model, route.effort)
+        except ValueError:
+            return None
+    route.dynamic = True
+    with _ROUTES_LOCK:
+        existing = _DYNAMIC_ROUTES.get(route.id.lower())
+        if existing is not None:
+            _DYNAMIC_ROUTES[spec.lower()] = existing
+            return existing
+        if len({r.id for r in _DYNAMIC_ROUTES.values()}) >= MAX_DYNAMIC_ROUTES:
+            return None
+        _DYNAMIC_ROUTES[route.id.lower()] = route
+        _DYNAMIC_ROUTES[spec.lower()] = route
+    LOG.warning("added on-demand route %s (--allow-any)", route.id)
+    return route
+
+
+def resolve_route(requested):
+    """The route a request's `model` field selects (see ROUTING in the module docstring)."""
+    routes = _routes()
+    if requested is None or (isinstance(requested, str) and not requested.strip()):
+        return routes[0]
+    if not isinstance(requested, str):
+        raise RequestValidationError("model", "must be a string")
+    key = requested.strip().lower()
+    for route in routes:
+        if key in route.keys():
+            return route
+    bare = [route for route in routes if key in route.bare_keys()]
+    if len(bare) == 1:
+        return bare[0]
+    with _ROUTES_LOCK:
+        known = _DYNAMIC_ROUTES.get(key)
+    if known is not None:
+        return known
+    base, at, suffix = key.rpartition("@")
+    if at and base and suffix in EFFORT_LEVELS:
+        # `codex/6-luna@high` for a configured `codex/6-luna`: the effort variant of that route.
+        for route in routes:
+            if base in route.keys() or base in route.bare_keys():
+                return route_for_effort(route, suffix)[0]
+    if getattr(CFG, "allow_any", False):
+        route = _dynamic_route(requested.strip())
+        if route is not None:
+            return route
+    if _strict_models():
+        raise BridgeError("model '%s' is not served by this bridge; available: %s"
+                          % (requested.strip()[:120], ", ".join(r.id for r in routes)),
+                          status=404, error_type="invalid_request_error", code="model_not_found",
+                          param="model")
+    return routes[0]
+
+
+# Reasoning effort per request (OpenAI `reasoning_effort`, or `reasoning: {"effort": ...}`).
+EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def requested_effort(body):
+    """The request's reasoning effort, lower-cased, or None when absent. 400 when malformed."""
+    value = body.get("reasoning_effort")
+    param = "reasoning_effort"
+    if value is None and isinstance(body.get("reasoning"), dict):
+        value, param = body["reasoning"].get("effort"), "reasoning.effort"
+    if value is None:
+        return None
+    if not isinstance(value, str) or value.strip().lower() not in EFFORT_LEVELS:
+        raise RequestValidationError(param, "must be one of %s" % ", ".join(EFFORT_LEVELS))
+    return value.strip().lower()
+
+
+def _nearest_effort(wanted, supported):
+    """The supported level closest to `wanted` on the none..max scale; ties go to the cheaper one."""
+    rank = {level: index for index, level in enumerate(EFFORT_LEVELS)}
+    known = [level for level in supported if level in rank] or list(supported)
+    if wanted in known or not known:
+        return wanted
+    return min(known, key=lambda level: (abs(rank.get(level, 0) - rank[wanted]), rank.get(level, 0)))
+
+
+def route_for_effort(route, wanted):
+    """(route, info): the route variant one conversation runs on for a requested effort.
+
+    The effort is part of a conversation's identity: a different effort is a different route id
+    (`codex/6-luna@high`), so it never resumes a session that was started with another effort.
+    A level the engine does not advertise (provider.json "efforts") is clamped to the nearest one
+    it does -- reported, never silent; an engine without an effort setting ignores the field."""
+    supported = list((PROVIDERS.get(route.engine) or {}).get("efforts") or ())
+    info = {"requested": wanted, "supported": bool(supported), "clamped": False,
+            "source": "request" if wanted else "default"}
+    if not wanted or not supported:
+        info["applied"] = route.applied_effort if supported else None
+        if wanted and not supported:
+            info["note"] = "%s has no reasoning-effort setting; the requested effort was ignored" % (
+                route.engine or "this engine")
+        return route, info
+    effort = _nearest_effort(wanted, supported)
+    info["clamped"] = effort != wanted
+    if info["clamped"]:
+        info["note"] = "%s supports %s; %s was clamped to %s" % (
+            route.engine, "/".join(supported), wanted, effort)
+    base = route.variant_of or route
+    if effort == base.effort:
+        variant = base
+    else:
+        with _ROUTES_LOCK:
+            variant = base.variants.get(effort)
+            if variant is None:
+                wanted_id = route_id(base.engine, base.model, effort)
+                variant = next((r for r in _routes() if r.id == wanted_id), None)
+                if variant is None:
+                    variant = Route(base.engine, base.model, effort, dynamic=base.dynamic,
+                                    variant_of=base)
+                base.variants[effort] = variant
+    info["applied"] = variant.applied_effort
+    return variant, info
+
+
+def _effort_routes():
+    """Configured/dynamic routes followed by the effort variants requests have created."""
+    routes = _all_routes()
+    with _ROUTES_LOCK:
+        variants = [v for r in routes for v in r.variants.values() if v.variant_of is r]
+    return routes + variants
+
+
+def _response_metadata(route):
+    """The `neoxider` object in every completion: what actually ran, for benchmark reports."""
+    info = getattr(_CTX, "effort", None) or {}
+    session = getattr(_CTX, "session", None)
+    base = route.variant_of or route
+    return {"route": route.id, "base_route": base.id, "engine": route.engine,
+            "model": route.model, "label": route.label,
+            "reasoning_effort": info.get("applied", route.applied_effort if route.supports_effort else None),
+            "reasoning_effort_requested": info.get("requested"),
+            "reasoning_effort_source": info.get("source", "default"),
+            "reasoning_effort_supported": info.get("supported", route.supports_effort),
+            "reasoning_effort_clamped": info.get("clamped", False),
+            "reasoning_effort_note": info.get("note"),
+            "session": getattr(session, "id", None)}
+
+
+# --------------------------------------------------------------------------------------------
+# The session pool: independent conversations, each with its own CLI session (see THE SESSION
+# MODEL in the module docstring).
+DEFAULT_MAX_CONCURRENCY = 8
+DEFAULT_MAX_QUEUE = 64
+DEFAULT_QUEUE_TIMEOUT = 300
+DEFAULT_MAX_SESSIONS = 64
+
+
+class Session(dict):
+    """One conversation: its remembered `messages`, CLI task (`task_name` -> its own log/meta and
+    provider session id), scratch dir and, for claude, its own persistent native process.
+    dict-shaped so the session-model code reads it exactly like the historic module SESSION."""
+
+    __hash__ = object.__hash__
+
+    def __init__(self, route):
+        super().__init__(task_name=None, messages=[], dir=None, last_activity=0.0)
+        self.id = uuid.uuid4().hex[:10]
+        self.route = route
+        self.turn_lock = threading.Lock()   # one turn of this conversation at a time
+        self.state_lock = threading.Lock()  # the historic SESSION_LOCK, per conversation
+        self.native = _new_native_state()
+        self.created = self.last_used = time.time()
+        self.busy = False
+        self.closed = False
+        self.turns = 0
+
+    def __eq__(self, other):
+        return self is other
+
+    def __ne__(self, other):
+        return self is not other
+
+    def describe(self, now=None, detail=False):
+        """Bookkeeping only -- never message content."""
+        now = now or time.time()
+        task = self.get("task_name")
+        info = {"id": self.id, "model": self.route.id, "turns": self.turns,
+                "messages": len(self.get("messages") or ()), "busy": self.busy,
+                "resumable": bool(task), "idle_seconds": int(max(0, now - self.last_used)),
+                "age_seconds": int(max(0, now - self.created))}
+        if detail:
+            info["task"] = task if task and task != CLAUDE_NATIVE_TASK else None
+            info["native_process"] = task == CLAUDE_NATIVE_TASK
+            info["cli_session"] = (read_meta(task).get("session") or None) if info["task"] else None
+            info["dir"] = self.get("dir")
+        return info
+
+
+def _cfg_int(name, default, minimum=0):
+    try:
+        value = getattr(CFG, name, None)
+        return max(minimum, int(default if value is None else value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _close_session(session, reason, quiet=False):
+    """Release one evicted conversation: its native process and its own scratch dir."""
+    session.closed = True
+    try:
+        _native_kill_state(session.native)
+    except Exception:
+        LOG.exception("could not stop the native process of session %s", session.id)
+    directory = session.get("dir")
+    pinned = getattr(CFG, "dir", "") or ""
+    if (directory and directory != pinned
+            and os.path.basename(directory).startswith("session-")
+            and os.path.basename(os.path.dirname(directory)) == "neoxider-openai-bridge"):
+        shutil.rmtree(directory, ignore_errors=True)
+    log = LOG.debug if quiet else LOG.warning
+    log("evicted session %s (model %s, %d turn(s), idle %ds): %s", session.id, session.route.id,
+        session.turns, int(time.time() - session.last_used), reason)
+
+
+class SessionPool:
+    """Conversation sessions plus the global/per-engine concurrency slots and wait queue."""
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.sessions = {}
+        self.active = 0
+        self.engine_active = {}
+        self.waiting = 0
+        self.evicted = 0
+        self.rejected = 0
+
+    @staticmethod
+    def _deadline(timeout):
+        if timeout is None:
+            timeout = _cfg_int("queue_timeout", DEFAULT_QUEUE_TIMEOUT)
+        return time.monotonic() + max(0, timeout)
+
+    def _expired_locked(self, now):
+        ttl = _cfg_int("session_ttl", 1800)
+        doomed = []
+        for session in list(self.sessions.values()):
+            if session.busy:
+                continue
+            if session.closed:
+                doomed.append((session, "closed", True))
+            elif ttl and now - session.last_used > ttl:
+                doomed.append((session, "idle longer than --session-ttl %ds" % ttl, False))
+        for session, _reason, _quiet in doomed:
+            self.sessions.pop(session.id, None)
+            session.closed = True
+            self.evicted += 1
+        return doomed
+
+    def _capacity_locked(self, keep):
+        limit = _cfg_int("max_sessions", DEFAULT_MAX_SESSIONS, 1)
+        doomed = []
+        while len(self.sessions) > limit:
+            idle = [s for s in self.sessions.values() if not s.busy and s is not keep]
+            if not idle:
+                break  # every other session is active: never evict an active conversation
+            victim = min(idle, key=lambda s: s.last_used)
+            self.sessions.pop(victim.id, None)
+            victim.closed = True
+            self.evicted += 1
+            doomed.append((victim, "capacity --max-sessions %d (least recently used idle session)"
+                           % limit, False))
+        return doomed
+
+    @staticmethod
+    def _close_all(doomed):
+        for session, reason, quiet in doomed:
+            _close_session(session, reason, quiet)
+
+    def evict(self):
+        """TTL eviction pass (also run by the janitor thread)."""
+        with self.cond:
+            doomed = self._expired_locked(time.time())
+        self._close_all(doomed)
+        return len(doomed)
+
+    def checkout(self, route, messages, cancel=None, timeout=None):
+        """The conversation `messages` continues (longest exact-prefix match on this route), with
+        its turn lock held -- or a brand-new session. Waits for an in-flight turn of the same
+        conversation; never hands one conversation's session to another."""
+        deadline = self._deadline(timeout)
+        excluded = set()
+        while True:
+            chosen = target = None
+            with self.cond:
+                doomed = self._expired_locked(time.time())
+                candidates = [
+                    s for s in self.sessions.values()
+                    if not s.closed and s.id not in excluded and s.route.id == route.id
+                    and s["messages"] and is_extension(s["messages"], messages)]
+                candidates.sort(key=lambda s: (-len(s["messages"]), s.busy, -s.last_used))
+                for session in candidates:
+                    if session.turn_lock.acquire(blocking=False):
+                        chosen = session
+                        break
+                if chosen is None and not candidates:
+                    chosen = Session(route)
+                    chosen.turn_lock.acquire()
+                    self.sessions[chosen.id] = chosen
+                    doomed += self._capacity_locked(chosen)
+                if chosen is not None:
+                    chosen.busy = True
+                    chosen.last_used = time.time()
+                else:
+                    target = candidates[0]
+                    self.waiting += 1
+            self._close_all(doomed)
+            if chosen is not None:
+                return chosen
+            got = False
+            try:
+                while not got:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    if cancel is not None and cancel.is_set():
+                        raise ClientDisconnected("client disconnected while queued")
+                    got = target.turn_lock.acquire(timeout=min(0.5, remaining))
+            finally:
+                with self.cond:
+                    self.waiting -= 1
+            if not got:
+                with self.cond:
+                    self.rejected += 1
+                raise BridgeError("timed out waiting for the previous turn of this conversation "
+                                  "(--queue-timeout)", status=503, code="bridge_busy",
+                                  retryable=True, retry_after=5)
+            with self.cond:
+                still = (not target.closed and target.id in self.sessions
+                         and is_extension(target["messages"], messages))
+                if still:
+                    target.busy = True
+                    target.last_used = time.time()
+                    return target
+                target.turn_lock.release()
+                excluded.add(target.id)
+
+    def checkin(self, session, discard=False):
+        doomed = []
+        with self.cond:
+            session.busy = False
+            session.last_used = time.time()
+            if discard or session.closed or not session["messages"]:
+                # A probe, a reset-while-busy, or a first turn that never produced a transcript:
+                # nothing a later request could continue, so it goes now (not a live conversation).
+                if self.sessions.pop(session.id, None) is not None or not session.closed:
+                    doomed.append((session, "discarded after its turn", True))
+                session.closed = True
+            session.turn_lock.release()
+            self.cond.notify_all()
+        self._close_all(doomed)
+
+    def acquire_slot(self, route, cancel=None, timeout=None):
+        """One of --max-concurrency global slots and the route engine's --engine-limit slots."""
+        deadline = self._deadline(timeout)
+        maximum = _cfg_int("max_concurrency", DEFAULT_MAX_CONCURRENCY)
+        engine_limit = (getattr(CFG, "engine_limits", None) or {}).get(route.engine)
+        engine = route.engine
+
+        def free():
+            return ((not maximum or self.active < maximum)
+                    and (not engine_limit or self.engine_active.get(engine, 0) < engine_limit))
+
+        with self.cond:
+            if not free():
+                if self.waiting >= _cfg_int("max_queue", DEFAULT_MAX_QUEUE):
+                    self.rejected += 1
+                    raise BridgeError("bridge queue is full (%d requests waiting); retry later"
+                                      % self.waiting, status=503, code="bridge_busy",
+                                      retryable=True, retry_after=5)
+                self.waiting += 1
+                try:
+                    while not free():
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            self.rejected += 1
+                            raise BridgeError(
+                                "no free slot within --queue-timeout (max-concurrency %s, %s limit"
+                                " %s); retry later" % (maximum or "unlimited", engine,
+                                                        engine_limit or "none"),
+                                status=503, code="bridge_busy", retryable=True, retry_after=5)
+                        if cancel is not None and cancel.is_set():
+                            raise ClientDisconnected("client disconnected while queued")
+                        self.cond.wait(min(0.5, remaining))
+                finally:
+                    self.waiting -= 1
+            self.active += 1
+            self.engine_active[engine] = self.engine_active.get(engine, 0) + 1
+
+    def release_slot(self, route):
+        with self.cond:
+            self.active = max(0, self.active - 1)
+            self.engine_active[route.engine] = max(0, self.engine_active.get(route.engine, 0) - 1)
+            self.cond.notify_all()
+
+    def reset(self, route_id=None):
+        """Forget every (or one route's) conversation; a busy one is dropped when its turn ends."""
+        doomed = []
+        with self.cond:
+            for session in list(self.sessions.values()):
+                if route_id and session.route.id != route_id:
+                    continue
+                session.closed = True
+                if not session.busy:
+                    self.sessions.pop(session.id, None)
+                    doomed.append((session, "POST /reset", False))
+        self._close_all(doomed)
+        return len(doomed)
+
+    def close_all(self):
+        with self.cond:
+            doomed = [(s, "bridge shutdown", True) for s in self.sessions.values()]
+            self.sessions.clear()
+        self._close_all(doomed)
+
+    def list_sessions(self):
+        with self.cond:
+            return list(self.sessions.values())
+
+    def snapshot(self):
+        with self.cond:
+            return {"active_slots": self.active, "engine_active": dict(self.engine_active),
+                    "queue_depth": self.waiting, "evicted": self.evicted,
+                    "rejected": self.rejected}
+
+
+POOL = SessionPool()
+
+
+@contextlib.contextmanager
+def _conversation(route, messages, cancel=None, discard=False):
+    """Bind one request to its pooled session and a concurrency slot for the CLI turn."""
+    session = POOL.checkout(route, messages, cancel)
+    try:
+        POOL.acquire_slot(route, cancel)
+        try:
+            saved = (_CTX.session, _CTX.route, _CTX.cancel, _CTX.task, _CTX.last_run)
+            _CTX.session, _CTX.route, _CTX.cancel = session, route, cancel
+            _CTX.task = _CTX.last_run = None
+            try:
+                yield session
+            finally:
+                (_CTX.session, _CTX.route, _CTX.cancel, _CTX.task, _CTX.last_run) = saved
+        finally:
+            POOL.release_slot(route)
+    finally:
+        POOL.checkin(session, discard=discard)
+
+
+class _DisconnectWatch:
+    """Polls the client socket while a turn runs; a closed connection sets `cancel`, which stops
+    the CLI process tree instead of letting an abandoned request burn provider time."""
+
+    def __init__(self, handler, cancel):
+        self.cancel = cancel
+        self.stop_event = threading.Event()
+        sock = getattr(handler, "connection", None)
+        if isinstance(sock, socket.socket):
+            self.sock = sock
+            threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while not self.stop_event.wait(0.5):
+            try:
+                readable, _w, _x = select.select([self.sock], [], [], 0)
+                if not readable:
+                    continue
+                data = self.sock.recv(1, socket.MSG_PEEK)
+            except (OSError, ValueError):
+                data = b""
+            if data == b"":
+                if not self.stop_event.is_set():
+                    self.cancel.set()
+            return  # closed, or the client is sending more bytes (alive): stop watching
+
+    def stop(self):
+        self.stop_event.set()
+
+
+def _model_object(route, default=False):
+    """An OpenAI /v1/models entry plus the label and live readiness of the route."""
+    info = route.describe(default)
+    return {"id": route.id, "object": "model", "created": int(STARTED_AT),
+            "owned_by": "neoxider-agents", "label": info["label"], "engine": route.engine,
+            "default": default, "state": info["state"], "ready": info["ready"],
+            "reasoning_effort": info["applied_effort"],
+            "reasoning_efforts": list((PROVIDERS.get(route.engine) or {}).get("efforts") or ())}
+
+
+def health_payload():
+    """GET /health: per-model readiness, per-conversation sessions (bookkeeping only, never
+    content), queue depth, plus the historic single-session fields."""
+    now = time.time()
+    routes = _all_routes()
+    default = routes[0]
+    sessions = POOL.list_sessions()
+    legacy = [SESSION] if (SESSION.get("task_name") or SESSION.get("messages")) else []
+    every = list(sessions) + legacy
+    latest = max(every, key=lambda s: s.get("last_activity") or 0, default=None)
+    resumable = [s for s in every if s.get("task_name")]
+    idle = min((now - (s.get("last_activity") or now) for s in resumable), default=None)
+    pool = POOL.snapshot()
+    with ACTIVE_LOCK:
+        active_requests = ACTIVE_REQUESTS
+    by_route = {}
+    for session in sessions:
+        by_route[session.route.id] = by_route.get(session.route.id, 0) + 1
+    models = []
+    for index, route in enumerate(_effort_routes()):
+        info = route.describe(index == 0)
+        info["sessions"] = by_route.get(route.id, 0)
+        info["active"] = sum(1 for s in sessions if s.busy and s.route is route)
+        models.append(info)
+    return {
+        "ok": True, "instance_id": INSTANCE_ID, "pid": os.getpid(),
+        "engine": default.engine, "model": default.label, "default_model": default.id,
+        "models": models,
+        "sessions": [s.describe(now) for s in sessions],
+        "session_count": len(sessions),
+        "max_sessions": _cfg_int("max_sessions", DEFAULT_MAX_SESSIONS, 1),
+        "session_active": bool(resumable), "session_turns": len(latest.get("messages") or ()) if latest else 0,
+        "session_idle_seconds": None if idle is None else int(idle),
+        "session_ttl_seconds": getattr(CFG, "session_ttl", None),
+        "timeout_seconds": getattr(CFG, "timeout", None), "retries": getattr(CFG, "retries", None),
+        "stall_timeout_seconds": _stall_seconds(),
+        "busy": active_requests > 0, "active_requests": active_requests,
+        "active_turns": pool["active_slots"], "engine_active": pool["engine_active"],
+        "queue_depth": pool["queue_depth"],
+        "max_concurrency": _cfg_int("max_concurrency", DEFAULT_MAX_CONCURRENCY),
+        "engine_limits": dict(getattr(CFG, "engine_limits", None) or {}),
+        "evicted_sessions": pool["evicted"], "rejected_requests": pool["rejected"],
+        "reasoning_effort_policy": "request reasoning_effort selects the effort per conversation "
+                                   "(part of its session identity); unsupported levels are clamped "
+                                   "to the nearest the engine advertises; engines without effort "
+                                   "support ignore it (effort_supported=false)",
+        "uptime_seconds": int(now - STARTED_AT),
+    }
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, fmt, *a):  # request lines only, DEBUG-gated (opt-in via AGENT_LOG_LEVEL)
         LOG.debug("%s %s", self.address_string(), fmt % a)
 
-    def _send_json(self, code, obj):
+    def _send_json(self, code, obj, headers=None):
         b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(b)))
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(b)
 
@@ -2748,61 +4011,71 @@ class H(BaseHTTPRequestHandler):
         if self._reject_unauthorized():
             return
         p = urllib.parse.urlparse(self.path).path
-        label = model_label(CFG.engine, CFG.model, CFG.effort)
         if p == "/health":
-            # WHY lock-free: a completion holds SESSION_LOCK for its whole CLI call (seconds+),
-            # so acquiring it here would make /health hang for the duration -- and a status probe
-            # (e.g. the GUI's bridge list) would time out and wrongly treat a busy-but-live bridge
-            # as dead. A momentarily inconsistent read of these simple fields is fine for /health.
-            active, turns = bool(SESSION.get("task_name")), len(SESSION.get("messages") or ())
-            with ACTIVE_LOCK:
-                busy = ACTIVE_REQUESTS > 0
-            try:
-                idle = session_idle_seconds()
-            except Exception:
-                idle = None
-            self._send_json(200, {"ok": True, "instance_id": INSTANCE_ID, "engine": CFG.engine,
-                                   "model": label,
-                                   "session_active": active, "session_turns": turns,
-                                   "session_idle_seconds": None if idle is None else int(idle),
-                                   "session_ttl_seconds": CFG.session_ttl,
-                                   "timeout_seconds": CFG.timeout, "retries": CFG.retries,
-                                   "busy": busy, "active_requests": ACTIVE_REQUESTS})
+            # WHY lock-free: a completion holds its session's lock for the whole CLI call
+            # (seconds+); /health must answer instantly so a status probe (the GUI's bridge list,
+            # `openai-server list`) never mistakes a busy-but-live bridge for a dead one.
+            self._send_json(200, health_payload())
         elif p in ("/models", "/v1/models"):
-            self._send_json(200, {"object": "list", "data": [{"id": label, "object": "model", "owned_by": "neoxider-agents"}]})
+            self._send_json(200, {"object": "list", "data": [
+                _model_object(route, index == 0) for index, route in enumerate(_all_routes())]})
+        elif p.startswith(("/models/", "/v1/models/")):
+            wanted = urllib.parse.unquote(p.split("/models/", 1)[1])
+            try:
+                route = resolve_route(wanted)
+            except (BridgeError, RequestValidationError):
+                route = None
+            if route is None or wanted.lower() not in route.keys() | route.bare_keys():
+                return self._send_json(404, BridgeError(
+                    "model '%s' is not served by this bridge" % wanted[:120], status=404,
+                    error_type="invalid_request_error", code="model_not_found",
+                    param="model").payload())
+            self._send_json(200, _model_object(route, route is _routes()[0]))
+        elif p in ("/sessions", "/v1/sessions"):
+            now = time.time()
+            self._send_json(200, {"object": "list", "data": [
+                session.describe(now, detail=True) for session in POOL.list_sessions()]})
         elif p == "/":
-            with SESSION_LOCK:
-                active, turns = bool(SESSION["task_name"]), len(SESSION["messages"])
-            self._send_json(200, {"neoxider_openai_bridge": True, "engine": CFG.engine, "model": label,
+            health = health_payload()
+            self._send_json(200, {"neoxider_openai_bridge": True, "engine": health["engine"],
+                                   "model": health["model"], "models": [m["id"] for m in health["models"]],
                                    "endpoint": "POST .../chat/completions", "reset_endpoint": "POST .../reset",
-                                   "session_active": active, "session_turns": turns})
+                                   "session_active": health["session_active"],
+                                   "session_turns": health["session_turns"]})
         else:
-            self._send_json(404, {"error": {"message": "not found: " + p}})
+            self._send_json(404, {"error": {"message": "not found: " + p, "type": "invalid_request_error",
+                                            "code": "not_found", "param": None}})
 
     def _raw_completion(self, messages, tools, tool_choice="auto", on_delta=None,
                         can_retry=None, on_retry=None):
-        """Implements THE SESSION MODEL (see module docstring): continue the existing CLI
-        session via `agent.sh reply` when `messages` is a deterministic extension of what we
-        saw last time and that session is still healthy; otherwise fall back to a brand-new
-        `agent.sh run` with the full history. Holds SESSION_LOCK for the whole CLI call --
-        by design, this bridge serves one conversation at a time.
+        """Implements THE SESSION MODEL (see module docstring) for the CURRENT conversation:
+        continue its CLI session via `agent.sh reply` when `messages` is a deterministic
+        extension of what it saw last time and that session is still healthy; otherwise fall back
+        to a brand-new `agent.sh run` with the full history. Holds the conversation's own state
+        lock for the whole CLI call -- other conversations are unaffected.
 
         With on_delta set (and the engine live-capable, and --no-live-stream not given), the CLI
         runs in streaming output mode and every new piece of answer text is forwarded to
         on_delta while it generates. can_retry() gates the invisible fallbacks (resume->fresh,
         empty->retry): once deltas have reached the client they cannot be retried silently --
         LiveStreamDied is raised instead so the caller finalizes with what was already sent.
-        on_retry() (if given) resets the caller's incremental state before a permitted retry."""
+        on_retry() (if given) resets the caller's incremental state before a permitted retry.
+
+        A failed turn raises the mapped BridgeError (see classify_failure_outcome); only
+        internally-retryable failures (empty answer, crash, network) are re-run."""
+        route = _route()
+        engine, model, effort = route.engine, route.model, route.effort
         live = (on_delta is not None
-                and (CFG.engine in LIVE_STREAM_ENGINES or _use_opencode_native())
+                and (engine in LIVE_STREAM_ENGINES or _use_opencode_native())
                 and not getattr(CFG, "no_live_stream", False))
         if _use_claude_native():
             return _claude_native_raw(messages, tools, tool_choice, on_delta,
                                       can_retry, on_retry, live)
         retry_ok = can_retry or (lambda: True)
-        with SESSION_LOCK:
-            supports_resume = bool((PROVIDERS.get(CFG.engine) or {}).get("supports_resume"))
-            prev_name = SESSION["task_name"]
+        session = _session()
+        with _session_lock():
+            supports_resume = bool((PROVIDERS.get(engine) or {}).get("supports_resume"))
+            prev_name = session["task_name"]
             # Healthy means POSITIVELY finished ("done"/"waiting"), not merely "not errored":
             # after a subprocess timeout the wrapper's meta can stay "running" while an orphaned
             # CLI grandchild keeps appending to the log -- resuming onto that session could
@@ -2813,56 +4086,68 @@ class H(BaseHTTPRequestHandler):
                 and read_meta(prev_name).get("state") in ("done", "waiting")
             )
             raw_text = None
-            if supports_resume and healthy and is_extension(SESSION["messages"], messages):
-                new_turns = messages[len(SESSION["messages"]):]
-                if CFG.engine in ("codex", "opencode") and not _use_opencode_native():
+            name = prev_name
+            if supports_resume and healthy and is_extension(session["messages"], messages):
+                new_turns = messages[len(session["messages"]):]
+                if engine in ("codex", "opencode") and not _use_opencode_native():
                     _validated_bridge_images(new_turns)
                 answer = build_prompt(new_turns, tools, tool_choice)
+                _CTX.last_run = None
                 if live:
                     with _bridge_images(new_turns):
-                        raw_text = reply_agent_live(CFG.engine, CFG.model, CFG.effort, SESSION["dir"],
+                        raw_text = reply_agent_live(engine, model, effort, session["dir"],
                                                     prev_name, answer, CFG.timeout, on_delta)
                 else:
                     with _bridge_images(new_turns):
-                        raw_text = reply_agent(CFG.engine, CFG.model, CFG.effort, SESSION["dir"],
+                        raw_text = reply_agent(engine, model, effort, session["dir"],
                                                prev_name, answer, CFG.timeout)
                 if raw_text is not None and not raw_text.strip():
                     # A resume that "succeeded" but produced an EMPTY answer is as useless to the
                     # caller as one that died -- fall back to a fresh run rather than returning "".
                     raw_text = None
-                name = prev_name
+                if raw_text is None:
+                    # A refusal (auth, limit, model), a stall/timeout or a cancelled client would
+                    # only repeat on a fresh run with the whole history -- surface it now.
+                    refusal = _resume_failure(engine, prev_name)
+                    if refusal is not None:
+                        session["task_name"] = None
+                        session["last_activity"] = time.time()
+                        raise refusal
                 if raw_text is None and live:
                     if not retry_ok():
                         # The resume died/errored but its deltas already reached the client --
                         # a silent fresh-run would send the answer twice.
-                        SESSION["last_activity"] = time.time()
+                        session["last_activity"] = time.time()
                         raise LiveStreamDied()
                     if on_retry is not None:
                         on_retry()  # wipe the failed resume's partial state before falling back
             if raw_text is None or not raw_text.strip():
                 # First call, a non-extension, an unhealthy session, OR a resume that appended
                 # nothing (reply_agent returned None). Any of these -> a clean fresh run with the
-                # FULL history, never a stale echo of the previous answer. Empty/errored fresh
-                # runs are retried (--retries, default 1): a real OpenAI endpoint effectively
-                # never returns an empty 200, and a transient CLI hiccup (rate-limit blip, session
-                # startup race) should not zero a whole benchmark scenario.
-                if CFG.engine in ("codex", "opencode") and not _use_opencode_native():
+                # FULL history, never a stale echo of the previous answer. Empty/transiently
+                # failed fresh runs are retried (--retries, default 1): a real OpenAI endpoint
+                # effectively never returns an empty 200, and a transient CLI hiccup should not
+                # zero a whole benchmark scenario. Refusals and timeouts are not retried.
+                if engine in ("codex", "opencode") and not _use_opencode_native():
                     _validated_bridge_images(messages)
                 prompt = build_prompt(messages, tools, tool_choice)
                 # Keep the directory only when this really is the same conversation carrying on
                 # (the normal case for a no-resume engine, where every turn lands here anyway).
-                continuing = (bool(SESSION["task_name"]) and bool(SESSION["dir"])
+                continuing = (bool(session["task_name"]) and bool(session["dir"])
                               and not session_expired()
-                              and is_extension(SESSION["messages"], messages))
+                              and is_extension(session["messages"], messages))
                 workdir = fresh_session_dir(wipe=not continuing)
-                SESSION["dir"] = workdir
+                session["dir"] = workdir
                 completed = False
+                failure = None
                 for attempt in range(CFG.retries + 1):
                     name = new_task_name()
+                    _CTX.last_run = None
+                    meta = {}
                     if _use_opencode_native():
                         try:
                             raw_text = opencode_native_complete(
-                                CFG.model, prompt, CFG.timeout, on_delta if live else None,
+                                model, prompt, CFG.timeout, on_delta if live else None,
                                 workdir=workdir)
                             state = "done" if raw_text.strip() else "error"
                         except Exception as _oce:
@@ -2870,39 +4155,56 @@ class H(BaseHTTPRequestHandler):
                             LOG.warning("opencode native incident %s exception=%s",
                                         incident, type(_oce).__name__)
                             raw_text, state = "", "error"
+                            meta = {"state": "error", "reason": "opencode serve request failed (%s)"
+                                    % type(_oce).__name__}
                     elif live:
                         with _bridge_images(messages):
-                            raw_text = run_agent_live(CFG.engine, CFG.model, CFG.effort, workdir,
+                            raw_text = run_agent_live(engine, model, effort, workdir,
                                                       prompt, name, CFG.timeout, on_delta)
-                        state = read_meta(name).get("state")
+                        meta = read_meta(name)
+                        state = meta.get("state")
                     else:
                         with _bridge_images(messages):
-                            raw_text = run_agent(CFG.engine, CFG.model, CFG.effort, workdir, prompt,
+                            raw_text = run_agent(engine, model, effort, workdir, prompt,
                                                  name, CFG.timeout)
-                        state = read_meta(name).get("state")
-                    if raw_text.strip() and state != "error":
+                        meta = read_meta(name)
+                        state = meta.get("state")
+                    outcome = getattr(_CTX, "last_run", None) or {}
+                    cancel = getattr(_CTX, "cancel", None)
+                    if outcome.get("cancelled") or (cancel is not None and cancel.is_set()):
+                        session["task_name"] = None
+                        session["last_activity"] = time.time()
+                        raise ClientDisconnected("client disconnected; the CLI run was cancelled")
+                    if (raw_text.strip() and state not in ("error", "limited", "silent", "stopped")
+                            and not outcome.get("stalled") and not outcome.get("timed_out")):
                         completed = True
                         break
-                    if attempt < CFG.retries and retry_ok():
-                        print("[openai-bridge] empty/errored completion (state=%s), retry %d/%d"
-                              % (state, attempt + 1, CFG.retries), file=sys.stderr)
+                    failure = classify_failure_outcome(engine, meta, outcome, raw_text)
+                    if isinstance(failure, ClientDisconnected):
+                        session["task_name"] = None
+                        session["last_activity"] = time.time()
+                        raise failure
+                    if attempt < CFG.retries and retry_ok() and failure.internal_retry:
+                        print("[openai-bridge] %s on %s (state=%s), retry %d/%d"
+                              % (failure.code, route.id, state, attempt + 1, CFG.retries),
+                              file=sys.stderr)
                         if on_retry is not None:
                             on_retry()
                         time.sleep(2)
                     elif not raw_text.strip() and live and not retry_ok():
-                        SESSION["task_name"] = name
-                        SESSION["messages"] = messages
-                        SESSION["last_activity"] = time.time()
+                        session["task_name"] = name
+                        session["messages"] = messages
+                        session["last_activity"] = time.time()
                         raise LiveStreamDied()
                     else:
                         break
                 if not completed:
-                    SESSION["task_name"] = None
-                    SESSION["last_activity"] = time.time()
-                    raise CompletionFailed("provider invocation did not complete")
-            SESSION["task_name"] = name
-            SESSION["messages"] = messages
-            SESSION["last_activity"] = time.time()
+                    session["task_name"] = None
+                    session["last_activity"] = time.time()
+                    raise failure or CompletionFailed("provider invocation did not complete")
+            session["task_name"] = name
+            session["messages"] = messages
+            session["last_activity"] = time.time()
         return raw_text
 
     def _run(self, messages, tools, tool_choice="auto", _retry_left=1, _record=True):
@@ -2975,9 +4277,10 @@ class H(BaseHTTPRequestHandler):
                 finally:
                     # Any hidden turn changes native/CLI context, even when it succeeds. The
                     # next real request must therefore start fresh from its full visible history.
-                    with SESSION_LOCK:
-                        SESSION["messages"] = list(messages)
-                        SESSION["task_name"] = None
+                    session = _session()
+                    with _session_lock():
+                        session["messages"] = list(messages)
+                        session["task_name"] = None
                         claude_native_kill()
                     resumable = False
                 if tool_choice == "none" and not r_calls:
@@ -2993,39 +4296,50 @@ class H(BaseHTTPRequestHandler):
                 tc["function"]["name"] != selected_name for tc in result_calls)))
         final_missing = _tool_choice_requires_call(tool_choice) and not result_calls
         if final_forbidden or final_missing:
-            with SESSION_LOCK:
-                SESSION["messages"] = list(messages)
-                SESSION["task_name"] = None
-                SESSION["last_activity"] = time.time()
+            session = _session()
+            with _session_lock():
+                session["messages"] = list(messages)
+                session["task_name"] = None
+                session["last_activity"] = time.time()
                 claude_native_kill()
-            raise CompletionFailed("provider did not satisfy tool_choice")
+            raise CompletionFailed("%s did not satisfy tool_choice %s" % (
+                _route().engine or "provider",
+                json.dumps(tool_choice, ensure_ascii=False)[:120]),
+                code="tool_choice_unsatisfied")
 
         if _record:
             _record_completion(messages, result_text, result_calls, resumable=resumable)
         return result_text, result_calls, result_usage
 
-    def _reset_session(self):
-        with SESSION_LOCK:
-            claude_native_kill()
-            old_dir = SESSION["dir"]
-            SESSION["task_name"] = None
-            SESSION["messages"] = []
-            SESSION["dir"] = None
-            SESSION["last_activity"] = 0.0
-            if old_dir and not CFG.dir:
-                shutil.rmtree(old_dir, ignore_errors=True)
-        self._send_json(200, {"ok": True, "reset": True})
+    def _reset_session(self, route_id=None):
+        """Forget remembered conversations: all of them, or only `route_id`'s."""
+        dropped = POOL.reset(route_id)
+        if route_id is None:
+            with SESSION_LOCK:
+                claude_native_kill()
+                old_dir = SESSION["dir"]
+                SESSION["task_name"] = None
+                SESSION["messages"] = []
+                SESSION["dir"] = None
+                SESSION["last_activity"] = 0.0
+                if old_dir and not CFG.dir:
+                    shutil.rmtree(old_dir, ignore_errors=True)
+        self._send_json(200, {"ok": True, "reset": True, "sessions": dropped,
+                              "model": route_id})
 
     def _sync_response(self, messages, tools, tool_choice="auto"):
         text, tool_calls, usage = self._run(messages, tools, tool_choice)
         message = {"role": "assistant", "content": None if tool_calls else text.strip()}
         if tool_calls:
             message["tool_calls"] = tool_calls
+        route = _route()
         self._send_json(200, {
             "id": "chatcmpl-%s" % uuid.uuid4().hex,
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": model_label(CFG.engine, CFG.model, CFG.effort),
+            "model": route.label,
+            "neoxider_route": route.id,
+            "neoxider": _response_metadata(route),
             "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls" if tool_calls else "stop"}],
             "usage": usage,
         })
@@ -3043,12 +4357,14 @@ class H(BaseHTTPRequestHandler):
         self.close_connection = True
         self._sse_started = True  # a second HTTP status line is now impossible -- see do_POST
 
-    def _abort_stream_safely(self):
+    def _abort_stream_safely(self, payload=None):
         """Close a failed SSE response explicitly; never masquerade as a successful [DONE]."""
         try:
-            payload = {"error": {"message": "stream terminated before completion",
-                                 "type": "server_error", "code": "stream_failed"}}
-            wire = "event: error\ndata: %s\n\n" % json.dumps(payload, separators=(",", ":"))
+            payload = payload or {"error": {"message": "stream terminated before completion",
+                                            "type": "server_error", "code": "stream_failed",
+                                            "param": None, "retryable": True}}
+            wire = "event: error\ndata: %s\n\n" % json.dumps(payload, separators=(",", ":"),
+                                                             ensure_ascii=False)
             self.wfile.write(wire.encode("utf-8"))
             self.wfile.flush()
         except (OSError, ValueError):
@@ -3058,8 +4374,9 @@ class H(BaseHTTPRequestHandler):
         # Required/specific/disabled choices must be parsed and verified before any bytes become
         # irrevocable.  The replay path still speaks SSE, but can fail closed with a normal error.
         choice_live_safe = not tools or tool_choice == "auto"
+        route = _route()
         if (choice_live_safe
-                and (CFG.engine in LIVE_STREAM_ENGINES or _use_opencode_native())
+                and (route.engine in LIVE_STREAM_ENGINES or _use_opencode_native())
                 and not getattr(CFG, "no_live_stream", False)):
             return self._stream_response_live(messages, tools, tool_choice)
         # Legacy/emulated path (non-live engines): run to completion, then replay the finished
@@ -3067,12 +4384,14 @@ class H(BaseHTTPRequestHandler):
         text, tool_calls, _usage = self._run(messages, tools, tool_choice)
         cid = "chatcmpl-%s" % uuid.uuid4().hex
         created = int(time.time())
-        label = model_label(CFG.engine, CFG.model, CFG.effort)
+        label = route.label
         self._sse_headers()
 
         def emit(delta, finish_reason=None):
             chunk = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": label,
                       "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}]}
+            if finish_reason:
+                chunk["neoxider"] = _response_metadata(route)
             self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
             self.wfile.flush()
 
@@ -3100,7 +4419,8 @@ class H(BaseHTTPRequestHandler):
         still surface as a clean HTTP 429 through do_POST's normal error path."""
         cid = "chatcmpl-%s" % uuid.uuid4().hex
         created = int(time.time())
-        label = model_label(CFG.engine, CFG.model, CFG.effort)
+        route = _route()
+        label = route.label
         state = {"headers": False, "gone": False, "content": [], "calls": {}}
 
         def emit(delta, finish_reason=None):
@@ -3117,6 +4437,8 @@ class H(BaseHTTPRequestHandler):
                     state["role_sent"] = True
                     chunk["choices"][0]["delta"] = dict(chunk["choices"][0]["delta"])
                     chunk["choices"][0]["delta"]["role"] = "assistant"
+                if finish_reason:
+                    chunk["neoxider"] = _response_metadata(route)
                 if isinstance(delta.get("content"), str):
                     state["content"].append(delta["content"])
                 for call in delta.get("tool_calls") or []:
@@ -3125,7 +4447,12 @@ class H(BaseHTTPRequestHandler):
                 self.wfile.write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionAbortedError, OSError):
-                state["gone"] = True  # client went away: keep draining the CLI, stop writing
+                # Client went away: stop writing and cancel the CLI run instead of letting an
+                # abandoned turn keep spending provider time.
+                state["gone"] = True
+                cancel = getattr(_CTX, "cancel", None)
+                if cancel is not None:
+                    cancel.set()
 
         emitter = LiveToolCallEmitter(
             tool_names(tools), tools, prior_call_keys(messages),
@@ -3186,71 +4513,175 @@ class H(BaseHTTPRequestHandler):
         p = self.path.partition("?")[0]
         if len(p) > 1 and p.endswith("/"):
             p = p[:-1]
-        if p not in ("/chat/completions", "/v1/chat/completions", "/reset", "/v1/reset"):
-            return self._send_json(404, {"error": {"message": "not found: " + p}})
+        if p not in ("/chat/completions", "/v1/chat/completions", "/reset", "/v1/reset",
+                     "/admin/shutdown"):
+            return self._send_json(404, {"error": {"message": "not found: " + p,
+                                                   "type": "invalid_request_error",
+                                                   "code": "not_found", "param": None}})
         length, err = self._read_content_length()
         if err:
-            return self._send_json(err[0], {"error": {"message": err[1]}})
+            return self._send_json(err[0], {"error": {
+                "message": err[1], "type": "invalid_request_error",
+                "code": "request_too_large" if err[0] == 413 else "invalid_request",
+                "param": None}})
         raw = self.rfile.read(length) if length else b""
         try:
             body = json.loads(raw or b"{}")
         except ValueError:
-            return self._send_json(400, {"error": {"message": "invalid JSON body"}})
+            return self._send_json(400, {"error": {"message": "invalid JSON body",
+                                                   "type": "invalid_request_error",
+                                                   "code": "invalid_json", "param": None}})
         if not isinstance(body, dict):
-            return self._send_json(400, {"error": {"message": "request body must be a JSON object"}})
+            return self._send_json(400, {"error": {"message": "request body must be a JSON object",
+                                                   "type": "invalid_request_error",
+                                                   "code": "invalid_json", "param": None}})
+        if p == "/admin/shutdown":
+            return _admin_shutdown(self, body)
         if p in ("/reset", "/v1/reset"):
-            return self._reset_session()
-        try:
-            messages, tools, tool_choice, stream = validate_chat_request(body)
-        except RequestValidationError as e:
-            return self._send_json(400, _parameter_error(e))
+            if body.get("model") is None:
+                return self._reset_session()
+            try:
+                return self._reset_session(resolve_route(body.get("model")).id)
+            except RequestValidationError as e:
+                return self._send_json(400, _parameter_error(e))
+            except BridgeError as e:
+                return self._send_json(e.status, e.payload())
         global ACTIVE_REQUESTS
-        with ACTIVE_LOCK:
-            ACTIVE_REQUESTS += 1
+        saved_route = getattr(_CTX, "route", None)
+        saved_effort = getattr(_CTX, "effort", None)
+        route = None
         try:
-            with REQUEST_LOCK:
-                if stream:
-                    self._stream_response(messages, tools, tool_choice)
-                else:
-                    self._sync_response(messages, tools, tool_choice)
-        except RequestValidationError as e:
-            if getattr(self, "_sse_started", False):
-                return self._abort_stream_safely()
-            return self._send_json(e.status, _parameter_error(e))
-        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
-            _invalidate_resume_session(messages)
-        except ProviderLimitError:
-            incident = uuid.uuid4().hex[:12]
-            LOG.warning("provider limit incident %s", incident)
-            if getattr(self, "_sse_started", False):
-                return self._abort_stream_safely()  # 429 headers cannot follow an SSE body
             try:
-                self._send_json(429, {"error": {"message": "provider quota exceeded",
-                                                 "type": "rate_limit_error",
-                                                 "code": "rate_limit_exceeded"}})
-            except OSError:
-                pass
-        except Exception as e:  # noqa: BLE001 -- a bridge bug must surface as an OpenAI-style
-            # error response, not a bare connection reset the client can't distinguish from a
-            # network failure. A second status line would corrupt an already-started SSE stream.
-            incident = uuid.uuid4().hex[:12]
-            # WHY: the type alone sent one real bug (a FileNotFoundError that was really Windows
-            # refusing an over-long command line) to a dead end. The message names the failure and
-            # the traceback names the line.
-            LOG.warning("bridge incident %s exception=%s: %s", incident, type(e).__name__, e)
-            LOG.debug("bridge incident %s traceback", incident, exc_info=True)
-            if getattr(self, "_sse_started", False):
-                return self._abort_stream_safely()
+                route = resolve_route(body.get("model"))
+                wanted = requested_effort(body)
+                via_model = wanted is None and route.variant_of is not None
+                route, effort_info = route_for_effort(route, wanted)
+                if via_model:
+                    effort_info.update(requested=route.effort, source="model")
+            except RequestValidationError as e:
+                return self._send_json(400, _parameter_error(e))
+            except BridgeError as e:
+                return self._send_json(e.status, e.payload())
+            _CTX.route = route  # image/camera handling during validation depends on the engine
+            _CTX.effort = effort_info
             try:
-                self._send_json(500, {"error": {"message": "bridge request failed",
-                                                 "type": "server_error",
-                                                 "code": "bridge_failure",
-                                                 "incident_id": incident}})
-            except OSError:
-                pass
-        finally:
+                messages, tools, tool_choice, stream = validate_chat_request(body)
+            except RequestValidationError as e:
+                return self._send_json(400, _parameter_error(e))
             with ACTIVE_LOCK:
-                ACTIVE_REQUESTS = max(0, ACTIVE_REQUESTS - 1)
+                ACTIVE_REQUESTS += 1
+            cancel = threading.Event()
+            watch = _DisconnectWatch(self, cancel)
+            try:
+                with _conversation(route, messages, cancel):
+                    try:
+                        if stream:
+                            self._stream_response(messages, tools, tool_choice)
+                        else:
+                            self._sync_response(messages, tools, tool_choice)
+                    except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError,
+                            ClientDisconnected):
+                        # The caller cannot be assumed to have received this turn: its own
+                        # session must not resume past it. Nothing can be written back.
+                        _invalidate_resume_session(messages)
+                        LOG.info("client disconnected; model=%s turn cancelled", route.id)
+                        return
+                route.mark_ok()
+            except RequestValidationError as e:
+                if getattr(self, "_sse_started", False):
+                    return self._abort_stream_safely()
+                return self._send_json(e.status, _parameter_error(e))
+            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError,
+                    ClientDisconnected):
+                LOG.info("client disconnected while queued; model=%s",
+                         getattr(route, "id", "?"))
+            except ProviderLimitError as e:
+                limit = BridgeError(_error_summary(route.engine or "provider", str(e)),
+                                    status=429, error_type="rate_limit_error",
+                                    code="rate_limit_exceeded", retryable=True,
+                                    retry_after=_retry_after_seconds(str(e)))
+                incident = _log_incident(limit, route)
+                route.mark_error(limit)
+                if getattr(self, "_sse_started", False):
+                    return self._abort_stream_safely(limit.payload(incident))  # no 2nd status line
+                try:
+                    self._send_json(429, limit.payload(incident), limit.headers())
+                except OSError:
+                    pass
+            except BridgeError as e:
+                incident = _log_incident(e, route)
+                if e.code != "bridge_busy":
+                    route.mark_error(e)
+                if getattr(self, "_sse_started", False):
+                    return self._abort_stream_safely(e.payload(incident))
+                try:
+                    if e.headers():
+                        self._send_json(e.status, e.payload(incident), e.headers())
+                    else:
+                        self._send_json(e.status, e.payload(incident))
+                except OSError:
+                    pass
+            except LiveStreamDied:
+                # The provider failed after deltas already reached the client: nothing can be
+                # retried invisibly, so the stream ends with a mapped error event (never [DONE]).
+                died = CompletionFailed("%s: the provider stream ended before completion; partial "
+                                        "output was already sent" % (route.engine or "provider"),
+                                        code="stream_interrupted")
+                incident = _log_incident(died, route)
+                route.mark_error(died)
+                if getattr(self, "_sse_started", False):
+                    return self._abort_stream_safely(died.payload(incident))
+                try:
+                    self._send_json(died.status, died.payload(incident))
+                except OSError:
+                    pass
+            except Exception as e:  # noqa: BLE001 -- a bridge bug must surface as an OpenAI-style
+                # error response, not a bare connection reset the client can't distinguish from a
+                # network failure. A second status line would corrupt an already-started SSE stream.
+                incident = uuid.uuid4().hex[:12]
+                # WHY: the type alone sent one real bug (a FileNotFoundError that was really Windows
+                # refusing an over-long command line) to a dead end. The message names the failure and
+                # the traceback names the line.
+                LOG.warning("bridge incident %s status=500 exception=%s: %s", incident,
+                            type(e).__name__, e)
+                LOG.debug("bridge incident %s traceback", incident, exc_info=True)
+                payload = {"error": {"message": "bridge request failed: internal %s (incident %s; "
+                                                "see the bridge log)" % (type(e).__name__, incident),
+                                     "type": "server_error", "code": "bridge_failure",
+                                     "param": None, "retryable": True, "incident_id": incident}}
+                if getattr(self, "_sse_started", False):
+                    return self._abort_stream_safely(payload)
+                try:
+                    self._send_json(500, payload)
+                except OSError:
+                    pass
+            finally:
+                watch.stop()
+                with ACTIVE_LOCK:
+                    ACTIVE_REQUESTS = max(0, ACTIVE_REQUESTS - 1)
+        finally:
+            _CTX.route = saved_route
+            _CTX.effort = saved_effort
+
+
+def _admin_shutdown(handler, body):
+    """POST /admin/shutdown {"instance_id": ...}: graceful stop for `openai-server stop`. Only a
+    loopback caller that names this process's instance id (from the local registry) may use it;
+    the API key gate (when configured) already ran."""
+    client = (getattr(handler, "client_address", None) or ("",))[0]
+    if not _host_is_loopback(str(client)):
+        return handler._send_json(403, {"error": {
+            "message": "shutdown is only accepted from this machine", "type": "permission_error",
+            "code": "forbidden", "param": None}})
+    if body.get("instance_id") != INSTANCE_ID:
+        return handler._send_json(409, {"error": {
+            "message": "instance_id does not match this bridge", "type": "invalid_request_error",
+            "code": "instance_mismatch", "param": "instance_id"}})
+    handler._send_json(200, {"ok": True, "shutting_down": True, "instance_id": INSTANCE_ID})
+    server = getattr(handler, "server", None)
+    if server is not None:
+        LOG.warning("shutdown requested over HTTP by %s", client)
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
 
 def _lan_ips():
@@ -3309,9 +4740,26 @@ def _bridge_file(port):
     return os.path.join(BRIDGES_DIR, "bridge-%d.json" % int(port))
 
 
+def _cfg_routes(cfg):
+    routes = getattr(cfg, "routes", None)
+    if routes:
+        return list(routes)
+    return [Route(getattr(cfg, "engine", "") or "", getattr(cfg, "model", "") or "",
+                  getattr(cfg, "effort", "") or "")]
+
+
+def _own_pid_stamp():
+    try:
+        from neoxider_agents.process import pid_stamp
+        return pid_stamp(os.getpid())
+    except Exception:
+        return ""
+
+
 def register_bridge(cfg):
-    """Write this bridge's metadata so the GUI can discover/stop it. Best-effort: a failure
-    here must never stop the bridge from serving, so every error is swallowed."""
+    """Write this bridge's metadata so the GUI and `openai-server list/stop` can discover/stop it.
+    Best-effort: a failure here must never stop the bridge from serving, so every error is
+    swallowed."""
     try:
         os.makedirs(BRIDGES_DIR, exist_ok=True)
         all_ifaces = cfg.host in ("0.0.0.0", "::")
@@ -3322,23 +4770,33 @@ def register_bridge(cfg):
         # public/WAN address too (only reachable with a router port-forward; see _public_ip note)
         public_ip = _public_ip() if all_ifaces else None
         public_url = "http://%s:%d" % (public_ip, cfg.port) if public_ip else ""
+        routes = _cfg_routes(cfg)
+        default = routes[0]
         rec = {
             "port": cfg.port,
             "host": cfg.host,
             "base_url": "http://%s:%d" % (shown_host, cfg.port),
             "lan_urls": lan_urls,
             "public_url": public_url,
-            "engine": cfg.engine,
-            "model": cfg.model,
-            "effort": cfg.effort,
-            "label": model_label(cfg.engine, cfg.model, cfg.effort),
+            "engine": default.engine,
+            "model": default.model,
+            "effort": default.effort,
+            "label": default.label,
+            "models": [{"id": r.id, "label": r.label, "engine": r.engine, "model": r.model,
+                        "effort": r.effort} for r in routes],
+            "name": getattr(cfg, "name", "") or "",
             "dir": cfg.dir,
             "lan": all_ifaces,
             "pid": os.getpid(),
+            "pid_stamp": _own_pid_stamp(),
+            "parent_pid": os.getppid() if hasattr(os, "getppid") else None,
             "instance_id": INSTANCE_ID,
             "started": time.time(),
             "timeout": cfg.timeout,
             "session_ttl": cfg.session_ttl,
+            "max_concurrency": getattr(cfg, "max_concurrency", None),
+            "detached": os.environ.get("AGENT_BRIDGE_DETACHED") == "1",
+            "log": os.environ.get("AGENT_BRIDGE_LOG", "") if os.environ.get("AGENT_BRIDGE_DETACHED") == "1" else "",
             # the KEY itself is never written here -- only whether one is required, so the GUI can
             # show an open LAN bridge as unprotected without leaking the secret into a world-
             # readable file under ~/.claude/agent-cli-logs.
@@ -3352,22 +4810,32 @@ def register_bridge(cfg):
         LOG.warning("bridge registry write failed (%s)", type(e).__name__)
 
 
-def unregister_bridge(port):
+def unregister_bridge(port, instance_id=None):
+    """Remove this bridge's registry file (only our own when instance_id is given)."""
+    path = _bridge_file(port)
+    if instance_id is not None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                if json.load(f).get("instance_id") != instance_id:
+                    return
+        except (OSError, ValueError, AttributeError):
+            pass
     try:
-        os.remove(_bridge_file(port))
+        os.remove(path)
     except OSError as e:
         # expected on the double-exit path (file already gone) or a never-registered port
         LOG.debug("registry removal skipped (%s)", e.strerror or type(e).__name__)
 
 
 def _port_arg(v):
-    """argparse type for -p/--port: an integer in 1..65535 or a clean CLI error."""
+    """argparse type for -p/--port: an integer in 0..65535 (0 = pick a free port) or a clean
+    CLI error."""
     try:
         p = int(v)
     except (TypeError, ValueError):
         raise argparse.ArgumentTypeError("port must be an integer, got %r" % v)
-    if not 1 <= p <= 65535:
-        raise argparse.ArgumentTypeError("port must be an integer in 1..65535, got %r" % v)
+    if not 0 <= p <= 65535:
+        raise argparse.ArgumentTypeError("port must be an integer in 0..65535 (0 = any free port), got %r" % v)
     return p
 
 
@@ -3389,124 +4857,708 @@ def validate_network_config(cfg):
     """Return a startup refusal reason, or None when the requested bind is safe enough."""
     if getattr(cfg, "lan", False) and getattr(cfg, "localhost", False):
         return "--lan and --localhost cannot be used together"
-    if cfg.engine == "claude":
-        try:
-            resolve_claude_model(cfg.model, cfg.effort)
-        except ValueError:
-            return "unsupported Claude model/effort; choose values advertised by the provider"
+    routes = _cfg_routes(cfg)
+    for route in routes:
+        if route.engine == "claude":
+            try:
+                resolve_claude_model(route.model, route.effort)
+            except ValueError:
+                return "unsupported Claude model/effort; choose values advertised by the provider"
     if _host_is_loopback(cfg.host):
         return None
     if not (getattr(cfg, "api_key", "") or "").strip():
         return "non-loopback binding requires --api-key"
-    if cfg.engine in ("codex", "gemini"):
-        return ("%s chat-only mode retains read capability and is loopback-only; "
-                "use --localhost" % cfg.engine)
-    if cfg.engine == "opencode" and OPENCODE_NATIVE:
-        return "unsafe native OpenCode mode is loopback-only; unset AGENT_OPENCODE_NATIVE_UNSAFE"
+    if getattr(cfg, "allow_any", False):
+        return "--allow-any is loopback-only (it would let remote callers pick read-capable engines)"
+    for route in routes:
+        if route.engine in ("codex", "gemini"):
+            return ("%s chat-only mode retains read capability and is loopback-only; "
+                    "use --localhost" % route.engine)
+        if route.engine == "opencode" and OPENCODE_NATIVE:
+            return "unsafe native OpenCode mode is loopback-only; unset AGENT_OPENCODE_NATIVE_UNSAFE"
     return None
 
 
-def main():
-    global CFG
-    if os.name != "nt":
-        os.umask(0o077)
+# --------------------------------------------------------------------------------------------
+# Command line: serve (default) / start [--detach] / list / stop / check.
+SUBCOMMANDS = ("start", "serve", "list", "ls", "status", "stop", "check")
+
+
+def _non_negative_int(v):
+    try:
+        number = int(v)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("expected a non-negative integer, got %r" % v)
+    if number < 0:
+        raise argparse.ArgumentTypeError("expected a non-negative integer, got %r" % v)
+    return number
+
+
+def build_parser(prog="openai_server.py"):
     ap = argparse.ArgumentParser(
-        prog="openai_server.py",
-        description="OpenAI-compatible /v1/chat/completions bridge over a CLI subagent.")
-    ap.add_argument("-e", "--engine", default="codex", choices=sorted(PROVIDERS) or None,
-                     help="which CLI subagent backs this server (default: codex)")
-    ap.add_argument("-m", "--model", default="", help="model alias passed to agent.sh (default: provider default)")
-    ap.add_argument("-f", "--effort", default="", help="effort level passed to agent.sh (default: provider default)")
+        prog=prog,
+        description="OpenAI-compatible /v1/chat/completions bridge over CLI subagents. "
+                    "Subcommands: [start|serve] (default), list, stop PORT|NAME|all, check.")
+    ap.add_argument("-e", "--engine", default=None, choices=sorted(PROVIDERS) or None,
+                    help="engine for bare -m values (default: codex)")
+    ap.add_argument("-m", "--model", action="append", default=None, metavar="MODEL",
+                    help="model alias passed to the CLI (one -m with -e = the historic single-route "
+                         "bridge), or ENGINE/MODEL[@EFFORT]; repeat to serve several routes from one "
+                         "process -- the request's `model` field picks one, the first is the default")
+    ap.add_argument("--models", action="append", default=None, metavar="LIST",
+                    help="comma-separated ENGINE/MODEL[@EFFORT] routes (same as repeated -m)")
+    ap.add_argument("-f", "--effort", default="", help="effort level for routes without @EFFORT")
     ap.add_argument("-C", "--dir", default="",
-                     help="working dir for the agent's session (default: a scratch temp dir, "
-                          "wiped and recreated each time a brand-new session starts). Pin this "
-                          "to a real project path if the agent should operate there instead.")
-    ap.add_argument("-p", "--port", type=_port_arg, default=os.environ.get("AGENT_OPENAI_PORT") or 8801)
+                    help="working dir for every session (default: a scratch temp dir per "
+                         "conversation, wiped when that conversation ends). Pin this to a real "
+                         "project path if the agent should operate there instead.")
+    ap.add_argument("-p", "--port", type=_port_arg, default=os.environ.get("AGENT_OPENAI_PORT") or 8801,
+                    help="port to bind (default 8801; 0 = pick a free port and print it)")
     ap.add_argument("--host", default=default_bind_host(),
-                     help="interface to bind (default: 127.0.0.1 = this machine only). "
-                          "Set AGENT_OPENAI_HOST to change the "
-                          "default, or pass --localhost to restrict to this machine only.")
+                    help="interface to bind (default: 127.0.0.1 = this machine only). "
+                         "Set AGENT_OPENAI_HOST to change the "
+                         "default, or pass --localhost to restrict to this machine only.")
     ap.add_argument("--lan", action="store_true",
-                     help="explicitly bind all interfaces (0.0.0.0); requires an API key")
+                    help="explicitly bind all interfaces (0.0.0.0); requires an API key")
     ap.add_argument("--localhost", action="store_true",
-                     help="restrict to 127.0.0.1 (this machine only). Use when you do NOT want other "
-                          "devices on the network to reach the bridge.")
+                    help="restrict to 127.0.0.1 (this machine only). Use when you do NOT want other "
+                         "devices on the network to reach the bridge.")
     ap.add_argument("--timeout", type=int, default=240, help="max seconds to wait for one completion (default: 240)")
     ap.add_argument("--retries", type=int, default=1,
-                     help="how many times to re-run a completion whose CLI invocation came back "
-                          "empty or in an error state before giving up (default: 1)")
+                    help="how many times to re-run a completion that came back empty or with a "
+                         "transient failure (network/crash); refusals and timeouts are never "
+                         "re-run (default: 1)")
     ap.add_argument("--no-live-stream", action="store_true",
-                     help="disable real token streaming for live-capable engines (claude); "
-                          "stream:true then replays the finished answer as word-sized SSE deltas")
+                    help="disable real token streaming for live-capable engines (claude); "
+                         "stream:true then replays the finished answer as word-sized SSE deltas")
     ap.add_argument("--api-key", default=os.environ.get("AGENT_OPENAI_KEY") or "",
-                     help="shared secret every caller must present as 'Authorization: Bearer <key>' "
-                          "(or 'X-Api-Key: <key>'). Empty = open bridge (the historic behaviour, fine "
-                          "on loopback). STRONGLY recommended whenever the bridge is reachable from "
-                          "anything but this machine. Default: $AGENT_OPENAI_KEY.")
+                    help="shared secret every caller must present as 'Authorization: Bearer <key>' "
+                         "(or 'X-Api-Key: <key>'). Empty = open bridge (the historic behaviour, fine "
+                         "on loopback). STRONGLY recommended whenever the bridge is reachable from "
+                         "anything but this machine. Default: $AGENT_OPENAI_KEY.")
     ap.add_argument("--session-ttl", type=int, default=1800,
-                     help="seconds of inactivity before the ongoing session is treated as expired and the "
-                          "next call starts fresh instead of resuming it (default: 1800 = 30 minutes)")
-    CFG = ap.parse_args()
-    CFG.retries = max(0, CFG.retries)  # a negative value would skip the run loop entirely
-    if getattr(CFG, "lan", False):
-        CFG.host = "0.0.0.0"
-    if getattr(CFG, "localhost", False):
-        CFG.host = "127.0.0.1"
-    refusal = validate_network_config(CFG)
+                    help="seconds of inactivity before a conversation's session is evicted and its "
+                         "next call starts fresh (default: 1800 = 30 minutes)")
+    ap.add_argument("--max-sessions", type=_non_negative_int, default=DEFAULT_MAX_SESSIONS,
+                    help="remembered conversations; above it the least recently used IDLE one is "
+                         "evicted, never an active one (default: %d)" % DEFAULT_MAX_SESSIONS)
+    ap.add_argument("--max-concurrency", type=_non_negative_int, default=DEFAULT_MAX_CONCURRENCY,
+                    help="CLI turns running at once across all conversations; 0 = unlimited "
+                         "(default: %d; 1 restores the historic one-at-a-time bridge)"
+                         % DEFAULT_MAX_CONCURRENCY)
+    ap.add_argument("--engine-limit", action="append", default=None, metavar="ENGINE=N",
+                    help="per-engine cap on concurrent CLI turns, e.g. claude=1 (repeatable)")
+    ap.add_argument("--max-queue", type=_non_negative_int, default=DEFAULT_MAX_QUEUE,
+                    help="requests allowed to wait for a slot before new ones get 503 "
+                         "(default: %d)" % DEFAULT_MAX_QUEUE)
+    ap.add_argument("--queue-timeout", type=_non_negative_int, default=DEFAULT_QUEUE_TIMEOUT,
+                    help="seconds a request may wait for a slot / its conversation's previous turn "
+                         "before 503 bridge_busy (default: %d)" % DEFAULT_QUEUE_TIMEOUT)
+    ap.add_argument("--stall-timeout", type=_non_negative_int, default=180,
+                    help="stream watchdog: abort a CLI turn whose provider printed nothing for N "
+                         "seconds and answer 504 (default: 180; 0 = off)")
+    ap.add_argument("--max-request-mb", type=_non_negative_int, default=64,
+                    help="largest accepted request body in MiB (default: 64)")
+    strict = ap.add_mutually_exclusive_group()
+    strict.add_argument("--strict-models", dest="strict_models", action="store_const", const=True,
+                        default=None, help="404 for a request model no route serves (default when "
+                                           "several routes are configured)")
+    strict.add_argument("--no-strict-models", dest="strict_models", action="store_const",
+                        const=False, help="serve unknown request models with the default route "
+                                          "(the default for a single route)")
+    ap.add_argument("--allow-any", action="store_true",
+                    help="also route any ENGINE/MODEL of a known engine on demand (loopback only)")
+    ap.add_argument("--check", "--probe", dest="check", action="store_true",
+                    help="at startup send one tiny completion per route and print ok or the mapped "
+                         "error (results also appear in /health)")
+    ap.add_argument("--detach", action="store_true",
+                    help="(start) run in the background, log to %s/bridge-<port>.log, register, "
+                         "print the port and exit" % BRIDGES_DIR.replace("\\", "/"))
+    ap.add_argument("--name", default="", help="a name for `openai-server list/stop NAME`")
+    ap.add_argument("--json", action="store_true", help="(start --detach / check) print JSON")
+    return ap
+
+
+def _engine_limits(values, ap):
+    limits = {}
+    for value in values or ():
+        for item in value.split(","):
+            engine, sep, number = item.strip().partition("=")
+            if not sep or engine not in PROVIDERS or not number.strip().isdigit() or int(number) < 1:
+                ap.error("--engine-limit wants ENGINE=N with a known engine and N >= 1, got %r" % item)
+            limits[engine] = int(number)
+    return limits
+
+
+def parse_config(argv):
+    """Parse and validate the serve/start/check options into a CFG (routes included)."""
+    ap = build_parser()
+    cfg = ap.parse_args(argv)
+    cfg.retries = max(0, cfg.retries)  # a negative value would skip the run loop entirely
+    if cfg.lan:
+        cfg.host = "0.0.0.0"
+    if cfg.localhost:
+        cfg.host = "127.0.0.1"
+    specs = [value.strip() for value in (cfg.model or ()) if value.strip()]
+    for value in cfg.models or ():
+        specs.extend(item.strip() for item in value.split(",") if item.strip())
+    engine_explicit = cfg.engine is not None
+    engine = cfg.engine or "codex"
+    if engine not in PROVIDERS:
+        ap.error("unknown engine %r" % engine)
+    for spec in specs:
+        if spec.startswith("-"):
+            ap.error("model %r looks like an option" % spec)
+    cfg.routes = build_routes(engine, specs, cfg.effort, engine_explicit)
+    default = cfg.routes[0]
+    cfg.engine, cfg.model, cfg.effort = default.engine, default.model, default.effort
+    cfg.engine_limits = _engine_limits(cfg.engine_limit, ap)
+    refusal = validate_network_config(cfg)
     if refusal:
         ap.error(refusal)
+    return cfg
 
+
+class _BridgeHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 128  # bursts of parallel clients must not be refused at accept()
+
+
+_PROBE_PROMPT = "Reply with exactly the word OK and nothing else."
+
+
+def probe_route(route):
+    """One tiny completion through the normal pooled path; the probe session is discarded."""
+    messages = [{"role": "user", "content": _PROBE_PROMPT}]
+    started = time.monotonic()
+    result = {"model": route.id, "label": route.label}
     try:
-        srv = ThreadingHTTPServer((CFG.host, CFG.port), H)
-    except OSError as e:
-        print("[openai-bridge] could not bind %s:%d: %s" % (CFG.host, CFG.port, e), file=sys.stderr)
-        sys.exit(1)
+        with _conversation(route, messages, discard=True):
+            text, _calls, _usage = H._run(object(), messages, None, "none")
+        route.mark_ok()
+        result.update(ok=True, answer=" ".join(text.split())[:60])
+    except ProviderLimitError as e:
+        error = BridgeError(_error_summary(route.engine, str(e)), status=429,
+                            error_type="rate_limit_error", code="rate_limit_exceeded",
+                            retryable=True, retry_after=_retry_after_seconds(str(e)))
+        route.mark_error(error)
+        result.update(ok=False, status=429, code=error.code, message=str(error))
+    except BridgeError as e:
+        route.mark_error(e)
+        result.update(ok=False, status=e.status, code=e.code, message=str(e),
+                      retryable=bool(e.retryable))
+    except Exception as e:  # noqa: BLE001 -- a probe must report, never crash the bridge
+        error = BridgeError("internal %s during the probe" % type(e).__name__)
+        route.mark_error(error)
+        result.update(ok=False, status=500, code="bridge_failure", message=str(error))
+    result["seconds"] = round(time.monotonic() - started, 1)
+    return result
 
-    register_bridge(CFG)
-    atexit.register(unregister_bridge, CFG.port)
+
+def _format_probe(result):
+    if result.get("ok"):
+        return "[openai-bridge] check %s: ok in %.1fs (%r)" % (result["model"], result["seconds"],
+                                                                result.get("answer", ""))
+    return "[openai-bridge] check %s: HTTP %s %s after %.1fs -- %s" % (
+        result["model"], result.get("status"), result.get("code"), result["seconds"],
+        result.get("message", ""))
+
+
+def probe_routes(routes, emit=None):
+    """Probe every route concurrently (bounded by the pool) and return the results in order."""
+    results = [None] * len(routes)
+
+    def work(index, route):
+        results[index] = probe_route(route)
+        if emit is not None:
+            emit(results[index])
+
+    threads = [threading.Thread(target=work, args=(i, r), daemon=True) for i, r in enumerate(routes)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return results
+
+
+def _install_config(cfg):
+    global CFG, ROUTES, MAX_BODY_BYTES
+    CFG = cfg
+    ROUTES = list(cfg.routes)
+    MAX_BODY_BYTES = max(1, int(getattr(cfg, "max_request_mb", 64) or 64)) * 1024 * 1024
+
+
+def cmd_check(cfg):
+    """`openai-server check`: probe every configured route, print, exit 0 only if all answered."""
+    _install_config(cfg)
+    try:
+        results = probe_routes(ROUTES, emit=None if cfg.json else
+                               (lambda result: print(_format_probe(result), flush=True)))
+    finally:
+        POOL.close_all()
+        _shutdown_process_trees()
+    if cfg.json:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    return 0 if all(result.get("ok") for result in results) else 1
+
+
+def _janitor():
+    while True:
+        time.sleep(30)
+        try:
+            POOL.evict()
+        except Exception:
+            LOG.exception("session eviction pass failed")
+
+
+def serve(cfg):
+    global INSTANCE_ID
+    _install_config(cfg)
+    preset = os.environ.get("AGENT_BRIDGE_INSTANCE_ID", "")
+    if re.fullmatch(r"[0-9a-f]{12}", preset):
+        INSTANCE_ID = preset
+    try:
+        srv = _BridgeHTTPServer((cfg.host, cfg.port), H)
+    except OSError as e:
+        print("[openai-bridge] could not bind %s:%d: %s" % (cfg.host, cfg.port, e), file=sys.stderr)
+        return 1
+    cfg.port = srv.server_address[1]  # --port 0 -> the port the OS picked
+
+    if cfg.check:
+        for route in ROUTES:
+            route.mark_probing()  # before registering, so a detached parent never sees "unknown"
+    register_bridge(cfg)
+    atexit.register(unregister_bridge, cfg.port, INSTANCE_ID)
     atexit.register(_shutdown_process_trees)
     signal.signal(signal.SIGTERM, _handle_sigterm)
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            signal.signal(signal.SIGBREAK, _handle_sigterm)
+        except (OSError, ValueError):
+            pass
 
-    label = model_label(CFG.engine, CFG.model, CFG.effort)
-    all_ifaces = CFG.host in ("0.0.0.0", "::")
-    shown_host = "127.0.0.1" if all_ifaces else CFG.host
-    base = "http://%s:%d" % (shown_host, CFG.port)
-    print("[openai-bridge] %s  ->  %s  (Ctrl-C to stop)" % (base, label))
+    all_ifaces = cfg.host in ("0.0.0.0", "::")
+    shown_host = "127.0.0.1" if all_ifaces else cfg.host
+    base = "http://%s:%d" % (shown_host, cfg.port)
+    print("[openai-bridge] %s  ->  %s  (Ctrl-C to stop)" % (base, ROUTES[0].label))
     print("[openai-bridge] point an OpenAI-compatible client's base_url at %s/v1 (or %s -- both work)" % (base, base))
+    print("[openai-bridge] port=%d pid=%d instance=%s" % (cfg.port, os.getpid(), INSTANCE_ID))
+    if len(ROUTES) > 1 or getattr(cfg, "allow_any", False):
+        print("[openai-bridge] models (request `model` field): %s%s; %s" % (
+            ", ".join(r.id for r in ROUTES), " + any ENGINE/MODEL (--allow-any)" if cfg.allow_any else "",
+            "unknown model -> 404" if _strict_models() else "unknown model -> default route"))
+    print("[openai-bridge] concurrency: %s turn(s) at once%s, queue %d, %d remembered conversation(s), "
+          "stall watchdog %s" % (
+              cfg.max_concurrency or "unlimited",
+              "".join(", %s<=%d" % item for item in sorted(cfg.engine_limits.items())),
+              cfg.max_queue, cfg.max_sessions,
+              ("%ds" % cfg.stall_timeout) if cfg.stall_timeout else "off"), flush=True)
     if all_ifaces:
         lan = _lan_ips()
         if lan:
             for ip in lan:
-                print("[openai-bridge] LAN: reachable from other devices (phone/APK, another PC) at http://%s:%d/v1" % (ip, CFG.port))
+                print("[openai-bridge] LAN: reachable from other devices (phone/APK, another PC) at http://%s:%d/v1" % (ip, cfg.port))
         else:
-            print("[openai-bridge] LAN: bound to all interfaces on port %d (could not autodetect this host's LAN IP)" % CFG.port)
+            print("[openai-bridge] LAN: bound to all interfaces on port %d (could not autodetect this host's LAN IP)" % cfg.port)
         pub = _public_ip()
         if pub:
-            print("[openai-bridge] PUBLIC: this host's internet IP is http://%s:%d/v1 -- only reachable from" % (pub, CFG.port))
-            print("[openai-bridge]         outside your network if you add a router port-forward for TCP %d." % CFG.port)
+            print("[openai-bridge] PUBLIC: this host's internet IP is http://%s:%d/v1 -- only reachable from" % (pub, cfg.port))
+            print("[openai-bridge]         outside your network if you add a router port-forward for TCP %d." % cfg.port)
         print("[openai-bridge] WARNING: bound to all interfaces -- this bridge drives a CLI agent with your")
         print("[openai-bridge]          credentials/tools. Only expose it on a trusted network, and open the")
         print("[openai-bridge]          port in the firewall (Windows PowerShell, as admin):")
-        print("[openai-bridge]          New-NetFirewallRule -DisplayName 'agent-openai %d' -Direction Inbound -Action Allow -Protocol TCP -LocalPort %d" % (CFG.port, CFG.port))
+        print("[openai-bridge]          New-NetFirewallRule -DisplayName 'agent-openai %d' -Direction Inbound -Action Allow -Protocol TCP -LocalPort %d" % (cfg.port, cfg.port))
         if _configured_api_key():
             print("[openai-bridge] AUTH: a key IS required -- callers must send 'Authorization: Bearer <key>'.")
         else:
-            print("[openai-bridge] AUTH: NO KEY SET -- anyone who can reach port %d can spend your tokens." % CFG.port)
+            print("[openai-bridge] AUTH: NO KEY SET -- anyone who can reach port %d can spend your tokens." % cfg.port)
             print("[openai-bridge]       Start with --api-key <secret> (or AGENT_OPENAI_KEY=<secret>) to require one.")
     elif _configured_api_key():
         print("[openai-bridge] AUTH: a key is required ('Authorization: Bearer <key>').")
-    if _use_opencode_native():
+    if any(r.engine == "opencode" for r in ROUTES) and OPENCODE_NATIVE:
         print("[openai-bridge] !! AGENT_OPENCODE_NATIVE_UNSAFE=1 -- opencode's native server path is ON.")
         print("[openai-bridge] !! Those sessions keep FULL tools (bash/write/edit + your MCP servers):")
         print("[openai-bridge] !! opencode does not honour a chat-only agent over HTTP. Loopback only.")
+    sys.stdout.flush()
+    threading.Thread(target=_janitor, daemon=True).start()
+    if cfg.check:
+        threading.Thread(target=probe_routes, args=(ROUTES,),
+                         kwargs={"emit": lambda r: print(_format_probe(r), flush=True)},
+                         daemon=True).start()
     try:
-        srv.serve_forever()
+        srv.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         print("\n[openai-bridge] stopped")
     finally:
+        POOL.close_all()
         _shutdown_process_trees()
         srv.server_close()
+        unregister_bridge(cfg.port, INSTANCE_ID)
+    return 0
+
+
+# ---- registry tools: list / stop / start --detach ----------------------------------------
+def _registry_records():
+    records = []
+    for path in sorted(glob.glob(os.path.join(BRIDGES_DIR, "bridge-*.json"))):
+        try:
+            with open(path, encoding="utf-8") as f:
+                record = json.load(f)
+        except (OSError, ValueError):
+            continue
+        port = record.get("port") if isinstance(record, dict) else None
+        if isinstance(port, int) and not isinstance(port, bool) and 0 < port <= 65535:
+            record["_file"] = path
+            records.append(record)
+    return records
+
+
+def _http_json(url, method="GET", body=None, timeout=2.0, api_key=""):
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    request = _urlreq.Request(url, data=data, method=method, headers=headers)
+    try:
+        with _urlreq.urlopen(request, timeout=timeout) as response:
+            return response.status, json.loads(response.read().decode("utf-8", "replace") or "{}")
+    except _urlerr.HTTPError as error:
+        try:
+            return error.code, json.loads(error.read().decode("utf-8", "replace") or "{}")
+        except ValueError:
+            return error.code, {}
+    except (OSError, ValueError):
+        return None, None
+
+
+def _local_base(record):
+    return "http://127.0.0.1:%d" % record["port"] if record.get("lan") else (
+        record.get("base_url") or "http://127.0.0.1:%d" % record["port"])
+
+
+def _pid_alive_checked(record):
+    """True/False when the recorded process (pid + creation stamp) is provably alive/dead."""
+    pid = record.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        from neoxider_agents.process import pid_alive
+        return pid_alive(pid, record.get("pid_stamp") or "")
+    except Exception:
+        return False
+
+
+def _port_in_use(port):
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.5)
+        return probe.connect_ex(("127.0.0.1", int(port))) == 0
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def _bridge_status(record):
+    """(status, health): live (identity proven by /health), unresponsive (process alive),
+    stale (another process owns the port) or dead."""
+    code, health = _http_json(_local_base(record) + "/health")
+    if code == 200 and isinstance(health, dict):
+        if record.get("instance_id") and health.get("instance_id") not in (None, record["instance_id"]):
+            return "stale", health
+        return "live", health
+    if _pid_alive_checked(record):
+        return "unresponsive", None
+    if time.time() - float(record.get("started") or 0) < 5:
+        return "starting", None
+    return "dead", None
+
+
+def _drop_registry(record):
+    try:
+        os.remove(record["_file"])
+    except (OSError, KeyError):
+        pass
+
+
+def cmd_list(argv):
+    ap = argparse.ArgumentParser(prog="openai-server list",
+                                 description="List registered bridges with live health.")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+    rows = []
+    for record in _registry_records():
+        status, health = _bridge_status(record)
+        if status in ("dead", "stale"):
+            _drop_registry(record)  # the process is gone; never leave ghosts behind
+            continue
+        models = [m.get("id") for m in (health or {}).get("models") or ()] or \
+            [m.get("id") for m in record.get("models") or ()] or [record.get("label") or "?"]
+        rows.append({"port": record["port"], "pid": record.get("pid"), "status": status,
+                     "name": record.get("name") or "", "models": models,
+                     "base_url": record.get("base_url"),
+                     "sessions": (health or {}).get("session_count"),
+                     "active": (health or {}).get("active_turns"),
+                     "queue": (health or {}).get("queue_depth"),
+                     "uptime_seconds": (health or {}).get("uptime_seconds"),
+                     "detached": bool(record.get("detached")), "log": record.get("log") or "",
+                     "instance_id": record.get("instance_id")})
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("no running bridges (registry: %s)" % BRIDGES_DIR)
+        return 0
+    print("%-6s %-7s %-12s %-9s %-6s %-5s %-8s %-14s %s" % (
+        "PORT", "PID", "STATUS", "SESSIONS", "ACTIVE", "QUEUE", "UPTIME", "NAME", "MODELS"))
+    for row in rows:
+        uptime = row["uptime_seconds"]
+        shown = "-" if uptime is None else "%dh%02dm" % (uptime // 3600, uptime % 3600 // 60)
+        print("%-6s %-7s %-12s %-9s %-6s %-5s %-8s %-14s %s" % (
+            row["port"], row["pid"], row["status"], "-" if row["sessions"] is None else row["sessions"],
+            "-" if row["active"] is None else row["active"], "-" if row["queue"] is None else row["queue"],
+            shown, row["name"] or "-", ", ".join(row["models"])))
+    return 0
+
+
+def _kill_bridge_tree(record):
+    """Terminate the recorded bridge and every descendant (identity checked by creation stamp)."""
+    pid = record.get("pid")
+    stamp = record.get("pid_stamp") or ""
+    from neoxider_agents import process as core_process
+    if os.name == "nt":
+        return core_process.kill_tree(pid, stamp=stamp)
+    try:
+        os.kill(pid, signal.SIGTERM)  # its handler stops every provider tree first
+    except OSError:
+        return False
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and core_process.pid_alive(pid, stamp):
+        time.sleep(0.1)
+    if core_process.pid_alive(pid, stamp):
+        return core_process._kill_posix_tree(pid, stamp)
+    return True
+
+
+def _stop_one(record, force=False, wait=10.0, api_key=""):
+    port = record["port"]
+    status, health = _bridge_status(record)
+    result = {"port": port, "pid": record.get("pid"), "stopped": False}
+    if status in ("dead", "stale"):
+        _drop_registry(record)
+        result.update(stale_registry=True, message="not running; removed its stale registry entry")
+        return result
+    identity = status == "live" or (bool(record.get("pid_stamp")) and status == "unresponsive")
+    if not identity and not force:
+        result["message"] = ("could not verify the bridge identity on port %d (no /health answer and "
+                             "no recorded process stamp); retry, or pass --force" % port)
+        return result
+    graceful = False
+    if status == "live":
+        code, _payload = _http_json(_local_base(record) + "/admin/shutdown", "POST",
+                                    {"instance_id": record.get("instance_id")}, timeout=5,
+                                    api_key=api_key)
+        graceful = code == 200
+    deadline = time.monotonic() + (wait if graceful else 0)
+    while time.monotonic() < deadline and _pid_alive_checked(record):
+        time.sleep(0.2)
+    killed = False
+    if _pid_alive_checked(record) or (status == "live" and not graceful):
+        killed = _kill_bridge_tree(record)
+        end = time.monotonic() + 5
+        while time.monotonic() < end and _pid_alive_checked(record):
+            time.sleep(0.1)
+    if _pid_alive_checked(record):
+        result["message"] = "process %s did not exit; registry kept for a retry" % record.get("pid")
+        return result
+    _drop_registry(record)
+    result.update(stopped=True, graceful=graceful, killed=bool(killed))
+    return result
+
+
+def cmd_stop(argv):
+    ap = argparse.ArgumentParser(prog="openai-server stop",
+                                 description="Stop registered bridges and their whole process trees.")
+    ap.add_argument("targets", nargs="+", help="PORT, NAME (--name at start), instance id, or all")
+    ap.add_argument("--force", action="store_true",
+                    help="kill a recorded pid even when its identity cannot be verified")
+    ap.add_argument("--wait", type=float, default=10.0,
+                    help="seconds to wait for a graceful exit before killing the tree (default 10)")
+    ap.add_argument("--api-key", default=os.environ.get("AGENT_OPENAI_KEY") or "",
+                    help="key for an authenticated bridge's graceful shutdown (default $AGENT_OPENAI_KEY)")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+    records = _registry_records()
+    selected, missing = [], []
+    for target in args.targets:
+        if target == "all":
+            matches = records
+        elif target.isdigit():
+            matches = [r for r in records if r["port"] == int(target)]
+        else:
+            matches = [r for r in records if target in (r.get("name"), r.get("instance_id"))]
+        if not matches and target != "all":
+            missing.append(target)
+        for record in matches:
+            if record not in selected:
+                selected.append(record)
+    results = [_stop_one(record, args.force, args.wait, args.api_key) for record in selected]
+    if args.json:
+        print(json.dumps({"results": results, "missing": missing}, ensure_ascii=False, indent=2))
+    else:
+        for target in missing:
+            print("[openai-bridge] stop %s: no registered bridge matches" % target)
+        for result in results:
+            if result["stopped"]:
+                print("[openai-bridge] stopped port %s (pid %s, %s)" % (
+                    result["port"], result["pid"], "graceful" if result.get("graceful") else "killed tree"))
+            else:
+                print("[openai-bridge] port %s: %s" % (result["port"], result.get("message")))
+        if not selected and not missing:
+            print("[openai-bridge] no running bridges")
+    ok = not missing and all(r["stopped"] or r.get("stale_registry") for r in results)
+    return 0 if ok else 1
+
+
+def _detached_kwargs(breakaway):
+    if os.name != "nt":
+        return {"start_new_session": True}
+    flags = (getattr(subprocess, "DETACHED_PROCESS", 0x8)
+             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200))
+    if breakaway:
+        flags |= getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = subprocess.SW_HIDE
+    return {"creationflags": flags, "startupinfo": startup}
+
+
+def _find_registry(instance):
+    for record in _registry_records():
+        if record.get("instance_id") == instance:
+            return record
+    return None
+
+
+_DETACHED_CHILDREN = []
+
+
+def cmd_start_detached(cfg, argv):
+    """Start the same command line in the background and report where it listens."""
+    instance = uuid.uuid4().hex[:12]
+    os.makedirs(BRIDGES_DIR, exist_ok=True)
+    log_path = os.path.join(BRIDGES_DIR, "bridge-%s.log" % (cfg.port or "auto-" + instance))
+    try:
+        if os.path.getsize(log_path) > 5 * 1024 * 1024:
+            os.remove(log_path)
+    except OSError:
+        pass
+    child_args = [arg for arg in argv if arg not in ("--detach", "--json")]
+    command = [sys.executable, os.path.abspath(__file__)] + child_args
+    env = dict(os.environ)
+    env.pop("AGENT_LAUNCHER_PID", None)
+    env.update(AGENT_BRIDGE_INSTANCE_ID=instance, AGENT_BRIDGE_LOG=log_path,
+               AGENT_BRIDGE_DETACHED="1", AGENT_CLI_LOGS=LOGDIR, PYTHONUNBUFFERED="1",
+               PYTHONIOENCODING="utf-8")
+    with open(log_path, "ab") as log:
+        log.write(("\n==== %s start: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                                              " ".join(child_args))).encode("utf-8"))
+        log.flush()
+        proc = None
+        for breakaway in (True, False):
+            try:
+                proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log,
+                                        stderr=subprocess.STDOUT, env=env, cwd=HERE,
+                                        close_fds=True, **_detached_kwargs(breakaway))
+                break
+            except OSError:
+                if not breakaway:
+                    raise
+    _DETACHED_CHILDREN.append(proc)  # intentionally outlives this handle; never reaped here
+    deadline = time.monotonic() + 30
+    record = None
+    while time.monotonic() < deadline:
+        record = _find_registry(instance)
+        if record is not None or proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    if record is None:
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                tail = f.read()[-2000:]
+        except OSError:
+            tail = ""
+        if proc.poll() is None:
+            try:
+                from neoxider_agents.process import kill_tree
+                kill_tree(proc.pid)
+            except Exception:
+                proc.kill()
+        print("[openai-bridge] the background bridge did not start (exit %s). Log %s:\n%s"
+              % (proc.poll(), log_path, tail), file=sys.stderr)
+        return 1
+    base = record.get("base_url") or "http://127.0.0.1:%d" % record["port"]
+    probes = []
+    if cfg.check:
+        wait_until = time.monotonic() + max(60, cfg.timeout * 2 + 30)
+        while time.monotonic() < wait_until:
+            code, health = _http_json(base + "/health")
+            models = (health or {}).get("models") or []
+            if code == 200 and models and all(m.get("state") != "probing" for m in models):
+                probes = models
+                break
+            time.sleep(1)
+    summary = {"ok": True, "port": record["port"], "pid": record.get("pid"),
+               "base_url": base + "/v1", "log": log_path, "instance_id": instance,
+               "models": [m.get("id") for m in record.get("models") or ()],
+               "name": record.get("name") or ""}
+    if cfg.check:
+        summary["check"] = [{"model": m.get("id"), "state": m.get("state"),
+                             "error": m.get("last_error")} for m in probes] or "timed out"
+    if cfg.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    print("[openai-bridge] started in the background: %s/v1 (port %d, pid %s)"
+          % (base, record["port"], record.get("pid")))
+    print("[openai-bridge] models: %s" % ", ".join(summary["models"]))
+    print("[openai-bridge] log: %s" % log_path)
+    print("[openai-bridge] stop: openai-server stop %s" % (record.get("name") or record["port"]))
+    for model in probes:
+        error = model.get("last_error")
+        if error:
+            print("[openai-bridge] check %s: HTTP %s %s -- %s" % (
+                model.get("id"), error.get("status"), error.get("code"), error.get("message")))
+        else:
+            print("[openai-bridge] check %s: %s" % (model.get("id"), model.get("state")))
+    if cfg.check and not probes:
+        print("[openai-bridge] check: still probing; see /health or the log")
+    return 0
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+    if os.name != "nt":
+        os.umask(0o077)
+    command = "serve"
+    if argv and argv[0] in SUBCOMMANDS:
+        command = argv.pop(0)
+    if command in ("list", "ls", "status"):
+        return cmd_list(argv)
+    if command == "stop":
+        return cmd_stop(argv)
+    cfg = parse_config(argv)
+    if command == "check":
+        return cmd_check(cfg)
+    if cfg.detach:
+        return cmd_start_detached(cfg, argv)
+    return serve(cfg)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

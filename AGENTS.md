@@ -205,19 +205,32 @@ bash agent.sh openai-server -e claude -m sonnet -f low -p 8801
 ```
 
 This is a wire-compatible shim, not a real low-latency LLM API — know the trade-offs
-before relying on it: it keeps **one ongoing chat session per process**, not a fresh
-agent every call — when a new call's `messages` is a deterministic extension of what
-it saw last time (exact prefix match, not a guess), it resumes the *same* underlying
-CLI session via `agent.sh reply` with only the new tail; any mismatch (edited history,
-an unrelated conversation, the first call, or a dead/errored session) falls back safely
-to a brand-new `agent.sh run` with the full history. `claude`/`codex`/`kimi`/`opencode` support
-resume (`gemini` always takes the fresh-run path). Consequence: **one bridge
-process serves one conversation at a time** — a lock serializes every request, so don't
-point multiple unrelated tasks at the same port expecting independence (run one process
-per port per conversation instead); `POST .../reset` clears the remembered session,
-and `GET /health` reports `session_active`/`session_turns`. An idle session also
-auto-expires after `--session-ttl` seconds (default 1800 = 30 min) — the next call
-after that just starts fresh instead of resuming. Beyond that: latency is a
+before relying on it: it keeps **a pool of ongoing chat sessions, one per conversation**, not a fresh
+agent every call — when a new call's `messages` is a deterministic extension of a known
+conversation (exact prefix match, not a guess), it resumes *that* conversation's CLI
+session via `agent.sh reply` with only the new tail; anything else (edited history,
+an unrelated conversation, the first call, or a dead/errored session) gets its own new
+session with a fresh `agent.sh run` of the full history and never overwrites or evicts
+another conversation (own history, CLI session id, task files and scratch dir each).
+`claude`/`codex`/`kimi`/`opencode` support resume (`gemini` always takes the fresh-run
+path). Unrelated conversations run **in parallel** (`--max-concurrency`, default 8;
+`--engine-limit ENGINE=N`; bounded queue, then 503 with `Retry-After`) while one
+conversation's turns stay sequential; `POST .../reset` drops the remembered sessions
+(body `{"model": …}`: one route's), and `GET /health` lists sessions (id, route, turns,
+idle seconds — no content) plus per-model readiness and queue depth. Sessions are evicted
+only after `--session-ttl` idle seconds (default 1800 = 30 min) or by `--max-sessions`
+(LRU of idle sessions), and every eviction is logged. **One process can serve several
+models**: repeat `-m ENGINE/MODEL[@EFFORT]` (e.g. `-m codex/6-luna -m claude/sonnet`) and
+the request's `model` field picks the route (unknown model -> 404 when several routes are
+configured; a single `-e X -m Y` route still serves every request). A request's
+`reasoning_effort` selects the effort per conversation (default `-f`; clamped to the levels the
+engine advertises, ignored by engines without effort; a different effort is a different session)
+and the response reports it in `model` and `neoxider.reasoning_effort`. Provider failures are
+OpenAI-style errors with a real status (401/403 incl. the provider's own refusal text,
+402, 429 + `Retry-After`, 404, 400, 502/503, 504 on timeout or a `--stall-timeout`
+stall) and a `retryable` hint; refusals are never retried inside the bridge.
+`openai-server start --detach [-p 0] [--check]`, `openai-server list` and
+`openai-server stop PORT|NAME|all` manage background bridges and their whole process trees. Beyond that: latency is a
 **full CLI subprocess invocation** (seconds to low minutes, not a token stream);
 `stream: true` **is REAL per-token streaming on the `claude` engine** (deltas stream as SSE
 chunks while the model generates); non-live engines (codex/kimi/opencode/gemini) and
@@ -230,8 +243,8 @@ prompt warns that prose describing an action is ignored; re-sent on every `tools
 "neoxider_estimated": true) — not billing-grade; and **`content` is a clean answer for every bundled engine** (`codex` would
 otherwise mix its banner/session-id/error-log/"tokens used" chrome into the answer, so its
 provider runs `codex exec --json` and extracts only the final agent message — this also
-cleaned up `agent.sh last`/the GUI for codex). One process = one fixed engine/model/effort
-— run it again on another port to compare models. **The wrapped CLI is locked to
+cleaned up `agent.sh last`/the GUI for codex). Each route keeps a fixed
+engine/model/effort — configure several routes, or run one process per port, to compare models. **The wrapped CLI is locked to
 chat-only execution for bridge calls**: `AGENT_CHAT_ONLY=1` makes codex run
 `--sandbox read-only --ignore-user-config`, claude keeps `--permission-mode acceptEdits`
 and runs `--strict-mcp-config --disallowedTools
@@ -280,12 +293,12 @@ export COREAI_TEST_MODEL="opencode/muse"
 
 Know what this proves and what it does not. It proves the code path works against a real
 OpenAI-compatible endpoint. It is NOT a substitute for a run against the real backend:
-every call spawns a CLI subprocess and a lock serializes them, so a fixture that makes
-nine role calls or builds a whole scene takes many minutes and can hit its own timeouts;
-and tool calling is emulated through prompting rather than native, so a test whose subject
-IS the tool-call protocol may behave differently than it would on a real provider. Check
-`/health` for `session_active` and `POST /v1/reset` between unrelated suites — one process
-serves one conversation at a time.
+every call spawns a CLI subprocess, so a fixture that makes nine role calls or builds a
+whole scene takes many minutes and can hit its own timeouts (independent conversations do
+run in parallel, up to `--max-concurrency`); and tool calling is emulated through prompting
+rather than native, so a test whose subject IS the tool-call protocol may behave differently
+than it would on a real provider. Unrelated suites no longer overwrite each other's
+sessions; `POST /v1/reset` still clears them all, and `/health` lists them.
 
 ## Model discovery and explicit probes
 

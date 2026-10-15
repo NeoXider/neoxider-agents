@@ -25,7 +25,7 @@ COMMANDS = {
     "probe": "[-e opencode] -m MODEL [-f EFFORT] [-t NAME] [--timeout SECONDS] [--standard] [--json]",
     "test-api": "--base-url URL --goal TEXT [--out F] [-e ENGINE] [-m MODEL] [-f EFFORT] [-C DIR] [-t NAME]",
     "gui": "[PORT] [--lan] [--localhost] [--token SECRET]",
-    "openai-server": "[-e ENGINE] [-m MODEL] [-f EFFORT] [-p PORT] [--api-key SECRET] (see openai_server.py --help)",
+    "openai-server": "[start [--detach]] [-e ENGINE] [-m MODEL | -m ENGINE/MODEL ...] [-f EFFORT] [-p PORT|0] [--api-key SECRET] [--check] | list | stop PORT|NAME|all | check -m ... (see openai_server.py --help)",
     "config": "get KEY | set KEY VALUE | list (keys: engine, model, effort)",
     "brief": "--outcome TEXT [--owns GLOBS] [--not-touch GLOBS] [--return TEXT] [--context-file FILE]",
     "completion": "[powershell|bash|zsh] [--install] [--profile FILE]", "help": "[COMMAND]"}

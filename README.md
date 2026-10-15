@@ -319,7 +319,7 @@ Command reference (native PowerShell/cmd: `neoxider`; POSIX: `./agent.sh`):
 | `clean`, `prune` | `[--all] [--purge] [-n or --dry-run]`; `prune` aliases `clean` |
 | `doctor`, `provider-info` | `doctor [--json or --deep]`; `provider-info ENGINE` prints one provider's diagnostic JSON |
 | `test-api` | `--base-url URL --goal TEXT [--out FILE] [task options]` |
-| `gui`, `openai-server` | `gui [PORT] [--localhost or --lan --token SECRET]`; `openai-server [-e ENGINE] [-m MODEL] [-f EFFORT] [-p PORT] [--api-key SECRET]` |
+| `gui`, `openai-server` | `gui [PORT] [--localhost or --lan --token SECRET]`; `openai-server [start [--detach]] [-e ENGINE] [-m MODEL or -m ENGINE/MODEL ...] [-f EFFORT] [-p PORT or 0] [--api-key SECRET] [--check]`; `openai-server list`, `stop PORT or NAME or all`, `check -m ...` |
 | `config`, `completion`, `help` | `config get KEY`, `config set KEY VALUE`, `config list`; `completion powershell or bash or zsh [--install]`; `help [COMMAND]` / `COMMAND --help` |
 
 Task options: `-e ENGINE -m MODEL -f EFFORT -C DIR -t NAME -P PARENT`.
@@ -329,7 +329,7 @@ by another option, while `-p FILE` reads a prompt. Ambiguous old `-p TEXT` gives
 `--progress TEXT`. `--no-progress` is accepted silently. `--no-terse` suppresses the terse directive;
 `-v` / `--verbose` streams output, `--log` keeps full logs, and `--notify` enables optional
 desktop notifications. `--terminal` explicitly permits a visible provider console.
-Service `openai-server -p` sets its port. See [SKILL.md](SKILL.md) for examples.
+Service `openai-server -p` sets its port (`-p 0` picks a free one). See [SKILL.md](SKILL.md) for examples.
 
 ### Python core and migration
 
@@ -581,12 +581,17 @@ same engine/model and hits the same limit until it resets. Warning: piping
 ```bash
 agent.sh openai-server -e claude -m sonnet -f low -p 8801 --api-key "$(openssl rand -hex 16)"
 # then: base_url = http://127.0.0.1:8801/v1 , api_key = <that secret>
+
+# several models, parallel conversations, in ONE background process on a free port:
+agent.sh openai-server start --detach -m codex/6-luna -m codex/6-sol -m claude/sonnet -p 0 --check
+agent.sh openai-server list                 # running bridges, health, sessions, queue
+agent.sh openai-server stop 8801            # or: stop NAME (--name at start) | stop all
 ```
 
 A standalone, zero-dependency HTTP server exposing `POST /v1/chat/completions` (plus
-`GET /health`, `GET /v1/models`, `GET /`, `POST /reset`) backed by a CLI subagent. Point any
-OpenAI-compatible client at it and it drives your CLI subscription as the "model" — no separate
-provider API key needed.
+`GET /health`, `GET /v1/models`, `GET /v1/sessions`, `GET /`, `POST /reset`) backed by CLI
+subagents. Point any OpenAI-compatible client at it and it drives your CLI subscription as the
+"model" — no separate provider API key needed.
 
 > ⚠️ **It is a wire-compatible shim, not a low-latency native LLM backend.** Read the trade-offs
 > below before pointing production-ish things at it.
@@ -595,8 +600,12 @@ provider API key needed.
 
 | | |
 |---|---|
-| Session model | one process = **one ongoing conversation**, resumed via `agent.sh reply` when the `messages` array is an exact extension; anything else falls back to a fresh run |
-| Concurrency | a lock serializes requests — safe, but not parallel. One port per conversation |
+| Routing | one process serves one or many `engine/model` routes; the request's `model` field picks one (`codex/6-luna`, its label, or a unique alias) |
+| Reasoning effort | the request's `reasoning_effort` (default: `-f`) maps to the engine's effort flag, is part of the conversation's identity, and is reported back in `neoxider.reasoning_effort` |
+| Session model | a pool of **independent conversations**; each one resumes its OWN CLI session via `agent.sh reply` when `messages` is an exact extension of it; anything else gets a new session |
+| Concurrency | independent conversations run in parallel (`--max-concurrency`, `--engine-limit`, bounded queue); one conversation stays strictly sequential |
+| Errors | OpenAI-style JSON with a real status: 401/403/402/404/429 (+`Retry-After`)/400/502/503/504, provider text included, `retryable` hint |
+| Operations | `start --detach`, `list`, `stop PORT\|NAME\|all` (whole process tree), `-p 0`, `--check`, `check` |
 | Streaming | real token deltas on `claude`; word-sized replay of the finished answer elsewhere |
 | Tool calling | emulated via prompting, parsing every call spelling real models emit |
 | Auth | `--api-key` / `$AGENT_OPENAI_KEY` → `Authorization: Bearer …`; open if unset |
@@ -606,11 +615,17 @@ provider API key needed.
 <details>
 <summary><b>Session continuation, reset, and idle expiry</b></summary>
 
-The bridge remembers the exact `messages` array from the previous call. When a new call's
-`messages` is that array **plus** one or more messages appended at the end (a deterministic prefix
-check, not a model guessing), only the new tail goes to the *same* CLI session via `agent.sh
-reply`, instead of re-serializing the whole growing history into a brand-new `agent.sh run`. That
-saves the resend cost and lets the provider's own prompt caching actually apply.
+The bridge remembers every conversation separately: its exact `messages` array, its own CLI
+task (task name, `.log`/`.meta`, the provider's session id) and its own scratch working directory
+(`Temp/neoxider-openai-bridge/session-<port>-<id>`). When a new call's `messages` is a known
+conversation's array **plus** one or more messages appended at the end (a deterministic prefix
+check, not a model guessing), only the new tail goes to *that* conversation's CLI session via
+`agent.sh reply`, instead of re-serializing the whole growing history into a brand-new
+`agent.sh run`. That saves the resend cost and lets the provider's own prompt caching actually
+apply. A new or different conversation never overwrites, resumes or evicts another one's entry:
+interleaved calls `A1, B1, A2, B2, A3` continue A and B in their own sessions (covered by an offline
+test, and verified live on `codex/6-luna`: two concurrent first turns, then each second turn was a
+`[reply]` on its own task with its own codex session id and recalled only its own codeword).
 
 API-вызовы отключают инструкции вести `PROGRESS.<task>.md` как при запуске, так и при
 продолжении: текстовый endpoint не должен просить модель менять файлы. Служебные `.log`,
@@ -634,16 +649,24 @@ Verified live: Claude's task log showed one `[run]`
 block followed by a `[reply]` block containing only the new tail, the task count stayed at 1
 across 4 sequential calls, and an unrelated conversation sent next correctly started a new session.
 
-**One bridge process serves one conversation at a time.** A lock (`SESSION_LOCK`) serializes every
-request. That is safe under concurrency (verified: two genuinely concurrent unrelated requests both
-got correct answers with zero cross-contamination) but not efficient for many independent parallel
-conversations — start one bridge per port for those.
+**Parallel conversations, sequential turns.** Independent conversations run concurrently, up to
+`--max-concurrency` CLI turns at once (default 8; `0` = unlimited; `1` restores the historic
+one-at-a-time bridge) and optional per-engine caps (`--engine-limit claude=1`, repeatable). Extra
+requests wait in a bounded queue (`--max-queue`, default 64) for at most `--queue-timeout` seconds
+(default 300) and then get `503 bridge_busy` with `Retry-After`. Two requests for the SAME
+conversation never overlap: the second waits for the first (a per-conversation lock) and, if its
+history is no longer an exact extension afterwards, gets its own new session. Every CLI turn gets a
+unique task name, so the core's task files and locks never collide.
 
-**`POST /reset`** clears the remembered session (drops the messages/task, wipes the scratch working
-dir unless `--dir` pinned a real project). **Idle sessions expire** after `--session-ttl` seconds
-(default 1800 = 30 min): an untouched session is treated exactly like a dead one, so an abandoned
-conversation can't grow forever. `GET /health` reports `session_active`, `session_turns`,
-`session_idle_seconds` and `session_ttl_seconds`.
+**`POST /reset`** forgets every remembered conversation (body `{"model": "codex/6-luna"}` limits it
+to one route): their tasks are dropped and their scratch dirs wiped unless `--dir` pinned a real
+project. **Eviction** happens only by idle TTL (`--session-ttl`, default 1800 s) or by the explicit
+capacity bound (`--max-sessions`, default 64 — the least recently used IDLE conversation goes, an
+active one never does); each eviction is logged. `GET /health` lists the conversations — id, route,
+turns, idle seconds, never message content — plus `session_count`, `queue_depth`, per-model
+readiness and the historic `session_active`/`session_turns`/`session_idle_seconds`/
+`session_ttl_seconds`. `GET /v1/sessions` (behind the API key) adds each conversation's task name
+and provider session id.
 
 </details>
 
@@ -747,16 +770,111 @@ fact, which it genuinely is.
 </details>
 
 <details>
-<summary><b>Reliability: retries, 429s, clean output</b></summary>
+<summary><b>Routing several models, operations, and the stream watchdog</b></summary>
 
-A completion whose CLI invocation came back empty or in an `error` state is re-run (`--retries`,
-default 1) — a real OpenAI endpoint effectively never returns an empty 200, and one transient CLI
-hiccup should not zero a whole benchmark scenario. A resume that "succeeds" but produces an empty
-answer falls back to a fresh run the same way. An unexpected bridge exception returns an
-OpenAI-style `{"error": {...}}` HTTP 500, never a bare connection reset. A CLI answer that IS the
-provider's usage-limit banner ("You've hit your session limit · resets …") becomes an HTTP 429
-`rate_limit_error`, so a rate-limited account reads as an environment problem rather than a model
-that suddenly scores zero.
+**Routes.** `-e X -m Y` (one model) is the historic single-route bridge: every request is served by
+that route whatever its `model` says. Repeat `-m ENGINE/MODEL[@EFFORT]` (or pass
+`--models a,b,c`) to serve several routes from one process; bare `-m` values use `-e` (default
+`codex`). The request's `model` selects a route by id (`codex/6-luna`), by label
+(`codex/GPT-6 Luna`) or by a unique bare alias (`6-luna`); the first route is the default.
+`@EFFORT` is split off only when it is one of that provider's efforts (`claude/sonnet@low`). An
+OpenCode Zen id keeps its provider segment (`opencode/space-bunny-free` runs `opencode run -m
+opencode/space-bunny-free`), while bundled aliases stay aliases (`opencode/muse`).
+
+**Reasoning effort per request.** The OpenAI field `reasoning_effort`
+(`none|minimal|low|medium|high|xhigh|max`; `reasoning: {"effort": …}` and a model id suffix such as
+`codex/6-luna@high` work too) sets the effort for that conversation; without it the route's
+configured `-f`/`@EFFORT` applies (or the provider's own default, e.g. codex `medium`). It is mapped
+to the engine's effort flag (`-f` → codex `model_reasoning_effort`, claude `--effort`, opencode
+`--variant`). A level the engine does not advertise in `provider.json` is clamped to the nearest one
+it does (codex advertises `medium`/`high`, so `xhigh` runs as `high`); engines without an effort
+setting (`kimi`, `gemini`) ignore it. The effort is part of a conversation's identity: a request
+with another effort runs on the route variant `codex/6-luna@high` and never resumes a session
+started with a different effort. Every response proves what ran: `model` is the label with the
+effort (`codex/GPT-6 Luna (high)`), `neoxider_route` the variant id, and a `neoxider` object carries
+`reasoning_effort` (applied), `reasoning_effort_requested`, `_source` (request/model/default),
+`_supported`, `_clamped`, a note and the session id (in streaming: on the final chunk). `/health`
+lists the variants with `variant_of`, `applied_effort` and `effort_supported`.
+
+**Strictness (decided).** A multi-route bridge is strict by default: an unknown `model` is
+`404 model_not_found` listing the available ids, never a silent substitution that would corrupt a
+model comparison. A single-route bridge stays lenient like before (the default serves any `model`).
+`--strict-models` / `--no-strict-models` override either default. `--allow-any` additionally
+creates a route on demand for any `ENGINE/MODEL` of a known engine (validated, at most 32; refused
+on non-loopback binds). Responses carry the route's real label in `model` and its id in
+`neoxider_route`; `GET /v1/models` lists every route with `label`, `default` and live `state`.
+
+**Operations.**
+
+| Command | What it does |
+|---|---|
+| `openai-server [start] …` | foreground server, as before (`start` is optional) |
+| `openai-server start --detach … [--name N] [--json]` | background server; output goes to `~/.claude/agent-cli-logs/bridges/bridge-<port>.log`, the registry entry records pid, creation stamp, port, models and log; prints the URL |
+| `-p 0` | bind a free port and print it (`port=…` in the banner, `port` in `--json`) |
+| `--check` / `--probe` | after binding, send one tiny completion per route and print `ok` or the mapped error; `/health` shows each route's state (`probing` → `ok`/`error`) |
+| `openai-server check -m … [--json]` | the same probes without a server; exit 0 only when every route answered |
+| `openai-server list [--json]` | registered bridges with live `/health`: status, sessions, active turns, queue, uptime, models; dead entries are pruned |
+| `openai-server stop PORT\|NAME\|all [--force] [--wait S]` | identity-checked (`/health` instance id or the recorded process creation stamp) graceful stop via a loopback-only `POST /admin/shutdown`, then the whole process tree is killed if it is still alive (Windows and POSIX); the registry entry is removed |
+
+All of these go through every launcher (`agent.sh`, `agent.ps1`, `agent.cmd`, `agent.py`) exactly like
+`openai-server` itself. A foreground bridge whose launcher is interrupted (Ctrl-C) now takes its
+server and CLI children down with it instead of leaving an orphaned tree.
+
+**Stream watchdog and cancellation.** `--stall-timeout N` (default 180 s, `0` = off) is handed to the
+core's no-output watchdog (`AGENT_SILENCE_SEC`) for every bridge turn, with a bridge-side backstop
+30 s later and the same rule on the native Claude path: a provider that prints nothing for N
+seconds — the known "stream hangs with the process alive and ~0 CPU" quirk — has its CLI process
+tree stopped and the request gets `504 provider_stalled`. A client that disconnects mid-turn cancels
+that turn's CLI tree (the socket is polled while the turn runs; a failed SSE write does the same),
+and its conversation will not resume past the unacknowledged turn. Request bodies are capped by
+`--max-request-mb` (default 64 → `413`). Shutdown (Ctrl-C, SIGTERM, SIGBREAK, `stop`) closes every
+session and kills every registered provider tree.
+
+</details>
+
+<details>
+<summary><b>Reliability: errors, retries, 429s, clean output</b></summary>
+
+**Provider failures become OpenAI-style errors with a meaningful status**, never a bare 500 after a
+silent retry:
+
+```json
+{"error": {"message": "opencode: OpenCode's free tier can only be used from within OpenCode. … (provider HTTP 403, FreeTierError)",
+           "type": "permission_error", "code": "provider_forbidden", "param": null,
+           "retryable": false, "incident_id": "2809014e4139"}}
+```
+
+| Status | `code` | When | `retryable` |
+|---|---|---|---|
+| 401 | `provider_auth_failed` | not logged in, invalid key, expired token | no |
+| 403 | `provider_forbidden` | refused by the provider: permission, region, OpenCode free tier outside OpenCode | no |
+| 402 | `provider_billing` | payment required, insufficient credits | no |
+| 429 | `rate_limit_exceeded` | rate/usage limit (`state=limited`, a limit banner); `Retry-After` when the provider says when | yes |
+| 404 | `model_not_found` | the provider does not know the model, or no route serves the request's `model` | no |
+| 400 | `provider_bad_request` | the provider rejected the request (e.g. context too long) | no |
+| 502 | `provider_failed` / `provider_crashed` / `empty_completion` | CLI crashed, unknown failure, empty answer | yes |
+| 503 | `provider_unavailable` / `bridge_busy` | network/overload, CLI missing (not retryable), bridge queue full (`Retry-After`) | mostly |
+| 504 | `provider_timeout` / `provider_stalled` | `--timeout` or the stream watchdog fired | yes |
+
+The status comes from the core's task record (`state`, `exit`, `failure_json`: the provider's own
+redacted error, e.g. opencode's `statusCode: 403` and `FreeTierError` body), the wrapper's stderr
+and the bridge's watchdog flags — never from the model's answer text (except the exact limit banner).
+Each failure logs one `provider incident <id> status=… code=… model=… retryable=…` line carrying the
+mapped status; the response quotes the same `incident_id`. `/health` keeps each route's
+`last_error`. Verified live on 2026-10-15: `opencode/space-bunny-free` came back as this 403 JSON
+after one CLI attempt (the OpenCode CLI itself needed ~40 s to fail), where it used to be a bare
+`500 Internal Server Error` after a retry. The refusal is reported, not worked around.
+
+**Retries.** Only transient failures are re-run inside the bridge (`--retries`, default 1): an empty
+answer, a crash, a network blip, an unknown provider error (unless the provider marked it
+`isRetryable: false`). Auth, billing, limit, model and bad-request refusals and timeouts/stalls are
+returned at once — a 403 used to be retried, doubling the wait. A resume that "succeeds" but
+produces an empty answer still falls back to a fresh run; a resume that was refused is not replayed
+as a fresh full-history run. An unexpected bridge exception returns `500 bridge_failure` naming the
+exception class and an incident id (details stay in the log), never a bare connection reset. A CLI
+answer that IS the provider's usage-limit banner ("You've hit your session limit · resets …")
+becomes an HTTP 429 `rate_limit_error`, so a rate-limited account reads as an environment problem
+rather than a model that suddenly scores zero.
 
 The bridge disables `agent.sh`'s inner retry layer (`AGENT_RETRIES=0`) for its child calls, so
 `--retries N` means exactly one initial provider call plus at most N bridge retries rather than a
@@ -769,8 +887,7 @@ runs `codex exec --json` and extracts just the final agent message, which also c
 `agent.sh last` and the GUI chat view.
 
 **Images are attached for real on two engines.** Most engines still get an `[image omitted]` note
-in place of the picture, but a bridge started with `-e codex` or with `-e opencode` (the safe CLI
-path) accepts OpenAI `image_url` data URLs and hands the actual file to the model — `codex exec -i`
+in place of the picture, but a `codex` or `opencode` route (the safe CLI path) accepts OpenAI `image_url` data URLs and hands the actual file to the model — `codex exec -i`
 or `opencode run -f` — so the turn is genuinely multimodal:
 
 ```jsonc
@@ -793,12 +910,12 @@ Camera tools that return an `ok` JSON result with `camera` and `dataUrl` are als
 image part automatically. The CLI receives the pixels, while its text prompt keeps the camera
 summary without the base64 payload.
 
-GPT-6 Luna/Sol require Codex CLI 0.156.1 or newer;
-select them with `-e codex -m 6-luna` or `-e codex -m 6-sol` on separate ports.
+GPT-6 Luna/Sol require Codex CLI 0.156.1 or newer; select them with `-e codex -m 6-luna`, or
+serve both from one process with `-m codex/6-luna -m codex/6-sol`.
 
-
-**One process = one fixed engine/model/effort** for its whole lifetime. To compare models, run the
-command again with different `-e/-m/-f/-p`. `codex` resume preserves its pinned model/effort
+**Each route keeps its engine/model/effort** for the process lifetime, and each conversation stays
+on the route it started with (the same transcript sent to another model is a different
+conversation). `codex` resume preserves its pinned model/effort
 (`provider_codex_resume_cmd` re-sends `-m` and `model_reasoning_effort`) — fixing a real drift found
 live, where a session started with `-m spark` silently ran under `gpt-5.5` on resume.
 
@@ -822,8 +939,11 @@ export COREAI_TEST_MODEL=claude-sonnet-5
 export COREAI_TEST_API_KEY=
 ```
 
-To compare several models in one full benchmark run each, start one bridge per model on a
-different port (`-p 8801/8802/…`, different `-e/-m/-f`) and point a separate run at each `/v1`.
+To compare several models, one bridge can now serve all of them in parallel:
+`openai-server start --detach -m codex/6-luna -m codex/6-sol -m claude/sonnet -p 8801 --check`,
+then point each run at the same `/v1` with its own `COREAI_TEST_MODEL` (the route id). Parallel
+scenarios are independent conversations, so they no longer need one port each; `openai-server stop
+8801` ends the whole thing. One bridge per port still works exactly as before.
 
 </details>
 

@@ -2805,32 +2805,29 @@ class TailTaskLogTests(unittest.TestCase):
             self.dead = True
 
     def test_forwards_only_after_marker_and_in_pieces(self):
-        import threading
         name = "tail-test"
         path = os.path.join(self._tmp, name + ".log")
-        proc = self._FakeProc()
         got = []
+        # Each poll precedes a drain: publish one chunk per read, including a UTF-8
+        # character split across reads, regardless of the reader's scheduling.
+        chunks = iter([b"header stuff\n> PROMPT: hi\n",
+                       (srv.OUTPUT_MARKER + "\nHel").encode("utf-8"),
+                       b"lo \xd0", b"\xb6"])
 
-        def writer():
-            with open(path, "w", encoding="utf-8", newline="") as f:
-                f.write("header stuff\n> PROMPT: hi\n")
-                f.flush()
-                srv.time.sleep(0.15)
-                f.write(srv.OUTPUT_MARKER + "\n")
-                f.write("Hel")
-                f.flush()
-                srv.time.sleep(0.15)
-                f.write("lo ж")  # multi-byte char near a flush boundary
-                f.flush()
-                srv.time.sleep(0.15)
-            proc.dead = True
+        class WritingProc(self._FakeProc):
+            def poll(self):
+                chunk = next(chunks, None)
+                if chunk is None:
+                    self.dead = True
+                else:
+                    with open(path, "ab") as f:
+                        f.write(chunk)
+                return super().poll()
 
-        t = threading.Thread(target=writer)
-        t.start()
+        proc = WritingProc()
         srv._tail_task_log(name, proc, timeout=10, on_delta=got.append)
-        t.join()
         self.assertEqual("".join(got), "Hello ж")
-        self.assertGreaterEqual(len(got), 2)  # arrived in pieces, not one blob
+        self.assertEqual(got, ["Hel", "lo ", "ж"])
 
 
 class ProviderNoiseStreamFilterTests(unittest.TestCase):
@@ -3371,6 +3368,13 @@ class StreamErrorSafetyTests(unittest.TestCase):
         self.assertIn(b"event: error", wfile)
         self.assertNotIn(b"[DONE]", wfile)
 
+    def test_provider_stream_dying_mid_answer_ends_with_a_mapped_error_event(self):
+        sent, wfile = self._drive(True, srv.LiveStreamDied())
+        self.assertEqual(sent, [])
+        self.assertIn(b"event: error", wfile)
+        self.assertIn(b"stream_interrupted", wfile)
+        self.assertNotIn(b"[DONE]", wfile)
+
     def test_image_validation_after_sse_started_closes_without_second_status(self):
         exc = srv.RequestValidationError("messages[1].content[0].image_url", "too many images", 413)
         sent, wfile = self._drive(True, exc)
@@ -3388,8 +3392,14 @@ class StreamErrorSafetyTests(unittest.TestCase):
         sent, wfile = self._drive(False, RuntimeError("boom"))
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][0], 500)
-        self.assertEqual(sent[0][1]["error"]["message"], "bridge request failed")
-        self.assertIn("server_error", sent[0][1]["error"]["type"])
+        error = sent[0][1]["error"]
+        # Never a bare 500: the message names the failure class and the incident to look up,
+        # while the exception text itself (which may carry request data) stays in the log.
+        self.assertTrue(error["message"].startswith("bridge request failed"))
+        self.assertIn("RuntimeError", error["message"])
+        self.assertIn(error["incident_id"], error["message"])
+        self.assertIsNone(error["param"])
+        self.assertIn("server_error", error["type"])
         self.assertNotIn("boom", json.dumps(sent[0][1]))
         self.assertEqual(wfile, b"", "no stream bytes may be written on the sync error path")
 
@@ -3427,8 +3437,11 @@ class PortArgTests(unittest.TestCase):
         self.assertEqual(srv._port_arg("8801"), 8801)
         self.assertEqual(srv._port_arg(65535), 65535)
 
+    def test_zero_means_pick_a_free_port(self):
+        self.assertEqual(srv._port_arg("0"), 0)
+
     def test_garbage_out_of_range_and_negative_are_clean_errors(self):
-        for v in ("abc", "", None, "0", "-1", "65536", "70000"):
+        for v in ("abc", "", None, "-1", "65536", "70000"):
             with self.subTest(port=v), self.assertRaises(argparse.ArgumentTypeError):
                 srv._port_arg(v)
 
@@ -3528,6 +3541,1025 @@ class NetworkSafetyTests(unittest.TestCase):
             srv.CFG = old_cfg
         with self.assertRaises(ValueError):
             srv.resolve_claude_model("arbitrary-shell-alias", "")
+
+
+# ==============================================================================================
+# Multi-model routing, the conversation pool, error mapping, watchdogs and the registry tools.
+# Stub providers only: no CLI is launched and no provider is contacted.
+# ==============================================================================================
+import socket
+import urllib.error
+import urllib.request
+
+_REAL_SLEEP = time.sleep  # captured before any test stubs srv.time.sleep (the same module)
+
+# The exact `reason` the core recorded on 2026-10-15 for an OpenCode free model driven through
+# the bridge (trimmed headers): it must come back as a clear 403, not a bare 500 after a retry.
+FREE_TIER_REASON = json.dumps({
+    "name": "APIError",
+    "data": {
+        "message": "OpenCode's free tier can only be used from within OpenCode. "
+                   "Download it at https://opencode.ai and keep building.",
+        "statusCode": 403, "isRetryable": False,
+        "responseHeaders": {"content-type": "application/json", "server": "cloudflare"},
+        "responseBody": json.dumps({"type": "error", "error": {
+            "type": "FreeTierError",
+            "message": "OpenCode's free tier can only be used from within OpenCode. "
+                       "Download it at https://opencode.ai and keep building."}}),
+        "metadata": {"url": "https://opencode.[REDACTED]"}}})
+
+
+def _meta(state="error", exit_code="126", category="", reason=""):
+    meta = {"state": state, "exit": exit_code, "reason": reason}
+    if category or reason:
+        meta["failure_json"] = json.dumps({"category": category, "reason": reason,
+                                           "source": "provider_stream", "confidence": "explicit",
+                                           "blocking": True, "exit_code": 126})
+    return meta
+
+
+FAKE_PROVIDERS = {
+    "fakeeng": {"supports_resume": True, "efforts": ["low", "high"], "models": []},
+    "fakealt": {"supports_resume": True, "efforts": [], "models": []},
+    "noresume": {"supports_resume": False, "efforts": [], "models": []},
+}
+
+
+def _cfg(**overrides):
+    values = dict(engine="fakeeng", model="m", effort="", dir="", port=8990, host="127.0.0.1",
+                  timeout=60, retries=0, session_ttl=1800, max_sessions=64, max_concurrency=8,
+                  engine_limits={}, max_queue=64, queue_timeout=10, stall_timeout=0, api_key="",
+                  no_live_stream=True, strict_models=None, allow_any=False, check=False,
+                  json=False, name="", lan=False, localhost=False, routes=None,
+                  max_request_mb=64)
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+class _FakeProviderMixin:
+    """Swaps in stub engines and a fresh pool; records every run/reply the bridge would launch."""
+
+    def setUp(self):
+        self._saved_bridge = (srv.CFG, srv.ROUTES, srv.POOL, srv.PROVIDERS, srv.run_agent,
+                              srv.reply_agent, srv.read_meta, srv.time.sleep, srv.SESSION,
+                              dict(srv._DYNAMIC_ROUTES))
+        srv.PROVIDERS = dict(FAKE_PROVIDERS)
+        srv.POOL = srv.SessionPool()
+        srv.SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
+        srv._DYNAMIC_ROUTES.clear()
+        srv.time.sleep = lambda seconds: None
+        self.calls = []
+        self.metas = {}
+        self.calls_lock = threading.Lock()
+        srv.read_meta = lambda name: dict(self.metas.get(name, {"state": "done"}))
+        srv.run_agent = self._fake_run
+        srv.reply_agent = self._fake_reply
+        self.answer = lambda kind, engine, model, prompt, name: "%s answer" % kind
+        self.configure()
+
+    def tearDown(self):
+        srv.POOL.close_all()
+        (srv.CFG, srv.ROUTES, srv.POOL, srv.PROVIDERS, srv.run_agent, srv.reply_agent,
+         srv.read_meta, srv.time.sleep, srv.SESSION, dynamic) = self._saved_bridge
+        srv._DYNAMIC_ROUTES.clear()
+        srv._DYNAMIC_ROUTES.update(dynamic)
+
+    def configure(self, *specs, **overrides):
+        srv.CFG = _cfg(**overrides)
+        routes = srv.build_routes(srv.CFG.engine, list(specs) or ["m"], srv.CFG.effort,
+                                  engine_explicit=not specs)
+        srv.CFG.routes = routes
+        srv.ROUTES = list(routes)
+        return routes
+
+    def _record(self, kind, engine, model, workdir, name, prompt, effort=None):
+        with self.calls_lock:
+            self.calls.append({"kind": kind, "engine": engine, "model": model, "dir": workdir,
+                               "task": name, "prompt": prompt, "effort": effort,
+                               "thread": threading.current_thread().name,
+                               "session": getattr(srv._CTX.session, "id", None)})
+
+    def _fake_run(self, engine, model, effort, workdir, prompt, name, timeout):
+        self._record("run", engine, model, workdir, name, prompt, effort)
+        return self.answer("run", engine, model, prompt, name)
+
+    def _fake_reply(self, engine, model, effort, workdir, name, answer, timeout):
+        self._record("reply", engine, model, workdir, name, answer, effort)
+        return self.answer("reply", engine, model, answer, name)
+
+
+def _turn(messages, user, model=None):
+    body = {"messages": list(messages) + [{"role": "user", "content": user}]}
+    if model:
+        body["model"] = model
+    return body
+
+
+class _LiveHTTPMixin(_FakeProviderMixin):
+    """A real ThreadingHTTPServer on a free loopback port, backed by the stub providers."""
+
+    def setUp(self):
+        super().setUp()
+        request_done = self.request_done = {}
+
+        class Handler(srv.H):
+            def do_POST(self):
+                try:
+                    super().do_POST()
+                finally:
+                    done = request_done.get(self.headers.get("X-Test-Request-ID"))
+                    if done is not None:
+                        done.set()
+
+        self.server = srv._BridgeHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = "http://127.0.0.1:%d" % self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.1},
+                                       daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        super().tearDown()
+
+    def post(self, body, path="/v1/chat/completions", timeout=20):
+        done = threading.Event()
+        request_id = str(id(done))
+        self.request_done[request_id] = done
+        request = urllib.request.Request(self.base + path, data=json.dumps(body).encode("utf-8"),
+                                         headers={"Content-Type": "application/json",
+                                                  "X-Test-Request-ID": request_id}, method="POST")
+        try:
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    result = response.status, json.loads(response.read().decode("utf-8")), dict(response.headers)
+            except urllib.error.HTTPError as error:
+                with error:
+                    result = error.code, json.loads(error.read().decode("utf-8")), dict(error.headers)
+            # Receiving the body can precede checkin(), readiness updates and logging.
+            # Tests inspecting that state must wait for the handler's finally blocks.
+            self.assertTrue(done.wait(timeout), "HTTP handler did not finish after its response")
+            return result
+        finally:
+            self.request_done.pop(request_id, None)
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def chat(self, history, user, model=None):
+        """One OpenAI-style turn; returns the client-side history including the answer."""
+        status, body, _headers = self.post(_turn(history, user, model))
+        self.assertEqual(status, 200, body)
+        return list(history) + [{"role": "user", "content": user},
+                                {"role": "assistant", "content": body["choices"][0]["message"]["content"]}]
+
+
+class RouteParsingTests(unittest.TestCase):
+    def test_engine_model_effort_specs(self):
+        route = srv.parse_model_spec("codex/6-luna")
+        self.assertEqual((route.engine, route.model, route.id), ("codex", "6-luna", "codex/6-luna"))
+        route = srv.parse_model_spec("claude/sonnet@low")
+        self.assertEqual((route.engine, route.model, route.effort, route.id),
+                         ("claude", "sonnet", "low", "claude/sonnet@low"))
+        self.assertEqual(route.label, "claude/Sonnet 5 (low)")
+        self.assertIsNone(srv.parse_model_spec("6-luna"))
+        self.assertIsNone(srv.parse_model_spec("unknown-engine/x"))
+
+    def test_opencode_zen_ids_keep_their_provider_segment_and_aliases_stay_aliases(self):
+        route = srv.parse_model_spec("opencode/space-bunny-free")
+        self.assertEqual((route.engine, route.model, route.id),
+                         ("opencode", "opencode/space-bunny-free", "opencode/space-bunny-free"))
+        route = srv.parse_model_spec("opencode/muse")
+        self.assertEqual((route.model, route.id), ("muse", "opencode/muse"))
+        route = srv.parse_model_spec("opencode/anthropic/claude-x")
+        self.assertEqual(route.model, "anthropic/claude-x")
+
+    def test_single_model_with_explicit_engine_keeps_the_historic_verbatim_meaning(self):
+        (route,) = srv.build_routes("codex", ["6-luna"], "", engine_explicit=True)
+        self.assertEqual((route.engine, route.model), ("codex", "6-luna"))
+        (route,) = srv.build_routes("opencode", ["opencode/big-pickle"], "", engine_explicit=True)
+        self.assertEqual((route.engine, route.model), ("opencode", "opencode/big-pickle"))
+        (route,) = srv.build_routes("codex", [], "medium", engine_explicit=False)
+        self.assertEqual((route.engine, route.model, route.effort), ("codex", "", "medium"))
+        (route,) = srv.build_routes("codex", ["claude/sonnet"], "", engine_explicit=False)
+        self.assertEqual(route.engine, "claude")
+
+    def test_several_specs_become_several_routes_default_first_without_duplicates(self):
+        routes = srv.build_routes("codex", ["codex/6-luna", "6-sol", "claude/sonnet", "codex/6-luna"],
+                                  "", engine_explicit=False)
+        self.assertEqual([r.id for r in routes], ["codex/6-luna", "codex/6-sol", "claude/sonnet"])
+
+    def test_parse_config_accepts_repeated_m_and_models_lists(self):
+        cfg = srv.parse_config(["-m", "codex/6-luna", "--models", "codex/6-sol,claude/sonnet",
+                                "-p", "0", "--engine-limit", "claude=1", "--max-concurrency", "3"])
+        self.assertEqual([r.id for r in cfg.routes], ["codex/6-luna", "codex/6-sol", "claude/sonnet"])
+        self.assertEqual((cfg.engine, cfg.model, cfg.port), ("codex", "6-luna", 0))
+        self.assertEqual(cfg.engine_limits, {"claude": 1})
+        self.assertEqual(cfg.max_concurrency, 3)
+        legacy = srv.parse_config(["-e", "claude", "-m", "sonnet", "-f", "low", "-p", "8801"])
+        self.assertEqual([r.id for r in legacy.routes], ["claude/sonnet@low"])
+        self.assertEqual((legacy.engine, legacy.model, legacy.effort), ("claude", "sonnet", "low"))
+
+    def test_network_safety_checks_every_route_and_allow_any(self):
+        cfg = _cfg(host="0.0.0.0", api_key="secret",
+                   routes=[srv.Route("claude", "sonnet", ""), srv.Route("codex", "6-luna", "")])
+        self.assertIn("loopback-only", srv.validate_network_config(cfg))
+        cfg = _cfg(host="0.0.0.0", api_key="secret", allow_any=True,
+                   routes=[srv.Route("claude", "sonnet", "")])
+        self.assertIn("--allow-any", srv.validate_network_config(cfg))
+        cfg = _cfg(routes=[srv.Route("claude", "arbitrary-shell-alias", "")])
+        self.assertIn("unsupported Claude", srv.validate_network_config(cfg))
+
+
+class RouteResolutionTests(_FakeProviderMixin, unittest.TestCase):
+    def test_request_model_selects_route_by_id_label_or_unique_alias(self):
+        routes = self.configure("fakeeng/alpha", "fakeeng/beta@high", "fakealt/alpha")
+        self.assertIs(srv.resolve_route("fakeeng/beta@high"), routes[1])
+        self.assertIs(srv.resolve_route("FAKEENG/BETA (HIGH)"), routes[1])   # label, any case
+        self.assertIs(srv.resolve_route("fakeeng/beta"), routes[1])           # id without effort
+        self.assertIs(srv.resolve_route("beta"), routes[1])                   # unique bare alias
+        self.assertIs(srv.resolve_route(None), routes[0])
+        self.assertIs(srv.resolve_route(""), routes[0])
+
+    def test_multi_route_bridges_are_strict_unless_told_otherwise(self):
+        self.configure("fakeeng/alpha", "fakealt/alpha")
+        with self.assertRaises(srv.BridgeError) as raised:
+            srv.resolve_route("gpt-4o")
+        self.assertEqual((raised.exception.status, raised.exception.code), (404, "model_not_found"))
+        self.assertEqual(raised.exception.param, "model")
+        self.assertIn("fakeeng/alpha", str(raised.exception))
+        with self.assertRaises(srv.BridgeError):
+            srv.resolve_route("alpha")  # ambiguous bare alias is not guessed
+        srv.CFG.strict_models = False
+        self.assertIs(srv.resolve_route("gpt-4o"), srv.ROUTES[0])
+
+    def test_single_route_keeps_the_lenient_historic_behaviour(self):
+        (route,) = self.configure()
+        self.assertIs(srv.resolve_route("anything-the-client-says"), route)
+        srv.CFG.strict_models = True
+        with self.assertRaises(srv.BridgeError):
+            srv.resolve_route("anything-the-client-says")
+        with self.assertRaises(srv.RequestValidationError):
+            srv.resolve_route(42)
+
+    def test_allow_any_adds_validated_bounded_on_demand_routes(self):
+        self.configure("fakeeng/alpha", allow_any=True)
+        route = srv.resolve_route("fakealt/zeta")
+        self.assertEqual((route.engine, route.model, route.dynamic), ("fakealt", "zeta", True))
+        self.assertIs(srv.resolve_route("fakealt/zeta"), route)
+        self.assertIn("fakealt/zeta", [r.id for r in srv._all_routes()])
+        for bad in ("fakealt/-rf", "fakealt/a b", "nope/x"):
+            with self.subTest(model=bad), self.assertRaises(srv.BridgeError):
+                srv.resolve_route(bad)
+
+    def test_models_endpoint_lists_every_route_with_label_and_readiness(self):
+        self.configure("fakeeng/alpha", "fakealt/beta")
+        sent = []
+
+        class Fake:
+            headers = {}
+            path = "/v1/models"
+            _reject_unauthorized = srv.H._reject_unauthorized
+            _send_json = staticmethod(lambda code, body: sent.append((code, body)))
+
+        srv.H.do_GET(Fake())
+        code, body = sent[0]
+        self.assertEqual(code, 200)
+        self.assertEqual([m["id"] for m in body["data"]], ["fakeeng/alpha", "fakealt/beta"])
+        self.assertEqual([m["default"] for m in body["data"]], [True, False])
+        self.assertTrue(all(m["label"] and m["state"] == "unknown" for m in body["data"]))
+        sent.clear()
+        Fake.path = "/v1/models/fakealt/beta"
+        srv.H.do_GET(Fake())
+        self.assertEqual((sent[0][0], sent[0][1]["id"]), (200, "fakealt/beta"))
+        sent.clear()
+        Fake.path = "/v1/models/nope"
+        srv.H.do_GET(Fake())
+        self.assertEqual(sent[0][0], 404)
+
+
+class ErrorMappingTests(unittest.TestCase):
+    def classify(self, meta=None, outcome=None, raw_text="", engine="opencode"):
+        return srv.classify_failure_outcome(engine, meta, outcome, raw_text)
+
+    def test_opencode_free_tier_refusal_is_a_clear_non_retryable_403(self):
+        error = self.classify(_meta(category="auth", reason=FREE_TIER_REASON))
+        self.assertIsInstance(error, srv.CompletionFailed)
+        self.assertEqual((error.status, error.code, error.error_type), (403, "provider_forbidden", "permission_error"))
+        self.assertFalse(error.retryable)
+        self.assertFalse(error.internal_retry)
+        self.assertIn("free tier can only be used from within OpenCode", str(error))
+        self.assertIn("FreeTierError", str(error))
+        self.assertIn("provider HTTP 403", str(error))
+        payload = error.payload("abc")["error"]
+        self.assertEqual(set(payload), {"message", "type", "code", "param", "retryable", "incident_id"})
+        self.assertIsNone(payload["param"])
+
+    def test_status_and_category_table(self):
+        cases = [
+            (_meta(category="auth", reason="Invalid API key · Please run /login"), 401, "provider_auth_failed", False),
+            (_meta(reason=json.dumps({"error": {"message": "Payment required: insufficient credits", "status": 402}})),
+             402, "provider_billing", False),
+            (_meta(state="limited", category="quota", reason="Rate limit reached. Please try again in 20s"),
+             429, "rate_limit_exceeded", True),
+            (_meta(category="model_unavailable", reason="model gpt-x not found"), 404, "model_not_found", False),
+            (_meta(reason=json.dumps({"error": {"message": "prompt is too long", "code": 400}})),
+             400, "provider_bad_request", False),
+            (_meta(category="network", reason="ECONNRESET socket hang up"), 503, "provider_unavailable", True),
+            (_meta(category="transport", reason="503 Service Unavailable: overloaded"), 503, "provider_unavailable", True),
+            (_meta(category="provider_oom", reason="JavaScript heap out of memory"), 502, "provider_crashed", True),
+            (_meta(state="silent", exit_code="125", category="watchdog_silence"), 504, "provider_stalled", True),
+            (_meta(state="error", exit_code="124", category="watchdog_timeout"), 504, "provider_timeout", True),
+            (_meta(reason="something odd happened"), 502, "provider_failed", True),
+        ]
+        for meta, status, code, retryable in cases:
+            with self.subTest(code=code, reason=meta.get("reason", "")[:40]):
+                error = self.classify(meta)
+                self.assertEqual((error.status, error.code, error.retryable), (status, code, retryable))
+                self.assertTrue(str(error))
+
+    def test_429_carries_retry_after_from_the_provider_text(self):
+        error = self.classify(_meta(state="limited", category="quota",
+                                    reason="usage limit reached, resets in 2h 5m"))
+        self.assertEqual(error.retry_after, 2 * 3600 + 5 * 60)
+        self.assertEqual(error.headers(), {"Retry-After": "7500"})
+        self.assertEqual(srv._retry_after_seconds('"retry-after": "30"'), 30)
+        self.assertIsNone(srv._retry_after_seconds("try again at 7:40am"))
+
+    def test_watchdog_outcomes_and_wrapper_failures(self):
+        self.assertEqual(self.classify(outcome={"stalled": True}).code, "provider_stalled")
+        self.assertEqual(self.classify(outcome={"timed_out": True}).status, 504)
+        self.assertIsInstance(self.classify(outcome={"cancelled": True}), srv.ClientDisconnected)
+        missing = self.classify(meta={}, outcome={"stderr": "neoxider: opencode CLI not found; install it"})
+        self.assertEqual((missing.status, missing.code, missing.retryable), (503, "provider_unavailable", False))
+        empty = self.classify(meta={"state": "done"}, raw_text="")
+        self.assertEqual((empty.status, empty.code, empty.internal_retry), (502, "empty_completion", True))
+
+    def test_internal_retry_is_reserved_for_transient_failures(self):
+        self.assertTrue(self.classify(_meta(category="network", reason="fetch failed")).internal_retry)
+        provider_says_no = json.dumps({"data": {"message": "upstream 500", "statusCode": 500,
+                                                "isRetryable": False}})
+        self.assertFalse(self.classify(_meta(reason=provider_says_no)).internal_retry)
+        for meta in (_meta(category="auth", reason=FREE_TIER_REASON),
+                     _meta(state="limited", category="quota", reason="rate limit"),
+                     _meta(state="silent", exit_code="125")):
+            self.assertFalse(self.classify(meta).internal_retry)
+
+    def test_model_answer_text_is_never_pattern_matched_as_an_error(self):
+        # A successful-looking state with an answer that DISCUSSES limits/auth is not classified
+        # by its words; only the exact limit banner is.
+        error = self.classify({"state": "done"}, raw_text="Here is how a 403 forbidden works ...")
+        self.assertEqual(error.code, "provider_failed")
+        banner = self.classify({"state": "done"}, raw_text="You've hit your session limit · resets in 30m")
+        self.assertEqual((banner.status, banner.retry_after), (429, 1800))
+
+
+class NoRetryOnRefusalTests(_FakeProviderMixin, unittest.TestCase):
+    def test_403_is_raised_after_one_attempt_even_with_retries_left(self):
+        self.configure(retries=2)
+        self.answer = lambda *a: ""
+        self.metas = {}
+        srv.read_meta = lambda name: _meta(category="auth", reason=FREE_TIER_REASON)
+        with self.assertRaises(srv.CompletionFailed) as raised:
+            srv.H._run(object(), [{"role": "user", "content": "hi"}], None)
+        self.assertEqual(raised.exception.status, 403)
+        self.assertEqual(len([c for c in self.calls if c["kind"] == "run"]), 1)
+
+    def test_transient_failure_is_still_retried(self):
+        self.configure(retries=1)
+        answers = iter(["", "RECOVERED"])
+        self.answer = lambda *a: next(answers)
+        states = iter([_meta(category="network", reason="ECONNRESET"), {"state": "done"}])
+        srv.read_meta = lambda name: next(states, {"state": "done"})
+        text, _calls, _usage = srv.H._run(object(), [{"role": "user", "content": "hi"}], None)
+        self.assertEqual(text, "RECOVERED")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_refused_resume_is_not_replayed_as_a_fresh_full_history_run(self):
+        self.configure(retries=1)
+        first = [{"role": "user", "content": "one"}]
+        srv.SESSION.update(task_name="prior", messages=first + [{"role": "assistant", "content": "a"}],
+                           dir="/tmp/x", last_activity=time.time())
+        self.answer = lambda kind, *a: None if kind == "reply" else "FRESH"
+        metas = {"prior": {"state": "done"}}
+        srv.read_meta = lambda name: metas.get(name, {"state": "done"})
+
+        def refused_reply(engine, model, effort, workdir, name, answer, timeout):
+            self._record("reply", engine, model, workdir, name, answer)
+            metas["prior"] = _meta(state="limited", category="quota", reason="usage limit, retry after 60s")
+            return None
+
+        srv.reply_agent = refused_reply
+        with self.assertRaises(srv.CompletionFailed) as raised:
+            srv.H._run(object(), srv.SESSION["messages"] + [{"role": "user", "content": "two"}], None)
+        self.assertEqual((raised.exception.status, raised.exception.retry_after), (429, 60))
+        self.assertEqual([c["kind"] for c in self.calls], ["reply"])
+        self.assertIsNone(srv.SESSION["task_name"])
+
+
+class ConversationPoolHTTPTests(_LiveHTTPMixin, unittest.TestCase):
+    def test_interleaved_conversations_each_resume_their_own_session(self):
+        """A1, B1, A2, B2, A3: A and B never overwrite each other -- A2/A3 resume A's CLI task with
+        only the new tail, B2 resumes B's, each with its own working directory."""
+        self.configure()  # stub engine, per-conversation scratch dirs (no --dir pin)
+        a = self.chat([], "A1 question")
+        b = self.chat([], "B1 question")
+        a = self.chat(a, "A2 follow-up")
+        b = self.chat(b, "B2 follow-up")
+        a = self.chat(a, "A3 follow-up")
+        runs = [c for c in self.calls if c["kind"] == "run"]
+        replies = [c for c in self.calls if c["kind"] == "reply"]
+        self.assertEqual(len(runs), 2, "only the two first turns may start fresh runs")
+        self.assertEqual(len(replies), 3)
+        task_a, task_b = runs[0]["task"], runs[1]["task"]
+        self.assertNotEqual(task_a, task_b)
+        self.assertEqual([r["task"] for r in replies], [task_a, task_b, task_a])
+        # each resume carries ONLY the new tail of its own conversation
+        self.assertIn("A2 follow-up", replies[0]["prompt"])
+        self.assertNotIn("A1 question", replies[0]["prompt"])
+        self.assertNotIn("B1 question", replies[0]["prompt"])
+        self.assertIn("B2 follow-up", replies[1]["prompt"])
+        self.assertNotIn("A2", replies[1]["prompt"])
+        self.assertIn("A3 follow-up", replies[2]["prompt"])
+        # own working directory per conversation, stable across that conversation's turns
+        dir_a, dir_b = runs[0]["dir"], runs[1]["dir"]
+        self.assertNotEqual(dir_a, dir_b)
+        self.assertEqual({replies[0]["dir"], replies[2]["dir"]}, {dir_a})
+        self.assertEqual(replies[1]["dir"], dir_b)
+        for directory, session in ((dir_a, runs[0]["session"]), (dir_b, runs[1]["session"])):
+            self.assertTrue(os.path.basename(directory).endswith(session))
+        health = self.get("/health")
+        self.assertEqual(health["session_count"], 2)
+        turns = sorted(s["turns"] for s in health["sessions"])
+        self.assertEqual(turns, [2, 3])
+        self.assertTrue(all("idle_seconds" in s and "id" in s for s in health["sessions"]))
+        dumped = json.dumps(health)
+        for secret in ("A1 question", "B2 follow-up", "answer"):
+            self.assertNotIn(secret, dumped, "health must never expose message content")
+        detail = self.get("/v1/sessions")["data"]
+        self.assertEqual(sorted(s["task"] for s in detail), sorted([task_a, task_b]))
+
+    def test_cross_engine_conversations_stay_isolated_in_one_process(self):
+        self.configure("fakeeng/alpha", "fakealt/beta")
+        a = self.chat([], "A1", model="fakeeng/alpha")
+        b = self.chat([], "B1", model="fakealt/beta")
+        a = self.chat(a, "A2", model="fakeeng/alpha")
+        b = self.chat(b, "B2", model="fakealt/beta")
+        replies = [c for c in self.calls if c["kind"] == "reply"]
+        self.assertEqual([(r["engine"], r["model"]) for r in replies],
+                         [("fakeeng", "alpha"), ("fakealt", "beta")])
+        runs = [c for c in self.calls if c["kind"] == "run"]
+        self.assertEqual([r["task"] for r in runs], [replies[0]["task"], replies[1]["task"]])
+        # the same transcript sent to the OTHER model is a different conversation, never a resume
+        self.chat(a[:2], "A2", model="fakealt/beta")
+        self.assertEqual(self.calls[-1]["kind"], "run")
+        self.assertEqual(self.calls[-1]["engine"], "fakealt")
+
+    def test_response_reports_the_route_label_and_id(self):
+        self.configure("fakeeng/alpha", "fakealt/beta")
+        status, body, _headers = self.post(_turn([], "hi", "fakealt/beta"))
+        self.assertEqual(status, 200)
+        self.assertEqual(body["model"], "fakealt/beta")
+        self.assertEqual(body["neoxider_route"], "fakealt/beta")
+        self.assertEqual((self.calls[0]["engine"], self.calls[0]["model"]), ("fakealt", "beta"))
+        status, body, _headers = self.post(_turn([], "hi", "gpt-4o"))
+        self.assertEqual((status, body["error"]["code"]), (404, "model_not_found"))
+
+    def test_independent_conversations_actually_overlap(self):
+        self.configure(max_concurrency=4)
+        barrier = threading.Barrier(2, timeout=10)
+        active, peak, lock = [0], [0], threading.Lock()
+
+        def answer(kind, engine, model, prompt, name):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            try:
+                barrier.wait()  # only returns if BOTH conversations are inside the CLI at once
+                return "parallel ok"
+            finally:
+                with lock:
+                    active[0] -= 1
+
+        self.answer = answer
+        results = []
+        threads = [threading.Thread(target=lambda u=u: results.append(self.post(_turn([], u))))
+                   for u in ("conversation one", "conversation two")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(sorted(r[0] for r in results), [200, 200])
+        self.assertEqual(peak[0], 2)
+        self.assertEqual(len({c["session"] for c in self.calls}), 2)
+
+    def test_max_concurrency_one_restores_one_turn_at_a_time(self):
+        self.configure(max_concurrency=1)
+        active, peak, lock = [0], [0], threading.Lock()
+        real_sleep = _REAL_SLEEP
+
+        def answer(*_args):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            real_sleep(0.3)
+            with lock:
+                active[0] -= 1
+            return "serial ok"
+
+        self.answer = answer
+        results = []
+        threads = [threading.Thread(target=lambda u=u: results.append(self.post(_turn([], u))))
+                   for u in ("one", "two", "three")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(sorted(r[0] for r in results), [200, 200, 200])
+        self.assertEqual(peak[0], 1)
+
+    def test_same_conversation_turns_never_overlap(self):
+        self.configure(max_concurrency=4)
+        history = self.chat([], "first")
+        gate = threading.Event()
+        inside, overlaps, lock = {}, [], threading.Lock()
+        real_sleep = _REAL_SLEEP
+
+        def answer(kind, engine, model, prompt, name):
+            with lock:
+                inside[name] = inside.get(name, 0) + 1
+                if inside[name] > 1:
+                    overlaps.append(name)
+            gate.wait(5)
+            real_sleep(0.2)
+            with lock:
+                inside[name] -= 1
+            return "turn ok"
+
+        self.answer = answer
+        results = []
+        body = _turn(history, "second")  # the SAME continuation sent twice concurrently
+        threads = [threading.Thread(target=lambda: results.append(self.post(body))) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        real_sleep(0.5)
+        gate.set()
+        for thread in threads:
+            thread.join(20)
+        self.assertEqual(sorted(r[0] for r in results), [200, 200])
+        self.assertEqual(overlaps, [])
+        kinds = [c["kind"] for c in self.calls[1:]]
+        # one request resumed the conversation; the other waited for it and then (its history no
+        # longer being an extension) got its own fresh session instead of racing the first
+        self.assertEqual(sorted(kinds), ["reply", "run"])
+
+    def test_capacity_eviction_takes_the_lru_idle_session_and_is_logged(self):
+        self.configure(max_sessions=2)
+        with mock.patch.object(srv.time, "time", return_value=1000.0) as clock:
+            a = self.chat([], "A1")
+            session_a = self.calls[-1]["session"]
+            clock.return_value += 1
+            self.chat([], "B1")
+            clock.return_value += 1
+            with self.assertLogs(srv.LOG, level=logging.WARNING) as logs:
+                self.chat([], "C1")
+            self.assertTrue(any("evicted session " + session_a in line and "capacity" in line
+                                for line in logs.output))
+            self.assertEqual(self.get("/health")["session_count"], 2)
+            self.chat(a, "A2")  # A was evicted -> its next turn starts fresh (it was never resumed)
+            self.assertEqual(self.calls[-1]["kind"], "run")
+
+    def test_an_active_session_is_never_evicted(self):
+        self.configure(max_sessions=1, max_concurrency=4)
+        release = threading.Event()
+        entered = threading.Event()
+
+        def answer(kind, engine, model, prompt, name):
+            if "slow" in prompt:
+                entered.set()
+                release.wait(10)
+            return "ok"
+
+        self.answer = answer
+        slow = []
+        thread = threading.Thread(target=lambda: slow.append(self.post(_turn([], "slow A1"))))
+        thread.start()
+        self.assertTrue(entered.wait(10))
+        self.chat([], "B1")  # over capacity while A is busy: A must survive
+        release.set()
+        thread.join(10)
+        self.assertEqual(slow[0][0], 200)
+        a = [{"role": "user", "content": "slow A1"}, {"role": "assistant", "content": "ok"}]
+        self.chat(a, "A2")
+        self.assertEqual(self.calls[-1]["kind"], "reply", "A kept its session while it was busy")
+
+    def test_idle_ttl_eviction_is_logged(self):
+        self.configure(session_ttl=1)
+        with mock.patch.object(srv.time, "time", return_value=1000.0) as clock:
+            self.chat([], "A1")
+            session, = srv.POOL.list_sessions()
+            self.assertFalse(session.busy)
+            clock.return_value += 1
+            self.assertEqual(srv.POOL.evict(), 0)  # TTL expires strictly after the boundary.
+            with self.assertLogs(srv.LOG, level=logging.WARNING) as logs:
+                clock.return_value += 1
+                self.assertEqual(srv.POOL.evict(), 1)
+            self.assertTrue(any("evicted session " + session.id in line and "session-ttl" in line
+                                for line in logs.output))
+            self.assertTrue(session.closed)
+            self.assertEqual(srv.POOL.list_sessions(), [])
+            self.assertEqual(srv.POOL.evict(), 0)
+
+    def test_reset_can_target_one_route(self):
+        self.configure("fakeeng/alpha", "fakealt/beta")
+        self.chat([], "A1", model="fakeeng/alpha")
+        self.chat([], "B1", model="fakealt/beta")
+        status, body, _headers = self.post({"model": "fakealt/beta"}, path="/v1/reset")
+        self.assertEqual((status, body["sessions"]), (200, 1))
+        self.assertEqual([s["model"] for s in self.get("/health")["sessions"]], ["fakeeng/alpha"])
+        status, body, _headers = self.post({}, path="/v1/reset")
+        self.assertEqual(self.get("/health")["session_count"], 0)
+
+    def test_provider_refusal_is_openai_json_with_mapped_status_and_health(self):
+        self.configure(retries=1)
+        self.answer = lambda *a: ""
+        srv.read_meta = lambda name: _meta(category="auth", reason=FREE_TIER_REASON)
+        started = time.monotonic()
+        status, body, _headers = self.post(_turn([], "hi"))
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(status, 403)
+        error = body["error"]
+        self.assertEqual((error["type"], error["code"], error["param"], error["retryable"]),
+                         ("permission_error", "provider_forbidden", None, False))
+        self.assertIn("FreeTierError", error["message"])
+        self.assertTrue(error["incident_id"])
+        self.assertEqual(len(self.calls), 1, "a 403 must not be retried")
+        model = self.get("/health")["models"][0]
+        self.assertEqual((model["state"], model["ready"], model["last_error"]["status"]),
+                         ("error", False, 403))
+
+    def test_rate_limit_sets_retry_after_header(self):
+        self.answer = lambda *a: ""
+        srv.read_meta = lambda name: _meta(state="limited", category="quota",
+                                           reason="rate limit exceeded, retry after 42s")
+        status, body, headers = self.post(_turn([], "hi"))
+        self.assertEqual((status, body["error"]["code"]), (429, "rate_limit_exceeded"))
+        self.assertEqual(headers.get("Retry-After"), "42")
+        self.assertEqual(body["error"]["retry_after_seconds"], 42)
+
+    def test_full_queue_answers_503_with_retry_after(self):
+        self.configure(max_concurrency=1, max_queue=0)
+        release, entered = threading.Event(), threading.Event()
+
+        def answer(kind, engine, model, prompt, name):
+            entered.set()
+            release.wait(10)
+            return "ok"
+
+        self.answer = answer
+        first = []
+        thread = threading.Thread(target=lambda: first.append(self.post(_turn([], "one"))))
+        thread.start()
+        self.assertTrue(entered.wait(10))
+        status, body, headers = self.post(_turn([], "two"))
+        release.set()
+        thread.join(10)
+        self.assertEqual((status, body["error"]["code"], body["error"]["retryable"]),
+                         (503, "bridge_busy", True))
+        self.assertEqual(headers.get("Retry-After"), "5")
+        self.assertEqual(first[0][0], 200)
+
+    def test_client_disconnect_cancels_the_cli_run(self):
+        observed = threading.Event()
+        real_sleep = _REAL_SLEEP
+
+        def answer(kind, engine, model, prompt, name):
+            cancel = srv._CTX.cancel
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                if cancel is not None and cancel.is_set():
+                    observed.set()
+                    return ""
+                real_sleep(0.05)
+            return "never cancelled"
+
+        self.answer = answer
+        body = json.dumps(_turn([], "abandon me")).encode("utf-8")
+        port = self.server.server_address[1]
+        client = socket.create_connection(("127.0.0.1", port), timeout=5)
+        client.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                       b"Content-Type: application/json\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        real_sleep(0.5)
+        client.close()
+        self.assertTrue(observed.wait(8), "the CLI run must be cancelled when the client leaves")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and srv.POOL.snapshot()["active_slots"]:
+            real_sleep(0.05)
+        self.assertEqual(srv.POOL.snapshot()["active_slots"], 0)
+        health = self.get("/health")
+        self.assertTrue(all(not s["resumable"] for s in health["sessions"]))
+        # a client that left is not a provider failure: the model's readiness is untouched
+        self.assertEqual(health["models"][0]["state"], "unknown")
+
+
+class ReasoningEffortUnitTests(unittest.TestCase):
+    def test_nearest_supported_level_prefers_the_cheaper_on_ties(self):
+        self.assertEqual(srv._nearest_effort("high", ["medium", "high"]), "high")
+        self.assertEqual(srv._nearest_effort("xhigh", ["medium", "high"]), "high")
+        self.assertEqual(srv._nearest_effort("none", ["medium", "high"]), "medium")
+        self.assertEqual(srv._nearest_effort("low", ["medium", "high"]), "medium")
+        self.assertEqual(srv._nearest_effort("xhigh", ["minimal", "low", "medium", "high", "max"]), "high")
+        self.assertEqual(srv._nearest_effort("none", ["low", "medium", "high", "xhigh", "max"]), "low")
+
+    def test_request_field_validation(self):
+        self.assertIsNone(srv.requested_effort({}))
+        self.assertEqual(srv.requested_effort({"reasoning_effort": "HIGH"}), "high")
+        self.assertEqual(srv.requested_effort({"reasoning": {"effort": "low"}}), "low")
+        self.assertEqual(srv.requested_effort({"reasoning_effort": "high", "reasoning": {"effort": "low"}}), "high")
+        for bad in ("turbo", 3, ""):
+            with self.subTest(value=bad), self.assertRaises(srv.RequestValidationError) as raised:
+                srv.requested_effort({"reasoning_effort": bad})
+            self.assertEqual(raised.exception.param, "reasoning_effort")
+
+    def test_applied_effort_reports_the_provider_default_when_none_is_set(self):
+        self.assertEqual(srv.Route("codex", "6-luna", "").applied_effort, "medium")
+        self.assertEqual(srv.Route("codex", "6-luna", "high").applied_effort, "high")
+        self.assertEqual(srv.Route("claude", "sonnet", "").applied_effort, "high")
+        self.assertEqual(srv.Route("claude", "opus5", "").applied_effort, None)
+
+
+class ReasoningEffortHTTPTests(_LiveHTTPMixin, unittest.TestCase):
+    def ask(self, history, user, effort=None, model=None, **extra):
+        body = _turn(history, user, model)
+        if effort is not None:
+            body["reasoning_effort"] = effort
+        body.update(extra)
+        status, response, _headers = self.post(body)
+        return status, response
+
+    def test_request_effort_reaches_the_cli_and_the_response_proves_it(self):
+        self.configure("fakeeng/alpha")
+        status, body = self.ask([], "hi", effort="high")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.calls[-1]["effort"], "high")
+        meta = body["neoxider"]
+        self.assertEqual((meta["reasoning_effort"], meta["reasoning_effort_requested"],
+                          meta["reasoning_effort_source"], meta["reasoning_effort_clamped"]),
+                         ("high", "high", "request", False))
+        self.assertEqual((meta["route"], meta["base_route"]), ("fakeeng/alpha@high", "fakeeng/alpha"))
+        self.assertEqual(body["model"], "fakeeng/alpha (high)")
+        self.assertEqual(body["neoxider_route"], "fakeeng/alpha@high")
+        self.assertEqual(meta["session"], self.calls[-1]["session"])
+
+    def test_configured_effort_is_the_default_when_the_request_omits_it(self):
+        self.configure("fakeeng/alpha@low")
+        status, body = self.ask([], "hi")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.calls[-1]["effort"], "low")
+        self.assertEqual((body["neoxider"]["reasoning_effort"], body["neoxider"]["reasoning_effort_source"]),
+                         ("low", "default"))
+        self.configure("fakeeng/alpha", effort="high")
+        self.ask([], "again")
+        self.assertEqual(self.calls[-1]["effort"], "high")
+
+    def test_a_different_effort_never_resumes_another_efforts_session(self):
+        self.configure("fakeeng/alpha")
+        history = [{"role": "user", "content": "A1"}]
+        status, body = self.ask([], "A1", effort="high")
+        history.append({"role": "assistant", "content": body["choices"][0]["message"]["content"]})
+        status, _body = self.ask(history, "A2", effort="low")
+        self.assertEqual((status, self.calls[-1]["kind"], self.calls[-1]["effort"]), (200, "run", "low"))
+        status, _body = self.ask(history, "A2", effort="high")
+        self.assertEqual((self.calls[-1]["kind"], self.calls[-1]["effort"]), ("reply", "high"))
+        self.assertEqual(self.calls[-1]["task"], self.calls[0]["task"])
+        sessions = {s["model"] for s in self.get("/health")["sessions"]}
+        self.assertEqual(sessions, {"fakeeng/alpha@high", "fakeeng/alpha@low"})
+
+    def test_unsupported_level_is_clamped_and_reported(self):
+        self.configure("fakeeng/alpha")  # stub engine advertises low/high only
+        status, body = self.ask([], "hi", effort="xhigh")
+        self.assertEqual(status, 200)
+        meta = body["neoxider"]
+        self.assertEqual((self.calls[-1]["effort"], meta["reasoning_effort"], meta["reasoning_effort_requested"],
+                          meta["reasoning_effort_clamped"]), ("high", "high", "xhigh", True))
+        self.assertIn("clamped", meta["reasoning_effort_note"])
+        status, body = self.ask([], "hi", effort="none")
+        self.assertEqual(body["neoxider"]["reasoning_effort"], "low")
+
+    def test_engine_without_effort_support_ignores_it_and_says_so(self):
+        self.configure("fakealt/beta")
+        history = [{"role": "user", "content": "B1"}]
+        status, body = self.ask([], "B1", effort="high")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.calls[-1]["effort"], "")
+        meta = body["neoxider"]
+        self.assertEqual((meta["reasoning_effort"], meta["reasoning_effort_supported"]), (None, False))
+        self.assertIn("ignored", meta["reasoning_effort_note"])
+        self.assertEqual(body["neoxider_route"], "fakealt/beta")
+        history.append({"role": "assistant", "content": body["choices"][0]["message"]["content"]})
+        self.ask(history, "B2", effort="low")  # nothing differs, so the session is reused safely
+        self.assertEqual(self.calls[-1]["kind"], "reply")
+        model = self.get("/health")["models"][0]
+        self.assertEqual((model["effort_supported"], model["applied_effort"]), (False, None))
+
+    def test_invalid_effort_is_a_400_and_reaches_no_cli(self):
+        status, body = self.ask([], "hi", effort="turbo")
+        self.assertEqual((status, body["error"]["param"], body["error"]["code"]),
+                         (400, "reasoning_effort", "invalid_parameter"))
+        self.assertEqual(self.calls, [])
+
+    def test_reasoning_object_and_model_id_suffix_select_the_effort_too(self):
+        self.configure("fakeeng/alpha", "fakealt/beta")
+        status, body = self.ask([], "hi", reasoning={"effort": "high"}, model="fakeeng/alpha")
+        self.assertEqual((status, self.calls[-1]["effort"]), (200, "high"))
+        status, body = self.ask([], "hi", model="fakeeng/alpha@low")
+        self.assertEqual((status, self.calls[-1]["effort"]), (200, "low"))
+        self.assertEqual(body["neoxider"]["reasoning_effort_source"], "model")
+        health = {m["id"]: m for m in self.get("/health")["models"]}
+        self.assertEqual(health["fakeeng/alpha@high"]["variant_of"], "fakeeng/alpha")
+        self.assertEqual(health["fakeeng/alpha@low"]["state"], "ok")
+        self.assertNotIn("fakeeng/alpha@high", [m["id"] for m in self.get("/v1/models")["data"]])
+
+    def test_streaming_final_chunk_carries_the_effective_effort(self):
+        self.configure("fakeeng/alpha")
+        request = urllib.request.Request(
+            self.base + "/v1/chat/completions",
+            data=json.dumps(dict(_turn([], "stream it"), stream=True, reasoning_effort="high")).encode(),
+            headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=20) as response:
+            lines = response.read().decode("utf-8").splitlines()
+        chunks = [json.loads(line[6:]) for line in lines if line.startswith("data: {")]
+        final = [c for c in chunks if c["choices"][0]["finish_reason"]]
+        self.assertEqual(final[-1]["neoxider"]["reasoning_effort"], "high")
+        self.assertEqual(final[-1]["model"], "fakeeng/alpha (high)")
+        self.assertIn("data: [DONE]", lines)
+
+
+class StreamWatchdogTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = (srv.CFG, srv.LOGDIR, srv.STALL_GRACE_SECONDS, srv._CTX.task,
+                      srv._CTX.cancel, srv._CTX.last_run)
+        self.logs = tempfile.mkdtemp()
+        srv.LOGDIR = self.logs
+        srv.STALL_GRACE_SECONDS = 0
+        srv._CTX.cancel = None
+
+    def tearDown(self):
+        (srv.CFG, srv.LOGDIR, srv.STALL_GRACE_SECONDS, srv._CTX.task,
+         srv._CTX.cancel, srv._CTX.last_run) = self.saved
+        import shutil
+        shutil.rmtree(self.logs, ignore_errors=True)
+
+    SLEEPER = [sys.executable, "-c", "import time; time.sleep(60)"]
+
+    def test_silent_step_is_aborted_by_the_stall_watchdog(self):
+        srv.CFG = _cfg(stall_timeout=1)
+        srv._CTX.task = "stalled-task"
+        with open(os.path.join(self.logs, "stalled-task.log"), "w", encoding="utf-8") as f:
+            f.write("header\n")
+        started = time.monotonic()
+        outcome = srv._run_agent_process(self.SLEEPER, 60, dict(os.environ))
+        self.assertTrue(outcome["stalled"])
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertIsNotNone(outcome["returncode"])
+        error = srv.classify_failure_outcome("opencode", {"state": "running"}, outcome)
+        self.assertEqual((error.status, error.code), (504, "provider_stalled"))
+
+    def test_progress_keeps_a_slow_step_alive(self):
+        srv.CFG = _cfg(stall_timeout=1)
+        srv._CTX.task = "busy-task"
+        path = os.path.join(self.logs, "busy-task.log")
+        writer = ("import sys,time\nfor i in range(12):\n"
+                  "    open(sys.argv[1],'a').write('x%d\\n' % i); time.sleep(0.25)\n")
+        outcome = srv._run_agent_process([sys.executable, "-c", writer, path], 60, dict(os.environ))
+        self.assertFalse(outcome["stalled"])
+        self.assertEqual(outcome["returncode"], 0)
+
+    def test_cancel_event_stops_the_tree(self):
+        srv.CFG = _cfg(stall_timeout=0)
+        srv._CTX.task = None
+        cancel = threading.Event()
+        srv._CTX.cancel = cancel
+        threading.Timer(0.5, cancel.set).start()
+        started = time.monotonic()
+        outcome = srv._run_agent_process(self.SLEEPER, 60, dict(os.environ))
+        self.assertTrue(outcome["cancelled"])
+        self.assertLess(time.monotonic() - started, 15)
+
+    def test_stall_timeout_reaches_the_core_silence_watchdog(self):
+        srv.CFG = _cfg(stall_timeout=120, timeout=240)
+        self.assertEqual(srv._chatonly_env()["AGENT_SILENCE_SEC"], "120")
+        srv.CFG = _cfg(stall_timeout=0, timeout=240)
+        old = os.environ.pop("AGENT_SILENCE_SEC", None)
+        try:
+            self.assertNotIn("AGENT_SILENCE_SEC", srv._chatonly_env())
+        finally:
+            if old is not None:
+                os.environ["AGENT_SILENCE_SEC"] = old
+
+
+class RegistryCommandTests(unittest.TestCase):
+    """start --detach on port 0, list, stop: real background processes, no provider calls."""
+
+    def setUp(self):
+        self.saved = (srv.LOGDIR, srv.BRIDGES_DIR)
+        self.logs = tempfile.mkdtemp()
+        srv.LOGDIR = self.logs
+        srv.BRIDGES_DIR = os.path.join(self.logs, "bridges")
+
+    def tearDown(self):
+        srv.LOGDIR, srv.BRIDGES_DIR = self.saved
+        import shutil
+        shutil.rmtree(self.logs, ignore_errors=True)
+
+    def run_main(self, *argv):
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            code = srv.main(list(argv))
+        return code, out.getvalue()
+
+    def test_detached_start_on_port_zero_is_listed_and_stopped_with_its_tree(self):
+        code, out = self.run_main("start", "--detach", "-e", "codex", "-m", "spark", "-p", "0",
+                                  "--name", "unit-detach", "--json")
+        self.assertEqual(code, 0, out)
+        started = json.loads(out)
+        port, pid = started["port"], started["pid"]
+        try:
+            self.assertNotEqual(port, 0)
+            self.assertTrue(os.path.exists(os.path.join(srv.BRIDGES_DIR, "bridge-%d.json" % port)))
+            self.assertTrue(os.path.exists(started["log"]))
+            with urllib.request.urlopen("http://127.0.0.1:%d/health" % port, timeout=5) as response:
+                health = json.loads(response.read().decode("utf-8"))
+            self.assertEqual(health["instance_id"], started["instance_id"])
+            self.assertEqual(health["default_model"], "codex/spark")
+            code, out = self.run_main("list", "--json")
+            rows = json.loads(out)
+            self.assertEqual([(r["port"], r["status"], r["name"]) for r in rows],
+                             [(port, "live", "unit-detach")])
+            code, out = self.run_main("stop", "unit-detach", "--json")
+            result = json.loads(out)["results"][0]
+            self.assertTrue(result["stopped"], result)
+            self.assertTrue(result["graceful"])
+            self.assertFalse(ProcessTreeTimeoutTests._pid_alive(pid))
+            self.assertFalse(os.path.exists(os.path.join(srv.BRIDGES_DIR, "bridge-%d.json" % port)))
+            code, out = self.run_main("list", "--json")
+            self.assertEqual(json.loads(out), [])
+        finally:
+            if ProcessTreeTimeoutTests._pid_alive(pid):
+                from neoxider_agents.process import kill_tree
+                kill_tree(pid)
+
+    def test_list_prunes_a_dead_registry_entry_and_stop_reports_unknown_targets(self):
+        os.makedirs(srv.BRIDGES_DIR)
+        finished = subprocess.Popen([sys.executable, "-c", "pass"])
+        finished.wait()
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            free_port = probe.getsockname()[1]
+        path = os.path.join(srv.BRIDGES_DIR, "bridge-%d.json" % free_port)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"port": free_port, "pid": finished.pid, "pid_stamp": "1",
+                       "instance_id": "deadbeef0000", "started": time.time() - 60,
+                       "base_url": "http://127.0.0.1:%d" % free_port}, f)
+        code, out = self.run_main("list", "--json")
+        self.assertEqual((code, json.loads(out)), (0, []))
+        self.assertFalse(os.path.exists(path))
+        code, out = self.run_main("stop", "no-such-bridge")
+        self.assertEqual(code, 1)
+        self.assertIn("no registered bridge matches", out)
+
+
+class LauncherWiringTests(unittest.TestCase):
+    def test_service_launcher_accepts_the_new_subcommands_and_flags(self):
+        from neoxider_agents import services
+        launched = []
+
+        class FakeProcess:
+            pid = 0
+
+            def __init__(self, args, **kwargs):
+                launched.append(args)
+
+            def wait(self):
+                return 0
+
+            def poll(self):
+                return 0
+
+        argvs = (["start", "--detach", "-m", "codex/6-luna", "-m", "opencode/x", "-p", "0", "--check",
+                  "--name", "bench", "--max-concurrency", "4", "--engine-limit", "claude=1",
+                  "--stall-timeout", "120", "--queue-timeout", "60", "--max-sessions", "16",
+                  "--strict-models", "--json"],
+                 ["list", "--json"], ["stop", "all", "--force", "--wait", "5"],
+                 ["check", "--models", "codex/6-luna,claude/sonnet", "--allow-any"])
+        with mock.patch.object(services.subprocess, "Popen", FakeProcess):
+            for argv in argvs:
+                self.assertEqual(services.launch_service("openai-server", list(argv)), 0)
+            with self.assertRaises(ValueError):
+                services.launch_service("openai-server", ["--definitely-unknown"])
+        self.assertEqual([args[2:] for args in launched], [list(a) for a in argvs])
+        self.assertTrue(all(args[1].endswith("openai_server.py") for args in launched))
 
 
 if __name__ == "__main__":

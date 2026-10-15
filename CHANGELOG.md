@@ -8,6 +8,20 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- OpenAI bridge errors: provider/CLI failures are OpenAI-style JSON
+  `{"error": {"message", "type", "code", "param": null, "retryable"}}` with a mapped status
+  (401/403 auth or tier refusal with the provider's own text, 402 billing, 429 + `Retry-After`,
+  404 unknown model, 400 rejected request, 502/503 crashed/unavailable, 504 timeout/stall) instead
+  of a bare `500 Internal Server Error`; non-retryable refusals are no longer retried (an OpenCode
+  `FreeTierError` 403 used to be re-run, doubling the wait) and every failure logs one incident line
+  with the mapped status. Verified live: `opencode/space-bunny-free` now returns this 403 after one
+  attempt; the provider's restriction is reported, not bypassed.
+- OpenAI bridge conversations no longer overwrite each other: each conversation keeps its own
+  remembered history, CLI task/session id and scratch dir (`session-<port>-<id>`), so an unrelated
+  request can no longer replace another conversation's continuation (and its prompt cache).
+- A foreground `openai-server` whose launcher is interrupted stops its server and CLI children
+  instead of leaving an orphaned process tree on Windows.
+
 - Report provider usage limits consistently everywhere a task result is read: `last`/`result`
   print the STOPPED block for `limited` tasks (an empty answer is never silent again), and
   `status`/`list` show a parsed `resets="…"` next to the reason.
@@ -22,6 +36,29 @@ All notable changes to this project are documented here. Format follows
   preserve answers before expiry and report explicit cleanup failures without aborting state views.
 
 ### Added
+
+- OpenAI bridge multi-model routing: repeat `-m ENGINE/MODEL[@EFFORT]` (or `--models a,b`) and
+  the request's `model` selects the route by id, label or unique alias; `/v1/models` lists routes
+  with labels and readiness; responses report the label and `neoxider_route`. Multi-route bridges
+  answer 404 `model_not_found` for unknown models (`--no-strict-models` / `--strict-models`
+  override); `--allow-any` routes any `ENGINE/MODEL` on demand (loopback only).
+- OpenAI bridge conversation pool: independent conversations run concurrently
+  (`--max-concurrency` 8, per-engine `--engine-limit`, `--max-queue`/`--queue-timeout` then 503
+  `bridge_busy`), one conversation stays sequential, idle TTL / `--max-sessions` LRU-of-idle
+  eviction is logged, `POST /reset` can target one route, `/health` lists sessions without content
+  and `GET /v1/sessions` adds task names and provider session ids.
+- OpenAI bridge operations: `openai-server start --detach` (log `bridges/bridge-<port>.log`,
+  registry with pid stamp and models), `openai-server list`, `openai-server stop PORT|NAME|all`
+  (identity-checked graceful stop via loopback `POST /admin/shutdown`, then the whole tree),
+  `--port 0`, `--check`/`--probe` and the `check` subcommand; wired through every launcher.
+- OpenAI bridge per-request reasoning effort: `reasoning_effort` (or `reasoning.effort`, or an
+  `@effort` model suffix) maps to the engine's effort flag with `-f` as the default, is part of the
+  conversation's session identity, is clamped to the levels `provider.json` advertises (reported),
+  is ignored by engines without effort (reported), and every response carries the applied effort in
+  its `model` label and a `neoxider` metadata object (also on the final streaming chunk).
+- OpenAI bridge reliability: `--stall-timeout` stream watchdog (default 180 s, 504
+  `provider_stalled`), CLI runs cancelled when the client disconnects, `--max-request-mb`, and
+  graceful shutdown on SIGTERM/SIGBREAK that closes every session and provider tree.
 
 - Phase 2B convenience: implicit `run`, answer-only `ask`, file/stdin prompts, config defaults,
   prompt-derived task names, `brief` contracts and one-command completion installation.
@@ -38,6 +75,12 @@ All notable changes to this project are documented here. Format follows
   (exit 3 when limited+failed > 0 and rc would otherwise be 0).
 
 ### Changed
+
+- OpenAI bridge defaults: requests are no longer serialized by one global lock (`--max-concurrency
+  1` restores it); internal `--retries` apply only to transient failures (empty answer, crash,
+  network), never to refusals or timeouts; `/v1/models` ids are route ids (`codex/6-luna`), and the
+  previous label ids are still accepted; `-p 0` is now valid. Single `-e X -m Y` bridges keep their
+  historic behaviour otherwise.
 
 - Progress files are opt-in (`--progress`, `AGENT_PROGRESS=1`); `--no-progress` remains a silent
   compatibility flag. The wrapper writes no project files by default.

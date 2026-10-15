@@ -70,8 +70,12 @@ python tests/test_openai_server.py
 
 `test_gui.py` imports `gui.py` by file path and covers GUI state, parsing, HTTP guards, bridge
 lifecycle, and diagnostics. `test_openai_server.py` covers bridge parsing, sessions, routing,
-streaming, tool-call extraction, and diagnostics. They start no persistent servers, use scratch
-directories where needed, and rely only on stdlib `unittest`.
+streaming, tool-call extraction, and diagnostics, plus multi-model routing, the conversation pool
+(parallel conversations, sequential turns, interleaved A/B resumes, eviction), provider-error
+mapping, the stall watchdog, client-disconnect cancellation and `start --detach`/`list`/`stop`.
+They use stub providers (no CLI, no provider usage), short-lived loopback servers and one
+detached bridge that the test stops again, scratch directories where needed, and rely only on
+stdlib `unittest`.
 
 ## Bash suite (agent.sh)
 

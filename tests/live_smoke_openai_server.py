@@ -36,6 +36,7 @@ Prints a final "N/N passed" summary and exits 1 on any failure, matching this pr
 test scripts' style (see tests/test_agent_sh.sh).
 """
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -347,11 +348,14 @@ def main():
         check(unrelated_choice.get("finish_reason") == "stop",
               "divergent response has finish_reason=stop")
         n3 = count_tasks(scratch_logdir, args.port)
-        # session_turns is the one divergence signal that works on EVERY backend: an unrelated
-        # single-message conversation plus its canonical response replaces the old transcript.
+        # The session pool is the divergence signal that works on EVERY backend: an unrelated
+        # conversation gets its OWN session (the latest one, 2 messages) and never overwrites the
+        # first conversation, which stays remembered and resumable.
         _, health = http_get(base, "/health")
         check(health.get("session_turns") == 2,
-              "divergence replaced the remembered conversation (session_turns=%s)" % health.get("session_turns"))
+              "divergence started its own conversation (session_turns=%s)" % health.get("session_turns"))
+        check(health.get("session_count") == 2,
+              "the first conversation was kept, not overwritten (session_count=%s)" % health.get("session_count"))
         if native:
             skip("divergence task-count behaviour", native_why)
         else:
@@ -415,7 +419,10 @@ def main():
             print("[smoke] scratch logs kept at %s" % scratch_logdir)
         else:
             shutil.rmtree(scratch_logdir, ignore_errors=True)
-        shutil.rmtree(os.path.join(tempfile.gettempdir(), "neoxider-openai-bridge", "session-%d" % args.port), ignore_errors=True)
+        # One scratch dir per conversation: session-<port>-<session id>.
+        for leftover in glob.glob(os.path.join(tempfile.gettempdir(), "neoxider-openai-bridge",
+                                               "session-%d*" % args.port)):
+            shutil.rmtree(leftover, ignore_errors=True)
 
     print()
     print("%d/%d passed%s" % (PASS, PASS + FAIL,

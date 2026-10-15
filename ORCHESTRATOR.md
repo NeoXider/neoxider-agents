@@ -98,7 +98,9 @@ returns 3 when any watched task ended limited/failed and rc would otherwise be 0
 the summary line reads `WAIT_DONE tasks=N rc=R ok=a limited=b failed=c`.
 `clean --dry-run` equals `clean -n`, and `completion powershell|bash|zsh`
 prints shell completion; add `--install` to install it once. The bridge's `openai-server -p PORT`
-uses `-p` for its port. `config get|set|list` manages engine/model/effort defaults in
+uses `-p` for its port (`-p 0` = a free port, printed); `openai-server start --detach`,
+`openai-server list` and `openai-server stop PORT|NAME|all` manage background bridges, and
+repeated `-m ENGINE/MODEL` serves several models with parallel conversations from one process. `config get|set|list` manages engine/model/effort defaults in
 `%APPDATA%/neoxider-agents/config.json` or `~/.config/neoxider-agents/config.json`
 (`XDG_CONFIG_HOME` respected, `AGENT_CONFIG` overrides the file). Keys are engine, model and effort.
 
