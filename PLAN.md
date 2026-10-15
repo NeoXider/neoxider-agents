@@ -1,3 +1,44 @@
+# Installed skill docs publication — 2026-10-15
+
+The installed Unity/CLI Markdown corrections are complete and validated.
+Current commit/push outcomes and exact remote SHAs are recorded by Root in
+`C:/AI/outputs/skills-publication-final-20261015/PUBLISH_RECEIPT.json`;
+verify that receipt against the remotes before treating publication as confirmed.
+
+At this pass's snapshot, CLI `main` and `origin/main` both point to
+`7d6e2341b1913984187a0f91ada8ec0d39a95dbd`; Unity both point to
+`e93b01a176ea27cd3ed36e66303b620f8b8f4b60`. Root must freshly check remote
+SHAs before publishing. No new worktree, branch or stash is needed.
+
+The earlier parity receipt at
+`C:/AI/outputs/parity-final-recovery-20261015/RELEASE_RECEIPT.json` records
+`PUBLISHED_VERIFIED_CLEANED` at 2026-10-15T08:11:15Z for
+`828c3b7136851bdc23ffaf8911ad992fdda896ea`. That is a prior release,
+not the commit for this docs update. The source verification remains in
+[release verification](docs/RELEASE_VERIFICATION_20261015.md), now reconciled
+with that receipt. The historical PLAN snapshot below remains unchanged.
+
+Completed work: synchronize stale CLI integration statements with the canonical
+[SKILL.md](SKILL.md), qualify Unity lesson generalizations without dropping the
+lessons, then validate the installed docs. Preserve unrelated tracked files,
+`.opencode/` and `docs/ProviderProbe20261011.md`. Ordinary-provider enforcement
+remains false/fail closed; no new runtime, billing or model-quota claim follows.
+
+Evidence and milestone state:
+`C:/AI/outputs/skills-publication-final-20261015/PLAN.md`, `REVIEW.md` and
+`READY.json`. The packet records actual checks, final hashes and remaining
+Root acceptance/publication steps. The Root publication receipt above supersedes
+the worker's pre-publication status. Workers do not commit or push.
+
+## Historical parity recovery snapshot — retained verbatim below
+
+The following text is archival. Its pending steps, writer/process state,
+worktree paths and Git restrictions are not active instructions for this pass.
+The receipt above supersedes its pending publication/cleanup status; current
+user instructions and the docs-publication state above govern this work.
+
+---
+
 # Parity final recovery — durable root PLAN — 2026-10-15
 
 Goal: finish and verify Neoxider Agents, publish the accepted result as sole

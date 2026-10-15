@@ -1,6 +1,6 @@
 ---
 name: neoxider-agents
-description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tasks to CLI subagents (configured or detected engine; Claude Code, Kimi Code, Codex, opencode, Gemini) through native neoxider launchers, then verify and integrate their results. Covers ask/run/brief, top/diff/result, model selection, send/stop/restart, retention, and verification. Also covers ledger mode for single hard tasks (plan/tasks.json/notes/solution loop with test verifier, up to 10 rounds). Use for multi-agent coordination, bounded delegation, worker recovery and verification; keep small or tightly coupled work local.
+description: Delegate and coordinate CLI coding workers through neoxider launchers (Codex, Claude Code, Kimi Code, OpenCode or Gemini), inspect their results, send durable follow-ups and recover settled tasks. Use for CLI fleet work or an explicit CLI/model request; honor the requested native/CLI route and keep small, tightly coupled work local when delegation is not required.
 ---
 
 # CLI Subagents (Codex Orchestration)
@@ -20,9 +20,9 @@ tests / 5 skips; authority `root_source_gate.json` SHA256
 `ba196679…b60b6c8c3b`): reviewed SDK startup admission with retained
 failed-start resources, Root's native helper gate (37 passed + 31 subtests,
 incl. loopback control) covering the detached helper only — public
-ordinary-provider enforcement stays false. Release publication/push/cleanup
-remain Root-owned (authoritative receipt: `RELEASE_RECEIPT.json`); no code
-writers remain.
+ordinary-provider enforcement stays false. These are dated source-gate observations,
+not a live route or sandbox guarantee. See the linked release verification for acceptance
+evidence; verify publication against the actual release receipt/remote when relevant.
 
 Acceptance means durable queue/journal persistence; delivery means successful
 invocation completion with a nonempty answer; acknowledgment requires explicit
@@ -52,8 +52,9 @@ owned launchers are identity-checked and released within 300 seconds of observed
 settlement. Retain the task/session/profile/results for resume; no keepalive prompts.
 GUI-owned children are reaped on exit; visible terminal lifetime belongs to its host.
 `owns` remains a declaration/diff contract. Public ordinary-provider enforcement is
-false, and the independent outside-AAP escape baseline was rejected. Windows fixes
-remain under security review. Hosted-chat injection and hard billing caps remain
+false/fail closed. The rejected outside-AAP baseline and the accepted detached-helper
+gate are distinct; helper acceptance does not enable ordinary-provider enforcement.
+Hosted-chat injection and hard billing caps remain
 unsupported. Provider exit zero is not tests/QA; estimates and reported usage are
 not confirmed billing. Free OpenCode routes were rate limited in this effort
 (historical); on 2026-10-14 OpenCode 1.18.27 SpaceBunny and Muse Spark 1.3
@@ -61,8 +62,8 @@ each completed one measured file task (see the native parity report and the
 release verification) — that
 exact case only, not all models or stable free quota; a fresh 2026-10-15 Muse
 free probe (`parity-route-20261015`, done, exit 0, tool-read) is likewise that
-single case only. The human authorized
-Codex CLI fallback. Do not label a catalogue, launch, fixture
+single case only. A fallback requires authorization from the current user/session;
+a historical task's permission does not carry into another task. Do not label a catalogue, launch, fixture
 or rate-limited call as live provider success.
 
 PowerShell is the Windows entry point. Resolve the installed skill or plugin once:
@@ -147,6 +148,14 @@ profile proves neither a quota limit nor model unavailability. `--standard` expl
 ordinary OpenCode in the empty directory with tools available; no automatic profile fallback.
 Discover actual modes first; the example's `xhigh` is not a permanent provider-wide default.
 No automatic GUI/model catalogue probe.
+
+For a configured custom OpenCode provider, pass its exact `provider/model` ID; do not
+rewrite it to `opencode/…` or a similarly named alias. Discovery/doctor timeouts leave
+that diagnostic unknown; they do not prove a selected route failed. When route verification
+is authorized, use a bounded, named task on that exact route and inspect its outcome.
+A real file/tool task with independently checked output proves that case; a chat-only
+`probe`, catalogue capability or reachable `/models` endpoint does not. Keep diagnostic or
+launch-specific environment changes local to the task; they do not authorize global config edits.
 
 ## Work as an orchestrator (default mode)
 
@@ -243,8 +252,10 @@ If it proves incapable, report the limitation and seek a model change rather tha
   ~20 minutes and report"), and ask them to write the result to a file after every step, so a
   timeout still leaves usable output. Free routes are weaker on long browser-driven tasks; pick a
   stronger model for those, a cheap one for mechanical edits.
-- **Restart instead of re-running.** If a worker drifts or stalls, `restart NAME "narrower task"`
-  (same session, keeps context) rather than a fresh `run` that redoes the work.
+- **Recover deliberately.** Inspect status, exact ownership, partial edits and delivery/recovery
+  evidence before stopping or restarting. A quiet task or caller timeout alone is not a recovery
+  reason. For eligible settled tasks, prefer reviewed same-session resume over a fresh `run`;
+  manual legacy restart retains replay risks.
 - **Launch in a narrow folder.** `-C` the smallest directory that contains the owned files: the
   change-attribution snapshot is taken of that tree, so a narrow folder starts faster.
 - **Verify by files, not by the report.** Check the worker's result through `diff NAME`, the files
@@ -1209,7 +1220,8 @@ bash "$SK" run -e opencode -m opencode/space-bunny-free -t spot-check -C "$PWD" 
 Two rules that decide everything here: **ids with a provider prefix must be verbatim**
 (`opencode/space-bunny-free` works, `space-bunny-free` does not), and **an unknown `-m` is passed
 through unchanged rather than rejected** — so a brand-new Zen id works immediately, without a code
-change. The tier is free but liveness inside it is uneven; bound your timeout and treat silence as
+change. The listed routes were advertised as free in the dated catalog; verify current pricing/quota.
+Bound your timeout and treat silence as
 unknown, not as a verdict. Full trade-offs in the gotchas list above.
 
 ## Rules for setting tasks
@@ -1226,7 +1238,7 @@ delegation, plus:
 A handy alias (git-bash, add to `~/.bashrc`):
 
 ```bash
-alias agent='bash ~/.claude/skills/neoxider-agents/agent.sh'
+alias agent='bash "$HOME/.claude/skills/cli-agents/agent.sh"'
 # agent run -t readme -C /c/Git/Project "fix the typo in the README"
 # agent peek -f readme    # readable activity, in real time
 # agent last readme       # short summary: the agent's last answer

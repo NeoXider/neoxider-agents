@@ -1,4 +1,4 @@
-# Release verification — 2026-10-15 (финал source scope, публикация pending Root)
+# Release verification — 2026-10-15 (source gate принят, исторический выпуск опубликован)
 
 Короткий итоговый отчёт проверки восстановления паритета. Статус:
 **source gate ACCEPTED** — Root-авторитет
@@ -18,13 +18,19 @@ in-process test runner); затронутые 31 тест перезапущен
 source `6e836d18a2c072b9e97abab473ce25ffce65205c72b28c7cdec715223af3dce9`;
 SDK 63 пройден внутри полного прогона. Пакеты scope-compliance от
 doc/source-воркеров НЕ приняты (нарушение read-only-Git ограничения); Root
-независимо принял фактические source/diffs/tests. Публикация/push/cleanup —
-только Root; итог будет записан в
-`C:/AI/outputs/parity-final-recovery-20261015/RELEASE_RECEIPT.json` —
-авторитет по всем Git-побочкам, здесь будущий SHA не выдумывается и push не
-заявляется. Новый native worker-тест не проводился. Документационная задача:
-Git (включая status/diff), вызовы провайдеров, делегирование, source-тесты,
-Unity и изменения конфигов не выполнялись.
+независимо принял фактические source/diffs/tests.
+
+Историческая публикация подтверждена Root-квитанцией
+`C:/AI/outputs/parity-final-recovery-20261015/RELEASE_RECEIPT.json`:
+статус `PUBLISHED_VERIFIED_CLEANED`, 2026-10-15T08:11:15 UTC.
+[Коммит `828c3b7136851bdc23ffaf8911ad992fdda896ea`](https://github.com/NeoXider/neoxider-agents/commit/828c3b7136851bdc23ffaf8911ad992fdda896ea)
+опубликован и установлен; `remote_head` и `installed_head` совпали по квитанции.
+Удалены только собственные recovery-worktree и task-branch; unrelated
+`.opencode/` и `docs/ProviderProbe20261011.md` сохранены. Это результат того
+выпуска по датированной квитанции, не новая проверка текущего remote или runtime.
+Новый native worker-тест не проводился. При исторической документационной
+подготовке source gate Git (включая status/diff), вызовы провайдеров,
+делегирование, source-тесты, Unity и изменения конфигов не выполнялись.
 
 База: worktree от remote `main 9b74239`, включает опубликованные parity-фичи
 `2dd31e0`. [NATIVE_PARITY_REPORT](NATIVE_PARITY_REPORT.md) — исторический
@@ -84,20 +90,23 @@ Unity и изменения конфигов не выполнялись.
 | Live provider маршруты | 2026-10-14: SpaceBunny (UUID `41b5106e…` delivered + explicit ack, stop `0`/`130`, recovery `c8dc54c8…` → `waiting`) и Muse Spark 1.3 (`done`, exit 0); два конкурентных Codex с attach/send/ack/dedupe + 14 callbacks | Сохранены как proof тех exact cases; source-binding старше и раскрыт. Новое: fresh Muse free probe `parity-route-20261015` — `done`, exit 0, tool-read сигнатура, текущий cwd. **Только этот случай, не universal quota** |
 | Runtime isolation | 26-test docs check (25 pass, 1 symlink-skip) — fixture-only; live isolation freeze dir retained | **BOUNDED component acceptance** per Root `root_isolation_acceptance.json` (`BOUNDED_RUNTIME_ISOLATION_ACCEPTED`, rechecked 2026-10-15, 0 new provider calls, no auth files read): исторический Codex-парный прогон 2026-10-14 — два реальных профиля, каждый initial + same-session resume `done`/exit 0, distinct `CODEX_HOME`, реальные хеши файлов проверены, ack/dedupe, 14 callbacks, billing unknown. Текущий `runtime_profiles.py` отличается ТОЛЬКО CRLF (нормализованный LF SHA `50db5d382b82c436c0270f9c8ca09f7ddf5286ccbc944c73244e54e4b76d8cc2` совпал с историческим; raw current `9532b858cd7e024ad7390c31cfb8a20dc5521b551df70edc945abe7405c98abf`). Это НЕ свежий whole-current-SDK isolated-pair rerun и НЕ общий OS sandbox; текущий обычный OpenCode live-прогон нового SDK — отдельная проверка |
 | Fleet GUI | Fixture reconnect QA PASS (synthetic) | Root CLI 41 PASS (55.115 с), GUI 191 PASS, Node chat/tree + Fleet 12 групп PASS, fixture browser reload/reselect ровно 1 event (`fleet-replay.png`); `ROOT_GUI_VERIFICATION.md` фиксирует узкий default viewport и server-disconnect traces — без гарантий responsive/visible-terminal-window |
-| Интеграция/публикация | Parity-фичи `2dd31e0` опубликованы; source gate ACCEPTED | Финальная публикация, push SHA + remote-верификация, cleanup worktree — **pending Root**. Авторитет: `C:/AI/outputs/parity-final-recovery-20261015/RELEASE_RECEIPT.json`; будущий SHA здесь не выдумывается |
+| Интеграция/публикация | Parity-фичи `2dd31e0` опубликованы; source gate ACCEPTED | **PUBLISHED_VERIFIED_CLEANED** по Root `C:/AI/outputs/parity-final-recovery-20261015/RELEASE_RECEIPT.json`, 2026-10-15T08:11:15 UTC: коммит `828c3b7136851bdc23ffaf8911ad992fdda896ea` опубликован/установлен, remote SHA проверен, собственные recovery-worktree/task-branch удалены. Датированная приёмка того выпуска |
 
 Ограничения явно: никаких caps/hosted-chat/auto-auth-copy/auto-CAS; `win32u.dll`
 может грузиться — не escape; `0xC0000142` для ordinary/`noWindow` детей;
 оценки каталога и reported usage — не биллинг.
 
-## 4. Статусы фаз (PLAN.md § Phase status на 2026-10-15)
+## 4. Статусы фаз (исторический PLAN.md § Phase status на 2026-10-15)
 
 Фазы 1–5, 7 — bounded acceptance в source gate (см. PLAN.md); runtime
 isolation — bounded component acceptance (историческая Codex-пара 2026-10-14 +
 текущий CRLF-only компонент + 26 fixture-тестов, см. строку выше);
 GUI — fixture QA (см.
-строку выше); фаза 9: source gate ACCEPTED, push/remote-верификация и cleanup
-полностью pending Root — ни push, ни cleanup. Кодовых воркеров не осталось.
+строку выше); фаза 9: source gate ACCEPTED, исторический выпуск
+`828c3b7136851bdc23ffaf8911ad992fdda896ea` опубликован/установлен, remote SHA
+проверен и собственный cleanup завершён по Root-квитанции 08:11:15 UTC.
+Исторические pending-статусы PLAN superseded этой квитанцией. Кодовых воркеров
+того выпуска не осталось.
 
 ## 5. Ссылки на свидетельства
 
@@ -128,20 +137,22 @@ GUI — fixture QA (см.
   (`BOUNDED_RUNTIME_ISOLATION_ACCEPTED`; source gate `ba196679…` неизменён)
 - Текущий реальный SDK-прогон:
   `C:/AI/outputs/parity-final-recovery-20261015/sdk-live-proof.json`
-- Авторитет публикации/cleanup (заполняется Root, не здесь):
+- Авторитет завершённой исторической публикации/cleanup (Root, 08:11:15 UTC):
   `C:/AI/outputs/parity-final-recovery-20261015/RELEASE_RECEIPT.json`
 
-## 6. Оставшиеся действия выпуска и пределы проверки
+## 6. Завершённый исторический выпуск и пределы проверки
 
-Root осталось выполнить commit, push, сверить remote SHA и убрать своё рабочее дерево;
-результат фиксируется в `RELEASE_RECEIPT.json`. Native fixture suite, текущий живой
-SDK-прогон и ограниченная браузерная проверка уже описаны выше. Общий sandbox
+Root-квитанция `RELEASE_RECEIPT.json` от 08:11:15 UTC подтверждает commit, push,
+проверку remote SHA, установку и cleanup собственного recovery-worktree/task-branch
+для выпуска `828c3b7136851bdc23ffaf8911ad992fdda896ea`. Native fixture suite,
+датированный живой SDK-прогон и ограниченная браузерная проверка описаны выше;
+сверка квитанции не является новым runtime-прогоном. Общий sandbox
 провайдеров, другие Windows/ABI, полная responsive-QA и поведение окон пользовательского
 терминального хоста не подтверждены и не заявляются.
 
 ## CHANGED
 
-Только шесть документов: `PLAN.md`, `SKILL.md`,
+Историческая документационная подготовка source gate затронула только шесть документов: `PLAN.md`, `SKILL.md`,
 `docs/RELEASE_VERIFICATION_20261015.md` (финал source scope),
 `docs/NATIVE_PARITY_REPORT.md` (исторический снимок),
 `docs/ENFORCED_SCOPE.md`, `docs/ORCHESTRATOR_API.md`. Исходники, тесты,
@@ -162,8 +173,9 @@ Python-блоки `NATIVE_PARITY_REPORT.md`/`ORCHESTRATOR_API.md` распарс
 
 ## NOT DONE
 
-См. раздел 6. Source scope принят; публикация остаётся pending Root
-(`RELEASE_RECEIPT.json` ещё не создан Root).
+См. раздел 6. Source scope принят, историческая публикация и cleanup завершены
+по Root `RELEASE_RECEIPT.json`. Перечисленные ограничения runtime, sandbox,
+биллинга и GUI-проверок сохраняются; новых проверок эти сведения не заявляют.
 
 ## CONCERNS
 

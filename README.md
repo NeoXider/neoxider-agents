@@ -14,15 +14,17 @@ across **Codex · Claude Code · Kimi Code · opencode · Gemini CLI**.
 
 </div>
 
-## Integrated orchestration contracts (2026-10-14)
+## Integrated orchestration contracts (2026-10-15)
 
 The typed [Python SDK](docs/ORCHESTRATOR_API.md) and CLI share the
 [core lifecycle](docs/CORE_INTEGRATION.md): durable message UUIDs/receipts,
 parent events and named callback replay, reviewed recovery, optional retained
 Codex/OpenCode runtime profiles, and typed failure/cost/verification evidence.
 The [Fleet GUI](docs/FLEET_UI.md) reads the same receipts and event journals.
-The [native parity report](docs/NATIVE_PARITY_REPORT.md) is **DRAFT** pending
-Root security, final regression, live and remote gates.
+The [native parity report](docs/NATIVE_PARITY_REPORT.md) is a historical snapshot.
+The accepted source gate and its scoped live evidence are recorded in
+[release verification](docs/RELEASE_VERIFICATION_20261015.md); this does not make
+ordinary provider execution an OS-enforced sandbox.
 
 Acceptance means durable queue/journal persistence; delivery means successful
 invocation completion with a nonempty answer; acknowledgment requires explicit
@@ -52,14 +54,16 @@ owned launchers are identity-checked and released within 300 seconds of observed
 settlement. Retain the task/session/profile/results for resume; no keepalive prompts.
 GUI-owned children are reaped on exit; visible terminal lifetime belongs to its host.
 `owns` remains a declaration/diff contract. Public ordinary-provider enforcement is
-false, and the independent outside-AAP escape baseline was rejected. Windows fixes
-remain under security review. Hosted-chat injection and hard billing caps remain
+false/fail closed. The rejected outside-AAP baseline and the accepted detached-helper
+gate are distinct; helper acceptance does not enable ordinary-provider enforcement.
+Hosted-chat injection and hard billing caps remain
 unsupported. Provider exit zero is not tests/QA; estimates and reported usage are
 not confirmed billing. Free OpenCode routes were rate limited in this effort
 (historical); on 2026-10-14 OpenCode 1.18.27 SpaceBunny and Muse Spark 1.3
 each completed one measured file task (see the native parity report) — that
-exact case only, not all models or stable free quota. The human authorized
-Codex CLI fallback. Do not label a catalogue, launch, fixture
+exact case only, not all models or stable free quota. A fallback requires permission
+from the current user/session; historical permission is not reusable authorization.
+Do not label a catalogue, launch, fixture
 or rate-limited call as live provider success.
 
 ---
@@ -114,6 +118,11 @@ If OpenCode rejects the custom chat-only profile, `route-rejected` describes tha
 not the model's remaining quota. Separately select `--standard` to check ordinary OpenCode
 in an empty workspace with tools available. The profile never changes automatically.
 Use the modes returned by your current catalogue; the examples are not a permanent mode list.
+For configured custom providers, preserve the exact `provider/model` ID. A doctor/catalogue
+timeout leaves that diagnostic unknown; it does not disprove the selected route. A bounded
+real tool task with independently checked output verifies that case; `/models` reachability
+or a chat-only response does not prove file/tool execution. Preserve explicit native/CLI and
+model choices; task-local route diagnostics do not authorize global configuration changes.
 
 ### Defaults and files
 

@@ -8,9 +8,10 @@ they change launch policy. This document supersedes the standalone-phase
 integration caveats in the individual backend documents; their durability and
 security limitations still apply.
 
-The [native parity report](NATIVE_PARITY_REPORT.md) remains **DRAFT** pending
-Root security, final regression, live and remote gates. Ordinary provider write-scope
-enforcement is false; candidate Windows changes are not acceptance evidence.
+The [native parity report](NATIVE_PARITY_REPORT.md) is a historical snapshot; see
+[release verification](RELEASE_VERIFICATION_20261015.md) for the accepted source gate
+and scoped live evidence. Ordinary provider write-scope enforcement remains false/fail
+closed. Acceptance of the detached Windows helper does not enable an enforced provider backend.
 
 ## Receipts and safe delivery
 

@@ -1,14 +1,16 @@
 # neoxider-agents — agent instructions
 
-## Integrated orchestration contracts (2026-10-14)
+## Integrated orchestration contracts (2026-10-15)
 
 The typed [Python SDK](docs/ORCHESTRATOR_API.md) and CLI share the
 [core lifecycle](docs/CORE_INTEGRATION.md): durable message UUIDs/receipts,
 parent events and named callback replay, reviewed recovery, optional retained
 Codex/OpenCode runtime profiles, and typed failure/cost/verification evidence.
 The [Fleet GUI](docs/FLEET_UI.md) reads the same receipts and event journals.
-The [native parity report](docs/NATIVE_PARITY_REPORT.md) is **DRAFT** pending
-Root security, final regression, live and remote gates.
+The [native parity report](docs/NATIVE_PARITY_REPORT.md) is a historical snapshot.
+See [release verification](docs/RELEASE_VERIFICATION_20261015.md) for the accepted
+2026-10-15 source gate and scoped live evidence; [SKILL.md](SKILL.md) is the
+canonical operating manual. Dated evidence does not guarantee a current provider route.
 
 Acceptance means durable queue/journal persistence; delivery means successful
 invocation completion with a nonempty answer; acknowledgment requires explicit
@@ -38,14 +40,16 @@ owned launchers are identity-checked and released within 300 seconds of observed
 settlement. Retain the task/session/profile/results for resume; no keepalive prompts.
 GUI-owned children are reaped on exit; visible terminal lifetime belongs to its host.
 `owns` remains a declaration/diff contract. Public ordinary-provider enforcement is
-false, and the independent outside-AAP escape baseline was rejected. Windows fixes
-remain under security review. Hosted-chat injection and hard billing caps remain
+false/fail closed. The rejected outside-AAP baseline and accepted detached-helper
+gate are distinct; helper acceptance does not enable ordinary-provider enforcement.
+Hosted-chat injection and hard billing caps remain
 unsupported. Provider exit zero is not tests/QA; estimates and reported usage are
 not confirmed billing. Free OpenCode routes were rate limited in this effort
 (historical); on 2026-10-14 OpenCode 1.18.27 SpaceBunny and Muse Spark 1.3
 each completed one measured file task (see the native parity report) — that
-exact case only, not all models or stable free quota. The human authorized
-Codex CLI fallback. Do not label a catalogue, launch, fixture
+exact case only, not all models or stable free quota. Fallback authorization must
+come from the current user/session; historical permission is not reusable.
+Do not label a catalogue, launch, fixture
 or rate-limited call as live provider success.
 
 This repo is the Python `neoxider_agents/` core + native launchers + `gui.py`/`gui.html`: a non-interactive wrapper for launching
