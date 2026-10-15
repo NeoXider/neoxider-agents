@@ -205,7 +205,7 @@ starts its own fresh session, verified live to produce zero cross-contamination.
 caller genuinely needs many independent parallel conversations, the answer is the same
 as for comparing models: run more processes on more ports, not one smarter shared one.
 An abandoned conversation is handled the same way a real API session would be: past
-`--session-ttl` seconds of inactivity (default 30 min) the remembered session simply
+`--session-ttl` seconds of inactivity (default 10 min) the remembered session simply
 expires and the next call starts fresh, rather than staying resumable (and growing)
 forever.
 

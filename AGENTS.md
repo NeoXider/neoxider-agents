@@ -222,8 +222,15 @@ path). Unrelated conversations run **in parallel** (`--max-concurrency`, default
 conversation's turns stay sequential; `POST .../reset` drops the remembered sessions
 (body `{"model": …}`: one route's), and `GET /health` lists sessions (id, route, turns,
 idle seconds — no content) plus per-model readiness and queue depth. Sessions are evicted
-only after `--session-ttl` idle seconds (default 1800 = 30 min) or by `--max-sessions`
-(LRU of idle sessions), and every eviction is logged. **One process can serve several
+after `--session-ttl` idle seconds (default 600 = 10 min), by `--max-sessions`
+(default 16, LRU of idle sessions), or under memory pressure. `--min-free-memory-mb`
+(default 2048; 0 disables) checks before CLI turns and every 30 s, evicting LRU idle
+sessions until headroom recovers; busy sessions and the current conversation are protected.
+Windows headroom is the smaller of available physical memory and commit; Linux uses
+`MemAvailable`; macOS uses optional psutil (otherwise skips). Unknown memory skips eviction;
+low memory with no evictable session logs at most once per minute and requests continue.
+Every eviction is logged. `/health` adds `memory_free_mb` (null if unknown) and
+`min_free_memory_mb`. **One process can serve several
 models**: repeat `-m ENGINE/MODEL[@EFFORT]` (e.g. `-m codex/6-luna -m claude/sonnet`) and
 the request's `model` field picks the route (unknown model -> 404 when several routes are
 configured; a single `-e X -m Y` route still serves every request). A request's

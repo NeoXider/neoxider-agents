@@ -11,7 +11,7 @@ def launch_service(command, args):
     if command == "openai-server":
         # Subcommands (start/list/stop/check) are positionals and pass through unchanged.
         operands.update({"--models", "--max-concurrency", "--engine-limit", "--max-queue", "--queue-timeout",
-                         "--max-sessions", "--stall-timeout", "--max-request-mb", "--name", "--wait"})
+                         "--max-sessions", "--min-free-memory-mb", "--stall-timeout", "--max-request-mb", "--name", "--wait"})
         switches.update({"--no-live-stream", "--detach", "--allow-any", "--strict-models", "--no-strict-models",
                          "--check", "--probe", "--json", "--force"})
     iterator = iter(args)

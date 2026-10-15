@@ -809,9 +809,15 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   `gemini` always takes the fresh-run path.
 - **Parallel conversations, sequential turns.** Unrelated conversations run concurrently up to
   `--max-concurrency` (1 restores the old one-at-a-time bridge); two requests of the same
-  conversation are serialized by its own lock. Sessions are evicted only after `--session-ttl`
-  idle seconds (default 1800) or by `--max-sessions` (LRU of idle sessions, never an active one);
-  every eviction is logged. `POST .../reset` drops all sessions (body `{"model": …}`: one route's);
+  conversation are serialized by its own lock. Sessions are evicted after `--session-ttl`
+  idle seconds (default 600), by `--max-sessions` (default 16, LRU of idle sessions), or under
+  memory pressure. `--min-free-memory-mb` (default 2048 MiB; 0 disables) checks before CLI turns
+  and every 30 s, evicting idle sessions in LRU order until headroom recovers. Busy sessions and
+  the current conversation are protected. Windows uses the smaller of available physical memory
+  and commit; Linux uses `MemAvailable`; macOS uses optional psutil, otherwise skips. Unknown
+  memory skips eviction; low memory without idle sessions logs once per minute and requests
+  continue. `/health` adds `memory_free_mb` (null if unknown) and `min_free_memory_mb`.
+  Every eviction is logged. `POST .../reset` drops all sessions (body `{"model": …}`: one route's);
   `GET /health` lists sessions (id, route, turns, idle seconds — no content), per-model readiness,
   queue depth and the old `session_active`/`session_turns`; `GET /v1/sessions` adds task names
   and provider session ids.

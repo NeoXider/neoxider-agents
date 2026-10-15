@@ -669,12 +669,19 @@ unique task name, so the core's task files and locks never collide.
 
 **`POST /reset`** forgets every remembered conversation (body `{"model": "codex/6-luna"}` limits it
 to one route): their tasks are dropped and their scratch dirs wiped unless `--dir` pinned a real
-project. **Eviction** happens only by idle TTL (`--session-ttl`, default 1800 s) or by the explicit
-capacity bound (`--max-sessions`, default 64 — the least recently used IDLE conversation goes, an
-active one never does); each eviction is logged. `GET /health` lists the conversations — id, route,
+project. **Eviction** happens by idle TTL (`--session-ttl`, default 600 s), the capacity bound
+(`--max-sessions`, default 16), or memory pressure (`--min-free-memory-mb`, default 2048 MiB;
+`0` disables). Before CLI turns and on each 30-second reaper tick, low memory evicts the least
+recently used IDLE sessions one at a time until headroom recovers. Busy sessions and the current
+conversation are protected. Windows uses the smaller of available physical memory and available
+commit; Linux reads `MemAvailable`; macOS uses psutil if installed, otherwise skips. No dependency
+is required. An unknown probe skips memory eviction. If no idle session can be evicted, requests
+continue with a warning at most once per minute. Explicit TTL/capacity settings still work;
+each eviction is logged. `GET /health` lists the conversations — id, route,
 turns, idle seconds, never message content — plus `session_count`, `queue_depth`, per-model
 readiness and the historic `session_active`/`session_turns`/`session_idle_seconds`/
-`session_ttl_seconds`. `GET /v1/sessions` (behind the API key) adds each conversation's task name
+`session_ttl_seconds`, plus `memory_free_mb` (null when unknown) and `min_free_memory_mb`.
+`GET /v1/sessions` (behind the API key) adds each conversation's task name
 and provider session id.
 
 </details>

@@ -39,9 +39,10 @@ THE SESSION MODEL -- a pool of independent conversations, each one an ongoing CL
   - Independent conversations run concurrently (`--max-concurrency`, per-engine `--engine-limit`,
     a bounded queue with `--queue-timeout`); one conversation stays strictly sequential (a
     per-session lock), so two turns of it never race.
-  - Sessions are evicted only by idle TTL (`--session-ttl`, default 1800s) or by the explicit
-    capacity bound (`--max-sessions`, LRU of IDLE sessions, never an active one); every eviction
-    is logged. `GET /health` lists the sessions (id, route, turns, idle seconds -- never content).
+  - Idle sessions are evicted by TTL (`--session-ttl`, default 600s), capacity (`--max-sessions`,
+    default 16), or memory pressure (`--min-free-memory-mb`, default 2048; 0 disables). Capacity
+    and memory pressure evict the least recently used IDLE sessions, never an active one; every
+    eviction is logged. `GET /health` lists sessions and available memory headroom.
   - `POST .../reset` drops every remembered session (or only one route's: body {"model": ...}).
   - Engines without CLI-level resume support (`gemini`) always take the fresh-run path; their
     conversation still keeps its own working directory between turns.
@@ -3594,7 +3595,41 @@ def _response_metadata(route):
 DEFAULT_MAX_CONCURRENCY = 8
 DEFAULT_MAX_QUEUE = 64
 DEFAULT_QUEUE_TIMEOUT = 300
-DEFAULT_MAX_SESSIONS = 64
+DEFAULT_SESSION_TTL = 600
+DEFAULT_MAX_SESSIONS = 16
+DEFAULT_MIN_FREE_MEMORY_MB = 2048
+
+
+def _memory_free_mb():
+    """Available machine headroom in MiB, or None if the platform/probe is unavailable."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32)] + [
+                    (name, ctypes.c_uint64) for name in (
+                        "ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+                        "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")]
+
+            status = MEMORYSTATUSEX()
+            status.dwLength = ctypes.sizeof(status)
+            probe = ctypes.WinDLL("kernel32", use_last_error=True).GlobalMemoryStatusEx
+            probe.argtypes = [ctypes.POINTER(MEMORYSTATUSEX)]
+            probe.restype = ctypes.c_int
+            if probe(ctypes.byref(status)):
+                return min(status.ullAvailPhys, status.ullAvailPageFile) // (1024 * 1024)
+        elif sys.platform.startswith("linux"):
+            with open("/proc/meminfo", encoding="ascii") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) // 1024
+        elif sys.platform == "darwin":
+            import psutil  # optional: no dependency required on any platform
+            return int(psutil.virtual_memory().available) // (1024 * 1024)
+    except Exception:
+        pass  # an unavailable probe must never prevent a request
+    return None
 
 
 class Session(dict):
@@ -3667,8 +3702,11 @@ def _close_session(session, reason, quiet=False):
 class SessionPool:
     """Conversation sessions plus the global/per-engine concurrency slots and wait queue."""
 
-    def __init__(self):
+    def __init__(self, memory_probe=None):
         self.cond = threading.Condition()
+        self.memory_lock = threading.Lock()
+        self.memory_probe = memory_probe
+        self.last_memory_warning = None
         self.sessions = {}
         self.active = 0
         self.engine_active = {}
@@ -3683,7 +3721,7 @@ class SessionPool:
         return time.monotonic() + max(0, timeout)
 
     def _expired_locked(self, now):
-        ttl = _cfg_int("session_ttl", 1800)
+        ttl = _cfg_int("session_ttl", DEFAULT_SESSION_TTL)
         doomed = []
         for session in list(self.sessions.values()):
             if session.busy:
@@ -3719,11 +3757,47 @@ class SessionPool:
             _close_session(session, reason, quiet)
 
     def evict(self):
-        """TTL eviction pass (also run by the janitor thread)."""
+        """TTL and memory-pressure eviction pass (also run by the janitor thread)."""
         with self.cond:
             doomed = self._expired_locked(time.time())
         self._close_all(doomed)
-        return len(doomed)
+        return len(doomed) + self.evict_memory()
+
+    def memory_free_mb(self):
+        try:
+            return (self.memory_probe or _memory_free_mb)()
+        except Exception:
+            return None
+
+    def evict_memory(self, keep=None):
+        """Release LRU idle processes one at a time, rechecking headroom after each close."""
+        threshold = _cfg_int("min_free_memory_mb", DEFAULT_MIN_FREE_MEMORY_MB)
+        if not threshold:
+            return 0
+        evicted = 0
+        # Parallel requests and the janitor share one pressure pass. Close outside cond so
+        # provider cleanup never blocks session checkin, but before probing memory again.
+        with self.memory_lock:
+            while True:
+                free = self.memory_free_mb()
+                if free is None or free >= threshold:
+                    break
+                reason = "memory pressure: %d MB free < %d MB" % (free, threshold)
+                with self.cond:
+                    idle = [s for s in self.sessions.values() if not s.busy and s is not keep]
+                    if not idle:
+                        now = time.monotonic()
+                        if self.last_memory_warning is None or now - self.last_memory_warning >= 60:
+                            self.last_memory_warning = now
+                            LOG.warning("%s; no idle session can be evicted; continuing", reason)
+                        break
+                    victim = min(idle, key=lambda s: s.last_used)
+                    self.sessions.pop(victim.id, None)
+                    victim.closed = True
+                    self.evicted += 1
+                self._close_all([(victim, reason, False)])
+                evicted += 1
+        return evicted
 
     def checkout(self, route, messages, cancel=None, timeout=None):
         """The conversation `messages` continues (longest exact-prefix match on this route), with
@@ -3885,6 +3959,7 @@ def _conversation(route, messages, cancel=None, discard=False):
     try:
         POOL.acquire_slot(route, cancel)
         try:
+            POOL.evict_memory(keep=session)  # after queueing, before this turn can spawn a CLI
             saved = (_CTX.session, _CTX.route, _CTX.cancel, _CTX.task, _CTX.last_run)
             _CTX.session, _CTX.route, _CTX.cancel = session, route, cancel
             _CTX.task = _CTX.last_run = None
@@ -3969,6 +4044,8 @@ def health_payload():
         "sessions": [s.describe(now) for s in sessions],
         "session_count": len(sessions),
         "max_sessions": _cfg_int("max_sessions", DEFAULT_MAX_SESSIONS, 1),
+        "memory_free_mb": POOL.memory_free_mb(),
+        "min_free_memory_mb": _cfg_int("min_free_memory_mb", DEFAULT_MIN_FREE_MEMORY_MB),
         "session_active": bool(resumable), "session_turns": len(latest.get("messages") or ()) if latest else 0,
         "session_idle_seconds": None if idle is None else int(idle),
         "session_ttl_seconds": getattr(CFG, "session_ttl", None),
@@ -4940,12 +5017,16 @@ def build_parser(prog="openai_server.py"):
                          "(or 'X-Api-Key: <key>'). Empty = open bridge (the historic behaviour, fine "
                          "on loopback). STRONGLY recommended whenever the bridge is reachable from "
                          "anything but this machine. Default: $AGENT_OPENAI_KEY.")
-    ap.add_argument("--session-ttl", type=int, default=1800,
+    ap.add_argument("--session-ttl", type=int, default=DEFAULT_SESSION_TTL,
                     help="seconds of inactivity before a conversation's session is evicted and its "
-                         "next call starts fresh (default: 1800 = 30 minutes)")
+                         "next call starts fresh (default: 600 = 10 minutes)")
     ap.add_argument("--max-sessions", type=_non_negative_int, default=DEFAULT_MAX_SESSIONS,
                     help="remembered conversations; above it the least recently used IDLE one is "
                          "evicted, never an active one (default: %d)" % DEFAULT_MAX_SESSIONS)
+    ap.add_argument("--min-free-memory-mb", type=_non_negative_int,
+                    default=DEFAULT_MIN_FREE_MEMORY_MB,
+                    help="evict least recently used IDLE sessions below this machine memory "
+                         "headroom in MiB (default: %d; 0 = off)" % DEFAULT_MIN_FREE_MEMORY_MB)
     ap.add_argument("--max-concurrency", type=_non_negative_int, default=DEFAULT_MAX_CONCURRENCY,
                     help="CLI turns running at once across all conversations; 0 = unlimited "
                          "(default: %d; 1 restores the historic one-at-a-time bridge)"

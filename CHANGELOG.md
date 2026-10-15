@@ -8,6 +8,14 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- OpenAI bridge idle CLI processes no longer accumulate under the old pool defaults:
+  `--session-ttl` now defaults to 600 s and `--max-sessions` to 16; explicit values still work.
+  New `--min-free-memory-mb` (default 2048 MiB; 0 disables) evicts LRU idle sessions before CLI
+  turns and on every reaper tick, rechecking headroom after each eviction. Windows uses the
+  smaller of available physical memory and commit; Linux uses `MemAvailable`; macOS uses
+  optional psutil. Busy sessions and the current conversation are protected; probe failures
+  skip eviction and low memory without idle sessions logs once per minute without refusing
+  requests. `/health` adds `memory_free_mb` (null if unknown) and `min_free_memory_mb`.
 - OpenAI bridge preserves undeclared names in emulated tool calls for client validation,
   including streaming responses, and returns the model's raw text when parsing would
   otherwise leave an assistant message without content or tool calls.
@@ -952,7 +960,8 @@ All notable changes to this project are documented here. Format follows
   project) so the next call starts completely fresh. `GET /health` and `GET /` now also
   report `session_active` (bool) and `session_turns` (message count in the remembered
   array).
-- New `--session-ttl` flag (default `1800` = 30 minutes): an idle session is treated
+- New `--session-ttl` flag (original default `1800` = 30 minutes; now `600` = 10 minutes):
+  an idle session is treated
   exactly like a dead one once it's gone unused longer than this, so an abandoned
   conversation can't be resumed forever or grow unbounded. `GET /health` now also
   reports `session_idle_seconds`/`session_ttl_seconds`. Verified live with

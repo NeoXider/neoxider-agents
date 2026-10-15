@@ -11,6 +11,7 @@ Run:
 """
 import argparse
 import base64
+import contextlib
 import importlib.util
 import io
 import json
@@ -3689,7 +3690,8 @@ FAKE_PROVIDERS = {
 
 def _cfg(**overrides):
     values = dict(engine="fakeeng", model="m", effort="", dir="", port=8990, host="127.0.0.1",
-                  timeout=60, retries=0, session_ttl=1800, max_sessions=64, max_concurrency=8,
+                  timeout=60, retries=0, session_ttl=600, max_sessions=16, max_concurrency=8,
+                  min_free_memory_mb=2048,
                   engine_limits={}, max_queue=64, queue_timeout=10, stall_timeout=0, api_key="",
                   no_live_stream=True, strict_models=None, allow_any=False, check=False,
                   json=False, name="", lan=False, localhost=False, routes=None,
@@ -3706,7 +3708,7 @@ class _FakeProviderMixin:
                               srv.reply_agent, srv.read_meta, srv.time.sleep, srv.SESSION,
                               dict(srv._DYNAMIC_ROUTES))
         srv.PROVIDERS = dict(FAKE_PROVIDERS)
-        srv.POOL = srv.SessionPool()
+        srv.POOL = srv.SessionPool(memory_probe=lambda: 8192)
         srv.SESSION = {"task_name": None, "messages": [], "dir": None, "last_activity": 0.0}
         srv._DYNAMIC_ROUTES.clear()
         srv.time.sleep = lambda seconds: None
@@ -4060,7 +4062,177 @@ class NoRetryOnRefusalTests(_FakeProviderMixin, unittest.TestCase):
         self.assertIsNone(srv.SESSION["task_name"])
 
 
+class MemoryProbeTests(unittest.TestCase):
+    def test_windows_uses_the_smaller_of_physical_and_commit_headroom(self):
+        def probe(pointer):
+            status = pointer._obj
+            self.assertEqual(status.dwLength, 64)
+            status.ullAvailPhys = physical * 1024 * 1024
+            status.ullAvailPageFile = commit * 1024 * 1024
+            return 1
+
+        import ctypes
+        api = mock.Mock(side_effect=probe)
+        kernel = mock.Mock(GlobalMemoryStatusEx=api)
+        with mock.patch.object(srv.sys, "platform", "win32"), \
+                mock.patch.object(ctypes, "WinDLL", return_value=kernel, create=True):
+            for physical, commit in [(8192, 1024), (512, 8192)]:
+                self.assertEqual(srv._memory_free_mb(), min(physical, commit))
+            api.side_effect = None
+            api.return_value = 0
+            self.assertIsNone(srv._memory_free_mb())
+
+    def test_linux_reads_memavailable(self):
+        info = "MemFree: 1024 kB\nMemAvailable: 3145728 kB\n"
+        with mock.patch.object(srv.sys, "platform", "linux"), \
+                mock.patch("builtins.open", mock.mock_open(read_data=info)) as opened:
+            self.assertEqual(srv._memory_free_mb(), 3072)
+            opened.assert_called_once_with("/proc/meminfo", encoding="ascii")
+
+    def test_linux_probe_failure_or_missing_field_is_unknown(self):
+        with mock.patch.object(srv.sys, "platform", "linux"):
+            for info in ["MemFree: 1024 kB\n", "MemAvailable: invalid kB\n"]:
+                with mock.patch("builtins.open", mock.mock_open(read_data=info)):
+                    self.assertIsNone(srv._memory_free_mb())
+            with mock.patch("builtins.open", side_effect=OSError("unavailable")):
+                self.assertIsNone(srv._memory_free_mb())
+
+    def test_macos_psutil_is_optional(self):
+        psutil = mock.Mock()
+        psutil.virtual_memory.return_value.available = 4096 * 1024 * 1024
+        with mock.patch.object(srv.sys, "platform", "darwin"):
+            with mock.patch.dict(sys.modules, {"psutil": psutil}):
+                self.assertEqual(srv._memory_free_mb(), 4096)
+            with mock.patch.dict(sys.modules, {"psutil": None}):
+                self.assertIsNone(srv._memory_free_mb())
+
+
+class MemoryPressureTests(_FakeProviderMixin, unittest.TestCase):
+    def idle(self, label, last_used=None):
+        session = srv.POOL.checkout(srv.ROUTES[0], [{"role": "user", "content": label}])
+        session["messages"] = [{"role": "user", "content": label},
+                               {"role": "assistant", "content": "ok"}]
+        srv.POOL.checkin(session)
+        if last_used is not None:
+            session.last_used = last_used
+        return session
+
+    def test_parser_defaults_and_explicit_values(self):
+        parser = srv.build_parser()
+        cfg = parser.parse_args([])
+        self.assertEqual((cfg.session_ttl, cfg.max_sessions, cfg.min_free_memory_mb),
+                         (600, 16, 2048))
+        cfg = parser.parse_args(["--session-ttl", "1800", "--max-sessions", "64",
+                                 "--min-free-memory-mb", "0"])
+        self.assertEqual((cfg.session_ttl, cfg.max_sessions, cfg.min_free_memory_mb),
+                         (1800, 64, 0))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            parser.parse_args(["--min-free-memory-mb", "-1"])
+
+    def test_default_ttl_expires_after_600_seconds(self):
+        with mock.patch.object(srv.time, "time", return_value=1000.0):
+            session = self.idle("A")
+        with mock.patch.object(srv.time, "time", return_value=1600.0):
+            self.assertEqual(srv.POOL.evict(), 0)
+        with mock.patch.object(srv.time, "time", return_value=1601.0):
+            self.assertEqual(srv.POOL.evict(), 1)
+        self.assertTrue(session.closed)
+
+    def test_default_capacity_evicts_the_lru_above_16_sessions(self):
+        self.configure(session_ttl=0)
+        first = self.idle("0", last_used=0)
+        for index in range(1, 17):
+            self.idle(str(index))
+        self.assertTrue(first.closed)
+        self.assertEqual(len(srv.POOL.list_sessions()), 16)
+
+    def test_pressure_evicts_lru_idle_one_at_a_time_until_headroom_recovers(self):
+        self.configure(session_ttl=0)
+        newest = self.idle("newest", last_used=30)
+        oldest = self.idle("oldest", last_used=10)
+        middle = self.idle("middle", last_used=20)
+        expected = iter([(512, []), (1024, [oldest]), (2048, [oldest, middle])])
+
+        def probe():
+            free, closed = next(expected)
+            for session in closed:
+                self.assertTrue(session.closed)
+            return free
+
+        srv.POOL.memory_probe = mock.Mock(side_effect=probe)
+        with mock.patch.object(srv, "_close_session", wraps=srv._close_session) as close, \
+                self.assertLogs(srv.LOG, level=logging.WARNING) as logs:
+            self.assertEqual(srv.POOL.evict(), 2)  # same path as a reaper tick
+        self.assertEqual([call.args[0] for call in close.call_args_list], [oldest, middle])
+        self.assertEqual(srv.POOL.list_sessions(), [newest])
+        self.assertEqual(srv.POOL.snapshot()["evicted"], 2)
+        self.assertIn("memory pressure: 512 MB free < 2048 MB", logs.output[0])
+        self.assertIn("memory pressure: 1024 MB free < 2048 MB", logs.output[1])
+        self.assertEqual(srv.POOL.memory_probe.call_count, 3)
+
+    def test_busy_and_protected_sessions_are_never_evicted(self):
+        self.configure(session_ttl=0)
+        busy = srv.POOL.checkout(srv.ROUTES[0], [{"role": "user", "content": "busy"}])
+        keep = self.idle("keep", last_used=1)
+        idle = self.idle("idle", last_used=2)
+        srv.POOL.memory_probe = lambda: 512
+        try:
+            self.assertEqual(srv.POOL.evict_memory(keep=keep), 1)
+            self.assertEqual(srv.POOL.list_sessions(), [busy, keep])
+            self.assertFalse(busy.closed)
+            self.assertFalse(keep.closed)
+            self.assertTrue(idle.closed)
+        finally:
+            srv.POOL.checkin(busy)
+
+    def test_pressure_is_checked_before_the_cli_turn(self):
+        idle = self.idle("old")
+        srv.POOL.memory_probe = mock.Mock(side_effect=[512, 4096])
+        with srv._conversation(srv.ROUTES[0], [{"role": "user", "content": "new"}]) as chosen:
+            self.assertTrue(idle.closed)
+            self.assertTrue(chosen.busy)
+            self.assertFalse(chosen.closed)
+            self.assertEqual(srv.POOL.list_sessions(), [chosen])
+
+    def test_low_memory_without_idle_sessions_continues_and_warns_once_a_minute(self):
+        srv.POOL.memory_probe = lambda: 512
+        with mock.patch.object(srv.time, "monotonic", return_value=100.0) as clock, \
+                mock.patch.object(srv.LOG, "warning") as warning:
+            for now in [100.0, 120.0, 160.0]:
+                clock.return_value = now
+                with srv._conversation(srv.ROUTES[0], [{"role": "user", "content": "new"}]) as chosen:
+                    self.assertFalse(chosen.closed)
+                    self.assertEqual(srv.POOL.evict_memory(), 0)
+            pressure = [call for call in warning.call_args_list if "continuing" in call.args[0]]
+            self.assertEqual(len(pressure), 2)
+
+    def test_unknown_or_failed_probe_does_not_evict(self):
+        idle = self.idle("A")
+        for probe in [mock.Mock(return_value=None), mock.Mock(side_effect=OSError("unavailable"))]:
+            srv.POOL.memory_probe = probe
+            self.assertEqual(srv.POOL.evict_memory(), 0)
+            self.assertIsNone(srv.health_payload()["memory_free_mb"])
+        self.assertFalse(idle.closed)
+
+    def test_zero_disables_pressure_probing_and_eviction(self):
+        self.configure(min_free_memory_mb=0)
+        idle = self.idle("A")
+        srv.POOL.memory_probe = mock.Mock(return_value=0)
+        self.assertEqual(srv.POOL.evict(), 0)
+        with srv._conversation(srv.ROUTES[0], [{"role": "user", "content": "new"}]):
+            self.assertFalse(idle.closed)
+        srv.POOL.memory_probe.assert_not_called()
+
+
 class ConversationPoolHTTPTests(_LiveHTTPMixin, unittest.TestCase):
+    def test_health_reports_memory_headroom_and_threshold(self):
+        self.configure(min_free_memory_mb=3072)
+        srv.POOL.memory_probe = lambda: 4096
+        health = self.get("/health")
+        self.assertEqual((health["memory_free_mb"], health["min_free_memory_mb"]), (4096, 3072))
+        srv.POOL.memory_probe = lambda: None
+        self.assertIsNone(self.get("/health")["memory_free_mb"])
+
     def test_interleaved_conversations_each_resume_their_own_session(self):
         """A1, B1, A2, B2, A3: A and B never overwrite each other -- A2/A3 resume A's CLI task with
         only the new tail, B2 resumes B's, each with its own working directory."""
@@ -4652,6 +4824,7 @@ class LauncherWiringTests(unittest.TestCase):
         argvs = (["start", "--detach", "-m", "codex/6-luna", "-m", "opencode/x", "-p", "0", "--check",
                   "--name", "bench", "--max-concurrency", "4", "--engine-limit", "claude=1",
                   "--stall-timeout", "120", "--queue-timeout", "60", "--max-sessions", "16",
+                  "--min-free-memory-mb", "2048",
                   "--strict-models", "--json"],
                  ["list", "--json"], ["stop", "all", "--force", "--wait", "5"],
                  ["check", "--models", "codex/6-luna,claude/sonnet", "--allow-any"])
