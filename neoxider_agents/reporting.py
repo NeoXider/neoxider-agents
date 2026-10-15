@@ -509,15 +509,44 @@ def make_stop_block(store, name, data):
                 name, data.get("state", "stopped"), data.get("exit", STOP_EXIT))
 
 
+def _bounded_changes(store, name, directory):
+    """File delta for a stop record, bounded so a slow tree can never delay the terminal state.
+
+    WHY: the stop/failure record is what tells an orchestrator the task ended (for example on a usage
+    limit); the delta is advisory, so after AGENT_STOP_SNAPSHOT_SEC it is reported as unknown instead.
+    """
+    import threading
+    box = {}
+
+    def work():
+        try:
+            box["changes"] = file_changes(store, name, directory, freeze=True)
+        except Exception as error:  # advisory data: the stop record must still be written
+            box["error"] = error
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    try:
+        limit = float(os.environ.get("AGENT_STOP_SNAPSHOT_SEC", "45"))
+    except ValueError:
+        limit = 45.0
+    worker.join(limit if limit > 0 else None)
+    if "changes" in box:
+        return box["changes"], True
+    return [], False
+
+
 def record_stop(store, name, by="orchestrator", reason="stopped by orchestrator", code=STOP_EXIT,
                 state="stopped", partial="", activity=""):
     meta = store.read(name)
-    changes = file_changes(store, name, meta.get("dir", ""), freeze=True)
+    changes, delta_known = _bounded_changes(store, name, meta.get("dir", ""))
     names = [entry["path"] for entry in changes]
     from activity import redact
     from .ux_tracking import record_history
     fields = dict(state=state, exit=code, reason=redact(reason), stopped_by=by, stopped_at=now(), finished_epoch=time.time(),
-                  files=len(names), changed_names=" | ".join(names), delta_known=int(store.path(name, ".baseline.json").is_file()), session=store.session(name, meta))
+                  files=len(names), changed_names=" | ".join(names), delta_known=int(delta_known and store.path(name, ".baseline.json").is_file()), session=store.session(name, meta))
+    if not delta_known:
+        fields["baseline_warning"] = "file delta not computed in time; use diff to compute it"
     if partial:
         fields["partial_result"] = redact(" ".join(partial[-1200:].split()))
     if activity:

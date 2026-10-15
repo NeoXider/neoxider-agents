@@ -582,6 +582,10 @@ The tool NEVER silently switches engine/model: `reply`/`restart` on the same tas
 same engine/model and hits the same limit until it resets. Warning: piping
 `agent.sh run … | tail/head` hides `run`'s exit code in the pipeline — match on the printed
 `LIMIT_HIT` line, or check `status NAME` / `${PIPESTATUS[0]}`.
+The last limit each engine reported is remembered in `limits.json` (agent logs dir): `doctor` shows
+`LIMITED ... resets <time>` while it is in force and a new `run`/`send` to that engine warns once
+on stderr (it never blocks; a completed turn clears the note). A limit the provider already
+reported wins over a racing stop, so the task still ends `limited`/126 with its terminal event.
 
 ---
 

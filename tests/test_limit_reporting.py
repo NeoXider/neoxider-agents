@@ -184,6 +184,57 @@ class LimitReportingTests(unittest.TestCase):
         self.assertEqual(args, ["lim-wait"])
         self.assertIn("--strict", cli.COMMANDS["wait"])
 
+    def test_parse_reset_epoch_only_for_absolute_times(self):
+        from neoxider_agents.providers import parse_reset_epoch
+        stamp = parse_reset_epoch("Oct 22nd, 2026 11:27 AM")
+        self.assertEqual(time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp)), "2026-10-22 11:27")
+        self.assertEqual(time.strftime("%H:%M", time.localtime(parse_reset_epoch("Oct 14th, 2026 8:28 PM"))), "20:28")
+        self.assertIsNone(parse_reset_epoch("3 hours"))
+        self.assertIsNone(parse_reset_epoch("unknown"))
+
+    def test_recorded_limit_expires_clears_and_survives_bad_file(self):
+        from neoxider_agents.providers import clear_limit, known_limits, limits_path, record_limit
+        root = self.store.root
+        future = "try again at Oct 22nd, 2026 11:27 AM"
+        record_limit(root, "codex", "gpt-6.1-sol-high", "You've hit your usage limit; " + future)
+        now = time.mktime((2026, 10, 16, 3, 0, 0, 0, 0, -1))
+        self.assertEqual(known_limits(root, now=now)["codex"]["resets"], "Oct 22nd, 2026 11:27 AM")
+        self.assertEqual(known_limits(root, now=now + 7 * 86400), {})
+        record_limit(root, "claude", "m", "rate limit, retry after 60s")
+        self.assertIn("claude", known_limits(root, now=time.time()))  # relative reset: kept for 6 hours
+        clear_limit(root, "codex")
+        self.assertNotIn("codex", known_limits(root, now=now))
+        limits_path(root).write_text("{not json", encoding="utf-8")
+        self.assertEqual(known_limits(root), {})
+        record_limit(root, "codex", "m", future)  # a corrupt file is replaced, not fatal
+        self.assertIn("codex", known_limits(root, now=now))
+
+    def test_provider_limit_seen_wins_over_a_later_stop(self):
+        class Filter:
+            provider_error = CODEX_REASON
+        self.assertEqual(lifecycle.provider_limit_seen(None, Filter()), CODEX_REASON)
+        Filter.provider_error = "Not logged in; please run login."
+        self.assertEqual(lifecycle.provider_limit_seen(None, Filter()), "")
+        self.assertEqual(lifecycle.provider_limit_seen(None, None), "")
+
+    def test_stop_record_is_bounded_when_the_snapshot_is_slow(self):
+        calls = []
+
+        def slow(*args, **kwargs):
+            calls.append(1)
+            time.sleep(5)
+            return [{"path": "late.txt"}]
+
+        self.seed("slow", state="running")
+        with mock.patch.object(reporting, "file_changes", side_effect=slow),                 mock.patch.dict(os.environ, {"AGENT_STOP_SNAPSHOT_SEC": "0.2"}):
+            started = time.monotonic()
+            reporting.record_stop(self.store, "slow", by="watchdog", reason=CODEX_REASON, code=126, state="limited")
+            self.assertLess(time.monotonic() - started, 3)
+        meta = self.store.read("slow")
+        self.assertEqual(meta["state"], "limited")
+        self.assertEqual(str(meta["delta_known"]), "0")
+        self.assertIn("file delta not computed in time", meta["baseline_warning"])
+
     def test_status_and_list_show_resets(self):
         self.seed("lim-view")
         code, out, err = self.output(views.status, self.store, "lim-view")

@@ -357,6 +357,89 @@ def limit_line(name, engine, model, reason):
     return format_limit_hit(name, engine, model, redact(parse_limit_reset(reason or "")))
 
 
+_ABSOLUTE_RESET = re.compile(
+    r"([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)?", re.I)
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def parse_reset_epoch(text):
+    """Local epoch of an absolute reset like "Oct 22nd, 2026 11:27 AM"; None for relative or unknown text."""
+    match = _ABSOLUTE_RESET.search(text or "")
+    if not match:
+        return None
+    month, day, year, hour, minute, meridiem = match.groups()
+    if month[:3].lower() not in _MONTHS:
+        return None
+    hour = int(hour)
+    if meridiem:
+        hour = hour % 12 + (12 if meridiem.upper() == "PM" else 0)
+    try:
+        stamp = time.mktime((int(year), _MONTHS.index(month[:3].lower()) + 1, int(day), hour, int(minute), 0, 0, 0, -1))
+    except (OverflowError, ValueError):
+        return None
+    return stamp
+
+
+def limits_path(root=None):
+    """File that remembers the last usage limit each engine reported (best effort, secrets redacted)."""
+    base = root or os.environ.get("AGENT_CLI_LOGS") or str(Path.home() / ".claude/agent-cli-logs")
+    return Path(base) / "limits.json"
+
+
+def record_limit(root, engine, model, reason):
+    """Remember an engine's usage limit so doctor and later runs can warn before the next call fails."""
+    from activity import redact
+    path = limits_path(root)
+    try:
+        try:
+            known = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            known = {}
+        if not isinstance(known, dict):
+            known = {}
+        resets = redact(parse_limit_reset(reason or ""))
+        known[engine] = dict(model=model, resets=resets, resets_epoch=parse_reset_epoch(resets),
+                             recorded_epoch=time.time(), reason=redact(" ".join((reason or "").split()))[:300])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name("%s.tmp.%s" % (path.name, os.getpid()))
+        temporary.write_text(json.dumps(known, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        pass  # diagnostics only: never fail a task because the note could not be written
+
+
+def clear_limit(root, engine):
+    """Forget an engine's recorded limit after it completed a turn again (credits bought or window reset)."""
+    path = limits_path(root)
+    try:
+        known = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(known, dict) and known.pop(engine, None) is not None:
+            temporary = path.with_name("%s.tmp.%s" % (path.name, os.getpid()))
+            temporary.write_text(json.dumps(known, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(temporary, path)
+    except (OSError, ValueError):
+        pass
+
+
+def known_limits(root=None, now=None):
+    """Recorded limits that are still in force: absolute resets in the future, relative/unknown ones for 6 hours."""
+    try:
+        known = json.loads(limits_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    now = time.time() if now is None else now
+    active = {}
+    for engine, row in (known.items() if isinstance(known, dict) else ()):
+        if not isinstance(row, dict):
+            continue
+        until = row.get("resets_epoch")
+        if not isinstance(until, (int, float)):
+            until = float(row.get("recorded_epoch") or 0) + 6 * 3600
+        if until > now:
+            active[engine] = dict(row, until=until)
+    return active
+
+
 def is_transient_failure(text):
     if re.search(r"unauthorized|invalid api key|authentication|forbidden|(?:^|[^\w])model .*(not found|unavailable|unknown)|insufficient (quota|credit)|quota exceeded|payment required", text, re.I):
         return False

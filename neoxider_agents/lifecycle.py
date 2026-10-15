@@ -329,6 +329,28 @@ def release_delivery(store, name, delivered, generation, outcome):
         return receipts
 
 
+def provider_limit_seen(turn_failure, output_filter):
+    """Reason text when the provider already reported a blocking usage limit this turn, else ""."""
+    from .diagnostics import classify_failure
+    if turn_failure is not None and turn_failure.blocking and turn_failure.category == "quota":
+        return turn_failure.reason or "provider usage limit"
+    text = output_filter.provider_error if output_filter else ""
+    if text:
+        report = classify_failure(text, source="provider_error")
+        if report.blocking and report.category == "quota":
+            return text
+    return ""
+
+
+def warn_known_limit(store, engine):
+    """One stderr line when this engine's last reported usage limit has not reset yet (never blocks the run)."""
+    from .providers import known_limits
+    row = known_limits(store.root).get(engine)
+    if row:
+        print("neoxider: warning: %s reported a usage limit (resets %s); this call may fail until then"
+              % (engine, row.get("resets") or "unknown"), file=sys.stderr, flush=True)
+
+
 def checked_parent(store, name, parent, fallback="", limit=256):
     """Parent to record for task NAME, refusing self-parenting and loops.
 
@@ -399,6 +421,7 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
     store.update(name, failure_json="", partial_result="")
     store.lifecycle_event(name, "born", dict(state="running", engine=provider.engine, session=session))
     begin_snapshot(store, name, opts["dir"])
+    warn_known_limit(store, provider.engine)
     if not quiet_answer:
         hint = " (progress/log echo off; --progress/-v to enable)" if not progress_on and not verbose else ""
         print("[neoxider] started task=%s engine=%s/%s%s" % (name, provider.engine, model, hint), flush=True)
@@ -437,6 +460,12 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             if output_filter.cost is not None:
                 store.update(name, cost_usd=float(store.read(name).get("cost_usd") or 0) + output_filter.cost)
         retry_output = "".join(output_filter.raw) if output_filter else answer
+        if action == "stop" and code not in (124, 125):
+            # WHY: a stop that races a provider usage-limit error (launcher stopped, parent gone) must not
+            # replace the real cause with "stopped"; the limit stays the terminal outcome and notifies parents.
+            seen = provider_limit_seen(turn_failure, output_filter)
+            if seen:
+                action, reason, by, code = "failure", seen, "watchdog", 126
         if action == "stop":
             state = "error" if code == 124 else "silent" if code == 125 else "stopped"
             code = code if code in (124, 125) else STOP_EXIT
@@ -501,8 +530,10 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             store.update(name, failure_json=json.dumps(asdict(failure)))
             block = record_stop(store, name, by or "watchdog", reason, code, state, answer, turn.last_activity)
             release_delivery(store, name, delivered, generation, "turn failed before delivery: " + reason)
-            from .providers import limit_line
+            from .providers import limit_line, record_limit
             marker = limit_line(name, provider.engine, model + ("-" + effort if effort else ""), reason) if limited else ""
+            if limited:
+                record_limit(store.root, provider.engine, model + ("-" + effort if effort else ""), reason)
             if quiet_answer:
                 print_answer(store, name)
                 print("neoxider: task=%s %s; %s" % (name, state, reason), file=sys.stderr)
@@ -544,6 +575,9 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             changes = file_changes(store, name, opts["dir"], freeze=True)
             names = [entry["path"] for entry in changes]
             state = "error" if code else "waiting" if files or looks_waiting(answer) else "done"
+            if not code:
+                from .providers import clear_limit
+                clear_limit(store.root, provider.engine)
             if code:
                 from .diagnostics import classify_failure
                 from dataclasses import asdict

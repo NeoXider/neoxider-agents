@@ -8,6 +8,14 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- A usage limit is no longer easy to miss. The last limit each engine reported is remembered in
+  `limits.json` (agent logs dir): `agent.sh doctor` prints `LIMITED ... resets <time>` while it is in
+  force (it used to say "no rate-limit data"), and a new `run`/`send` to that engine warns once on
+  stderr (never blocks; a completed turn clears the note). A provider limit already seen now wins over
+  a racing stop or launcher-stopped, so the task ends as `state=limited`, exit 126 with `LIMIT_HIT` and
+  a terminal event instead of being overwritten by `stopped`/130. The file delta in a stop record is
+  bounded by `AGENT_STOP_SNAPSHOT_SEC` (default 45), so a slow tree can no longer delay the terminal
+  state; the delta is then reported as not computed.
 - OpenAI bridge idle CLI processes no longer accumulate under the old pool defaults:
   `--session-ttl` now defaults to 600 s and `--max-sessions` to 16; explicit values still work.
   New `--min-free-memory-mb` (default 2048 MiB; 0 disables) evicts LRU idle sessions before CLI

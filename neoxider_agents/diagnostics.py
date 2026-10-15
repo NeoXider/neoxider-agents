@@ -175,6 +175,13 @@ def render(results, deep_engines, deep, generated):
             lines.append("  %-9s ok   %s" % (engine, row.get("version") or "?"))
             if row.get("login"):
                 lines.append("  %-9s auth %s" % (engine, row["login"]))
+    from .providers import known_limits
+    for engine, row in sorted(known_limits(now=generated).items()):
+        left = int(row["until"] - generated)
+        remaining = "resets in %dd%02dh" % (left // 86400, left % 86400 // 3600) if left >= 86400 else "resets in %dh%02dm" % (left // 3600, left % 3600 // 60)
+        lines += ["=== %s usage limit (last reported by a task) ===" % engine,
+                  "  LIMITED   resets %s (%s)%s" % (row.get("resets") or "unknown", remaining,
+                                                   "" if isinstance(row.get("resets_epoch"), (int, float)) else "; reset time not exact")]
     for row in results:
         if row["engine"] not in ("codex", "claude"):
             continue
