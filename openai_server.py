@@ -2005,13 +2005,13 @@ def _args_of(d):
     return {}
 
 
-def _call_shaped(obj, names):
+def _call_shaped(obj, names, allow_unknown=False):
     """The object IS one tool call: the OpenAI shape ({"function": {"name": ...}}, its own
     marker), the flat shape with EXACTLY {name-or-action, arguments-alias} keys ({action,
     arguments} observed live from Opus 4.8, {name, parameters} from Haiku 4.5 -- both scored
     tools=0 or empty-args failures before). Normalized to {name, arguments} so downstream
     conversion just works. Exact-keys rules mean a data answer with extra fields survives as
-    content. The name must be a KNOWN declared tool."""
+    content. Outside explicit call arrays, the name must be a KNOWN declared tool."""
     if not isinstance(obj, dict):
         return None
     fn = obj.get("function") if isinstance(obj.get("function"), dict) else None
@@ -2030,7 +2030,8 @@ def _call_shaped(obj, names):
                     break
             if flat:
                 break
-    if isinstance(call_name, str) and call_name and names and call_name in names:
+    if (isinstance(call_name, str) and call_name
+            and (allow_unknown or (names and call_name in names))):
         if fn is not None:
             return {"name": call_name, "arguments": _args_of(fn)}
         return {"name": call_name, "arguments": _args_of(obj)}
@@ -2099,8 +2100,8 @@ def _parse_call_jsonl(body, names):
     return objs or None
 
 
-def _to_calls(raw_calls, declared_names=None):
-    """Canonical normalization for every extracted call; optionally enforce declarations."""
+def _to_calls(raw_calls):
+    """Normalize extracted calls, preserving model names for client-side validation."""
     out = []
     for c in raw_calls:
         if not isinstance(c, dict):
@@ -2108,8 +2109,6 @@ def _to_calls(raw_calls, declared_names=None):
         fn = c.get("function") if isinstance(c.get("function"), dict) else None
         name = c.get("name") or (fn or {}).get("name")
         if not isinstance(name, str) or not name:
-            continue
-        if declared_names is not None and name not in declared_names:
             continue
         args = _args_of(fn) if (fn is not None and any(k in fn for k in _ARGS_KEY_ALIASES)) \
             else _args_of(c)
@@ -2138,7 +2137,8 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
     it not to, a model sometimes still echoes a stray `{"tool_calls":[]}` alongside its real
     prose answer (observed live against Claude after a tool-result round-trip); leaving that
     JSON noise in a user-facing `content` string would be wrong even though no real call was
-    intended."""
+    intended. If stripping leaves neither calls nor visible text, the original text is
+    returned so the client can see the model's answer."""
     calls = None
     cleaned = text
     call_fences = []  # per-fence LISTS of call objects, in reverse text order; un-reversed below
@@ -2200,13 +2200,13 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
         if calls is None:
             raw = obj.get("tool_calls")
             if isinstance(raw, list) and raw:
-                calls = _to_calls(raw, names)
+                calls = _to_calls(raw)
         # No .strip() here: matches iterate in reverse over ORIGINAL offsets, and stripping
         # leading whitespace mid-loop shifted every earlier match's span, garbling the display
         # text when more than one fence was stripped. One strip at the end is enough.
         cleaned = cleaned[:m.start()] + cleaned[m.end():]
     if calls is None and call_fences:
-        calls = _to_calls([o for fence in reversed(call_fences) for o in fence], names)
+        calls = _to_calls([o for fence in reversed(call_fences) for o in fence])
     if calls is None and not call_fences and "```" in cleaned:
         # Strict pass found nothing: retry with the backtick-tolerant fallback so a tool_calls
         # fence whose string values contain backticks still parses. json.loads gates every
@@ -2217,7 +2217,7 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
             except ValueError:
                 continue
             if isinstance(obj, dict) and isinstance(obj.get("tool_calls"), list) and obj["tool_calls"]:
-                found = _to_calls(obj["tool_calls"], names)
+                found = _to_calls(obj["tool_calls"])
                 if found:
                     calls = found
                     cleaned = cleaned[:m.start()] + cleaned[m.end():]
@@ -2240,7 +2240,7 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
                     # calls object-by-object instead of losing the whole turn.
                     salvaged = _salvage_array_calls(stripped, names, tools)
                     if salvaged:
-                        found = _to_calls(salvaged, names)
+                        found = _to_calls(salvaged)
                         if found:
                             calls, cleaned = found, ""
             shaped_list = None
@@ -2261,7 +2261,7 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
                 shaped = [_call_shaped(o, names) for o in obj]
                 shaped_list = shaped if all(shaped) else _bare_args_array(obj, tools)
             if shaped_list:
-                found = _to_calls(shaped_list, names)
+                found = _to_calls(shaped_list)
                 if found:
                     calls, cleaned = found, stripped[end:]
     if calls is None and names:
@@ -2302,11 +2302,13 @@ def extract_tool_calls(text, names=None, tools=None, prior=None):
                 found = bare
                 spans = [(0, len(cleaned))] * len(bare)
         if found:
-            calls = _to_calls([{"name": n, "arguments": a} for n, a in found], names)
+            calls = _to_calls([{"name": n, "arguments": a} for n, a in found])
             for s, e in reversed(spans):          # strip the call spans from the display text
                 cleaned = cleaned[:s] + cleaned[e:]
             cleaned = cleaned.strip()
-    return calls, cleaned.strip()
+    cleaned = cleaned.strip()
+    # Parsing must never hide the model's entire answer when no usable call remains.
+    return calls, cleaned if calls or cleaned else text
 
 
 # How much streamed content is held back before the first byte goes to the client. Two jobs:
@@ -2444,7 +2446,7 @@ class LiveToolCallEmitter:
             self._flush_pending()
 
     def _emit_call_obj(self, obj):
-        converted = _to_calls([obj], self.names)
+        converted = _to_calls([obj])
         if not converted:
             return
         call = converted[0]
@@ -2580,7 +2582,9 @@ class LiveToolCallEmitter:
         (Fable 5's array-of-bare-args spelling, streamed object-by-object). Ambiguity (several
         tools fit) returns None -- the fence degrades to complete-at-close handling, where the
         whole-array key-union decides (see _bare_args_array)."""
-        shaped = _call_shaped(obj, self.names)
+        # An explicit name in a call array is the model's choice, even if undeclared.
+        # Match the full parser: leave rejection/correction to the client.
+        shaped = _call_shaped(obj, self.names, allow_unknown=True)
         if shaped is not None:
             return shaped
         if isinstance(obj, dict) and obj and self.tools:

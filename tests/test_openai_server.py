@@ -534,16 +534,110 @@ class ExtractToolCallsTests(unittest.TestCase):
         self.assertEqual(cleaned, "Tokyo is currently 22C, sunny, with a light breeze.")
         self.assertNotIn("tool_calls", cleaned)
 
-    def test_empty_tool_calls_fence_alone_yields_empty_string(self):
-        calls, cleaned = srv.extract_tool_calls('```json\n{"tool_calls":[]}\n```')
+    def test_empty_tool_calls_fence_alone_falls_back_to_raw_text(self):
+        raw = '```json\n{"tool_calls":[]}\n```'
+        calls, cleaned = srv.extract_tool_calls(raw)
         self.assertIsNone(calls)
-        self.assertEqual(cleaned, "")
+        self.assertEqual(cleaned, raw)
 
-    def test_canonical_wrapper_drops_undeclared_tool_names(self):
+    def test_canonical_wrapper_preserves_declared_and_undeclared_tool_names(self):
         text = ('```json\n{"tool_calls":[{"name":"declared","arguments":{}},'
                 '{"name":"secret_tool","arguments":{}}]}\n```')
         calls, _ = srv.extract_tool_calls(text, {"declared"})
-        self.assertEqual([c["function"]["name"] for c in calls], ["declared"])
+        self.assertEqual([c["function"]["name"] for c in calls],
+                         ["declared", "secret_tool"])
+
+
+class ToolCallResponseTests(unittest.TestCase):
+    """Exercise actual JSON/SSE response formatting without a provider or HTTP server."""
+
+    TOOLS = [{"type": "function", "function": {
+        "name": "world_command", "parameters": {"type": "object"}}}]
+    MESSAGES = [{"role": "user", "content": "Scale TowerB"}]
+
+    def setUp(self):
+        self.handler = srv.H.__new__(srv.H)
+        self.handler.wfile = io.BytesIO()
+        self.handler._sse_headers = mock.Mock()
+        self.handler._send_json = mock.Mock()
+        for attr, value in (
+                ("CFG", argparse.Namespace(no_live_stream=True)),
+                ("_route", mock.Mock(return_value=argparse.Namespace(
+                    engine="codex", label="codex/test", id="test"))),
+                ("_use_opencode_native", mock.Mock(return_value=False)),
+                ("_response_metadata", mock.Mock(return_value={})),
+                ("_record_completion", mock.Mock())):
+            patcher = mock.patch.object(srv, attr, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _response(self, raw, mode):
+        self.handler.wfile = io.BytesIO()
+
+        def complete(*args, **kwargs):
+            if "on_delta" in kwargs:
+                for i in range(0, len(raw), 3):
+                    kwargs["on_delta"](raw[i:i + 3])
+            return raw
+
+        with mock.patch.object(srv.H, "_raw_completion", side_effect=complete) as run:
+            if mode == "sync":
+                self.handler._sync_response(self.MESSAGES, self.TOOLS)
+                run.assert_called_once()
+                code, payload = self.handler._send_json.call_args.args
+                self.assertEqual(code, 200)
+                choice = payload["choices"][0]
+                return choice["message"], choice["finish_reason"]
+            if mode == "replay":
+                self.handler._stream_response(self.MESSAGES, self.TOOLS)
+            else:
+                self.handler._stream_response_live(self.MESSAGES, self.TOOLS)
+            run.assert_called_once()
+
+        wire = self.handler.wfile.getvalue().decode("utf-8")
+        self.assertTrue(wire.endswith("data: [DONE]\n\n"))
+        choices = [json.loads(line[6:])["choices"][0] for line in wire.splitlines()
+                   if line.startswith("data: ") and line != "data: [DONE]"]
+        message = {"content": "".join(c["delta"].get("content", "") for c in choices),
+                   "tool_calls": [call for c in choices
+                                  for call in c["delta"].get("tool_calls", [])]}
+        return message, choices[-1]["finish_reason"]
+
+    def test_undeclared_name_passes_through_without_remapping(self):
+        args = {"action": "change", "targetName": "TowerB", "scale": 2.0}
+        raw = '```json\n' + json.dumps({"tool_calls": [
+            {"name": "change", "arguments": args}]}) + '\n```'
+        for mode in ("sync", "replay", "live"):
+            with self.subTest(mode=mode):
+                message, reason = self._response(raw, mode)
+                self.assertEqual(reason, "tool_calls")
+                self.assertFalse(message["content"])
+                self.assertEqual(len(message["tool_calls"]), 1)
+                call = message["tool_calls"][0]
+                self.assertEqual(call["type"], "function")
+                self.assertTrue(call["id"].startswith("call_"))
+                self.assertEqual(call["function"]["name"], "change")
+                self.assertEqual(json.loads(call["function"]["arguments"]), args)
+
+    def test_declared_names_unchanged_alongside_unknown_names(self):
+        names = ["world_command", "change"]
+        raw = '```json\n' + json.dumps({"tool_calls": [
+            {"name": name, "arguments": {"scale": 2.0}} for name in names]}) + '\n```'
+        for mode in ("sync", "replay", "live"):
+            with self.subTest(mode=mode):
+                message, reason = self._response(raw, mode)
+                self.assertEqual(reason, "tool_calls")
+                self.assertEqual([c["function"]["name"] for c in message["tool_calls"]], names)
+
+    def test_empty_after_parse_returns_raw_text(self):
+        for calls in ([], [{"arguments": {}}], [{"name": "", "arguments": {}}]):
+            raw = '```json\n' + json.dumps({"tool_calls": calls}) + '\n```'
+            for mode in ("sync", "replay", "live"):
+                with self.subTest(mode=mode, calls=calls):
+                    message, reason = self._response(raw, mode)
+                    self.assertEqual(reason, "stop")
+                    self.assertFalse(message.get("tool_calls"))
+                    self.assertEqual(message["content"], raw)
 
 
 class FuncCallSyntaxTests(unittest.TestCase):
@@ -2621,6 +2715,14 @@ class LiveEmitterCanonicalTests(unittest.TestCase):
         cut = self.CANONICAL.index("]}")
         h.feed_chunked(self.CANONICAL[:cut])
         self.assertEqual([c[1] for c in h.calls], ["spawn_object", "set_color"])
+
+    def test_undeclared_call_emitted_before_fence_closes(self):
+        h = _EmitterHarness(names=("world_command",))
+        h.feed_chunked('```json\n{"tool_calls":[{"name":"change",'
+                       '"arguments":{"targetName":"TowerB","scale":2.0}}')
+        self.assertEqual(h.calls, [("call", "change", {"targetName": "TowerB", "scale": 2.0})])
+        h.emitter.finish()
+        self.assertEqual(len(h.calls), 1)
 
     def test_finish_does_not_double_emit(self):
         h = _EmitterHarness()

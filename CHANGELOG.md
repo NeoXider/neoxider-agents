@@ -8,6 +8,9 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- OpenAI bridge preserves undeclared names in emulated tool calls for client validation,
+  including streaming responses, and returns the model's raw text when parsing would
+  otherwise leave an assistant message without content or tool calls.
 - OpenAI bridge errors: provider/CLI failures are OpenAI-style JSON
   `{"error": {"message", "type", "code", "param": null, "retryable"}}` with a mapped status
   (401/403 auth or tier refusal with the provider's own text, 402 billing, 429 + `Retry-After`,
