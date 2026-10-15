@@ -116,8 +116,19 @@ event and refreshes the same handle; resource reaping does not prevent further r
 at runtime. The integrated fixture suite asserts UUID receipts and durable events;
 `os_sandbox` and `hosted_chat_injection` remain `False`. Optional reviewed resume and
 retained runtime isolation are integrated; hard billing caps remain unsupported.
-Windows enforcement changes are under security review; the independently audited
-outside-AAP escape baseline was rejected. See the [draft report](NATIVE_PARITY_REPORT.md).
+Windows enforcement changes are accepted at the helper level in the 2026-10-15
+Root source gate (`SOURCE_GATE_ACCEPTED`: 35 modules / 1313 unique tests / 5
+skips); the independently audited outside-AAP escape baseline was rejected and
+public ordinary-provider enforcement stays false. The SDK admission is
+**ACCEPTED**: reviewed startup admission (deterministic pump-start with
+pre-owner publication and failed-start cleanup — failed launches retain marked
+ownership until checked reap releases their prompt/process resources), retained failure
+resources with exact PID/start-stamp identity checks (reused PIDs spared,
+foreign/adopted owners never touched), and lingering settled owners released
+within 300 s of observed settlement. Original negative history (forged
+handles, RLock pickle, shared prompt filename, interim pump-start rejection)
+is retained as history. See the historical [report](NATIVE_PARITY_REPORT.md)
+and the final Russian [release verification](RELEASE_VERIFICATION_20261015.md).
 
 ## send / resume / stop semantics
 

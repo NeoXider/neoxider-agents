@@ -663,6 +663,10 @@ class _Native:
         return self.DeleteAppContainerProfile(name)
 
     def create_profile(self, name, owner=None):
+        if owner is None:
+            from .enforcement import EnforcementError
+            raise EnforcementError("profile-owner-required",
+                                   "Owned profile creation requires a session owner.")
         c, w = self.c, self.w
         sid = c.c_void_p()
         code = self.CreateAppContainerProfile(name,name,"Owned Neoxider console session",None,0,c.byref(sid))
@@ -672,34 +676,31 @@ class _Native:
         # Register actual ownership immediately after successful creation and
         # before conversion: only this created profile is ever claimed. Later
         # session cleanup retries it through checked, retryable releases.
-        if owner is not None:
-            owner._sid = sid
-            owner._profile = name
+        owner._sid = sid
+        owner._profile = name
         text = c.c_void_p()
-        converted = False
         try:
             self.check(self.ConvertSidToStringSidW(sid,c.byref(text)))
             value = c.wstring_at(text)
-            converted = True
-            return sid, value
         except BaseException:
             # Route every release through checked retryable cleanup and keep
-            # the original conversion failure authoritative. With an owner,
-            # the registered profile/SID stay owned for session cleanup retry.
-            if owner is None:
-                self.release_resources([
-                    ("profile-sid-free", lambda: self.free_sid(sid)),
-                    ("profile-delete", lambda: self._checked_delete_profile(name))],
+            # the original conversion failure authoritative. The registered
+            # profile/SID stay owned for session cleanup retry.
+            if text:
+                self.release_resources(
+                    [("profile-sid-text-free", lambda: self.local_free(text))],
                     raise_errors=False)
             raise
-        finally:
-            if text:
-                if converted:
-                    self.local_free(text)
-                else:
-                    self.release_resources(
-                        [("profile-sid-text-free", lambda: self.local_free(text))],
-                        raise_errors=False)
+        try:
+            self.local_free(text)
+        except BaseException as error:
+            # Successful conversion then LocalFree fault: keep the allocated
+            # text pointer owned for exactly-once retry and keep the LocalFree
+            # failure authoritative. SID/profile stay owned for session retry.
+            self.retain_release("profile-sid-text-free",
+                                lambda: self.local_free(text), error)
+            raise
+        return sid, value
 
     def _checked_delete_profile(self, name):
         code = self.delete_profile(name)

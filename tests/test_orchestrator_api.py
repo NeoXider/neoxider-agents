@@ -744,6 +744,338 @@ class OrchestratorApiTests(unittest.TestCase):
         self.assertFalse(client._monitor.is_alive())
         self.assertFalse(client._reaper.is_alive())
 
+    def test_spawn_close_admission_race_starts_no_process_after_close(self):
+        """Deterministic barrier: spawn pauses after the open check, close runs, then release."""
+        client = self.client()
+        entered, release = threading.Event(), threading.Event()
+        original_reserve = client._reserve_name
+
+        def gated(name):
+            value = original_reserve(name)
+            entered.set()
+            self.assertTrue(release.wait(10), "close must return while spawn is paused pre-launch")
+            return value
+
+        calls = []
+        real_popen = subprocess.Popen
+
+        def counting(*args, **kwargs):
+            calls.append(list(args[0]) if args else [])
+            return real_popen(*args, **kwargs)
+
+        errors = []
+
+        def spawn():
+            try:
+                client.spawn("RACY PROMPT", engine="fixture", cwd=self.work, name="sdk-race-1",
+                             env={"FIXTURE_MISSING_CLI": "1"})
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(client, "_reserve_name", side_effect=gated), \
+                mock.patch.object(subprocess, "Popen", side_effect=counting):
+            worker = threading.Thread(target=spawn)
+            worker.start()
+            self.assertTrue(entered.wait(10), "spawn pauses after the open check")
+            report = client.close()
+            self.assertTrue(worker.is_alive(), "close never waits on a pre-launch spawn pause")
+            release.set()
+            worker.join(15)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], sdk.ClientClosed)
+            self.assertEqual(calls, [], "a refused spawn starts no process after close")
+            self.assertEqual(list(self.logs.rglob("*.msg")), [], "a refused spawn leaves no prompt")
+            self.assertIs(client.close(), report)
+        self.assertFalse(client._monitor.is_alive())
+        self.assertFalse(client._reaper.is_alive())
+
+    def test_spawn_paused_before_owner_publication_is_cleaned_by_close(self):
+        """Spawn gated inside _await_owner: admitted but pre-registration child is in close cleanup."""
+        client = self.client()
+        entered, release = threading.Event(), threading.Event()
+        original_await = client._await_owner
+
+        def gated(child, task, timeout, phase):
+            entered.set()
+            self.assertTrue(release.wait(15), "close must return while spawn is paused pre-owner")
+            return original_await(child, task, timeout, phase)
+
+        errors = []
+
+        def spawn():
+            try:
+                client.spawn("BLOCKED PROMPT", engine="fixture", cwd=self.work, name="sdk-preowner-1",
+                             env=self.blocked_env(self.work))
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(client, "_await_owner", side_effect=gated):
+            worker = threading.Thread(target=spawn)
+            worker.start()
+            self.assertTrue(entered.wait(15), "spawn reaches pre-owner publication")
+            child = client._child_for("sdk-preowner-1")
+            self.assertIsNotNone(child, "the admitted child is tracked before owner publication")
+            report = client.close()
+            self.assertTrue(worker.is_alive(), "close never waits on a pre-owner spawn pause")
+            release.set()
+            worker.join(20)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(len(errors), 1)
+            # Either interleaving is safe: killed before publishing (SpawnError) or
+            # published-then-refused at registration (ClientClosed); never an orphan.
+            self.assertIsInstance(errors[0], (sdk.SpawnError, sdk.ClientClosed))
+            self.assertIs(client.close(), report)
+        self.assertFalse(child.alive(), "close kills the pre-registration child")
+        self.assertTrue(child.reaped, "close reaps the pre-registration child")
+        self.assertEqual(list(self.logs.rglob("*.msg")), [], "the cleaned spawn leaves no prompt")
+
+    def test_close_never_observes_unstarted_pump_thread(self):
+        """Gate pump start: close must wait for atomic admission, never join an unstarted thread."""
+        client = self.client()
+        entered, release = threading.Event(), threading.Event()
+        real_start = threading.Thread.start
+
+        def gated_start(thread, *args, **kwargs):
+            if thread.name == "neoxider-sdk-launcher":
+                entered.set()
+                self.assertTrue(release.wait(15), "close waits for atomic admission, not a half-start")
+            return real_start(thread, *args, **kwargs)
+
+        reap_states = []
+        original_reap = client._reap
+
+        def observing(child):
+            thread = child.thread
+            reap_states.append(thread._started.is_set() if thread is not None else None)
+            return original_reap(child)
+
+        errors, closer_errors, reports = [], [], []
+
+        def spawn():
+            try:
+                client.spawn("RACY PROMPT", engine="fixture", cwd=self.work, name="sdk-pump-race-1",
+                             env={"FIXTURE_MISSING_CLI": "1"})
+            except BaseException as error:
+                errors.append(error)
+
+        def close():
+            try:
+                reports.append(client.close())
+            except BaseException as error:
+                closer_errors.append(error)
+
+        with mock.patch.object(threading.Thread, "start", gated_start), \
+                mock.patch.object(client, "_reap", side_effect=observing):
+            worker = threading.Thread(target=spawn)
+            worker.start()
+            self.assertTrue(entered.wait(15), "spawn reaches pump start")
+            closer = threading.Thread(target=close)
+            closer.start()
+            time.sleep(0.5)
+            self.assertTrue(closer.is_alive(), "close waits for atomic admission instead of a half-started child")
+            release.set()
+            worker.join(20)
+            closer.join(20)
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(closer.is_alive())
+            self.assertEqual(closer_errors, [], "close never joins an unstarted pump thread")
+            self.assertEqual(len(reports), 1)
+            self.assertEqual(len(errors), 1)
+            self.assertTrue(reap_states, "cleanup observed the admitted child")
+            self.assertTrue(all(state is True for state in reap_states),
+                            "every observed child had a started pump thread")
+        self.assertFalse(client._monitor.is_alive())
+        self.assertFalse(client._reaper.is_alive())
+
+    def test_pump_start_failure_cleans_up_admitted_process(self):
+        """A pump start failure after Popen must kill the process, not leak an admitted child."""
+        client = self.client()
+        processes = []
+        real_popen = subprocess.Popen
+        real_start = threading.Thread.start
+
+        def counting(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        def failing_start(thread, *args, **kwargs):
+            if thread.name == "neoxider-sdk-launcher":
+                raise RuntimeError("injected pump start failure")
+            return real_start(thread, *args, **kwargs)
+
+        with mock.patch.object(subprocess, "Popen", side_effect=counting), \
+                mock.patch.object(threading.Thread, "start", failing_start):
+            with self.assertRaisesRegex(RuntimeError, "injected pump start failure"):
+                client.spawn("PROMPT", engine="fixture", cwd=self.work, name="sdk-start-fail-1",
+                             env={"FIXTURE_MISSING_CLI": "1"})
+        self.assertEqual(len(processes), 1, "one process was admitted before the start failure")
+        self.assertIsNotNone(processes[0].poll(), "the admitted process is cleaned up, not leaked")
+        self.assertTrue(processes[0].stdout.closed, "the admitted pipe is released")
+        self.assertEqual(client._children, [], "no half-admitted child stays tracked")
+        self.assertEqual(list(self.logs.rglob("*.msg")), [], "the failed launch leaves no prompt")
+
+    def test_pump_start_failure_first_cleanup_failure_retains_until_retry(self):
+        """Injected Thread.start failure over a real benign Popen; first wait fails.
+
+        The primary start error is preserved, the marked failed-start child is
+        retained (pipe/prompt still held), and a retry/close reaps the exact
+        process/stdout/Windows handle. Ad-hoc kill-then-drop is rejected.
+        """
+        client = self.client()
+        processes = []
+        real_popen = subprocess.Popen
+        real_start = threading.Thread.start
+        real_wait = subprocess.Popen.wait
+
+        def counting(*args, **kwargs):
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        def failing_start(thread, *args, **kwargs):
+            if thread.name == "neoxider-sdk-launcher":
+                raise RuntimeError("injected pump start failure")
+            return real_start(thread, *args, **kwargs)
+
+        calls = {"count": 0}
+
+        def flaky_wait(self, *args, **kwargs):
+            if calls["count"] == 0:
+                calls["count"] += 1
+                raise OSError("injected first wait failure")
+            return real_wait(self, *args, **kwargs)
+
+        with mock.patch.object(subprocess, "Popen", side_effect=counting), \
+                mock.patch.object(threading.Thread, "start", failing_start), \
+                mock.patch.object(real_popen, "wait", flaky_wait):
+            with self.assertRaisesRegex(RuntimeError, "injected pump start failure"):
+                client.spawn("PROMPT", engine="fixture", cwd=self.work, name="sdk-start-retry-1",
+                             env=self.blocked_env(self.work))
+        self.assertEqual(len(processes), 1, "one benign process was admitted before the start failure")
+        child = client._child_for("sdk-start-retry-1")
+        self.assertIsNotNone(child, "the failed-start child is tracked, never dropped")
+        self.assertIs(child.process, processes[0], "retry addresses the exact admitted process")
+        self.assertTrue(child.start_failed, "the child is marked as a failed start")
+        self.assertIn("injected pump start failure", child.start_error, "primary error preserved")
+        self.assertTrue(child.cleanup_error, "secondary wait error recorded, not swallowed")
+        self.assertFalse(child.process.stdout.closed, "pipe held until checked reap succeeds")
+        prompts = list(self.logs.rglob("*.msg"))
+        self.assertEqual(len(prompts), 1, "prompt held until actual exit, not unlinked early")
+        # Retry by original PID + creation identity: no handle/generation exists.
+        client._cleanup_children(force=True)
+        self.until(lambda: child.reaped, message="retry reaps the exact child")
+        self.assertIsNotNone(child.process.poll(), "the exact process actually exited")
+        self.assertTrue(child.process.stdout.closed, "the exact stdout released after exit")
+        self.assertEqual(list(self.logs.rglob("*.msg")), [], "prompt released only after actual exit")
+        self.assertEqual(client._child_for("sdk-start-retry-1"), None)
+        report = client.close()
+        self.assertEqual(report.failed, (), "no secondary cleanup error persists")
+
+    def test_failed_start_child_spares_reused_pid(self):
+        """A retained failed-start child never kills a foreign/reused PID."""
+        client = self.client()
+        real_start = threading.Thread.start
+
+        def failing_start(thread, *args, **kwargs):
+            if thread.name == "neoxider-sdk-launcher":
+                raise RuntimeError("injected pump start failure")
+            return real_start(thread, *args, **kwargs)
+
+        with mock.patch.object(threading.Thread, "start", failing_start), \
+                mock.patch("neoxider_agents.process.kill_tree",
+                           side_effect=RuntimeError("injected kill failure")) as killed:
+            with self.assertRaisesRegex(RuntimeError, "injected pump start failure"):
+                client.spawn("PROMPT", engine="fixture", cwd=self.work, name="sdk-start-reuse-1",
+                             env=self.blocked_env(self.work))
+            self.assertEqual(killed.call_count, 1, "checked termination was attempted, not skipped")
+        child = client._child_for("sdk-start-reuse-1")
+        self.assertIsNotNone(child, "the failed-start child is tracked, never dropped")
+        self.assertTrue(child.start_failed)
+        self.assertIn("injected pump start failure", child.start_error, "primary error preserved")
+        self.assertIn("injected kill failure", child.cleanup_error, "secondary error recorded")
+        self.assertTrue(child.alive(), "the live process is retained for retry")
+        pid = child.process.pid
+        foreign_calls = []
+
+        def spying_kill_tree(*args, **kwargs):
+            foreign_calls.append((args, kwargs))
+            return False
+
+        # Simulate PID reuse: the stamp no longer matches the captured identity.
+        with mock.patch("neoxider_agents.process.pid_stamp",
+                        return_value="stamp-of-a-different-process"), \
+                mock.patch("neoxider_agents.process.kill_tree", side_effect=spying_kill_tree):
+            client._cleanup_children(force=True)
+        self.assertEqual(foreign_calls, [], "no kill through a reused PID identity")
+        self.assertIs(client._child_for("sdk-start-reuse-1"), child,
+                      "the reused-PID child is retained, never silently dropped")
+        self.assertTrue(child.alive(), "the foreign PID was never touched")
+        # The exact original is still reaped by identity once the stamp matches again.
+        client._cleanup_children(force=True)
+        self.until(lambda: child.reaped, message="exact original reaped after stamp match")
+        self.assertFalse(pid_alive(pid), "the exact original process actually exited")
+        self.assertTrue(child.process.stdout.closed, "the exact stdout released after exit")
+        self.assertEqual(list(self.logs.rglob("*.msg")), [], "prompt released only after actual exit")
+
+    def test_close_cleans_up_already_admitted_launch_and_refuses_late_spawn(self):
+        client = self.client()
+        calls = []
+        real_popen = subprocess.Popen
+
+        def counting(*args, **kwargs):
+            calls.append(list(args[0]) if args else [])
+            return real_popen(*args, **kwargs)
+
+        with mock.patch.object(subprocess, "Popen", side_effect=counting):
+            handle = client.spawn("ORIGINAL", engine="fixture", cwd=self.work, name="sdk-admitted-1",
+                                  env=self.blocked_env(self.work))
+            self.until(lambda: (self.work / "turn.1.started").exists(), message="first turn")
+            child = client._child_for("sdk-admitted-1")
+            report = client.close()
+            self.assertEqual(report.stopped, ("sdk-admitted-1",))
+            settled = len(calls)
+            with self.assertRaises(sdk.ClientClosed):
+                client.spawn("LATE", engine="fixture", cwd=self.work, name="sdk-admitted-2")
+            self.assertEqual(len(calls), settled, "a refused spawn starts no process after close")
+        self.assertFalse(child.alive(), "close stops the admitted launcher")
+        self.assertTrue(child.reaped, "close reaps the admitted launcher")
+        self.assertFalse(child.thread.is_alive())
+        self.assertTrue(child.process.stdout.closed)
+        self.assertEqual(self.store().read("sdk-admitted-1").get("state"), "stopped")
+
+    def test_failed_spawn_cleans_up_prompt_and_child(self):
+        client = self.client()
+        with self.assertRaises(sdk.SpawnError):
+            client.spawn("BOOM", engine="fixture", cwd=self.other, name="sdk-fail-clean",
+                         env={"FIXTURE_MISSING_CLI": "1"})
+        self.assertEqual(client.handles(), ())
+        self.assertTrue(all(not child.alive() for child in client._children))
+        self.assertEqual(list(self.logs.rglob("*.msg")), [], "a failed spawn leaves no prompt file")
+        self.assertFalse(self.store().path("sdk-fail-clean", ".meta").exists())
+
+    def test_callback_close_from_real_settled_run_then_spawn_refused(self):
+        client = self.client()
+        reports = []
+
+        def callback(event):
+            if event.kind == "settled":
+                reports.append(client.close())
+
+        client.subscribe(callback)
+        handle = client.spawn("QUICK", engine="fixture", cwd=self.other, name="sdk-cb-close-real",
+                              env={"FIXTURE_DELAY": "0"})
+        self.assertEqual(handle.wait(timeout=30).state, "done")
+        self.until(lambda: reports, seconds=10, message="callback close")
+        client._monitor.join(5)
+        client._reaper.join(5)
+        self.assertFalse(client._monitor.is_alive())
+        self.assertFalse(client._reaper.is_alive())
+        self.assertFalse(reports[0].in_progress)
+        with self.assertRaises(sdk.ClientClosed):
+            client.spawn("LATE", engine="fixture", cwd=self.other, name="sdk-cb-close-late")
+
     def close_event(self, client, name="close-event", kind="born"):
         from neoxider_agents.events import EventStore
         self.store().update(name, state="done", exit="0", parent=client.parent,

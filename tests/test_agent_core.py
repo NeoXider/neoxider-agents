@@ -49,7 +49,12 @@ class CoreTests(unittest.TestCase):
             try:
                 self.temp.cleanup()
                 break
-            except PermissionError:
+            except OSError as error:
+                # Windows may report a late fixture log as directory-not-empty.
+                # Keep the existing bound; unrelated or persistent failures surface.
+                if not (isinstance(error, PermissionError) or
+                        (os.name == "nt" and getattr(error, "winerror", None) == 145)):
+                    raise
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.05)

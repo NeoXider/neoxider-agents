@@ -13,7 +13,7 @@ from unittest.mock import patch
 ROOT = Path(os.environ.get("AGENT_UX_TEST_ROOT", Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(ROOT))
 from neoxider_agents.state import Store, atomic_write
-from neoxider_agents.process import hidden_kwargs
+from neoxider_agents.process import hidden_kwargs, pid_alive, pid_stamp
 from neoxider_agents.logs import TailWriter, digest_rows, prune_task
 from neoxider_agents.output import OutputFilter
 
@@ -42,6 +42,18 @@ class StorageTests(unittest.TestCase):
             if job.poll() is None:
                 self.cli("stop", "task")
             job.communicate(timeout=8)
+        # fan() launchers are not in self.jobs; terminal metadata can precede
+        # their final journal write. Drain only the original owned identities.
+        deadline = time.monotonic() + 3
+        while True:
+            live = [meta for _, meta, _ in self.store.scan()
+                    if meta.get("pid_start") and str(meta.get("pid")) != str(os.getpid())
+                    and pid_alive(meta.get("pid"))
+                    and pid_stamp(meta.get("pid")) == meta["pid_start"]]
+            if not live:
+                break
+            self.assertLess(time.monotonic(), deadline, "owned fixture launchers did not exit")
+            time.sleep(0.05)
         self.temp.cleanup()
 
     def cli(self, *args, env=None, stdin=None):

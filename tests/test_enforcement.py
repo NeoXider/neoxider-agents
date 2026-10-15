@@ -794,6 +794,130 @@ class WindowsSessionTests(unittest.TestCase):
                             "fixture_sha256": self.pin}, indent=2), encoding="utf-8")
 
 
+@unittest.skipUnless(os.name == "nt", "Native profile-text ownership requires Windows.")
+class ProfileTextReleaseTests(unittest.TestCase):
+    def test_successful_conversion_releases_text_without_pending(self):
+        from neoxider_agents.windows_enforcement import _Native
+        from types import SimpleNamespace
+        native = _Native()
+        owner = SimpleNamespace()
+        name = "neoxider-text-ok-" + uuid.uuid4().hex
+        sid, text = native.create_profile(name, owner=owner)
+        try:
+            self.assertTrue(text.startswith("S-1-15-2-"))
+            self.assertEqual(owner._profile, name)
+            self.assertTrue(owner._sid)
+            with native._release_lock:
+                self.assertFalse(native._pending_releases)
+            self.assertFalse([e for e in native.cleanup_errors
+                              if e["step"] == "profile-sid-text-free"])
+        finally:
+            try:
+                native.free_sid(sid)
+            finally:
+                self.assertEqual(native.delete_profile(name), 0)
+
+    def test_successful_conversion_localfree_fault_retains_pointer_and_retries_once(self):
+        from neoxider_agents.windows_enforcement import _Native
+        from types import SimpleNamespace
+        native = _Native()
+        owner = SimpleNamespace()
+        name = "neoxider-text-fault-" + uuid.uuid4().hex
+        real_free = native.local_free
+        failed = []
+        def fail(pointer):
+            failed.append(pointer.value)
+            raise OSError(5, "injected profile text LocalFree fault")
+        native.local_free = fail
+        try:
+            with self.assertRaises(OSError) as caught:
+                native.create_profile(name, owner=owner)
+        finally:
+            native.local_free = real_free
+        self.assertIn("injected profile text LocalFree fault", str(caught.exception))
+        # Profile and SID were tracked immediately and stay owned for retry.
+        self.assertEqual(owner._profile, name)
+        self.assertTrue(owner._sid)
+        self.assertEqual(len(failed), 1)
+        with native._release_lock:
+            pending = list(native._pending_releases)
+        self.assertEqual([label for label, action in pending], ["profile-sid-text-free"])
+        self.assertTrue(any(e["step"] == "profile-sid-text-free" for e in native.cleanup_errors))
+        # Retry frees exactly the retained pointer, exactly once.
+        freed = []
+        real_retry = native.local_free
+        def counting(pointer):
+            freed.append(pointer.value)
+            return real_retry(pointer)
+        native.local_free = counting
+        try:
+            native.release_resources([])
+        finally:
+            native.local_free = real_retry
+        self.assertEqual(freed, failed)
+        with native._release_lock:
+            self.assertFalse(native._pending_releases)
+        # A second drain frees nothing: no double-free.
+        native.release_resources([])
+        self.assertEqual(len(freed), 1)
+        try:
+            native.free_sid(owner._sid)
+        finally:
+            self.assertEqual(native.delete_profile(name), 0)
+
+    def test_conversion_failure_keeps_profile_and_sid_owned(self):
+        from neoxider_agents.windows_enforcement import _Native
+        from types import SimpleNamespace
+        native = _Native()
+        owner = SimpleNamespace()
+        name = "neoxider-text-conv-" + uuid.uuid4().hex
+        real_convert = native.ConvertSidToStringSidW
+        def fail_convert(sid, text):
+            try:
+                native.c.set_last_error(5)
+            except AttributeError:
+                pass
+            return 0
+        native.ConvertSidToStringSidW = fail_convert
+        try:
+            with self.assertRaises(OSError):
+                native.create_profile(name, owner=owner)
+        finally:
+            native.ConvertSidToStringSidW = real_convert
+        self.assertEqual(owner._profile, name)
+        self.assertTrue(owner._sid)
+        try:
+            fresh = native.c.c_void_p()
+            self.assertNotEqual(native.CreateAppContainerProfile(
+                name, name, "Owned Neoxider console session", None, 0,
+                native.c.byref(fresh)), 0)
+        finally:
+            try:
+                native.free_sid(owner._sid)
+            finally:
+                self.assertEqual(native.delete_profile(name), 0)
+
+    def test_absent_owner_rejected_before_os_creation(self):
+        from neoxider_agents.windows_enforcement import _Native
+        from neoxider_agents.enforcement import EnforcementError
+        from types import SimpleNamespace
+        native = _Native()
+        name = "neoxider-text-noowner-" + uuid.uuid4().hex
+        with self.assertRaises(EnforcementError) as caught:
+            native.create_profile(name)
+        self.assertEqual(caught.exception.code, "profile-owner-required")
+        # Nothing was created: the same name is still free for owned creation.
+        owner = SimpleNamespace()
+        sid, text = native.create_profile(name, owner=owner)
+        try:
+            self.assertTrue(text.startswith("S-1-15-2-"))
+        finally:
+            try:
+                native.free_sid(sid)
+            finally:
+                self.assertEqual(native.delete_profile(name), 0)
+
+
 _WINDOWS_FIXTURE_SOURCE = r"""#include <winsock2.h>
 #include <windows.h>
 #include <stdio.h>

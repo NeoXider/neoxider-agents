@@ -217,7 +217,8 @@ ATTRIBUTION = ("Changes are measured against this task's start in its working di
 
 class _Child:
     __slots__ = ("task", "process", "stamp", "lines", "thread", "command", "prompt_path",
-                 "generation", "parent", "settled_at", "reaped", "lock", "control")
+                 "generation", "parent", "settled_at", "reaped", "lock", "control",
+                 "start_failed", "start_error", "cleanup_error")
 
     def __init__(self, task, process, stamp, lines, command):
         self.task = task
@@ -233,6 +234,9 @@ class _Child:
         self.reaped = False
         self.lock = threading.RLock()
         self.control = False
+        self.start_failed = False
+        self.start_error = ""
+        self.cleanup_error = ""
 
     def tail(self, count=6):
         return " | ".join(list(self.lines)[-count:]).strip()
@@ -551,7 +555,11 @@ class AgentClient:
         try:
             child = self._launch(task, argv, child_env, prompt_path=prompt_path)
         except BaseException:
-            self._unlink(prompt_path)
+            # A retained failed-start child owns the prompt until checked reap
+            # releases it after actual exit; only unlink when nothing is retained.
+            retained = self._child_for(task)
+            if retained is None or not getattr(retained, "start_failed", False):
+                self._unlink(prompt_path)
             raise
         try:
             meta = self._await_owner(child, task, self.publish_timeout, "spawn")
@@ -562,7 +570,11 @@ class AgentClient:
         handle = self._make_handle(task, child, meta, parent_id, directory, spawn_id,
                                    engine, model, effort, owns, detach)
         try:
-            self._register(handle, meta, adopted=False)
+            with self._lock:
+                # The child was admitted before close and is in close cleanup;
+                # refuse to publish a post-close handle for it instead of orphaning it.
+                self._check_open()
+                self._register(handle, meta, adopted=False)
         except BaseException:
             self._discard(child)
             raise
@@ -752,12 +764,18 @@ class AgentClient:
             child = self._launch(name, argv, self._child_env(detached=True), prompt_path=message_path)
             try:
                 self._await_owner(child, name, self.publish_timeout, "resume")
+                with self._lock:
+                    # The child was admitted before close and is in close cleanup;
+                    # refuse to hand back a post-close resume instead of orphaning it.
+                    self._check_open()
             except BaseException:
                 self._discard(child)
                 raise
         except BaseException:
             if message_path:
-                self._unlink(message_path)
+                retained = self._child_for(name)
+                if retained is None or not getattr(retained, "start_failed", False):
+                    self._unlink(message_path)
             raise
         self._refresh(name)
         return self.handle(name) or handle
@@ -1022,15 +1040,23 @@ class AgentClient:
                 spared.add(name)
         for child in children:
             if child.task in spared:
-                self._reap(child)  # exited resources can still be released safely
+                try:
+                    self._reap(child)  # exited resources can still be released safely
+                except BaseException as error:
+                    child.cleanup_error = "%s: %s" % (type(error).__name__, error)
+                    failed.append((child.task, "%s: %s" % (type(error).__name__, error)))
                 continue
-            if child.alive():
-                self._await_exit(child, 10)
-            if not child.alive():
-                self._reap(child)
-            else:
-                # stop() revalidates ownership; never blindly kill a cached PID here.
-                self._cleanup_children(force=True)
+            # Includes launches admitted just before close that never registered a
+            # handle, and retained failed-start children: stop() cannot see them,
+            # so identity-checked _kill must run.
+            # A PID that fails the stamp check is never touched here.
+            # Secondary cleanup errors retain ownership and are reported, never
+            # mistaken for a full release.
+            try:
+                self._kill(child)
+            except BaseException as error:
+                child.cleanup_error = "%s: %s" % (type(error).__name__, error)
+                failed.append((child.task, "%s: %s" % (type(error).__name__, error)))
         if not self._children:
             self._closing.set()
         self._wake.set()
@@ -1141,26 +1167,57 @@ class AgentClient:
         return result
 
     def _launch(self, task, argv, env, prompt_path=None, control=False):
+        """Single atomic admission point: refuse non-control launches once closed.
+
+        The closed check, Popen, _children registration and pump start share one
+        lock hold so close() either observes a fully-tracked child for cleanup or
+        the launch never starts. The child is registered BEFORE Thread.start with
+        thread None, so close never joins an unstarted thread. Only the short
+        Popen and thread start run under the lock: no publication waits, no
+        callbacks. A pump start failure preserves the primary start error and
+        retains a marked failed-start child until a CHECKED termination/reap
+        succeeds; kill/wait errors never drop ownership. Pipes, the Windows
+        Popen handle and the prompt are released only AFTER actual exit via the
+        existing _kill/_reap. Control launches stay admitted so close() can stop
+        workers and detached handles remain stoppable afterwards; they reap
+        synchronously in _run_control.
+        """
         from .process import pid_stamp
         if argv[0] in ("send", "restart", "stop"):
             self._read_owned(task, self.handle(task))
-        command = [self.python, self.entry] + [str(argument) for argument in argv]
-        try:
-            process = subprocess.Popen(command, stdin=subprocess.DEVNULL, env=env, stdout=subprocess.PIPE,
-                                       stderr=subprocess.STDOUT, close_fds=True, encoding="utf-8",
-                                       errors="replace", **launch_kwargs())
-        except OSError as error:
-            raise SpawnError("spawn: could not launch agent.py (%s)" % error, task=task,
-                             command=" ".join(command), returncode=1)
-        child = _Child(task, process, pid_stamp(process.pid), deque(maxlen=max(1, self.launcher_output)), command)
-        child.prompt_path = prompt_path
-        child.control = control
-        if "-P" in argv:
-            child.parent = argv[argv.index("-P") + 1]
-        child.thread = threading.Thread(target=self._pump, args=(child,), name="neoxider-sdk-launcher", daemon=True)
-        child.thread.start()
         with self._lock:
+            if self._closed and not control:
+                raise ClientClosed("client is closed; create a new AgentClient")
+            command = [self.python, self.entry] + [str(argument) for argument in argv]
+            try:
+                process = subprocess.Popen(command, stdin=subprocess.DEVNULL, env=env, stdout=subprocess.PIPE,
+                                           stderr=subprocess.STDOUT, close_fds=True, encoding="utf-8",
+                                           errors="replace", **launch_kwargs())
+            except OSError as error:
+                raise SpawnError("spawn: could not launch agent.py (%s)" % error, task=task,
+                                 command=" ".join(command), returncode=1)
+            child = _Child(task, process, pid_stamp(process.pid), deque(maxlen=max(1, self.launcher_output)), command)
+            child.prompt_path = prompt_path
+            child.control = control
+            if "-P" in argv:
+                child.parent = argv[argv.index("-P") + 1]
+            child.thread = None
             self._children.append(child)
+            thread = threading.Thread(target=self._pump, args=(child,), name="neoxider-sdk-launcher", daemon=True)
+            try:
+                thread.start()
+            except BaseException as primary:
+                # Preserve the primary start error; retain the failed-start child
+                # until checked termination/reap succeeds. Never drop ownership
+                # on a secondary kill/wait error: record it and keep the child.
+                child.start_failed = True
+                child.start_error = "%s: %s" % (type(primary).__name__, primary)
+                try:
+                    self._kill(child)
+                except BaseException as secondary:
+                    child.cleanup_error = "%s: %s" % (type(secondary).__name__, secondary)
+                raise
+            child.thread = thread
         return child
 
     def _pump(self, child):
@@ -1251,6 +1308,8 @@ class AgentClient:
     def _kill(self, child):
         from .process import kill_tree, pid_stamp
         # Only a captured, still-matching process identity may be terminated.
+        # A PID that fails the stamp check (reused/gone) is never touched here.
+        # Secondary errors propagate so ownership is retained, never dropped.
         if child.alive() and child.stamp and pid_stamp(child.process.pid) == child.stamp:
             kill_tree(child.process.pid, stamp=child.stamp)
             try:
@@ -1260,7 +1319,12 @@ class AgentClient:
         self._reap(child)
 
     def _reap(self, child):
-        """Release finished launcher resources immediately; retain only typed/durable state."""
+        """Release finished launcher resources immediately; retain only typed/durable state.
+
+        Pipes, the Windows Popen handle and the prompt are released only AFTER
+        actual exit. Any secondary release error propagates so the child stays
+        tracked and cleanup is retried; successful reap unlinks the prompt.
+        """
         with child.lock:
             if child.reaped:
                 return True
@@ -1295,6 +1359,23 @@ class AgentClient:
         for child in children:
             if self._reap(child):
                 continue
+            if getattr(child, "start_failed", False):
+                # A pre-handle failed-start child never registered an owner
+                # generation: retry purely by original PID + creation identity.
+                # No public handle/generation may be required. A stamp mismatch
+                # (reused/gone PID) is never killed; an exited original is
+                # reaped, releasing its exact process/stdout/Windows handle.
+                try:
+                    if child.alive():
+                        if child.stamp and pid_stamp(child.process.pid) == child.stamp:
+                            self._kill(child)
+                        else:
+                            self._reap(child)
+                    else:
+                        self._reap(child)
+                except BaseException as error:
+                    child.cleanup_error = "%s: %s" % (type(error).__name__, error)
+                continue
             if child.control:
                 continue
             try:
@@ -1320,7 +1401,12 @@ class AgentClient:
                 child.settled_at = None
 
     def _discard(self, child):
-        self._kill(child)
+        try:
+            self._kill(child)
+        except BaseException as error:
+            # Never mask the caller's primary failure and never drop ownership:
+            # retain the child for retry/close and record the secondary error.
+            child.cleanup_error = "%s: %s" % (type(error).__name__, error)
 
     def _require_resume(self, name, meta):
         engine = meta.get("engine", "")

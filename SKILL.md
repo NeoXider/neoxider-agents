@@ -5,15 +5,24 @@ description: Work as an ORCHESTRATOR — plan, decompose and delegate coding tas
 
 # CLI Subagents (Codex Orchestration)
 
-## Integrated orchestration contracts (2026-10-14)
+## Integrated orchestration contracts (2026-10-15)
 
 The typed [Python SDK](docs/ORCHESTRATOR_API.md) and CLI share the
 [core lifecycle](docs/CORE_INTEGRATION.md): durable message UUIDs/receipts,
 parent events and named callback replay, reviewed recovery, optional retained
 Codex/OpenCode runtime profiles, and typed failure/cost/verification evidence.
 The [Fleet GUI](docs/FLEET_UI.md) reads the same receipts and event journals.
-The [native parity report](docs/NATIVE_PARITY_REPORT.md) is **DRAFT** pending
-Root security, final regression, live and remote gates.
+The [native parity report](docs/NATIVE_PARITY_REPORT.md) is a historical
+snapshot superseded for accepted source by the concise Russian final
+[release verification](docs/RELEASE_VERIFICATION_20261015.md). Root source
+gate 2026-10-15 is ACCEPTED (`SOURCE_GATE_ACCEPTED`: 35 modules / 1313 unique
+tests / 5 skips; authority `root_source_gate.json` SHA256
+`ba196679…b60b6c8c3b`): reviewed SDK startup admission with retained
+failed-start resources, Root's native helper gate (37 passed + 31 subtests,
+incl. loopback control) covering the detached helper only — public
+ordinary-provider enforcement stays false. Release publication/push/cleanup
+remain Root-owned (authoritative receipt: `RELEASE_RECEIPT.json`); no code
+writers remain.
 
 Acceptance means durable queue/journal persistence; delivery means successful
 invocation completion with a nonempty answer; acknowledgment requires explicit
@@ -48,8 +57,11 @@ remain under security review. Hosted-chat injection and hard billing caps remain
 unsupported. Provider exit zero is not tests/QA; estimates and reported usage are
 not confirmed billing. Free OpenCode routes were rate limited in this effort
 (historical); on 2026-10-14 OpenCode 1.18.27 SpaceBunny and Muse Spark 1.3
-each completed one measured file task (see the native parity report) — that
-exact case only, not all models or stable free quota. The human authorized
+each completed one measured file task (see the native parity report and the
+release verification) — that
+exact case only, not all models or stable free quota; a fresh 2026-10-15 Muse
+free probe (`parity-route-20261015`, done, exit 0, tool-read) is likewise that
+single case only. The human authorized
 Codex CLI fallback. Do not label a catalogue, launch, fixture
 or rate-limited call as live provider success.
 
@@ -572,7 +584,7 @@ until restarted by the new core.
   `mimo-free` or `nemotron-ultra-free` are not aliases and fail as unknown models.
 - **`opencode/space-bunny-free` appeared in the 2026-09-29 catalog** as Space Bunny Free.
   Measured 2026-10-14: one SpaceBunny and one Muse Spark 1.3 file task each completed
-  (OpenCode 1.18.27; see the native parity report) — that exact case only, not stable
+  (OpenCode 1.18.27; see the native parity report and the release verification) — that exact case only, not stable
   free quota. Otherwise current availability is uncertain without a current catalog
   or probe. It has **no short alias** — pass the full id, and pass it
   verbatim *with* the `opencode/` prefix (a bare `space-bunny-free` is an unknown model):

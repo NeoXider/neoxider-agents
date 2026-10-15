@@ -1,14 +1,22 @@
-# Native parity final report — DRAFT — 2026-10-14
+# Native parity final report — HISTORICAL SNAPSHOT (2026-10-14 content, superseded 2026-10-15)
 
-**DRAFT: pending Root security, final regression, live-provider/browser and remote
-gates.** This records current integrated source and bounded evidence. It does not
-declare the full plan accepted, Windows enforcement supported, or publication done.
-The worktree remains under concurrent implementation, particularly Windows enforcement.
+**Superseded for accepted source by the final Russian
+[release verification](RELEASE_VERIFICATION_20261015.md).** Root source gate
+2026-10-15 is ACCEPTED (`SOURCE_GATE_ACCEPTED`: 35 modules / 1313 unique
+tests / 5 skips; authority `root_source_gate.json` SHA256
+`ba196679…b60b6c8c3b`). What follows below is the preserved 2026-10-14
+candidate text: it does not declare publication done, Windows enforcement
+supported, or the SDK unsafe — the SDK admission it calls "NOT accepted" was
+accepted in the gate via the final reviewed startup admission. The worktree
+had been under concurrent implementation; no code writers remain.
 Historical receipts bind their tested bytes; later changes reopen affected gates.
 
-Base: `origin/main ab3dd6cb07da101bf4f0bee2feca5e64814599b0` as recorded by Root.
+Base: recovery worktree from remote `main 9b74239`, which includes the previously
+published parity features `2dd31e0`; prior base `origin/main ab3dd6cb07da101bf4f0bee2feca5e64814599b0`
+is superseded as the checkout base (preserved for provenance).
 This documentation task did not fetch, commit, push, change credentials/network,
-launch models/subagents, or operate Unity. Root owns PLAN and release decisions;
+launch models/subagents, or operate Unity. No Git commands were run in this
+task at all, including status/diff handoff checks. Root owns PLAN and release decisions;
 security owners retain their [audit](SECURITY_AUDIT.md) and
 [enforcement contract](ENFORCED_SCOPE.md).
 
@@ -24,7 +32,7 @@ security owners retain their [audit](SECURITY_AUDIT.md) and
 | Runtime profiles | [runtime_profiles.py](../neoxider_agents/runtime_profiles.py), lifecycle/SDK launch and resume | Optional Codex/OpenCode private retained paths, executable/script pins and actual process lease. No automatic auth-file copy/global-home fallback. Other providers refuse isolation. |
 | Failures/costs/QA | [diagnostics.py](../neoxider_agents/diagnostics.py), runtime classification and result collector | Quota authority differs from auth/TLS/network/OOM. Catalogue estimates, provider usage and billing are separate. Hard billing caps refused; task exit zero is not QA. |
 | Fleet GUI | [gui.py](../gui.py), [fleet.js](../static/fleet.js), [Fleet contract](FLEET_UI.md) | Group/filter/conflict/status views, event rendering/read acknowledgments, exact UUID receipt polling. Launcher started means pending, `accepted=false`; browser/terminal live QA remains Root-owned. |
-| Write scope | Public enforcement capabilities and SDK `scope_enforced=False` | Ordinary providers have declaration/diff reporting only. Independent outside-AAP escape baseline rejected; candidate Windows fixes remain unverified by this report. |
+| Write scope | Public enforcement capabilities and SDK `scope_enforced=False` | Ordinary providers have declaration/diff reporting only. Independent outside-AAP escape baseline rejected; Root 2026-10-15 gate (37 passed + 31 subtests, incl. loopback control) covers the detached helper only — public enforcement stays false, no general sandbox claim. |
 
 Use [Core integration](CORE_INTEGRATION.md) for shared invariants and
 [SDK API](ORCHESTRATOR_API.md) for types/signatures. The
@@ -119,6 +127,30 @@ it does not prove tests, QA or billing. Separately, two concurrent private-`CODE
 Codex CLI launches with same-session SDK attach/send/ack/dedupe and 14 callbacks passed;
 Root source-hash, actual file-hash and PID-creation rechecks passed, billing unknown,
 auth was manually Root-provisioned (no automatic SDK auth copy, no global change).
+Fresh Muse free probe `parity-route-20261015` (2026-10-15): real-read source,
+`done`, exit 0 — that exact case only, not universal quota. Completed worker
+process resources are gone per Root-observed exact PIDs; sessions retained.
+
+## Root native gate 2026-10-15 (reviewed source + real fixture run)
+
+Root read the full profile-pointer source/test diff. Independent Root run
+`python -B -m pytest tests/test_enforcement.py -v` with the retained pinned
+fixture `C:/AI/outputs/neoxider-parity-v3-astra-20261014/suite-fixture.exe`:
+**exit 0, 37 passed + 31 subtests passed, 23.54 s** — native child/escape,
+cleanup faults **including the loopback control**. Logs/JUnit:
+`C:/AI/outputs/parity-final-recovery-20261015/security/root-enforcement.log`,
+`root-enforcement-junit.xml`. This gate **supersedes older statements that the
+network case was untested — for this loopback-control case only**. Public
+ordinary-provider enforcement remains **false / fail closed**; the detached
+native helper is not a general sandbox. Profile-text ownership correction is
+active in code (`windows_enforcement.py` + 4 `ProfileTextReleaseTests`): owner
+`None` refused before any OS call, original error stays authoritative, checked
+pending retry — see [ENFORCED_SCOPE](ENFORCED_SCOPE.md) and the
+[release verification](RELEASE_VERIFICATION_20261015.md). The SDK admission
+candidate described below as NOT accepted was ACCEPTED in the 2026-10-15
+source gate via the final reviewed startup admission (deterministic
+pump-start, pre-owner-publication, failed-start cleanup); the rejection
+described here is preserved history, not the current state.
 
 ## Before versus current SDK/CLI (wrapper ergonomics, not model quality)
 
@@ -167,6 +199,8 @@ snapshot instead of a self-join deadlock.
 ## Receipts, negative history and pending gates
 
 Evidence root: `C:/AI/outputs/neoxider-parity-core-20261014/`.
+Recovery evidence: `C:/AI/outputs/parity-final-recovery-20261015/` (`security/`,
+`sdk/`); concise Russian status: [release verification](RELEASE_VERIFICATION_20261015.md).
 The following are preserved receipts, not a new full regression run:
 
 | Receipt | Result and scope |
@@ -188,12 +222,14 @@ The following are preserved receipts, not a new full regression run:
 Runtime-profile verification command for the current docs check:
 `python -B -m unittest discover -s tests -p test_runtime_profiles.py -v`.
 Documentation Python blocks were parsed and API call signatures checked without
-launching providers; local links and CLI parser examples were checked, and
-`git diff --check` was required for handoff. No source-final security acceptance
+launching providers; local links and CLI parser examples were checked. No Git
+commands were executed for handoff. No source-final security acceptance
 is inferred from these documentation checks.
 
 Root still owns final source hashes/full regression and distribution checks,
 independent Windows escape/security gates, real authorized provider launch/message/
 control/recovery and isolated-runtime evidence, live browser/visible-terminal QA,
 fresh remote check, sole-author release decision and remote SHA verification.
-This report remains **DRAFT** until those gates are evidenced and Root updates it.
+This report is a **historical snapshot**; the final word for accepted source is
+the [release verification](RELEASE_VERIFICATION_20261015.md), and the
+authoritative record of publication/cleanup will be `RELEASE_RECEIPT.json`.

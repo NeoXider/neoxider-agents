@@ -2,7 +2,8 @@
 
 Public `enforcement.capabilities().enforced_write_scope` remains **false**.
 Public `prepare` and `launch` raise `EnforcementUnavailable`; no unrestricted
-fallback exists. Legacy `--owns` is a declaration/diff contract.
+fallback exists. Legacy `--owns` is a declaration/diff contract. Detached native
+children are a restricted helper, **not a general sandbox** for ordinary providers.
 
 The independent [security audit](SECURITY_AUDIT.md) rejected baseline
 `windows_enforcement.py` SHA256 `69d87c077bee37e26347b98d643c340966644f4c597b1e93196bee691595c9c9`:
@@ -104,6 +105,36 @@ and evidence; close does not delete them. The caller owns their retention/remova
 This is separate from the SDK's 300-second process-resource lifecycle policy.
 Temporary OS profiles, desktop, process/job handles and streams are closed.
 
+## Root gate 2026-10-15 (reviewed source + real fixture run)
+
+Root read the full profile-text source/test diff and ran
+`python -B -m pytest tests/test_enforcement.py -v` with the retained pinned
+fixture `C:/AI/outputs/neoxider-parity-v3-astra-20261014/suite-fixture.exe`:
+**exit 0, 37 passed + 31 subtests passed, 23.54 s**, covering native
+child/escape, cleanup faults and the **loopback control** (exact-C-literal
+match; pinned fixture binary per `security/ROOT_VERIFICATION.md` in the
+recovery evidence root)
+(`C:/AI/outputs/parity-final-recovery-20261015/security/root-enforcement.log`,
+JUnit `root-enforcement-junit.xml`). This supersedes the paragraph below that
+excluded the loopback test — **for this loopback-control case only**; no broader
+network claim follows, and public ordinary-provider enforcement stays false.
+
+Profile-text resource ownership correction (active code, [release
+verification](RELEASE_VERIFICATION_20261015.md), diff `security/fix.diff`):
+`_Native.create_profile` rejects `owner=None` with `profile-owner-required`
+before any OS call; profile+SID are tracked immediately after creation, before
+conversion; success + `LocalFree` fault retains `profile-sid-text-free` for
+exactly-once retry (original error authoritative, no double-free); conversion
+failure releases non-null text via checked `release_resources(...,
+raise_errors=False)`. Four `ProfileTextReleaseTests` cover success, fault
+retain+retry-once, conversion-failure ownership and absent-owner rejection
+(`verify-text-release.log`: 4 passed). Pre-fix repro `repro-old-bug.log` →
+`BUG_REPRODUCED`; post-fix `verify-postfix-repro.log` → `FIXED`. This helper
+coverage is part of the ACCEPTED 2026-10-15 Root source gate (35 modules /
+1313 unique tests / 5 skips; authority `root_source_gate.json`); public
+ordinary-provider enforcement stays false, and worker scope-compliance packets
+remain not accepted — Root independently reviewed the actual source/diffs/tests.
+
 ## Verification and limits
 
 Preserved original failures live in
@@ -138,8 +169,10 @@ The current offline gates include:
   and permanent job-termination failure on a real owned job with a benign
   detached child (job still closes, child exits, termination error preserved).
 
-The existing loopback network test is excluded from this effort at the user's
-no-network instruction; it is not counted as passed or silently skipped.
+The loopback network test below was excluded from the earlier effort at the user's
+no-network instruction; it is not counted as passed or silently skipped there.
+The 2026-10-15 Root gate above ran the loopback control with the retained
+fixture — that case only, not a general network grant.
 Compile the embedded C fixture with installed MSVC using
 `tests.test_enforcement.build_windows_fixture` (import from the `tests` path),
 set `AGENT_ENFORCEMENT_FIXTURE_BIN`, and run the selected unittest cases. Without
