@@ -81,6 +81,30 @@ def status(store, name):
     return 0
 
 
+def status_many(store, patterns, opts):
+    """One table for several tasks: names, globs and filters; --detail appends each full status."""
+    import json
+    from . import selection, ux_tracking
+    names, unmatched = selection.select(store, patterns, opts)
+    if patterns and not names:
+        raise ValueError("no task matches " + ", ".join("'%s'" % item for item in patterns))
+    for item in unmatched:
+        print("[agent.sh] no task matches '%s'" % item, file=sys.stderr)
+    rows = ux_tracking.dashboard_data(store, names)
+    rows.sort(key=lambda row: row["state"] not in selection.ACTIVE_STATES)
+    if opts.get("--json"):
+        print(json.dumps(rows, ensure_ascii=False))
+    elif not rows:
+        print("No tasks match.")
+    else:
+        ux_tracking.render_table(rows)
+        if opts.get("--detail"):
+            for row in rows:
+                print()
+                status(store, row["name"])
+    return 3 if opts.get("--strict") and ux_tracking.attention(rows) else 0
+
+
 def last(store, name, result=False):
     path = store.path(name, ".log")
     if not store.read(name):

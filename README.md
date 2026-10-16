@@ -185,6 +185,7 @@ or stdin for large inputs. Errors fit on one line with a fix; `--debug` exposes 
 ```powershell
 neoxider brief --outcome "Fix the parser; all parser tests pass" --owns "src/parser.py,tests/test_parser.py" --not-touch "providers/**" --return "Changed files and test evidence" | neoxider run -t parser -
 neoxider top --once
+neoxider status 'parser-*'      # several tasks in one table; also --active, --state failed, --since 2h, --here, --json, --strict
 neoxider diff parser --stat
 ```
 

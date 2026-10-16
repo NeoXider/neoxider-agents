@@ -13,12 +13,13 @@ COMMANDS = {
     "fan": "[-e ENGINE] [-m MODEL] [-f EFFORT] [-C DIR] [-t BASE] TEXT...",
     "reply": "NAME [--now] [-e ENGINE] [-m MODEL] [-f EFFORT] [-C DIR] (TEXT | --prompt-file F) | --flush NAME",
     "send": "NAME [--now] [-e ENGINE] [-m MODEL] [-f EFFORT] [-C DIR] (TEXT | --prompt-file F) | --flush NAME",
-    "stop": "NAME... | --all-mine", "restart": "NAME [TEXT | --prompt-file F] [--fresh] [-C DIR]",
+    "stop": "NAME|GLOB... | --all-mine", "restart": "NAME [TEXT | --prompt-file F] [--fresh] [-C DIR]",
     "peek": "NAME [-n N] [-f] [--raw]", "watch": "NAME [-n N] [--raw] (follow activity with status)", "log": "[NAME] [-f] [-n N] [-l]",
-    "last": "[NAME]", "result": "[NAME] [--json]", "status": "[NAME]", "list": "[LIMIT]",
-    "top": "[--once] [--json] [--interval SECONDS]", "dashboard": "(alias for top)",
+    "last": "[NAME]", "result": "[NAME] [--json]", "status": "[NAME|GLOB...] [--active] [--state S,S] [--since 2h] [--here] [--json] [--detail] [--strict]  (several names, a glob or a filter print one table)",
+    "list": "[LIMIT]",
+    "top": "[NAME|GLOB...] [--active] [--state S,S] [--since 2h] [--here] [--once] [--json] [--interval SECONDS]", "dashboard": "(alias for top)",
     "diff": "NAME [--stat|--names] (changes since the task baseline)",
-    "pending": "[--strict]", "wait": "[NAME...] [--timeout SECONDS] [--poll SECONDS] [--strict]",
+    "pending": "[--strict]", "wait": "[NAME|GLOB...] [--timeout SECONDS] [--poll SECONDS] [--strict]",
     "clean": "[--all] [--purge] [-n|--dry-run]", "prune": "[--all] [--purge] [-n|--dry-run]",
     "doctor": "[--deep|--json]", "provider-info": "ENGINE",
     "models": "[-e ENGINE] [--provider ID] [-m MODEL] [--refresh] [--json]",
@@ -85,6 +86,11 @@ def parse(command, argv):
     if command in ("top", "dashboard"):
         switches.update(("--once", "--json"))
         operands["--interval"] = "interval"
+    if command in ("top", "dashboard", "status"):
+        switches.update(("--active", "--here"))
+        operands.update({"--state": "state", "--since": "since"})
+    if command == "status":
+        switches.update(("--json", "--detail", "--strict"))
     if command == "result":
         switches.add("--json")
     if command == "diff":
@@ -239,8 +245,11 @@ def dispatch(command, opts, args, store):
         print(json.dumps(report, ensure_ascii=False))
         return 0
     if command in ("top", "dashboard"):
-        if args:
-            raise ValueError("top: remove extra arguments; use --once or --json")
+        names = None
+        if args or any(key in opts for key in ("--active", "--here", "state", "since")):
+            from . import selection
+            selection.select(store, args, opts)
+            names = lambda: selection.select(store, args, opts)[0]
         if "interval" in opts:
             try:
                 interval = float(opts["interval"])
@@ -249,7 +258,7 @@ def dispatch(command, opts, args, store):
             if interval <= 0:
                 raise ValueError("top: --interval must be a positive number")
         from .ux_tracking import top
-        return top(store, opts)
+        return top(store, opts, names)
     if command in ("list", "pending", "wait", "clean", "prune"):
         if command == "list":
             if len(args) > 1:
@@ -259,8 +268,13 @@ def dispatch(command, opts, args, store):
             return views.pending(store, opts.get("--strict", False))
         if command == "wait":
             poll = integer(opts.get("poll", os.environ.get("AGENT_WAIT_POLL", 5)), "wait: --poll", 5)
-            return views.wait(store, args, integer(opts.get("timeout", os.environ.get("AGENT_WAIT_TIMEOUT", 0)), "wait: --timeout"), max(0.1, poll), strict=bool(opts.get("--strict")))
+            from . import selection
+            return views.wait(store, selection.expand(store, args), integer(opts.get("timeout", os.environ.get("AGENT_WAIT_TIMEOUT", 0)), "wait: --timeout"), max(0.1, poll), strict=bool(opts.get("--strict")))
         return views.clean(store, opts)
+    if command == "status":
+        from . import selection
+        if selection.wants_selection(args, opts):
+            return views.status_many(store, args, opts)
     if command in ("last", "result", "status", "log", "peek", "watch", "diff"):
         if len(args) > 1:
             raise ValueError(command + ": needs at most one NAME")
@@ -296,6 +310,9 @@ def dispatch(command, opts, args, store):
             args = [name for name, meta, _ in store.scan() if views.mine(meta)]
         elif not args:
             raise ValueError("stop: needs NAME... or --all-mine")
+        else:
+            from . import selection
+            args = selection.expand(store, args)
         for name in args:
             lifecycle.stop(store, name, os.environ.get("AGENT_STOP_BY", os.environ.get("AGENT_CONTROL_BY", "orchestrator")))
         return 0

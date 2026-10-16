@@ -20,7 +20,7 @@ _neoxider() {
     elif [[ "$previous" == --effort || "$previous" == -f && "$words[2]" != peek && "$words[2]" != watch && "$words[2]" != log ]]; then
         compadd minimal low medium high xhigh max
     elif [[ "$PREFIX" == -* ]]; then
-        compadd -- -e -m -f -C -t -P -p -v -n -l --help --debug --engine --model --effort --dir --task --parent --prompt-file --timeout --poll --progress --no-progress --no-terse --verbose --terminal --log --owns --strict-owns --notify --now --flush --fresh --all-mine --all --purge --dry-run --strict --raw --deep --refresh --provider --standard --json --once --interval --stat --names --base-url --goal --out --outcome --not-touch --return --context-file --install --profile --lan --localhost --token --api-key
+        compadd -- -e -m -f -C -t -P -p -v -n -l --help --debug --engine --model --effort --dir --task --parent --prompt-file --timeout --poll --progress --no-progress --no-terse --verbose --terminal --log --owns --strict-owns --notify --now --flush --fresh --all-mine --all --purge --dry-run --strict --raw --deep --refresh --provider --standard --json --once --interval --stat --names --base-url --goal --out --outcome --not-touch --return --context-file --install --profile --lan --localhost --token --api-key --active --here --state --since --detail
     elif (( CURRENT == 2 )); then
         _describe 'command' commands
     elif [[ "$words[2]" == completion ]]; then

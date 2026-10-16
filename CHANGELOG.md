@@ -6,6 +6,24 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+### Added
+
+- Check several tasks at once. `status` now takes several names, globs (`status 'wave-*'`) and filters
+  (`--active`, `--state running,failed` with the groups `active` and `failed`, `--since 2h`, `--here`) and prints one
+  table instead of one detail block per call: state, short model, age, quiet time, changed files, queued
+  messages, tokens, a condensed last activity, a per-state count and a `needs attention` line (failed, waiting,
+  orphaned, or undelivered messages on a finished task). `--json` returns the same rows as `top --json`, `--detail`
+  appends the full per-task status, `--strict` exits 3 when anything needs attention. A single plain name keeps the
+  old detail view. `top`, `stop` and `wait` accept the same globs; `top` also takes the filters and re-evaluates them
+  on every refresh. Globs and filters see only tasks of the current orchestrator; an exact name is always honoured.
+  New `neoxider_agents/selection.py`; tests in `tests/test_multi_status.py`.
+
+### Changed
+
+- The `top`/`status` table is easier to read: a `MODEL` column, compact token counts (`15.3k`, `2.5M`), usage dumps
+  and JSON error envelopes condensed to one line, and the per-task `partial baseline` notes collapsed into one footer
+  line; `FILES` carries a `*` when the baseline was partial instead of silently showing a misleading `0`.
+
 ### Fixed
 
 - A usage limit is no longer easy to miss. The last limit each engine reported is remembered in

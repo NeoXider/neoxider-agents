@@ -220,13 +220,17 @@ def _delta_names(store, name, meta, current=None):
     return changed_files(store, name, meta.get("dir", ""))
 
 
-def dashboard_data(store):
+def dashboard_data(store, names=None):
     from .lifecycle import effective
     from .views import mine
     rows, scans = [], {}
     now = time.time()
+    chosen = None if names is None else set(names)
     for name, meta, stamp in store.scan():
-        if not mine(meta):
+        if chosen is not None:
+            if name not in chosen:
+                continue
+        elif not mine(meta):
             continue
         state = effective(store, name, meta)
         directory = meta.get("dir", "")
@@ -262,7 +266,78 @@ def _age(seconds):
     return "%ss" % int(seconds) if seconds < 60 else "%sm" % int(seconds / 60) if seconds < 3600 else "%.1fh" % (seconds / 3600)
 
 
-def top(store, opts=None):
+def _count(value):
+    if value is None:
+        return "-"
+    return str(value) if value < 10000 else "%.1fk" % (value / 1000) if value < 1000000 else "%.1fM" % (value / 1000000)
+
+
+def _short_model(model):
+    return str(model or "?").rsplit("/", 1)[-1]
+
+
+def brief_activity(text, limit=60):
+    """One readable line for the last-activity column: usage dumps and JSON error envelopes are condensed."""
+    text = " ".join(str(text or "").split())
+    if text.startswith("end turn ended"):
+        text = "turn ended"
+    elif text.startswith("error {"):
+        try:
+            data = json.loads(text[6:])
+            info = data.get("data") or {}
+            text = "error %s: %s" % (data.get("name", ""), info.get("message", "")) if isinstance(info, dict) else "error " + str(data.get("name", ""))
+        except ValueError:
+            pass
+    elif text.startswith("[opencode] activity:"):
+        text = text[len("[opencode] activity:"):].strip()
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def attention(rows):
+    """Tasks that need the orchestrator: failed or waiting ones, and queued messages nobody will deliver."""
+    from .selection import FAILED_STATES
+    result = []
+    for row in rows:
+        reasons = []
+        if row["state"] in FAILED_STATES + ("orphaned", "waiting"):
+            reasons.append(row["state"])
+        if row["queued"] and row["state"] not in ("running", "idle"):
+            reasons.append("%s undelivered" % row["queued"])
+        if row["state"] == "stopped" and not reasons:
+            continue
+        if reasons:
+            result.append((row["name"], ", ".join(reasons)))
+    return result
+
+
+def render_table(rows, out=None):
+    out = out or sys.stdout
+    from .views import ICONS
+    width = max([len(row["name"]) for row in rows] + [10])
+    model = max([len(_short_model(row["model"])) for row in rows] + [5])
+    line = "%-2s %-{w}s %-9s %-{m}s %-6s %-8s %-6s %-5s %-7s %-9s %s".format(w=width, m=model)
+    print(line % ("", "TASK", "STATE", "MODEL", "AGE", "ACTIVITY", "FILES", "QUEUE", "TOKENS", "COST USD", "LAST ACTIVITY"), file=out)
+    partial = 0
+    for row in rows:
+        files = "?" if row["files_changed"] is None else str(row["files_changed"]) + ("*" if row["baseline_partial"] else "")
+        partial += 1 if row["baseline_partial"] or row["baseline_warning"] else 0
+        print(line % (ICONS.get(row["state"], "•"), row["name"], row["state"], _short_model(row["model"]), _age(row["age_sec"]),
+                      _age(row["activity_age_sec"]), files, row["queued"], _count(row["tokens"]),
+                      "$%.4f" % row["cost_usd"] if row["cost_usd"] is not None else "-", brief_activity(row["last_activity"])), file=out)
+    if rows:
+        counts = {}
+        for row in rows:
+            counts[row["state"]] = counts.get(row["state"], 0) + 1
+        print("%d task(s): %s" % (len(rows), ", ".join("%d %s" % (count, state) for state, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])))), file=out)
+        if partial:
+            print("* partial baseline on %d task(s): FILES may be incomplete" % partial, file=out)
+        needs = attention(rows)
+        if needs:
+            print("needs attention: " + "; ".join("%s (%s)" % item for item in needs), file=out)
+    return rows
+
+
+def top(store, opts=None, names=None):
     opts = opts or {}
     once = opts.get("--once") or opts.get("--json") or not sys.stdout.isatty()
     try:
@@ -274,24 +349,15 @@ def top(store, opts=None):
     sleeper = Event()
     try:
         while True:
-            rows = dashboard_data(store)
+            rows = dashboard_data(store, names() if callable(names) else names)
             if opts.get("--json"):
                 print(json.dumps(rows, ensure_ascii=False))
             else:
                 if not once:
-                    print("\033[2J\033[H", end="")
-                print("%-24s %-9s %-6s %-8s %-6s %-5s %-9s %-9s %s" %
-                      ("TASK", "STATE", "AGE", "ACTIVITY", "FILES", "QUEUE", "TOKENS", "COST USD", "LAST ACTIVITY"))
-                for row in rows:
-                    print("%-24s %-9s %-6s %-8s %-6s %-5s %-9s %-9s %s" %
-                          (row["name"], row["state"], _age(row["age_sec"]), _age(row["activity_age_sec"]),
-                           row["files_changed"] if row["files_changed"] is not None else "?", row["queued"],
-                           row["tokens"] if row["tokens"] is not None else "-",
-                           "$%.4f" % row["cost_usd"] if row["cost_usd"] is not None else "-", row["last_activity"]))
-                    if row["baseline_warning"]:
-                        print("[neoxider] %s: %s" % (row["name"], row["baseline_warning"]))
+                    print("[2J[H", end="")
+                render_table(rows)
                 if not rows:
-                    print("No tasks for this orchestrator.")
+                    print("No tasks for this orchestrator." if names is None else "No tasks match.")
                 if not once:
                     print("Refreshing every %ss; Ctrl+C to exit." % interval, flush=True)
             if once:

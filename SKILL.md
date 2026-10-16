@@ -184,7 +184,7 @@ do not create workers, ledgers, or progress files solely to follow a ritual.
    Build a contract with `brief --outcome ... --owns ... --not-touch ... --return ...` and pipe
    it to `run -`. Add `run --owns "glob,glob"` to record ownership; `--strict-owns` refuses
    overlapping declarations from running tasks. `brief --owns` only writes prompt text.
-4. **Track without churn.** Reuse the exact task/session ID. Use `top --once` for your wave,
+4. **Track without churn.** Reuse the exact task/session ID. Use `status --active` (or `status 'wave-*'`) for your whole wave in one table, `top --once` for the dashboard,
    `diff NAME` to inspect baseline changes and `result NAME --json` for completion. Prefer `peek` for readable activity,
    `send` for follow-ups, `stop` for cancellation and `restart` for recovery over blind waiting.
    Read logs before retrying; distinguish
@@ -340,6 +340,11 @@ Get-Content -Raw prompt.txt | & $SK -            # stdin; Unicode and long text
 & $SK result fix-readme [--json]                 # state, answer, files, duration, known usage/cost, control history
 & $SK pending [--strict]                         # unread results / tasks needing attention; strict exits 3
 & $SK status fix-readme                          # state, last activity/age, queued messages, changed files
+& $SK status 'pl-*'                              # SEVERAL tasks at once: one table (state, model, age, quiet time, files, queue, last activity)
+& $SK status a b c --detail                      # names or globs; --detail appends each full status block
+& $SK status --active                            # only running/idle/waiting; --state failed,stopped; --since 2h; --here (this directory)
+& $SK status --active --strict                   # script gate: exit 3 when a task failed, waits for a reply or has undelivered messages
+& $SK top --once 'pl-*' --active                 # the same selection as a refreshing dashboard; stop 'pl-*' and wait 'pl-*' take globs too
 & $SK wait name-a name-b                         # BLOCK until named tasks settle, then print each final answer;
                                                        # includes inbox drain; stopped = settled (exit 130)
                                                        # exit 2 = --timeout hit while still running

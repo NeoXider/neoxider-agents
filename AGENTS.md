@@ -92,6 +92,7 @@ $SK = './agent.ps1'
 & $SK completion powershell --install       # task/flag/engine/model completion; also bash/zsh
 & $SK log  -f <name>                          # follow a task live
 & $SK status <name>                           # state / current step / needs a reply?
+& $SK status 'wave-*' | a b c | --active      # several tasks in ONE table; filters --state S --since 2h --here; --json --detail --strict
 & $SK doctor                                   # foreign CLI availability + limits, when needed
 & $SK doctor --deep                            # + one REAL run per engine that must EXECUTE a shell command
 & $SK gui                                      # web GUI (stable default port 8765; or: ./bin/neoxider gui)
