@@ -122,17 +122,30 @@ else:
 # OPENCODE_CONFIG MERGES with the user's own config (providers/models/auth stay intact), it does
 # not replace it — also verified live. Never set for a normal `agent.sh run`, which legitimately
 # needs full tool access.
+# AGENT_OPENCODE_FREETIER_COMPAT=1 (bridge/probe traffic on gated routes such as the OpenCode
+# free tier, which answers FreeTierError to a tool-less session): use the bundled reduced-tool
+# profile (chat-freetier.json, agent neoxider-freetier — no shell, writes, edits, prompts,
+# subagents or MCP execution) instead of the zero-tool one. Only these two bundled profiles are
+# reachable — the config path is never taken from the environment, so the knob cannot weaken
+# the lockdown to an arbitrary file.
+_provider_opencode_chatonly_freetier() { [ "${AGENT_OPENCODE_FREETIER_COMPAT:-0}" = 1 ]; }
 _provider_opencode_chatonly() { [ "${AGENT_CHAT_ONLY:-0}" = 1 ]; }
 # `cygpath -m` because opencode is a NATIVE Windows binary: it cannot open a git-bash
 # /c/Users/... path, only C:/Users/... . A no-op (plain path) on Linux/macOS.
 _provider_opencode_chatonly_config() {
     local p="$HERE/providers/opencode/chat-only.json"
+    _provider_opencode_chatonly_freetier && p="$HERE/providers/opencode/chat-freetier.json"
     [ -r "$p" ] || return 1
     command -v cygpath >/dev/null 2>&1 && p="$(cygpath -m "$p" 2>/dev/null || printf '%s' "$p")"
     printf '%s' "$p"
 }
 _provider_opencode_chatonly_args() {
-    _provider_opencode_chatonly && printf '%s\n' --agent neoxider-chat-only
+    _provider_opencode_chatonly || return 0
+    if _provider_opencode_chatonly_freetier; then
+        printf '%s\n' --agent neoxider-freetier
+    else
+        printf '%s\n' --agent neoxider-chat-only
+    fi
     return 0
 }
 

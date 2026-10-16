@@ -237,6 +237,30 @@ class Commands(unittest.TestCase):
         data = json.loads(Path(env["OPENCODE_CONFIG"]).read_text(encoding="utf-8"))
         self.assertEqual(data["agent"]["neoxider-chat-only"]["tools"], {"*": False})
 
+    def test_opencode_freetier_compat_selects_reduced_profile(self):
+        with patch.dict(os.environ, {"AGENT_OPENCODE_FREETIER_COMPAT": "1"}):
+            args, env = self.command("opencode", chat_only=True)
+        self.assertIn("neoxider-freetier", args)
+        self.assertNotIn("neoxider-chat-only", args)
+        self.assertTrue(env["OPENCODE_CONFIG"].endswith("chat-freetier.json"))
+        data = json.loads(Path(env["OPENCODE_CONFIG"]).read_text(encoding="utf-8"))
+        tools = data["agent"]["neoxider-freetier"]["tools"]
+        self.assertEqual(tools["*"], False)
+        for forbidden in ("bash", "edit", "write", "question", "task"):
+            self.assertNotIn(forbidden, tools)
+        for allowed in ("glob", "grep", "read", "skill", "todowrite", "webfetch",
+                        "websearch", "goal_clear", "goal_set", "goal_status",
+                        "list_mcp_resource_templates", "list_mcp_resources",
+                        "read_mcp_resource"):
+            self.assertEqual(tools.get(allowed), True)
+
+    def test_opencode_freetier_compat_needs_chat_only(self):
+        with patch.dict(os.environ, {"AGENT_OPENCODE_FREETIER_COMPAT": "1"}):
+            args, env = self.command("opencode")
+        self.assertFalse(any("neoxider-freetier" in arg for arg in args))
+        self.assertFalse(any("neoxider-chat-only" in arg for arg in args))
+        self.assertNotIn("OPENCODE_CONFIG", env)
+
     def test_kimi_uses_acp_prompt_transport(self):
         args, _ = self.command("kimi")
         self.assertTrue(any("acp_adapter.py" in arg for arg in args))

@@ -7,6 +7,12 @@ from neoxider_agents.providers import BaseProvider, CONFLICT, FAILURE, ROOT, TRA
 class Provider(BaseProvider):
     engine = "opencode"
 
+    # Reduced-tool agent for chat-only traffic on routes whose provider gate refuses
+    # tool-less sessions (OpenCode free tier answers FreeTierError to {"*": false}).
+    # chat-freetier.json keeps the session tooled enough to pass the gate while still
+    # forbidding shell, writes, edits, prompts, subagents and MCP execution.
+    FREETIER_AGENT = "neoxider-freetier"
+
     @property
     def retry_limit(self):
         value = os.environ.get("AGENT_OPENCODE_RETRIES", "3")
@@ -32,11 +38,18 @@ class Provider(BaseProvider):
             args += ["-s", session]
         env = {"AGENT_OPENCODE_WRAPPED": "1"}
         if chat_only:
-            path = ROOT / "providers/opencode/chat-only.json"
+            # AGENT_OPENCODE_FREETIER_COMPAT=1 selects the reduced-tool profile for
+            # bridge/probe traffic on gated routes (default stays zero-tool). Only the
+            # two bundled profiles are reachable; the config path is never taken from
+            # the environment, so this cannot weaken the lockdown to an arbitrary file.
+            freetier = os.environ.get("AGENT_OPENCODE_FREETIER_COMPAT") == "1"
+            profile, agent = ("chat-freetier.json", self.FREETIER_AGENT) if freetier \
+                else ("chat-only.json", "neoxider-chat-only")
+            path = ROOT / "providers/opencode" / profile
             if not path.is_file():
                 raise ValueError("bundled OpenCode chat-only config is unavailable")
             env["OPENCODE_CONFIG"] = str(path)
-            args += ["--agent", "neoxider-chat-only"]
+            args += ["--agent", agent]
             for image in os.environ.get("AGENT_OPENCODE_IMAGE_PATHS", "").splitlines():
                 if image and os.path.isfile(image):
                     args += ["-f", image]

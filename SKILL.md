@@ -655,6 +655,7 @@ until restarted by the new core.
 | `AGENT_CODEX_DOCTOR_MODEL` / `AGENT_CODEX_DOCTOR_TIMEOUT` | `spark` / `60` | Model and hard deadline for `doctor --deep`'s codex shell check. |
 | `AGENT_OPENCODE_RETRIES` | `3` | Automatic retries of a TRANSIENT opencode failure (stream error, connection reset, 502/503/504), each continuing the same session with a continue prompt; backoff 15s/30s/60s. Rate limits and timeouts are never retried. `0` disables. |
 | `AGENT_OPENCODE_KEEP_SMALL_MODEL` | unset | `1` = leave the user's `small_model` alone. By default it is pinned to the run's `-m` model, because a dead local `small_model` (LM Studio not running) kills sessions that run on a healthy hosted model. |
+| `AGENT_OPENCODE_FREETIER_COMPAT` | unset | `1` = chat-only opencode traffic uses the reduced-tool profile (`providers/opencode/chat-freetier.json`, `--agent neoxider-freetier`: no shell, writes, edits, prompts, subagents or MCP execution; file reads, todo/goal state and web reads stay) instead of the zero-tool one. Needed on routes whose provider gate refuses tool-less sessions — the OpenCode free tier answers those with `FreeTierError` 403. Default stays zero-tool; normal `run` tasks are unaffected either way. |
 | `AGENT_OPENCODE_TOOL_KEEPALIVE` / `AGENT_OPENCODE_KEEPALIVE_SEC` | `1` / `60` | While a build/tool process exists in the task's process tree, print a heartbeat so a long `dotnet build`/lift is not killed by the no-output watchdog as `state=silent`. Windows only. |
 | `AGENT_GUI_PORT` | `8765` | GUI port (an explicit `gui <port>` argument still wins). |
 | `AGENT_GUI_HOST` | `127.0.0.1` | GUI bind address. Anything but loopback also requires `AGENT_GUI_TOKEN`, or the panel refuses to start. `--lan` / `--localhost` override it. |
@@ -869,7 +870,13 @@ actually getting — it is a wire-compatible shim, not a real low-latency LLM AP
   `{"*": false}`** (`providers/opencode/chat-only.json`, applied through `OPENCODE_CONFIG` +
   `--agent neoxider-chat-only`; the unsafe native `serve` path is loopback-only). Codex also
   ignores `AGENT_CODEX_SANDBOX`, and Claude keeps
-  `--permission-mode acceptEdits` while ignoring `AGENT_CLAUDE_PERMISSION`. This is a security
+  `--permission-mode acceptEdits` while ignoring `AGENT_CLAUDE_PERMISSION`. Where the provider
+  itself refuses a tool-less session (the OpenCode free tier answers `FreeTierError` 403),
+  `AGENT_OPENCODE_FREETIER_COMPAT=1` switches bridge/probe traffic to the bundled reduced-tool
+  profile (`providers/opencode/chat-freetier.json`, `--agent neoxider-freetier`: reads, todo/goal
+  state and web reads stay; shell, writes, edits, prompts, subagents and every MCP server stay
+  off) — the only other profile reachable; an arbitrary config path still cannot be injected.
+  This is a security
   boundary: the HTTP endpoint turns arbitrary callers into CLI invocations, so environment overrides
   must never grant it write, shell, or permission-bypass access. These restrictions apply only to
   bridge subprocesses — a normal `agent.sh run` keeps full access. Verified live: `-c

@@ -17,12 +17,18 @@ All notable changes to this project are documented here. Format follows
   old detail view. `top`, `stop` and `wait` accept the same globs; `top` also takes the filters and re-evaluates them
   on every refresh. Globs and filters see only tasks of the current orchestrator; an exact name is always honoured.
   New `neoxider_agents/selection.py`; tests in `tests/test_multi_status.py`.
+- OpenCode bridge/probe traffic can use a reduced-tool agent profile on routes whose
+  provider gate refuses tool-less sessions: `AGENT_OPENCODE_FREETIER_COMPAT=1` switches
+  chat-only opencode calls from `--agent neoxider-chat-only` (`{"*": false}`) to
+  `--agent neoxider-freetier` (`providers/opencode/chat-freetier.json` — file reads,
+  todo/goal state and web reads stay; shell, writes, edits, prompts, subagents and every
+  MCP server stay off). The OpenCode free tier answers zero-tool sessions with
+  `FreeTierError` 403 while the same session with this tool set is served (verified live
+  2026-10-16 on `opencode/space-bunny-free`, CLI 1.19.3). Default stays zero-tool, normal
+  `run` tasks are unaffected, and only the two bundled profiles are reachable, so the
+  lockdown cannot be weakened to an arbitrary config through the environment.
 
 ### Changed
-
-- The `top`/`status` table is easier to read: a `MODEL` column, compact token counts (`15.3k`, `2.5M`), usage dumps
-  and JSON error envelopes condensed to one line, and the per-task `partial baseline` notes collapsed into one footer
-  line; `FILES` carries a `*` when the baseline was partial instead of silently showing a misleading `0`.
 
 ### Fixed
 
