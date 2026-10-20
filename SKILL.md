@@ -117,6 +117,10 @@ For CLI tasks, retain a harness job/session handle and exact task names until re
   `&`/`nohup` alone provides no tracked completion notification; retain a harness handle.
 - For a `fan` wave, follow it with one tracked named `wait name-01 name-02 ...`; retain the
   wait handle if the caller's observation timeout expires. That timeout does not stop workers.
+  An OpenCode wave starts its tasks one at a time (the previous task's first actual provider
+  activity gates the next launch), so `fan` returns later than a plain burst launch; a
+  pre-activity failure stops the wave, leaves the launched tasks running and names the
+  unlaunched ones.
 - Inspect exact scoped task names and consistent `AGENT_PARENT`/`AGENT_ORCHESTRATOR_ID`
   ownership. Use `pending` only for the intended ownership scope, not an unbounded historical
   sweep. It reports unread results/attention; `last NAME` or `wait NAME` acknowledges results,
@@ -232,7 +236,19 @@ read [runtime discipline](docs/RUNTIME-DISCIPLINE.md) before acting. For foreign
 model snapshots, continue below or use [ORCHESTRATOR.md](ORCHESTRATOR.md).
 
 **Fan vs ledger.** `fan` is for work that splits into independent pieces (non-overlapping
-files). When the task is ONE hard problem that does not split — a tricky algorithm, a bug
+files). An OpenCode wave starts its tasks one at a time: the next child is launched only
+after the previous task produced its FIRST actual provider activity of its own run (a
+thinking, text, tool, read or command event from the provider) — a session id alone does not
+count, and neither does the runtime's process-tree heartbeat (`[opencode] activity: tool
+running (N helper processes)`), because the OpenCode SQLite store locked while the session
+was created, the model was set and the user message was written when ten sessions started
+in one burst. This serializes STARTUP only: a task keeps running while the
+next one starts, and the other engines keep the plain burst launch. If a task fails, is limited
+or is stopped before its first activity, or the startup timeout expires, the wave stops
+scheduling further prompts: already launched tasks keep running and are never killed or
+replayed, and the error names the launched and the unlaunched tasks. The bound is
+`AGENT_FAN_STARTUP_TIMEOUT_SEC` (default 180s); an invalid or non-positive value is ignored and
+can never switch the barrier off. When the task is ONE hard problem that does not split — a tricky algorithm, a bug
 that needs several fix cycles, anything where a single-shot answer drowns in its own
 reasoning — consider **ledger mode** below if a durable multi-round record helps: one manager (you) + fresh worker contexts +
 shared filesystem ledger + test verifier, up to 10 rounds. Same model throughout, no
@@ -309,6 +325,10 @@ Get-Content -Raw prompt.txt | & $SK -            # stdin; Unicode and long text
                                                      # (audit-01, audit-02, ...); shared -e/-m/-f/-C;
                                                      # returns at once — track a named wait for the wave.
                                                      # Use instead of a hand-written `run ... &` loop
+                                                     # -e opencode starts the wave one task at a time:
+                                                     # the next child waits for the previous task's first
+                                                     # actual provider activity (startup barrier,
+                                                     # not serial work)
 & $SK run  --progress -t big-job -C dir "prompt" # opt-in PROGRESS.<task>.md; default creates no project files
 & $SK run  --log -v -t diagnose "prompt"        # full persistent raw log + live terminal stream
 & $SK run  --notify "prompt"                    # optional best-effort finish/waiting notification
@@ -541,6 +561,9 @@ $env:AGENT_PARENT = 'review-wave'
 Keep `run` / `reply` / `send` foreground commands inside the harness's tracked background
 job. The wrapper prints the result before returning. `fan` returns after launching tasks;
 track one `wait` for the wave. `wait --timeout SECONDS` returns 2 when its deadline expires.
+An OpenCode `fan` returns only after its startup barrier released the wave (or stopped it
+early); the error then names the launched and the unlaunched tasks, and the launched ones
+keep running.
 
 | Action | Native task contract | neoxider contract |
 |---|---|---|
@@ -657,6 +680,7 @@ until restarted by the new core.
 | `AGENT_OPENCODE_KEEP_SMALL_MODEL` | unset | `1` = leave the user's `small_model` alone. By default it is pinned to the run's `-m` model, because a dead local `small_model` (LM Studio not running) kills sessions that run on a healthy hosted model. |
 | `AGENT_OPENCODE_FREETIER_COMPAT` | unset | `1` = chat-only opencode traffic uses the reduced-tool profile (`providers/opencode/chat-freetier.json`, `--agent neoxider-freetier`: no shell, writes, edits, prompts, subagents or MCP execution; file reads, todo/goal state and web reads stay) instead of the zero-tool one. Needed on routes whose provider gate refuses tool-less sessions — the OpenCode free tier answers those with `FreeTierError` 403. Default stays zero-tool; normal `run` tasks are unaffected either way. |
 | `AGENT_OPENCODE_TOOL_KEEPALIVE` / `AGENT_OPENCODE_KEEPALIVE_SEC` | `1` / `60` | While a build/tool process exists in the task's process tree, print a heartbeat so a long `dotnet build`/lift is not killed by the no-output watchdog as `state=silent`. Windows only. |
+| `AGENT_FAN_STARTUP_TIMEOUT_SEC` | `180` | OpenCode `fan` startup barrier: how long the wave waits for one task's first actual provider activity before it stops scheduling further prompts. A session id or the process-tree heartbeat (`[opencode] activity: tool running (N helper processes)`) does not count as provider activity. Bounded to 3600s. An invalid or non-positive value is ignored (the default applies) and can never disable the barrier. Other engines are unaffected. |
 | `AGENT_GUI_PORT` | `8765` | GUI port (an explicit `gui <port>` argument still wins). |
 | `AGENT_GUI_HOST` | `127.0.0.1` | GUI bind address. Anything but loopback also requires `AGENT_GUI_TOKEN`, or the panel refuses to start. `--lan` / `--localhost` override it. |
 | `AGENT_GUI_TOKEN` | unset | Shared secret the GUI demands from every request when configured (`?token=` bootstrap, `X-Agent-Token`, or its HttpOnly cookie). Mandatory for `--lan`. |
