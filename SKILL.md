@@ -1187,8 +1187,12 @@ session survived (Claude stream-json; for any engine, `status NAME` shows the sa
   and only an exact `revive NAME --force` overrides it; `by=user reason="launcher stopped"` (Ctrl+C
   or the parent session ended) is ambiguous and needs `--force`; a watchdog stop, or an owner that
   died without any stop record, is a crash and eligible.
-- `--stale 600`: the task must have been quiet (last activity or finish) for longer than that.
-  `--within 6h`: filters and globs ignore tasks quiet for longer (name them; `0` = no bound).
+- Liveness is checked by pid: a task whose recorded owner or provider process is still alive (pid
+  plus start stamp, e.g. an owner still finishing housekeeping) is never revived, not even with
+  `--force`. Once both are confirmed dead, quiet time does not matter (a launcher killed a minute
+  ago is revived at once). `--stale 600` applies only when no pid is recorded (legacy/seeded
+  tasks); `--force` skips it. `--within 6h`: filters and globs ignore tasks quiet for longer (name
+  them; `0` = no bound).
 - `--cooldown 300`: never the same task again within that many seconds (`revive_epoch` in meta, set
   even when the launch fails). `--max-attempts 3`: at most three revives since the last
   `run`/`restart` or manual `send` (`0` = unlimited) — this ends a fail → revive → fail loop.

@@ -3,8 +3,10 @@
 revive never resumes by itself: for each eligible task it launches one detached
 `agent.py send NAME --prompt-file F`, so lifecycle.send -> preflight(resume=True)
 takes the session from store.session(NAME) exactly as a manual follow-up would.
-Safety gates: only error/stopped (opt-in silent/limited) tasks, quiet for --stale
-seconds but within --within (unless named), not revived within --cooldown, at most
+Safety gates: only error/stopped (opt-in silent/limited) tasks whose recorded owner and
+provider processes are dead (pid + start stamp; a live process is never touched, even with
+--force), quiet for --stale seconds only when no pid is recorded, within --within (unless
+named), not revived within --cooldown, at most
 --max-attempts revives since the last run and --limit per sweep, never a deliberate
 stop, never an unreset provider limit (without --force), never an unscoped bulk sweep.
 """
@@ -99,6 +101,23 @@ def streak(entries):
     return count
 
 
+def liveness(meta):
+    """('alive'|'dead'|'unknown', pid): the recorded owner and provider processes, checked by pid + start stamp."""
+    from .lifecycle import owner_alive
+    from .process import pid_alive
+    known = False
+    owner = meta.get("winpid") or meta.get("pid")
+    if owner:
+        known = True
+        if owner_alive(meta):
+            return "alive", owner
+    if meta.get("provider_pid"):
+        known = True
+        if pid_alive(meta["provider_pid"], meta.get("provider_start", "")):
+            return "alive", meta["provider_pid"]
+    return ("dead" if known else "unknown"), ""
+
+
 def quiet_seconds(store, name, meta, now):
     from .ux_tracking import _epoch
     epoch = max(_epoch(meta, "last_activity_epoch"), _epoch(meta, "activity_epoch"), _epoch(meta, "finished_epoch"))
@@ -138,8 +157,14 @@ def assess(store, name, meta, options, explicit, now):
     if not session:
         row["action"] = "skip: no saved session id; use restart --fresh"
         return row
-    if age <= options["stale"]:
-        row["action"] = "skip: active %ds ago (--stale %ds)" % (age, options["stale"])
+    alive, pid = liveness(meta)
+    if alive == "alive":
+        # A live owner or provider is never touched, not even with --force: a resume would burn its work.
+        row["action"] = "skip: process still alive (pid %s); never revived" % pid
+        return row
+    # Quiet time only stands in for liveness when no recorded process can be checked.
+    if alive == "unknown" and not force and age <= options["stale"]:
+        row["action"] = "skip: active %ds ago (--stale %ds; no recorded pid to check)" % (age, options["stale"])
         return row
     try:
         last = float(meta.get("revive_epoch") or 0)
@@ -195,6 +220,10 @@ def launch(store, name, row, options):
             if state != row["state_before"]:
                 row.update(action="skip: state changed to %s" % state, state_after=state)
                 return row
+            alive, pid = liveness(meta)
+            if alive == "alive":
+                row["action"] = "skip: process still alive (pid %s); never revived" % pid
+                return row
             try:
                 last = float(meta.get("revive_epoch") or 0)
             except ValueError:
@@ -229,11 +258,11 @@ def launch(store, name, row, options):
             sleeper = Event()
             while True:
                 data = store.read(name)
-                if data.get("generation", "") != generation:
+                if data and data.get("generation", "") != generation:
                     break  # send published its owner: the turn resumed in the saved session
                 if process.poll() is not None:
                     data = store.read(name)
-                    if data.get("generation", "") != generation:
+                    if data and data.get("generation", "") != generation:
                         break  # published and already finished between the two reads
                     row.update(action="failed", state_after=effective(store, name, data),
                                error="send exited %s before resuming%s" % (process.returncode, (

@@ -48,11 +48,12 @@ def usage(command=""):
         if command == "completion":
             print("Install once: neoxider completion powershell --install; open a new shell to activate.")
         if command == "revive":
-            print("Resumes each eligible task with `send NAME` in its SAVED session (detached owner). Defaults: --state error,stopped,")
-            print("--stale 600 (quiet seconds), --within 6h (older tasks only when named), --cooldown 300, --max-attempts 3")
-            print("revives since the last run, --limit 10 launches per sweep (0 = unlimited). A bulk sweep needs AGENT_PARENT or a glob.")
-            print("Never revives running/idle/done/waiting tasks or a deliberate stop; an ambiguous stop, an auth failure or an")
-            print("unreset provider limit needs --force. Preview with --dry-run; --watch repeats every --interval seconds until Ctrl+C.")
+            print("Resumes each eligible task with `send NAME` in its SAVED session (detached owner); defaults --state error,stopped.")
+            print("Never revives running/idle/done/waiting tasks, a live owner/provider process (pid + start stamp, even with")
+            print("--force) or a deliberate stop; an ambiguous stop, an auth failure or an unreset provider limit needs --force.")
+            print("--stale 600 quiet seconds applies only when no pid is recorded (--force skips it); --within 6h (older tasks only")
+            print("when named); --cooldown 300; --max-attempts 3 revives since the last run; --limit 10 per sweep (0 = unlimited).")
+            print("A bulk sweep needs AGENT_PARENT or a glob. Preview with --dry-run; --watch repeats every --interval s until Ctrl+C.")
         return
     print("neoxider — tracked CLI agents (PowerShell / cmd / POSIX; Python >=3.8)")
     for name, args in COMMANDS.items():

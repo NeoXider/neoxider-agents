@@ -86,10 +86,11 @@ class ReviveTests(unittest.TestCase):
         self.store.update(name, activity_epoch=old, last_activity_epoch=old, finished_epoch=old)
 
     def settle(self, name, seconds=30):
+        """Wait until the task left running AND its owner process exited (housekeeping done)."""
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             meta = self.store.read(name)
-            if meta.get("state") != "running":
+            if meta and meta.get("state") != "running" and revive.liveness(meta)[0] != "alive":
                 return meta
             time.sleep(0.05)
         self.fail("task %s did not settle" % name)
@@ -201,6 +202,51 @@ class ReviveTests(unittest.TestCase):
         self.assertIn("no saved session", actions["nosession"])
         _, data, _ = self.json_revive("--dry-run", "--stale", "0")
         self.assertEqual([row["name"] for row in data["candidates"]], ["fresh"])
+
+    def test_liveness_by_pid_decides_before_quiet_time(self):
+        sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], **hidden_kwargs())
+        dead_stamp = pid_stamp(sleeper.pid)
+        sleeper.kill()
+        sleeper.wait(10)
+        windows = os.name == "nt"
+        # Launcher killed seconds ago, process gone: quiet time no longer blocks the revive.
+        self.seed("died", "stopped", exit="", pid=sleeper.pid, winpid=sleeper.pid if windows else "", pid_start=dead_stamp)
+        record_history(self.store, "died", "run")
+        self.store.update("died", activity_epoch=time.time(), finished_epoch="")
+        # Meta still says running but the owner is gone: effective state stopped, a crash, revivable.
+        self.seed("ghostrun", "running", exit="", pid=sleeper.pid, winpid=sleeper.pid if windows else "", pid_start=dead_stamp)
+        record_history(self.store, "ghostrun", "run")
+        self.store.update("ghostrun", activity_epoch=time.time(), finished_epoch="")
+        # A live owner in a terminal state (e.g. still finishing housekeeping) is never touched.
+        me = pid_stamp(os.getpid())
+        self.seed("busy", "error", pid=os.getpid(), winpid=os.getpid() if windows else "", pid_start=me)
+        self.seed("prov", "error", provider_pid=os.getpid(), provider_start=me)
+        # No recorded pid: quiet time is the only signal; --force overrides it.
+        self.seed("nopid", "error")
+        self.store.update("nopid", activity_epoch=time.time())
+        _, data, _ = self.json_revive("--dry-run")
+        actions = {row["name"]: row["action"] for row in data["skipped"] + data["candidates"]}
+        self.assertEqual(actions["died"], "would revive")
+        self.assertEqual(actions["ghostrun"], "would revive")
+        self.assertIn("process still alive (pid %s)" % os.getpid(), actions["busy"])
+        self.assertIn("process still alive (pid %s)" % os.getpid(), actions["prov"])
+        self.assertIn("no recorded pid", actions["nopid"])
+        _, data, _ = self.json_revive("busy", "prov", "nopid", "died", "--dry-run", "--force")
+        actions = {row["name"]: row["action"] for row in data["skipped"] + data["candidates"]}
+        self.assertIn("process still alive", actions["busy"], "--force never touches a live process")
+        self.assertIn("process still alive", actions["prov"])
+        self.assertEqual(actions["nopid"], "would revive")
+        self.assertEqual(actions["died"], "would revive")
+        code, data, _ = self.json_revive("busy", "--force")
+        self.assertEqual(data["resumed"], [])
+        self.assertNotIn("revive_epoch", self.store.read("busy"))
+        # The real resume of the dead task: same saved session reaches the provider.
+        code, data, _ = self.json_revive("died")
+        self.assertEqual(code, 0, data)
+        self.assertEqual([(row["name"], row["session_id"], row["session_after"]) for row in data["resumed"]],
+                         [("died", "ses_died", "ses_died")])
+        self.assertEqual(self.settle("died").get("state"), "done")
+        self.assertEqual((self.work / "turn.1.session").read_text(), "ses_died")
 
     def test_deliberate_stop_is_not_revived_and_ambiguous_stop_needs_force(self):
         self.seed("halted", "stopped", exit=130)
