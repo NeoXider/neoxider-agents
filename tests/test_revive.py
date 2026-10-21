@@ -116,6 +116,7 @@ class ReviveTests(unittest.TestCase):
         row = data["resumed"][0]
         self.assertTrue(row["resumed"])
         self.assertEqual(row["state_before"], "error")
+        self.assertIn(row["state_after"], ("running", "done"))
         self.assertEqual(row["session_id"], session)
         self.assertEqual(row["session_after"], session)
         self.assertIsNone(row["error"])

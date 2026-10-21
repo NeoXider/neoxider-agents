@@ -163,7 +163,9 @@ def assess(store, name, meta, options, explicit, now):
             row["action"] = "skip: %s; intent unknown, confirm with --force" % detail
             return row
     try:
-        category = json.loads(meta.get("failure_json") or "{}").get("category", "")
+        failure = json.loads(meta.get("failure_json") or "{}")
+        # A heuristic category is raw-output noise, not evidence that a human must intervene.
+        category = failure.get("category", "") if failure.get("confidence", "explicit") == "explicit" else ""
     except (ValueError, AttributeError):
         category = ""
     if category in HUMAN_CATEGORIES and not force:
@@ -218,7 +220,7 @@ def launch(store, name, row, options):
             try:
                 process = subprocess.Popen([sys.executable, str(ROOT / "agent.py"), "send", name, "--prompt-file", str(prompt)],
                                            stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env=env,
-                                           close_fds=True, cwd=str(ROOT), **dict(hidden_kwargs(), **extra))
+                                           close_fds=True, **dict(hidden_kwargs(), **extra))
             finally:
                 output.close()
             stamp = pid_stamp(process.pid)
@@ -231,8 +233,11 @@ def launch(store, name, row, options):
                     break  # send published its owner: the turn resumed in the saved session
                 if process.poll() is not None:
                     data = store.read(name)
+                    if data.get("generation", "") != generation:
+                        break  # published and already finished between the two reads
                     row.update(action="failed", state_after=effective(store, name, data),
-                               error=data.get("last_send_error") or "send exited %s before resuming" % process.returncode)
+                               error="send exited %s before resuming%s" % (process.returncode, (
+                                   ": " + data["last_send_error"]) if data.get("last_send_error") else ""))
                     return row
                 if time.monotonic() >= deadline:
                     kill_tree(process.pid, stamp=stamp)
@@ -240,8 +245,10 @@ def launch(store, name, row, options):
                     return row
                 sleeper.wait(0.05)
             data = store.read(name)
+            # Just published: the old activity stamp would read as idle until the turn's first output.
+            after = "running" if data.get("state") == "running" else effective(store, name, data)
             row.update(resumed=True, action="revived (send, pid %s)" % process.pid,
-                       state_after=effective(store, name, data), session_after=store.session(name, data))
+                       state_after=after, session_after=store.session(name, data))
             if row["session_after"] and row["session_after"] != row["session_id"]:
                 row["error"] = "session changed: %s -> %s" % (row["session_id"], row["session_after"])
             return row
