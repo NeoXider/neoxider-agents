@@ -111,6 +111,15 @@ reasoning keeps that policy within that session; it is not a requirement for oth
 
 For CLI tasks, retain a harness job/session handle and exact task names until results are read.
 
+**Default launch mode: a tracked background job.** Start every worker with the harness's own
+background-task facility (Claude Code: `Bash` with `run_in_background: true`; other harnesses: their
+equivalent), one job per worker, running `agent.sh run ...` itself or `agent.sh wait NAME` for it.
+Then the worker is visible in the user's background-task panel and its completion arrives as a
+notification. A bare `nohup ... &` / `&` inside a foreground command is NOT enough: the worker
+keeps running and shows up in `agent.sh top`/GUI, but the harness lists no task and sends no
+notification, so the user sees nothing. If you already launched that way, attach one tracked
+`agent.sh wait NAME --timeout N` job per worker (as a `run_in_background` command) so each appears in the panel.
+
 - Start `& $SK run ...` (or `wait <name>`) on Windows or `bash "$SK" run ...` on POSIX using your harness's tracked background job. The command blocks until the
   agent finishes and prints its final answer, so the notification carries the result.
 - PowerShell's leading `&` is the call operator, not Bash background syntax. Detached POSIX
