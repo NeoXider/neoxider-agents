@@ -42,6 +42,7 @@ $SK = './agent.ps1'
 & $SK send --flush <name>                     # recover an undelivered inbox
 & $SK stop <name>...                          # stop by name; --all-mine uses current ownership
 & $SK restart <name> ["<message>"]            # resume saved session; --fresh replays original prompt
+& $SK revive ['arb-*'] [--dry-run] [--json]  # resume settled error/stopped tasks in their saved session; --watch repeats
 & $SK peek <name> [-n N] [-f] [--raw]          # readable activity; default last 25 entries
 & $SK watch <name>                           # follow activity with a status footer
 & $SK top --once                             # orchestrator tasks; --json or dashboard alias

@@ -358,6 +358,8 @@ Get-Content -Raw prompt.txt | & $SK -            # stdin; Unicode and long text
 & $SK send --flush NAME                          # deliver an undelivered inbox after wrapper failure
 & $SK stop NAME... | --all-mine                  # stop the process tree; preserve session and files
 & $SK restart NAME [TEXT | --prompt-file F] [--fresh] # resume, or new session from original prompt
+& $SK revive [NAME|GLOB...] [--dry-run] [--json]   # resume settled error/stopped tasks in their SAVED session (gated, see below)
+& $SK revive --watch --interval 60               # keep reviving fresh provider failures until Ctrl+C
 & $SK peek NAME [-n N] [-f] [--raw]              # readable recent activity; default last 25 entries
 & $SK watch NAME                                # peek -f with status footer
 & $SK top [--once] [--json]                      # orchestrator tasks; dashboard is an alias
@@ -1151,6 +1153,62 @@ repository in a state where the suite was red on purpose but nothing said so. So
 the root coordinator for a decision; do not make a third blind retry. A smaller task or different
 route needs an explicit coordinator decision within the user's model and fleet constraints.
 Do not alter a live fleet's provider wrappers, retry loop or runtime config as a docs fix.
+
+### Revive settled failures in the same session (`revive`)
+
+When workers die on a provider failure (exit 126: overload, an `api_retry` storm, a dropped
+stream, VPN/TLS) and lie settled, `revive` brings them back in their saved sessions:
+
+```powershell
+& $SK revive --dry-run                     # preview: what WOULD be resumed, and why the rest is skipped
+& $SK revive 'arb-*' --json                # resume; {"resumed":[...],"skipped":[...],"candidates":[],"summary":{...}}
+& $SK revive arb-big4 --force              # one named task, confirming an ambiguous or deliberate stop
+& $SK revive --watch --interval 60         # sweep every 60 s until Ctrl+C; prints each revive and a summary
+```
+
+**Same session, no new mechanism.** For each eligible task revive launches one detached
+`send NAME --prompt-file F` (`NAME.revive.prompt` in the state directory): the ordinary
+settled-task send path, whose preflight takes the session from the task's saved `session` and
+resumes it with the provider's own resume flag, the original engine/model/effort/directory and
+parent ownership. The message asks the agent to check `git status/diff` first and continue
+without redoing finished work; undelivered inbox messages ride in the same batch (at least once,
+as for any `send`). revive returns as soon as each owner has published itself
+(`state_after=running`); track completion with `wait`. The table shows TASK, BEFORE, AFTER,
+SESSION (short id) and ACTION; in `--json`, `session_id` and `session_after` must match. Verify
+later: `grep -o '"session_id":"[^"]*"' $AGENT_CLI_LOGS/NAME.log | sort -u` — one id means the
+session survived (Claude stream-json; for any engine, `status NAME` shows the same `session=`).
+
+**Safety rules** (conservative by default):
+
+- Only `error` and `stopped`; `--state error,stopped,silent,limited` opts into more. `running`,
+  `idle`, `done`, `waiting`, `orphaned` and `stalled` are never revived, even when named.
+- A deliberate stop is never revived by a filter or glob. The last stop record after the last turn
+  start in the task history decides: `by=orchestrator`/`gui`/a custom `AGENT_STOP_BY` is deliberate
+  and only an exact `revive NAME --force` overrides it; `by=user reason="launcher stopped"` (Ctrl+C
+  or the parent session ended) is ambiguous and needs `--force`; a watchdog stop, or an owner that
+  died without any stop record, is a crash and eligible.
+- `--stale 600`: the task must have been quiet (last activity or finish) for longer than that.
+  `--within 6h`: filters and globs ignore tasks quiet for longer (name them; `0` = no bound).
+- `--cooldown 300`: never the same task again within that many seconds (`revive_epoch` in meta, set
+  even when the launch fails). `--max-attempts 3`: at most three revives since the last
+  `run`/`restart` or manual `send` (`0` = unlimited) — this ends a fail → revive → fail loop.
+- `--limit 10` launches per sweep. A bulk sweep without names or globs needs `AGENT_PARENT` or
+  `AGENT_ORCHESTRATOR_ID` (the ownership of `stop --all-mine`); `--dry-run` works without it.
+- An `auth`/`model_unavailable` failure needs a human, and an engine whose recorded usage limit has
+  not reset is skipped: a turn resumed into an exhausted 5h/7d window only fails again. `--force`
+  overrides these once the cause is fixed. No session id, or Gemini (no resume): use `restart --fresh`.
+- `--dry-run` writes nothing (no meta, history or prompt file). A failed launch is reported per task
+  (`action=failed` with `error`, exit 3) and the sweep continues.
+
+**Diagnose first.** `list` (DETAIL `cause=...`), `status NAME` (`cause=`), `status --json`/`top --json`
+(`cause`) and the `needs attention` line name the cause: `task deadline (watchdog)` for 124,
+`silence watchdog` for 125; for 126 `provider: failure/limit (overloaded | rate limit | stream
+dropped | server error | api_retry xN, status S)`, `provider: certificate error (VPN?)`,
+`provider: network error`, `provider: auth refused` or `provider: failure (unclassified)`. Meta
+decides first; an unclassified error reads only the ENGINE output tail of the raw log (Claude's
+stream-json `api_retry` events), never the echoed prompt or assistant text. `doctor` prints a
+`revive` line per engine (`BLOCKED` while a window is exhausted or a recorded limit has not reset),
+an exit-code legend and the newest failed tasks with their causes — run it before reviving.
 
 ### Codex: every shell command hangs (environment issue)
 

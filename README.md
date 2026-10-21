@@ -307,7 +307,7 @@ AIprovider за пределами прежнего diagnostic workflow.
 | Interrupt | Completion reaches the launcher | `stop NAME` stops the tree and the owner prints `■ STOPPED`; owner and tracked `wait` exit 130 |
 | Change direction | Keep the worker identity | `send NAME --now TEXT` interrupts and resumes inside the existing wrapper |
 | Launcher cancelled | No abandoned worker | Job Object / process group kills descendants; recovery reports `launcher stopped` |
-| Recover | Continue saved context | `restart NAME`, or `restart NAME --fresh` for a new session |
+| Recover | Continue saved context | `restart NAME`, or `restart NAME --fresh` for a new session; `revive` for settled provider failures |
 | Quick answer | Foreground answer with task exit code | `ask TEXT`; output contains only the final answer |
 | Observe a wave | Activity and queued messages | `top [--once] [--json]`, `peek NAME`, `watch NAME` |
 | Review changes | Compare with the task's starting tree | `diff NAME [--names or --stat]`; dirty trees and non-git directories supported |

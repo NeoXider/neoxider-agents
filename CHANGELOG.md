@@ -8,6 +8,16 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- `revive [NAME|GLOB...]` resumes settled `error`/`stopped` tasks in their SAVED session through the ordinary
+  `send` path (one detached owner per task), behind safety gates: never running/idle/done/waiting, never a
+  deliberate stop (exact `NAME --force` only), `--force` for ambiguous stops, auth failures and unreset limits,
+  `--stale 600`, `--within 6h`, `--cooldown 300`, `--max-attempts 3`, `--limit 10`, and a scope for bulk sweeps.
+  `--dry-run`, `--json` (`resumed`/`skipped`/`candidates`/`summary` with session ids) and `--watch --interval`.
+  New `neoxider_agents/revive.py`; tests in `tests/test_revive.py`.
+- Failure causes in `list` (`cause=`), `status`, `status --json`/`top --json`, the needs-attention line and
+  `doctor`: 124 task deadline, 125 silence watchdog, 126 provider failure/limit (overloaded, rate limit, stream
+  dropped, api_retry xN), certificate (VPN?), network or auth. `doctor` adds a `revive` feasibility line per
+  engine window, an exit-code legend and the newest failed tasks. Tests in `tests/test_failure_cause.py`.
 - Check several tasks at once. `status` now takes several names, globs (`status 'wave-*'`) and filters
   (`--active`, `--state running,failed` with the groups `active` and `failed`, `--since 2h`, `--here`) and prints one
   table instead of one detail block per call: state, short model, age, quiet time, changed files, queued
