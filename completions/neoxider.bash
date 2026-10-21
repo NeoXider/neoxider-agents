@@ -1,8 +1,8 @@
 # Install: neoxider completion bash --install
 _neoxider_complete() {
     local current="${COMP_WORDS[COMP_CWORD]}" state="${AGENT_CLI_LOGS:-$HOME/.claude/agent-cli-logs}" item
-    local commands='run ask fan send reply stop restart peek watch top dashboard diff log last result pending wait status list clean prune doctor models probe provider-info test-api gui openai-server completion config brief help'
-    local flags='-e -m -f -C -t -P -p -v -n -l --help --debug --engine --model --effort --dir --task --parent --prompt-file --timeout --poll --progress --no-progress --no-terse --verbose --terminal --log --owns --strict-owns --notify --now --flush --fresh --all-mine --all --purge --dry-run --strict --raw --deep --refresh --provider --standard --json --once --interval --stat --names --base-url --goal --out --outcome --not-touch --return --context-file --install --profile --lan --localhost --token --api-key --active --here --state --since --detail'
+    local commands='run ask fan send reply stop restart revive peek watch top dashboard diff log last result pending wait status list clean prune doctor models probe provider-info test-api gui openai-server completion config brief help'
+    local flags='-e -m -f -C -t -P -p -v -n -l --help --debug --engine --model --effort --dir --task --parent --prompt-file --timeout --poll --progress --no-progress --no-terse --verbose --terminal --log --owns --strict-owns --notify --now --flush --fresh --all-mine --all --purge --dry-run --strict --raw --deep --refresh --provider --standard --json --once --interval --stat --names --base-url --goal --out --outcome --not-touch --return --context-file --install --profile --lan --localhost --token --api-key --active --here --state --since --detail --stale --cooldown --max-attempts --within --limit --force --watch --message'
     local previous="${COMP_WORDS[COMP_CWORD-1]}" engine='' models='' i
     for ((i=1; i<COMP_CWORD-1; i++)); do
         [[ "${COMP_WORDS[i]}" == -e || "${COMP_WORDS[i]}" == --engine ]] && engine="${COMP_WORDS[i+1]}"

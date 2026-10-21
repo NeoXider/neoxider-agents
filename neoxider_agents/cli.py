@@ -31,7 +31,8 @@ COMMANDS = {
     "brief": "--outcome TEXT [--owns GLOBS] [--not-touch GLOBS] [--return TEXT] [--context-file FILE]",
     "completion": "[powershell|bash|zsh] [--install] [--profile FILE]", "help": "[COMMAND]"}
 COMMANDS.update({"receipt": "NAME [UUID] [--list] [--ack --evidence TEXT --source assistant] [--json]",
-                 "recovery": "NAME [--json] (capture actual evidence for reviewed resume)"})
+                 "recovery": "NAME [--json] (capture actual evidence for reviewed resume)",
+                 "revive": "[NAME|GLOB...] [--state error,stopped] [--stale SECONDS] [--within 6h] [--cooldown SECONDS] [--max-attempts N] [--limit N] [--message TEXT] [--force] [--dry-run] [--json] [--watch [--interval SECONDS]]  (resume settled failed tasks in their saved session)"})
 
 
 def usage(command=""):
@@ -46,6 +47,12 @@ def usage(command=""):
             print("Pipe the contract: neoxider brief --outcome TEXT --owns GLOBS | neoxider run -t NAME -")
         if command == "completion":
             print("Install once: neoxider completion powershell --install; open a new shell to activate.")
+        if command == "revive":
+            print("Resumes each eligible task with `send NAME` in its SAVED session (detached owner). Defaults: --state error,stopped,")
+            print("--stale 600 (quiet seconds), --within 6h (older tasks only when named), --cooldown 300, --max-attempts 3")
+            print("revives since the last run, --limit 10 launches per sweep (0 = unlimited). A bulk sweep needs AGENT_PARENT or a glob.")
+            print("Never revives running/idle/done/waiting tasks or a deliberate stop; an ambiguous stop, an auth failure or an")
+            print("unreset provider limit needs --force. Preview with --dry-run; --watch repeats every --interval seconds until Ctrl+C.")
         return
     print("neoxider — tracked CLI agents (PowerShell / cmd / POSIX; Python >=3.8)")
     for name, args in COMMANDS.items():
@@ -75,6 +82,10 @@ def parse(command, argv):
         operands.update({"--evidence": "evidence", "--source": "source"})
     if command == "recovery":
         switches.add("--json")
+    if command == "revive":
+        switches.update(("--dry-run", "-n", "--json", "--force", "--watch"))
+        operands.update({"--state": "state", "--stale": "stale", "--cooldown": "cooldown", "--max-attempts": "max_attempts",
+                         "--within": "within", "--limit": "limit", "--interval": "interval", "--message": "message"})
     if command == "restart":
         switches.add("--fresh")
     if command == "test-api":
@@ -244,6 +255,9 @@ def dispatch(command, opts, args, store):
         report = inspect_recovery(store, store.resolve(args[0]))
         print(json.dumps(report, ensure_ascii=False))
         return 0
+    if command == "revive":
+        from .revive import command as revive
+        return revive(store, args, opts)
     if command in ("top", "dashboard"):
         names = None
         if args or any(key in opts for key in ("--active", "--here", "state", "since")):
