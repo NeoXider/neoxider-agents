@@ -113,11 +113,12 @@ def quiet_seconds(store, name, meta, now):
 def assess(store, name, meta, options, explicit, now):
     """One report row; row['action'] == 'revive' marks a candidate, anything else is the skip reason."""
     from .lifecycle import effective
+    from .views import failure_cause
     state = effective(store, name, meta)
     session = store.session(name, meta)
     age = quiet_seconds(store, name, meta, now)
     row = dict(name=name, state_before=state, state_after=state, session_id=session, session_after="",
-               resumed=False, action="", error=None, cause=" ".join(meta.get("reason", "").split())[:160],
+               resumed=False, action="", error=None, cause=failure_cause(store, name, meta, state),
                activity_age_sec=round(age, 1), engine=meta.get("engine", ""))
     force = options["force"]
     if state not in options["states"]:
@@ -201,7 +202,7 @@ def launch(store, name, row, options):
                 return row
             store.update(name, revive_epoch=time.time(), revive_count=int(meta.get("revive_count") or 0) + 1)
             record_history(store, name, "revive", by="revive", state=state, reason=row["cause"] or "", session=row["session_id"])
-            reason = " ".join((meta.get("reason") or row["cause"] or "").split())[:200]
+            reason = "; ".join(item for item in (row["cause"], " ".join((meta.get("reason") or "").split())[:200]) if item)
             text = options.get("message") or PROMPT % (state, meta.get("exit") or "-", "; " + reason if reason else "")
             prompt = store.path(name, ".revive.prompt")
             atomic_write(prompt, text)

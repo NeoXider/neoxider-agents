@@ -181,7 +181,8 @@ def render(results, deep_engines, deep, generated):
         remaining = "resets in %dd%02dh" % (left // 86400, left % 86400 // 3600) if left >= 86400 else "resets in %dh%02dm" % (left // 3600, left % 3600 // 60)
         lines += ["=== %s usage limit (last reported by a task) ===" % engine,
                   "  LIMITED   resets %s (%s)%s" % (row.get("resets") or "unknown", remaining,
-                                                   "" if isinstance(row.get("resets_epoch"), (int, float)) else "; reset time not exact")]
+                                                   "" if isinstance(row.get("resets_epoch"), (int, float)) else "; reset time not exact"),
+                  "  revive    BLOCKED until the reset: resumed %s turns fail again; neoxider revive skips them" % engine]
     for row in results:
         if row["engine"] not in ("codex", "claude"):
             continue
@@ -203,11 +204,16 @@ def render(results, deep_engines, deep, generated):
                 left = int(reset - generated) if reset else None
                 note = "" if left is None else " resets soon" if left <= 0 else " resets in %dh%02dm" % (left // 3600, left % 3600 // 60)
                 lines.append("  %-9s [%s] %4.0f%% (window %s)%s" % (window.get("label") or "window", "#" * size + "-" * (10 - size), used, label, note))
+            lines.append(revive_line(live, generated))
         elif row["engine"] == "codex":
             lines += ["=== codex rate limits (from latest session) ===", "  no rate-limit data in recent sessions"]
     claude = next((row for row in results if row["engine"] == "claude"), None)
     if claude and not windows(claude):
-        lines += ["=== claude usage (local transcript estimate) ===", "  " + (claude.get("note") or "no local usage data")]
+        lines += ["=== claude usage (local transcript estimate) ===", "  " + (claude.get("note") or "no local usage data"),
+                  "  revive    window state unknown: if a 5h/7d window is exhausted, revived turns fail with 126/limited"]
+    lines += ["=== exit codes of failed tasks ===",
+              "  124 task deadline (watchdog) | 125 silence watchdog | 126 provider failure/limit: check the windows",
+              "  above, then neoxider revive --dry-run (same session; nothing resumes while a window is exhausted)"]
     lines.append("=== deep checks (real one-shot runs) ===")
     if not deep_engines:
         lines.append("  (no provider implements a deep check)")
@@ -215,6 +221,50 @@ def render(results, deep_engines, deep, generated):
         lines += ["  skipped - run 'agent.sh doctor --deep' to execute a shell command through each supported engine",
                   "  (that is the only check that catches 'the model answers but every command hangs')"]
     return "\n".join(lines) + "\n"
+
+
+def revive_line(live, generated):
+    """Whether resuming tasks can work now, from the live usage windows of one engine."""
+    worst = None
+    for window in live:
+        value = window.get("used_percent", window.get("utilization"))
+        try:
+            used = float(value)
+        except (TypeError, ValueError):
+            continue
+        if worst is None or used > worst[0]:
+            worst = (used, window)
+    if worst is None:
+        return "  revive    window utilization unknown"
+    used, window = worst
+    label = window.get("label") or "window"
+    if used >= 100:
+        reset = epoch(window.get("resets_at"))
+        left = int(reset - generated) if reset else None
+        when = "" if left is None else " (resets in %dh%02dm)" % (max(0, left) // 3600, max(0, left) % 3600 // 60)
+        return "  revive    BLOCKED: %s window exhausted%s; revive/restart/send fail with 126/limited until it resets" % (label, when)
+    if used >= 90:
+        return "  revive    caution: %s window at %.0f%%; a revived turn may hit the limit" % (label, used)
+    return "  revive    possible: highest window %s at %.0f%%" % (label, used)
+
+
+def failed_tasks(store, limit=10):
+    """Lines for the current orchestrator's failed tasks with their causes (bounded)."""
+    from .lifecycle import effective
+    from .views import failure_cause, mine
+    rows = []
+    for name, meta, _ in store.scan():
+        if not mine(meta):
+            continue
+        state = effective(store, name, meta)
+        if state in ("error", "limited", "silent"):
+            rows.append("  %-28s %-8s exit=%-4s %s" % (name, state, meta.get("exit") or "-", failure_cause(store, name, meta, state) or "-"))
+        if len(rows) >= limit:
+            break
+    if not rows:
+        return ""
+    lines = ["=== failed tasks (newest %d; preview: neoxider revive --dry-run) ===" % limit] + rows
+    return "".join(line + "\n" for line in lines)
 
 
 def doctor(store, opts, args, single=False):
@@ -248,6 +298,7 @@ def doctor(store, opts, args, single=False):
     results = [normalize(row, engine) for row, engine in zip(results, engines)]
     generated = time.time()
     raw = render(results, deep_engines, opts.get("--deep"), generated)
+    raw += failed_tasks(store)
     raw += "=== diagnostic budgets: whole %.3fs / provider %.3fs / cleanup <=0.4s per helper ===\n" % (
         _seconds("AGENT_DOCTOR_TIMEOUT_SEC", DOCTOR_SECONDS),
         _seconds("AGENT_DOCTOR_PROVIDER_TIMEOUT_SEC", PROVIDER_SECONDS))
@@ -438,6 +489,102 @@ def classify_failure(text, exit_code=None, watchdog=None, source="raw", trusted=
     return FailureReport(category, _safe(reason), source, "explicit" if authorized else "heuristic",
                          authorized,
                          exit_code, len(original) > SCAN_LIMIT or len(reason) > TEXT_LIMIT)
+
+
+_TRANSIENT = (("overloaded", re.compile(r"overloaded|\b529\b", re.I)),
+              ("rate limit", re.compile(r"rate[ _-]?limit|\b429\b|too many requests", re.I)),
+              ("stream dropped", re.compile(r"stream (?:disconnected|error|closed|interrupted)|websocket closed|reconnecting\.\.\.", re.I)),
+              ("server error", re.compile(r"server_error|internal server error|bad gateway|service unavailable|\b50[0234]\b", re.I)))
+
+
+def provider_signals(text):
+    """(api_retry count, retry statuses, retry errors, error payloads) from ENGINE output only.
+
+    Claude's stream-json reports each backoff as {"type":"system","subtype":"api_retry",...}; other
+    engines leave error envelopes, AGENT_PROVIDER_ERROR lines or "Reconnecting..." lines. Assistant
+    and tool content is never read, so a model that merely discusses certificates is not a cause.
+    """
+    retries, statuses, errors, payloads = 0, [], [], []
+    for line in str(text or "").splitlines()[-4000:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if '"api_retry"' in stripped:
+            try:
+                event = json.loads(stripped)
+            except ValueError:
+                continue
+            if isinstance(event, dict) and event.get("type") == "system" and event.get("subtype") == "api_retry":
+                retries += 1
+                if event.get("error_status"):
+                    statuses.append(str(event["error_status"]))
+                if event.get("error") and str(event["error"]) != "unknown":
+                    errors.append(str(event["error"])[:300])
+            continue
+        payload = _error_boundary(stripped)
+        if payload is not None:
+            payloads.append(str(payload)[:500])
+        elif stripped.startswith(("!! ", "Reconnecting...", "ERROR:")):
+            payloads.append(stripped[:300])
+    return retries, statuses, errors, payloads[-8:]
+
+
+def explain_failure(meta, log_text=""):
+    """Short operator-facing cause of a settled failure from task meta and its engine output; "" when none."""
+    state = meta.get("state", "")
+    try:
+        code = int(meta.get("exit") or 0)
+    except ValueError:
+        code = 0
+    try:
+        failure = json.loads(meta.get("failure_json") or "{}")
+    except ValueError:
+        failure = {}
+    failure = failure if isinstance(failure, dict) else {}
+    # A heuristic category came from raw output (MCP/tool noise included); only explicit evidence decides.
+    if failure.get("confidence", "explicit") != "explicit":
+        failure = {}
+    category = str(failure.get("category") or "")
+    reason = str(meta.get("reason") or "")
+    if code == 124 or category == "watchdog_timeout":
+        return "task deadline (watchdog, AGENT_TIMEOUT_SEC)"
+    if code == 125 or category == "watchdog_silence" or state == "silent":
+        return "silence watchdog (AGENT_SILENCE_SEC)"
+    if state == "stopped" or code == 130:
+        return "stopped by %s%s" % (meta.get("stopped_by") or "orchestrator",
+                                    " (launcher stopped)" if reason.startswith("launcher stopped") else "")
+    if state not in ("error", "limited"):
+        return ""
+    retries, statuses, errors, payloads = provider_signals(log_text)
+    text = " ".join([reason, str(failure.get("reason") or "")] + errors + payloads + ["HTTP " + item for item in statuses])
+    if category in ("", "unknown"):
+        category = _failure_category(text)
+    if category == "unknown" and re.search(r"cannot connect|unable to connect|connection (?:error|failed)", text, re.I):
+        category = "network"
+    if category == "tls":
+        return "provider: certificate error (VPN?)"
+    if category == "quota" or state == "limited":
+        return "provider: failure/limit (usage limit)"
+    if category == "network":
+        return "provider: network error (VPN/proxy?)"
+    if category == "auth":
+        return "provider: auth refused (login/plan?)"
+    if category == "model_unavailable":
+        return "provider: model unavailable"
+    if category == "provider_oom":
+        return "provider: out of memory"
+    detail = [word for word, pattern in _TRANSIENT if pattern.search(text)]
+    if category == "transport" or retries or detail:
+        if retries:
+            detail.append("api_retry x%d%s" % (retries, ", status " + statuses[-1] if statuses else ""))
+        return "provider: failure/limit%s" % (" (%s)" % ", ".join(detail) if detail else "")
+    if category == "cancelled":
+        return "cancelled"
+    if code == 126:
+        return "provider: failure (unclassified; see neoxider log)"
+    if code == 3 and "empty answer" in reason:
+        return "empty answer (exit 3)"
+    return "exit %d" % code if code else ""
 
 
 def _money(value):

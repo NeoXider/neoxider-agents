@@ -22,6 +22,34 @@ def activity_text(store, name, meta):
     return "last activity=%s (%ss ago)" % (latest["kind"], latest["age_sec"]) if latest else ""
 
 
+CAUSE_TAIL = 32768
+
+
+def failure_cause(store, name, meta, state=None):
+    """Why a settled task failed (provider failure/limit, TLS, watchdog, deliberate stop); "" otherwise.
+
+    Meta (exit, failure_json, reason, stopped_by) decides first; only an unclassified error reads the
+    bounded tail of the raw log's ENGINE output, which may already be pruned (then meta alone answers).
+    """
+    state = state or effective(store, name, meta)
+    if state not in ("error", "limited", "silent", "stopped"):
+        return ""
+    if state == "stopped" and meta.get("state") == "running":
+        return "launcher died (no stop record)"
+    from .diagnostics import explain_failure
+    text = ""
+    try:
+        import json
+        failure = json.loads(meta.get("failure_json") or "{}")
+        settled = failure.get("confidence", "explicit") == "explicit" and failure.get("category", "") not in ("", "unknown", "transport")
+    except (ValueError, AttributeError):
+        settled = False
+    if state == "error" and not settled and meta.get("exit") not in ("124", "125"):
+        text = tail(store.path(name, ".log"), CAUSE_TAIL)
+        text = text[text.rfind(MARK) + len(MARK):] if MARK in text else text
+    return explain_failure(dict(meta, state=state), text)
+
+
 def task_list(store, limit=20):
     rows = store.scan()
     if limit:
@@ -30,6 +58,9 @@ def task_list(store, limit=20):
     for name, meta, stamp in rows:
         state = effective(store, name, meta)
         detail = meta.get("reason", "")
+        cause = failure_cause(store, name, meta, state) if state != "limited" else ""
+        if cause and cause != detail:
+            detail = "cause=" + cause + ("; " + detail if detail else "")
         if state == "orphaned":
             detail = "orphaned provider alive, launcher dead; stop " + name
         if state == "limited":
@@ -70,6 +101,9 @@ def status(store, name):
         if state == "limited":
             reason += '  resets="%s"' % parse_limit_reset(meta.get("reason", ""))
         print("   reason=" + reason)
+        cause = failure_cause(store, name, meta, state)
+        if cause:
+            print("   cause=" + cause)
     if meta.get("timeout"):
         print("   ⏱ killed by the step watchdog after %ss (AGENT_TIMEOUT_SEC)" % meta["timeout"])
     if state == "stopped":

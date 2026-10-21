@@ -252,7 +252,9 @@ def dashboard_data(store, names=None):
             except OSError:
                 activity_epoch = stamp
         usage, tokens, cost = _usage(meta)
+        from .views import failure_cause
         rows.append(dict(name=name, state=state, engine=meta.get("engine", ""), model=meta.get("model", ""),
+                         cause="" if state in ACTIVE else failure_cause(store, name, meta, state),
                          age_sec=max(0, round(now - _start(meta, stamp), 1)),
                          last_activity=_redact(meta.get("last_activity", ""))[:160],
                          activity_age_sec=max(0, round(now - activity_epoch, 1)),
@@ -300,7 +302,7 @@ def attention(rows):
     for row in rows:
         reasons = []
         if row["state"] in FAILED_STATES + ("orphaned", "waiting"):
-            reasons.append(row["state"])
+            reasons.append(row["state"] + (": " + row["cause"] if row.get("cause") else ""))
         if row["queued"] and row["state"] not in ("running", "idle"):
             reasons.append("%s undelivered" % row["queued"])
         if row["state"] == "stopped" and not reasons:
