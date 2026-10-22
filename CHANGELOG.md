@@ -8,6 +8,7 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- OpenCode free-tier routes (`opencode/<name>-free`, `big-pickle`) now get the reduced-tool chat profile (`neoxider-freetier`) automatically for bridge/probe traffic, so `openai-server -m opencode/deepseek-v4.1-flash-free` works without `AGENT_OPENCODE_FREETIER_COMPAT=1` instead of answering `FreeTierError` 403. Routes behind the user's own OpenCode login (`opencode auth login`, OAuth or API key) are not gated and keep the strict zero-tool profile; `AGENT_OPENCODE_FREETIER_COMPAT=1|0` still forces either profile. Tests in `tests/test_providers_core.py`.
 - `revive [NAME|GLOB...]` resumes settled `error`/`stopped` tasks in their SAVED session through the ordinary
   `send` path (one detached owner per task), behind safety gates: never running/idle/done/waiting, never a
   deliberate stop (exact `NAME --force` only), `--force` for ambiguous stops, auth failures and unreset limits,

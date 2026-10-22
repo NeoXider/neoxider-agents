@@ -13,6 +13,13 @@ class Provider(BaseProvider):
     # forbidding shell, writes, edits, prompts, subagents and MCP execution.
     FREETIER_AGENT = "neoxider-freetier"
 
+    FREE_TIER_ROUTE = re.compile(r"(?:^|/)(?:[A-Za-z0-9._:-]*-free|big-pickle)$")
+
+    @classmethod
+    def is_free_tier_route(cls, model):
+        """True for OpenCode Zen free-tier model ids (`opencode/<name>-free`, `big-pickle`)."""
+        return bool(model) and ("/" not in model or model.startswith("opencode/"))             and bool(cls.FREE_TIER_ROUTE.search(model))
+
     @property
     def retry_limit(self):
         value = os.environ.get("AGENT_OPENCODE_RETRIES", "3")
@@ -38,11 +45,15 @@ class Provider(BaseProvider):
             args += ["-s", session]
         env = {"AGENT_OPENCODE_WRAPPED": "1"}
         if chat_only:
-            # AGENT_OPENCODE_FREETIER_COMPAT=1 selects the reduced-tool profile for
-            # bridge/probe traffic on gated routes (default stays zero-tool). Only the
-            # two bundled profiles are reachable; the config path is never taken from
-            # the environment, so this cannot weaken the lockdown to an arbitrary file.
-            freetier = os.environ.get("AGENT_OPENCODE_FREETIER_COMPAT") == "1"
+            # Routes of the OpenCode free tier refuse tool-less sessions (FreeTierError 403),
+            # so chat-only traffic on them gets the reduced-tool profile automatically.
+            # AGENT_OPENCODE_FREETIER_COMPAT=1 forces that profile on any route, =0 forces the
+            # strict zero-tool profile everywhere. Routes behind the user's own login
+            # (`opencode auth login`, OAuth/API key) are not gated and keep zero tools. Only
+            # the two bundled profiles are reachable; the config path is never taken from the
+            # environment, so this cannot weaken the lockdown to an arbitrary file.
+            setting = os.environ.get("AGENT_OPENCODE_FREETIER_COMPAT")
+            freetier = setting == "1" or (setting != "0" and self.is_free_tier_route(model))
             profile, agent = ("chat-freetier.json", self.FREETIER_AGENT) if freetier \
                 else ("chat-only.json", "neoxider-chat-only")
             path = ROOT / "providers/opencode" / profile

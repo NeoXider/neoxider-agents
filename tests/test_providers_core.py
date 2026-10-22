@@ -261,6 +261,31 @@ class Commands(unittest.TestCase):
         self.assertFalse(any("neoxider-chat-only" in arg for arg in args))
         self.assertNotIn("OPENCODE_CONFIG", env)
 
+    def opencode_chat_only(self, model):
+        with patch("neoxider_agents.providers.executable", return_value=["opencode"]):
+            return get_provider("opencode").command(model, "", "D:/Temp/agents-ux/providers", "", True)
+
+    def test_opencode_free_tier_route_gets_reduced_profile_automatically(self):
+        for model in ("opencode/deepseek-v4.1-flash-free", "opencode/big-pickle", "nemotron-3-ultra-free"):
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AGENT_OPENCODE_FREETIER_COMPAT", None)
+                args, env = self.opencode_chat_only(model)
+            self.assertIn("neoxider-freetier", args, model)
+            self.assertTrue(env["OPENCODE_CONFIG"].endswith("chat-freetier.json"), model)
+
+    def test_opencode_logged_in_route_keeps_zero_tool_profile(self):
+        for model in ("anthropic/claude-sonnet-5-5", "openai/gpt-6", "openrouter/deepseek/deepseek-chat", "opencode/some-paid"):
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AGENT_OPENCODE_FREETIER_COMPAT", None)
+                args, env = self.opencode_chat_only(model)
+            self.assertIn("neoxider-chat-only", args, model)
+            self.assertTrue(env["OPENCODE_CONFIG"].endswith("chat-only.json"), model)
+
+    def test_opencode_freetier_compat_zero_forces_strict_profile(self):
+        with patch.dict(os.environ, {"AGENT_OPENCODE_FREETIER_COMPAT": "0"}):
+            args, _ = self.opencode_chat_only("opencode/deepseek-v4.1-flash-free")
+        self.assertIn("neoxider-chat-only", args)
+
     def test_kimi_uses_acp_prompt_transport(self):
         args, _ = self.command("kimi")
         self.assertTrue(any("acp_adapter.py" in arg for arg in args))
