@@ -5,6 +5,15 @@ description: Delegate and coordinate CLI coding workers through neoxider launche
 
 # CLI Subagents (Codex Orchestration)
 
+## When to route here instead of Hermes `delegate_task` (rule from Victor, 2026-10-19)
+
+`delegate_task` cannot choose a model per call: children take the global `delegation.provider` / `delegation.model` pin or inherit the parent. So when a task needs a specific model or a specific CLI agent, build and drive the worker here instead of flipping the global pin.
+
+- Free path first: OpenCode (and Kimi Code / Gemini where configured). OpenCode free tier: **DeepSeek is currently the best free model**.
+- Paid agents — **Claude Code and Codex only with Victor's explicit permission** for that task; ask before launching them.
+- Small, tightly coupled work stays local; delegate only when it buys a different model or real parallelism.
+- Judge a finished worker by its artifact delta (`files changed ... COUNT`), not by wall time. A research worker that hits `by=watchdog` with `files changed: 0` wasted the whole slot — do not re-run the same prompt, redo the lookup inline: pricing/token/usage questions close in a handful of local queries (sqlite + one public API pull), which is cheaper than another 30-minute worker. Re-dispatch only after changing the prompt to force incremental writes to a file.
+
 ## Integrated orchestration contracts (2026-10-15)
 
 The typed [Python SDK](docs/ORCHESTRATOR_API.md) and CLI share the
