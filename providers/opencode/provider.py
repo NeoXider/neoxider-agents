@@ -26,10 +26,11 @@ class Provider(BaseProvider):
         return int(value) if value.isdigit() else 3
 
     def resolve(self, model="", effort=""):
-        aliases = {"free": "muse-spark-1.3-contributor-free", "spark": "muse-spark-1.3-contributor-free",
-                   "muse": "muse-spark-1.3-contributor-free", "muse-spark": "muse-spark-1.3-contributor-free",
-                   "ox": "x-preview-f-free", "ox-alpha": "x-preview-f-free", "alpha": "x-preview-f-free",
-                   "pickle": "big-pickle", "big-pickle": "big-pickle", "hy3": "hy3-free", "mimo": "mimo-v2.5-free",
+        # Zen free tier as listed by `opencode models` on 2026-10-23; Muse Spark, x-preview and hy3
+        # have left it. `free` is the owner's pick (DeepSeek flash), not a benchmark ranking.
+        aliases = {"free": "deepseek-v4.1-flash-free", "deepseek": "deepseek-v4.1-flash-free",
+                   "ds-flash": "deepseek-v4.1-flash-free",
+                   "pickle": "big-pickle", "big-pickle": "big-pickle", "mimo": "mimo-v2.6-flash-free",
                    "nemotron": "nemotron-3-ultra-free", "ultra": "nemotron-3-ultra-free",
                    "lightning": "nemotron-3.5-lightning-free", "nemotron-fast": "nemotron-3.5-lightning-free"}
         return ("opencode/" + aliases[model] if model in aliases else model), effort

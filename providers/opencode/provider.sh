@@ -17,24 +17,21 @@
 # a free model without first shelling out to `opencode models`. These aliases pin the OpenCode Zen
 # free tier by the label the picker displays.
 #
-# Zen free tier as listed by `opencode models` on 2026-08-24 (all 7 are free):
-#   big-pickle | hy3-free | mimo-v2.5-free | muse-spark-1.2-contributor-free
-#   nemotron-3-ultra-free | nemotron-3.5-lightning-free | x-preview-f-free
-# The list is a moving target — re-check with `opencode models`; an unknown alias still falls
-# through unchanged, so a raw `-m opencode/<whatever>` keeps working.
+# Zen free tier as listed by `opencode models` on 2026-10-23:
+#   beam-free | big-pickle | deepseek-v4.1-flash-free | flint-40b-free | glm-5.3-flash-free
+#   mimo-v2.6-flash-free | nemotron-3-ultra-free | nemotron-3.5-lightning-free | nemotron-3.5-super-vl-free
+# Muse Spark, x-preview and hy3 have left it. The list is a moving target — re-check with
+# `opencode models`; an unknown alias still falls through unchanged, so a raw
+# `-m opencode/<whatever>` keeps working.
 #
-# NOT ranked by any benchmark: `free` points at muse-spark because that is the user's pick, not
-# because it was measured against the others.
+# NOT ranked by any benchmark: `free` points at DeepSeek flash because that is the user's pick,
+# not because it was measured against the others.
 provider_opencode_resolve() {
     local alias="${1:-}"; P_EFFORT=""
     case "$alias" in
-        # 03.09.2026: вышел 1.3. Комментарий держим ПОСЛЕ ;; — иначе он съедает
-        # закрытие ветки и весь case ломается синтаксической ошибкой.
-        free|spark|muse|muse-spark) P_MODEL="opencode/muse-spark-1.3-contributor-free" ;;
-        ox|ox-alpha|alpha)          P_MODEL="opencode/x-preview-f-free" ;;
+        free|deepseek|ds-flash)     P_MODEL="opencode/deepseek-v4.1-flash-free" ;;
         pickle|big-pickle)          P_MODEL="opencode/big-pickle" ;;
-        hy3)                        P_MODEL="opencode/hy3-free" ;;
-        mimo)                       P_MODEL="opencode/mimo-v2.5-free" ;;
+        mimo)                       P_MODEL="opencode/mimo-v2.6-flash-free" ;;
         nemotron|ultra)             P_MODEL="opencode/nemotron-3-ultra-free" ;;
         lightning|nemotron-fast)    P_MODEL="opencode/nemotron-3.5-lightning-free" ;;
         *)                          P_MODEL="$alias" ;;

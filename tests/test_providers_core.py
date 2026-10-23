@@ -129,8 +129,10 @@ class Aliases(unittest.TestCase):
 
     def test_opencode_aliases(self):
         provider = get_provider("opencode")
-        for alias, value in (("free", "opencode/muse-spark-1.3-contributor-free"), ("ox", "opencode/x-preview-f-free"),
-                             ("pickle", "opencode/big-pickle"), ("mimo", "opencode/mimo-v2.5-free"), ("new/free-model", "new/free-model")):
+        # Muse Spark left the Zen free tier: "muse" is no alias any more and passes through as written.
+        for alias, value in (("free", "opencode/deepseek-v4.1-flash-free"), ("deepseek", "opencode/deepseek-v4.1-flash-free"),
+                             ("pickle", "opencode/big-pickle"), ("mimo", "opencode/mimo-v2.6-flash-free"),
+                             ("new/free-model", "new/free-model"), ("muse", "muse")):
             self.assertEqual(provider.resolve(alias, "high"), (value, "high"))
 
     def test_gemini_raw(self):

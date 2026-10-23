@@ -3834,8 +3834,8 @@ class RouteParsingTests(unittest.TestCase):
         route = srv.parse_model_spec("opencode/space-bunny-free")
         self.assertEqual((route.engine, route.model, route.id),
                          ("opencode", "opencode/space-bunny-free", "opencode/space-bunny-free"))
-        route = srv.parse_model_spec("opencode/muse")
-        self.assertEqual((route.model, route.id), ("muse", "opencode/muse"))
+        route = srv.parse_model_spec("opencode/free")
+        self.assertEqual((route.model, route.id), ("free", "opencode/free"))
         route = srv.parse_model_spec("opencode/anthropic/claude-x")
         self.assertEqual(route.model, "anthropic/claude-x")
 

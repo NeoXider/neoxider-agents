@@ -72,11 +72,11 @@ class CatalogueTests(unittest.TestCase):
     def test_cli_json_filters_alias_and_rejects_unknown(self):
         with tempfile.TemporaryDirectory() as folder:
             store = Store(folder)
-            opts, args = parse("models", ["-m", "muse", "--json"])
-            payload = {"engine": "opencode", "models": [{"id": "opencode/muse-spark-1.3-contributor-free"}], "note": "fixture"}
+            opts, args = parse("models", ["-m", "free", "--json"])
+            payload = {"engine": "opencode", "models": [{"id": "opencode/deepseek-v4.1-flash-free"}], "note": "fixture"}
             with patch.object(catalog, "catalogue", return_value=payload), contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(dispatch("models", opts, args, store), 0)
-            self.assertEqual(json.loads(output.getvalue())["models"][0]["id"], "opencode/muse-spark-1.3-contributor-free")
+            self.assertEqual(json.loads(output.getvalue())["models"][0]["id"], "opencode/deepseek-v4.1-flash-free")
             with patch.object(catalog, "catalogue", return_value=payload), self.assertRaisesRegex(ValueError, "not found"):
                 dispatch("models", {"model": "missing"}, [], store)
 
@@ -101,7 +101,7 @@ class ProbeTests(unittest.TestCase):
             before = {key: os.environ.get(key) for key in ("AGENT_CHAT_ONLY", "AGENT_TIMEOUT_SEC", "AGENT_OPENCODE_RETRIES")}
             def run(actual_store, name, prompt, opts):
                 self.assertEqual(prompt, "Reply OK")
-                self.assertEqual(opts["model"], "opencode/muse-spark-1.3-contributor-free")
+                self.assertEqual(opts["model"], "opencode/deepseek-v4.1-flash-free")
                 self.assertEqual(opts["effort"], "max")
                 self.assertEqual(os.environ["AGENT_CHAT_ONLY"], "1")
                 self.assertEqual(os.environ["AGENT_OPENCODE_RETRIES"], "0")
@@ -111,7 +111,7 @@ class ProbeTests(unittest.TestCase):
                 actual_store.path(name, ".answer").write_text("OK", encoding="utf-8")
                 return 0
             with patch("neoxider_agents.lifecycle.run", side_effect=run):
-                result, code = catalog.run_probe(store, {"model": "muse", "effort": "max", "name": "probe-fixture"})
+                result, code = catalog.run_probe(store, {"model": "free", "effort": "max", "name": "probe-fixture"})
             self.assertEqual(code, 0)
             self.assertEqual(result["status"], "ok")
             self.assertIsNone(result["effective_effort"])
@@ -122,9 +122,9 @@ class ProbeTests(unittest.TestCase):
             store = Store(folder)
             store.update("existing", state="done")
             store.path("reserved", ".reserve").touch()
-            for opts in ({}, {"model": "muse", "engine": "gemini"}, {"model": "muse", "timeout": "0"},
-                         {"model": "muse", "timeout": "601"}, {"model": "muse", "name": "existing"},
-                         {"model": "muse", "name": "reserved"}):
+            for opts in ({}, {"model": "free", "engine": "gemini"}, {"model": "free", "timeout": "0"},
+                         {"model": "free", "timeout": "601"}, {"model": "free", "name": "existing"},
+                         {"model": "free", "name": "reserved"}):
                 with self.subTest(opts=opts), self.assertRaises(ValueError):
                     catalog.run_probe(store, opts)
             run.assert_not_called()
@@ -170,7 +170,7 @@ class ProbeTests(unittest.TestCase):
             with patch("neoxider_agents.lifecycle.run", side_effect=run), \
                     contextlib.redirect_stdout(io.StringIO()) as stdout, \
                     contextlib.redirect_stderr(io.StringIO()) as stderr:
-                code = dispatch("probe", {"model": "muse", "effort": "xhigh", "--json": True}, [], store)
+                code = dispatch("probe", {"model": "free", "effort": "xhigh", "--json": True}, [], store)
             self.assertEqual(code, 3)
             self.assertEqual(json.loads(stdout.getvalue())["status"], "route-mismatch")
             self.assertEqual(stderr.getvalue(), "")

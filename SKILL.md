@@ -639,15 +639,17 @@ pointed at the same state directory. Running legacy tasks keep their legacy proc
 until restarted by the new core.
 
 - **Model ids with a provider prefix must be passed verbatim**: `-e opencode -m
-  opencode/muse-spark-1.3-contributor-free` is passed through unchanged; execution still depends
-  on current route availability. A bare id lacks its provider. Short aliases (`-m free`, `-m ox`, …)
+  opencode/deepseek-v4.1-flash-free` is passed through unchanged; execution still depends
+  on current route availability. A bare id lacks its provider. Short aliases (`-m free`, `-m mimo`, …)
   resolve to the full id for you.
-- **OpenCode Zen free tier (historical catalog, 2026-08-28):** `big-pickle`, `hy3-free`, `mimo-v2.5-free`,
-  `muse-spark-1.2-contributor-free`, `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`.
-  Aliases: `free`/`spark`/`muse`, `ox`/`alpha`, `pickle`, `hy3`, `mimo`, `nemotron`/`ultra`,
-  `lightning`. Re-check with `opencode models` — **`x-preview-f-free` was absent** in that
-  2026-08-28 catalog. Write the id exactly as the current catalog prints it; near-misses like
-  `mimo-free` or `nemotron-ultra-free` are not aliases and fail as unknown models.
+- **OpenCode Zen free tier (catalog of 2026-10-23):** `beam-free`, `big-pickle`,
+  `deepseek-v4.1-flash-free`, `flint-40b-free`, `glm-5.3-flash-free`, `mimo-v2.6-flash-free`,
+  `nemotron-3-ultra-free`, `nemotron-3.5-lightning-free`, `nemotron-3.5-super-vl-free`.
+  Aliases: `free`/`deepseek`/`ds-flash`, `pickle`, `mimo`, `nemotron`/`ultra`, `lightning`.
+  Muse Spark, `x-preview-f-free` and `hy3-free` have left the free tier, so `muse`, `spark`, `ox`
+  and `hy3` are no longer aliases (a run on the old Muse id failed with `UnknownError` on
+  2026-10-23). Re-check with `opencode models` and write the id exactly as the current catalog
+  prints it; near-misses like `mimo-free` are not aliases and fail as unknown models.
 - **`opencode/space-bunny-free` appeared in the 2026-09-29 catalog** as Space Bunny Free.
   Measured 2026-10-14: one SpaceBunny and one Muse Spark 1.3 file task each completed
   (OpenCode 1.18.27; see the native parity report and the release verification) — that exact case only, not stable
@@ -663,8 +665,9 @@ until restarted by the new core.
   Any unknown `-m` value falls through unchanged, so a new/free-tier id works the day it appears
   without touching `providers/opencode/provider.py` — that is why raw ids keep working here, and
   why a missing alias is a convenience loss, not a failure. Confirm the chosen route rather than
-  assuming a historical alias remains available. `free` resolves to Muse Spark 1.3 in the current
-  wrapper resolver; this is not a benchmark ranking or proof of tool capability/quota.
+  assuming a historical alias remains available. `free` resolves to DeepSeek v4.1 flash (free) in
+  the current wrapper resolver; this is not a benchmark ranking or proof of tool capability/quota.
+  On 2026-10-23 that route completed a real four-file Markdown edit task.
   A free remote model is not offline. Silence, TLS and exhausted transport retries do not prove
   quota exhaustion. Inspect the provider's actual error and process/session identity, preserve
   partial work, and keep observation deadlines separate from provider watchdogs.
@@ -1329,10 +1332,10 @@ catalog membership require current evidence. No wrapper default model: pick one 
 | `-m` value | Resolves to | When |
 |---|---|---|
 | `opencode/space-bunny-free` | itself (raw id, **no alias**) | historical catalog entry, 2026-09-29; recheck availability |
-| `free` / `spark` / `muse` / `muse-spark` | `opencode/muse-spark-1.3-contributor-free` | current resolver mapping; not a ranking |
-| `ox` / `alpha` / `ox-alpha` | `opencode/x-preview-f-free` | second free lane — **re-verify, it has vanished before** |
+| `free` / `deepseek` / `ds-flash` | `opencode/deepseek-v4.1-flash-free` | current resolver mapping (owner's pick); not a ranking |
 | `pickle` / `big-pickle` | `opencode/big-pickle` | long-context free option |
-| `hy3`, `mimo`, `nemotron`/`ultra`, `lightning` | `…-free` ids | alternates, same caveats |
+| `mimo`, `nemotron`/`ultra`, `lightning` | `…-free` ids | alternates, same caveats |
+| `muse`, `spark`, `ox`, `hy3` | passed through unchanged | no longer aliases: those models left the free tier |
 
 ```bash
 bash "$SK" run -e opencode -m opencode/space-bunny-free -t spot-check -C "$PWD" \

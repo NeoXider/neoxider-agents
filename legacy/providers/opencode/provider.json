@@ -1,10 +1,9 @@
 {
   "label": "opencode",
   "models": [
-    "free", "spark", "muse", "muse-spark",
-    "ox", "ox-alpha", "alpha",
+    "free", "deepseek", "ds-flash",
     "pickle", "big-pickle",
-    "hy3", "mimo",
+    "mimo",
     "nemotron", "ultra",
     "lightning", "nemotron-fast"
   ],
