@@ -50,5 +50,9 @@ if ($launchArguments -contains '-') {
 } else {
     $argumentJson = ConvertTo-Json -InputObject $launchArguments -Compress
 }
+# Windows PowerShell 5.1 turns every stderr line of a native command into an error record when the
+# caller redirects stderr (2>&1, 2>$null). Under 'Stop' the core's first warning would end this
+# script, replace its exit code with 1 and can drop its stdout (result --json); pass stderr through.
+$ErrorActionPreference = 'Continue'
 $argumentJson | & $pythonCommand @pythonPrefix $entry --argv-stdin
 exit $LASTEXITCODE

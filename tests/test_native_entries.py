@@ -51,13 +51,13 @@ class NativeEntryTests(unittest.TestCase):
                         PYTHONIOENCODING="utf-8")
         self.assertNotIn("git", self.env["PATH"].lower())
 
-    def invoke_ps(self, arguments, launcher="bin/neoxider.ps1", shell=None):
+    def invoke_ps(self, arguments, launcher="bin/neoxider.ps1", shell=None, redirect=""):
         quoted = ",".join("'" + item.replace("'", "''") + "'" for item in arguments)
         script = self.root / "invoke.ps1"
         with script.open("w", encoding="utf-8-sig", newline="") as stream:
             stream.write("$values = @(" + quoted + ")\n& '" +
                          str(self.root / launcher).replace("'", "''") +
-                         "' @values\nexit $LASTEXITCODE\n")
+                         "' @values" + redirect + "\nexit $LASTEXITCODE\n")
         return subprocess.run([shell or POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
                                "-File", str(script)], env=self.env, capture_output=True,
                               encoding="utf-8", errors="replace", timeout=30, **hidden())
@@ -111,6 +111,40 @@ class NativeEntryTests(unittest.TestCase):
         mutant = self.invoke_ps(["list"])
         self.assertEqual(mutant.returncode, 0, mutant.stderr)
         self.assertEqual(json.loads(mutant.stdout).lower(), "py.exe")
+
+    def warn_then_answer(self, code=0):
+        (self.root / "agent.py").write_text(
+            "import json,sys\n"
+            "args=json.loads(sys.stdin.read())\n"
+            "sys.stderr.write('[neoxider] baseline partial: warning\\n'); sys.stderr.flush()\n"
+            "print(json.dumps(args,ensure_ascii=False))\n"
+            "sys.exit(%d)\n" % code, encoding="utf-8")
+
+    def test_ps51_caller_redirected_stderr_keeps_stdout_and_exit_code(self):
+        # A caller that discards or merges stderr (result --json 2>$null, run ... 2>&1) still gets
+        # the core's stdout and exit code after a warning on stderr.
+        self.warn_then_answer(code=5)
+        arguments = ["result", "fixture", "--json"]
+        discarded = self.invoke_ps(arguments, redirect=" 2>$null")
+        self.assertEqual(discarded.returncode, 5, discarded.stdout + discarded.stderr)
+        self.assertEqual(json.loads(discarded.stdout), arguments)
+        merged = self.invoke_ps(arguments, redirect=" 2>&1 | ForEach-Object { \"$_\" }")
+        self.assertEqual(merged.returncode, 5, merged.stdout + merged.stderr)
+        lines = merged.stdout.splitlines()
+        self.assertIn("[neoxider] baseline partial: warning", lines)
+        self.assertEqual(json.loads(lines[-1]), arguments)
+
+    def test_planted_stop_preference_defect_is_detected(self):
+        # Whether stdout survives depends on stream timing; the lost exit code is deterministic.
+        self.warn_then_answer(code=5)
+        launcher = self.root / "bin/neoxider.ps1"
+        original = launcher.read_text(encoding="ascii")
+        launcher.write_text(original.replace(
+            "$argumentJson | & $pythonCommand @pythonPrefix $entry --argv-stdin",
+            "$ErrorActionPreference = 'Stop'\n$argumentJson | & $pythonCommand @pythonPrefix $entry --argv-stdin"),
+            encoding="ascii")
+        result = self.invoke_ps(["result", "fixture", "--json"], redirect=" 2>$null")
+        self.assertNotEqual(result.returncode, 5)
 
     def test_missing_python_has_one_error_with_install_fix(self):
         self.env["PATH"] = str(self.root / "empty-path")
