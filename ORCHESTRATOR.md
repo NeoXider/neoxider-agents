@@ -169,10 +169,17 @@ until restarted by the new core.
 
 ## Paste-ready orchestrator prompt
 
-> Own the requested outcome. Delegate independent, bounded tasks while doing useful work
-> locally; implement small or tightly coupled changes yourself. Use native workers for your own
-> engine and `agent.sh` only for foreign engines. Honor explicit model/effort/endpoint choices;
-> do not silently substitute them. Check foreign CLI availability only when that route is needed.
+> Own the requested outcome. Before creating a native or CLI worker, estimate the useful
+> work in its owned task. By default, delegate only tasks estimated at 15 minutes or more;
+> handle shorter or tightly coupled work directly. State the estimate and deliverable in
+> the dispatch. Apply this to each worker, including fan-out and nested workers; group
+> related work instead of spawning many tiny tasks. Provider startup, waiting and retries
+> do not count, and no minimum runtime is required. Exceptions are an explicit user request
+> for a worker or model comparison, or independent review required by applicable instructions;
+> briefly name the exception. Model variety or parallelism alone does not qualify.
+> Use native workers for your own engine and `agent.sh` for foreign engines. Honor explicit
+> model/effort/endpoint choices; do not silently substitute them. Check foreign CLI
+> availability only when that route is needed.
 >
 > Give each worker an objective, owned files/resources, relevant context, acceptance checks and
 > permitted side effects. Serialize shared files, installs, configuration, ports and restarts.

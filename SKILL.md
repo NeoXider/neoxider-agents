@@ -1,9 +1,29 @@
 ---
 name: neoxider-agents
-description: Delegate and coordinate CLI coding workers through neoxider launchers (Codex, Claude Code, Kimi Code, OpenCode or Gemini), inspect their results, send durable follow-ups and recover settled tasks. Use for CLI fleet work or an explicit CLI/model request; honor the requested native/CLI route and keep small, tightly coupled work local when delegation is not required.
+description: Delegate and coordinate CLI coding workers through neoxider launchers (Codex, Claude Code, Kimi Code, OpenCode or Gemini), inspect their results, send durable follow-ups and recover settled tasks. Use for CLI fleet work or an explicit CLI/model request; normally create workers only for tasks estimated at 15 minutes or more of useful work, keep smaller work local, and honor the requested native/CLI route.
 ---
 
 # CLI Subagents (Codex Orchestration)
+
+## Decide whether to create a worker
+
+Before creating any native or CLI subagent, estimate the useful hands-on work in its
+owned task. **By default, create a worker only for a task estimated at 15 minutes or
+more.** Handle shorter tasks directly, including small fixes, lookups, launches and
+routine checks; do not spawn a worker merely because this skill is available.
+
+- State the estimate and intended deliverable in the dispatch. Count substantive
+  investigation, implementation and verification, excluding provider startup, waiting,
+  polling and retry overhead. This is an effort estimate, not a minimum runtime or a
+  timeout: do not wait or inflate scope to reach 15 minutes.
+- Apply the gate to each worker, including `fan` children and nested subagents. A large
+  parent task does not justify many tiny delegations; group related work into a cohesive
+  substantial task, and keep small or tightly coupled steps with the parent.
+- Exceptions: an explicit user request for a worker or model comparison, or independent
+  review required by applicable instructions. Name the exception briefly before dispatch.
+  A different engine, a free model or possible parallelism alone is not an exception.
+- When the estimate is uncertain, inspect locally first and reassess if the scope grows.
+  Once a worker is justified, follow the routing, ownership and verification rules below.
 
 ## When to route here instead of Hermes `delegate_task` (rule from Victor, 2026-10-19)
 
@@ -11,7 +31,7 @@ description: Delegate and coordinate CLI coding workers through neoxider launche
 
 - Free path first: OpenCode (and Kimi Code / Gemini where configured). OpenCode free tier: **DeepSeek is currently the best free model**.
 - Paid agents — **Claude Code and Codex only with Victor's explicit permission** for that task; ask before launching them.
-- Small, tightly coupled work stays local; delegate only when it buys a different model or real parallelism.
+- Apply the 15-minute effort gate above before choosing a provider; model variety or parallelism alone does not justify a worker.
 - Judge a finished worker by its artifact delta (`files changed ... COUNT`), not by wall time. A research worker that hits `by=watchdog` with `files changed: 0` wasted the whole slot — do not re-run the same prompt, redo the lookup inline: pricing/token/usage questions close in a handful of local queries (sqlite + one public API pull), which is cheaper than another 30-minute worker. Re-dispatch only after changing the prompt to force incremental writes to a file.
 
 ## Integrated orchestration contracts (2026-10-15)
@@ -109,7 +129,7 @@ done
 When working inside this repository, `SK=./agent.sh` is sufficient.
 For a plugin-root-only installation, the resolved POSIX wrapper is `$CLAUDE_PLUGIN_ROOT/agent.sh`.
 
-**Routing default:** use the host's native subagents for its own engine when available;
+**Routing default (after the effort gate):** use the host's native subagents for its own engine when available;
 use the wrapper for foreign engines. Later explicit human CLI/model/effort choices,
 restrictions on native workers, and native unavailability override this default, including
 same-engine CLI tasks. Preserve the user's chosen fleet and do not silently substitute.
@@ -181,9 +201,10 @@ launch-specific environment changes local to the task; they do not authorize glo
 
 ## Work as an orchestrator (default mode)
 
-Own the outcome, not just the delegation. Delegate bounded work when it can run independently
-alongside useful work you keep locally. Implement small or tightly coupled changes yourself;
-do not create workers, ledgers, or progress files solely to follow a ritual.
+Own the outcome, not just the delegation. Apply the 15-minute effort gate before creating
+workers. Delegate qualifying bounded work that can run independently alongside useful work
+you keep locally. Implement shorter or tightly coupled changes yourself; do not create
+workers, ledgers, or progress files solely to follow a ritual.
 
 1. **Establish scope.** Read applicable repository instructions and current changes. Translate
    the user's reported failure into an observable acceptance check. Preserve earlier requirements
@@ -282,7 +303,8 @@ If it proves incapable, report the limitation and seek a model change rather tha
   machine line `OUTCOME task=NAME state=STATE exit=N` -- match on it, not on prose.
 - **Run in a tracked background job.** Start `run` as a background task of your own harness and
   wait on it (or `wait NAME`), so its exit is observed; do not fire-and-forget.
-- **Narrow tasks for weak/free models.** Give them one small objective, a time budget ("stop after
+- **Bound tasks for weak/free models.** Give them one cohesive objective that meets the effort
+  gate (or its explicit exception), a time budget ("stop after
   ~20 minutes and report"), and ask them to write the result to a file after every step, so a
   timeout still leaves usable output. Free routes are weaker on long browser-driven tasks; pick a
   stronger model for those, a cheap one for mechanical edits.

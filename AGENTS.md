@@ -329,8 +329,12 @@ See the canonical [SKILL.md](SKILL.md) for status and GUI behavior.
 
 ## Rules for using this tool as a subagent orchestrator
 
-Follow the ownership, routing and verification loop in [SKILL.md](SKILL.md). Delegate only
-useful bounded work, honor explicit model choices, and serialize shared runtime mutations.
+Follow the ownership, routing and verification loop and
+[worker effort gate](SKILL.md#decide-whether-to-create-a-worker) in the canonical skill.
+By default, create native or CLI workers only for tasks estimated at 15 minutes or more
+of useful work per worker; handle shorter work directly. Apply the canonical exceptions
+for explicit worker/model-comparison requests and required independent review.
+Honor explicit model choices and serialize shared runtime mutations.
 For Windows launches or shared-service changes, read [runtime discipline](docs/RUNTIME-DISCIPLINE.md).
 Native workers do not require CLI `doctor`; a worker report alone is not acceptance.
 

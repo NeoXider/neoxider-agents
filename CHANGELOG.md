@@ -41,6 +41,11 @@ All notable changes to this project are documented here. Format follows
 
 ### Changed
 
+- Skill guidance now creates native and CLI subagents by default only for tasks estimated
+  at 15 minutes or more of useful work per worker. Smaller tasks stay local; explicit worker
+  requests and required independent review remain exceptions. Agent entry points and the
+  paste-ready orchestrator prompt use the same gate; CLI execution and timeouts are unchanged.
+
 ### Fixed
 
 - A usage limit is no longer easy to miss. The last limit each engine reported is remembered in

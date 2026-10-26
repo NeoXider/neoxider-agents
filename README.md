@@ -493,6 +493,10 @@ Claude Code as secondary context), and [`GEMINI.md`](GEMINI.md) (Gemini CLI, whi
 the shared `AGENTS.md` convention). Whichever CLI you're chatting with picks up the same baseline
 with no extra setup.
 
+The default [worker effort gate](SKILL.md#decide-whether-to-create-a-worker) reserves native
+and CLI subagents for tasks estimated at 15 minutes or more of useful work per worker.
+Shorter work stays local; explicit worker requests and required independent review are exceptions.
+
 </details>
 
 **Full command reference:** [`SKILL.md`](SKILL.md) — model aliases, the question-detection
