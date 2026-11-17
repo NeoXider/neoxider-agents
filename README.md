@@ -2,6 +2,8 @@
 
 # neoxider-agents
 
+![Task prompts flow through the orchestrator to parallel Codex, Claude Code, and Kimi Code workers, each returning a result.](docs/assets/cover-02-parallel.png)
+
 **A tiny local control room for AI coding subagents.**
 
 One Python core, native PowerShell/cmd/POSIX launchers, a zero-dependency web panel, and an OpenAI-compatible HTTP bridge —
