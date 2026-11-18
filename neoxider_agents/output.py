@@ -31,7 +31,10 @@ def error_text(value):
 
 _TRANSIENT_TRANSPORT = (
     r"tls handshake eof|request timed out|operation timed out|idle timeout|timed out waiting for response"
-    r"|connection (?:reset|closed|aborted)(?: by peer)?|error sending request(?: for url)?|broken pipe"
+    r"|connection (?:reset|closed|aborted|refused)(?: by peer)?|error sending request(?: for url)?|broken pipe"
+    r"|dns error|failed to lookup address(?: information)?|no such host is known|name or service not known"
+    # Any OS-level socket/DNS failure, whatever the locale of its text (e.g. Windows "os error 11001").
+    r"|[^()]*\(os error [0-9]{1,6}\)"
 )
 _PERMANENT_MARKERS = re.compile(r"quota|usage limit|rate limit|429|auth|unauthori[sz]ed|forbidden|context window"
                                 r"|invalid|not found|billing|exceeded", re.IGNORECASE)
