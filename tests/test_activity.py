@@ -71,6 +71,25 @@ class ActivityTests(unittest.TestCase):
         self.log.write_text(json.dumps({"type": "text", "part": {"text": "Authorization: Bearer " + secret}}) + "\n", encoding="utf-8")
         self.assertNotIn(secret, self.invoke("--raw"))
 
+    def test_paths_are_not_redacted_but_tokens_still_are(self):
+        path = "D:/Git/runs/hotd-webgl-20261118/rules/undeclared_names/NOTES.md"
+        self.assertIn(path, activity.redact("Add-Content " + path))
+        self.assertNotIn("[REDACTED]", activity.redact("cd /home/user/projects/some-long-folder-name/sub"))
+        b64 = "QWxhZGRpbjpvcGVuIHNlc2FtZQ/bm90LWEtcGF0aA+K2x5dW5kc2VjcmV0dG9rZW4="
+        self.assertNotIn(b64, activity.redact("x " + b64))
+        opaque = "sk" + "Ab3dE" * 8
+        self.assertNotIn(opaque, activity.redact(opaque))
+
+    def test_shell_launcher_is_stripped_from_command_digest(self):
+        cmd = '"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command \'rg -n foo src\''
+        kind, detail = activity.tool_entry("command_execution", {"command": cmd})
+        self.assertEqual("command", kind)
+        self.assertTrue(detail.startswith("rg -n foo src"), detail)
+        kind, detail = activity.tool_entry("bash", {"command": "/bin/bash -lc 'make test'"})
+        self.assertTrue(detail.startswith("make test"), detail)
+        kind, detail = activity.tool_entry("bash", {"command": "git status"})
+        self.assertEqual("git status", detail)
+
     def test_reasoning_not_exposed_in_raw(self):
         self.fixture("codex")
         self.assertNotIn("private reasoning", self.invoke("--raw"))

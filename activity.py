@@ -21,11 +21,50 @@ SECRET = re.compile(r"(?i)([\"']?(?:api[_-]?key|access[_-]?token|password|secret
 SECRET_KEYS = re.compile(r"(?i)^(?:authorization|api[_-]?key|access[_-]?token|password|secret|token)$")
 
 
+PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def _path_like(candidate):
+    """A long run of path segments (`Git/runs/hotd-webgl-20261118/fork-export`) is not a credential.
+
+    The opaque-token pattern accepts '/', so every forward-slash path over 32 characters used to be
+    masked (`$w='D:[REDACTED]'` in peek/status), hiding exactly what an orchestrator reads.
+    Base64/JWT-like secrets carry '+'/'=' or long unbroken segments; paths split into short readable ones.
+    """
+    if "/" not in candidate or "+" in candidate or "=" in candidate:
+        return False
+    parts = [part for part in candidate.split("/") if part]
+    return len(parts) >= 2 and all(PATH_SEGMENT.match(part) for part in parts)
+
+
 def redact(text):
     """Mask headers, named credentials, and long opaque credential-like strings."""
     value = AUTH.sub(r"\1[REDACTED]", str(text))
     value = SECRET.sub(r"\1[REDACTED]", value)
-    return TOKEN.sub("[REDACTED]", value)
+    return TOKEN.sub(lambda m: m.group(0) if _path_like(m.group(0)) else "[REDACTED]", value)
+
+
+SHELL_WRAPPER = re.compile(
+    r'^\s*"?(?:[A-Za-z]:)?[^"\s]*?(?:powershell|pwsh|cmd|bash|sh|zsh)(?:\.exe)?"?'
+    r'(?:\s+-(?:NoProfile|NoLogo|NonInteractive|ExecutionPolicy\s+\S+|lc?))*'
+    r'\s+(?:-Command|-c|/c|/C|-lc)\s+(?P<inner>.+)$', re.S)
+
+
+def inner_command(command):
+    """Strip the shell launcher codex/opencode wrap around every command.
+
+    Codex on Windows reports `"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command
+    '...'`, so every LAST ACTIVITY cell showed the same launcher path and none of the command.
+    """
+    if not isinstance(command, str):
+        return command
+    match = SHELL_WRAPPER.match(command)
+    if not match:
+        return command
+    inner = match.group("inner").strip()
+    if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in "'\"":
+        inner = inner[1:-1]
+    return inner
 
 
 def safe_event(value):
@@ -84,7 +123,7 @@ def tool_entry(name, args, result=None):
     command = args.get("command") or args.get("cmd")
     path = args.get("file_path") or args.get("filePath") or args.get("path") or args.get("filename")
     if command or lower in ("bash", "shell", "exec_command", "command_execution"):
-        detail = compact(command or args)
+        detail = compact(inner_command(command) if command else args)
         exit_code = None
         if isinstance(result, dict):
             exit_code = result.get("exit_code", result.get("exitCode"))
