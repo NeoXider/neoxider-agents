@@ -139,7 +139,10 @@ class CodexRetrySignalTests(unittest.TestCase):
                     'Reconnecting... 1/5 (stream disconnected before completion: request timed out)',
                     'Reconnecting... 3/5 (stream disconnected before completion: connection reset by peer)',
                     'Reconnecting... 4/5 (error sending request for url (https://chatgpt.example/backend))'.replace(' (https://chatgpt.example/backend)', ''),
-                    'Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for SSE)']
+                    'Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for SSE)',
+                    'Reconnecting... 2/5 (stream disconnected before completion: Этот хост неизвестен. (os error 11001))',
+                    'Reconnecting... 1/5 (error sending request for url: dns error: failed to lookup address information)',
+                    'Reconnecting... 3/5 (stream disconnected before completion: No such host is known. (os error 11001))']
         for message in messages:
             with self.subTest(message=message):
                 parser = OutputFilter('codex')
@@ -161,6 +164,7 @@ class CodexRetrySignalTests(unittest.TestCase):
             'Reconnecting... 2/5 (request timed out: usage limit reached)',
             'Reconnecting... 2/5 (stream disconnected before completion: 429 Too Many Requests)',
             'Reconnecting... 6/5 (request timed out)',
+            'Reconnecting... 2/5 (usage limit reached (os error 5))',
         ]
         for message in messages:
             with self.subTest(message=message):
