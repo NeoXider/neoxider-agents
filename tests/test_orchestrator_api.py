@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 from neoxider_agents import orchestrator as sdk
 from neoxider_agents.state import Store
-from neoxider_agents.process import pid_alive
+from neoxider_agents.process import pid_alive, pid_stamp
 
 
 class OrchestratorApiTests(unittest.TestCase):
@@ -569,7 +569,7 @@ class OrchestratorApiTests(unittest.TestCase):
         self.release(self.work, 1)
         self.until(lambda: child.reaped, message="changed owner resources released after natural exit")
 
-    def resource_owner(self):
+    def resource_owner(self, manual_cleanup=False):
         """Real hidden owner and descendant, with publication before prompt consumption."""
         entry = self.base / "resource-owner.py"
         entry.write_text("\n".join([
@@ -596,20 +596,31 @@ class OrchestratorApiTests(unittest.TestCase):
             "(work / 'consumed').write_text(text, encoding='utf-8')",
             "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)'],",
             "    stdin=subprocess.DEVNULL, **hidden_kwargs())",
-            "(work / 'child.pid').write_text(str(child.pid))",
+            "atomic_write(work / 'child.pid', str(child.pid))",
             "while not (work / 'finish').exists() and time.monotonic() < deadline: time.sleep(0.01)",
             "store.update(name, state='done', exit=0)",
             "while not (work / 'release').exists() and time.monotonic() < deadline: time.sleep(0.01)",
             "child.wait()",
         ]), encoding="utf-8")
-        client = self.client(entry=entry)
+        if manual_cleanup:
+            # Give fake-clock tests sole control of cleanup passes and PID mocks.
+            with mock.patch.object(sdk.AgentClient, "_resource_loop", return_value=None):
+                client = self.client(entry=entry)
+        else:
+            client = self.client(entry=entry)
         handle = client.spawn("EXACT DEFERRED PROMPT", engine="fixture", cwd=self.work, name="resources")
         return client, handle, client._child_for(handle.task)
 
+    def wait_for_cleanup(self, client, child, now=None):
+        def cleaned():
+            client._cleanup_children(now=now)
+            return child.reaped
+
+        self.until(cleaned, message="launcher resources to be reaped")
+
     def test_real_resources_reaped_by_fake_clock_300s_and_same_handle_resumes(self):
-        client, handle, child = self.resource_owner()
+        client, handle, child = self.resource_owner(manual_cleanup=True)
         self.assertTrue(child.prompt_path.exists(), "publication cannot imply prompt consumption")
-        client._clock = lambda: 100  # the background reaper shares the fake clock
         self.assertTrue(child.alive())
         client._cleanup_children(now=100)
         client._cleanup_children(now=1000)
@@ -618,15 +629,16 @@ class OrchestratorApiTests(unittest.TestCase):
         self.until(lambda: (self.work / "child.pid").exists())
         self.assertEqual((self.work / "consumed").read_text(encoding="utf-8"), "EXACT DEFERRED PROMPT")
         descendant = int((self.work / "child.pid").read_text())
+        descendant_stamp = pid_stamp(descendant)
+        self.assertTrue(descendant_stamp)
+        self.assertTrue(pid_alive(descendant, descendant_stamp))
         (self.work / "finish").touch()
         self.until(lambda: self.store().read(handle.task).get("state") == "done")
-        child.settled_at = None
         client._cleanup_children(now=100)
         client._cleanup_children(now=394)
         self.assertTrue(child.alive())
-        client._cleanup_children(now=399)
-        self.assertTrue(child.reaped, "completed owner resources released before 300s")
-        self.assertFalse(pid_alive(descendant))
+        self.wait_for_cleanup(client, child, now=399)
+        self.until(lambda: not pid_alive(descendant, descendant_stamp), message="original descendant to exit")
         self.assertFalse(child.thread.is_alive())
         self.assertTrue(child.process.stdout.closed)
         self.assertFalse(child.prompt_path.exists())
@@ -641,12 +653,13 @@ class OrchestratorApiTests(unittest.TestCase):
             self.assertFalse(handle._settled_event.is_set())
             self.assertEqual(handle.wait(timeout=30).session, "ses_resource")
             generations.add(handle.status().generation)
-            self.until(lambda: not client._children, message="repeated resume resources reaped")
+            self.wait_for_cleanup(client, client._child_for(handle.task))
         self.assertEqual(len(generations), 4)
         self.assertIs(client.handle(handle.task), handle)
 
     def test_cleanup_spares_reused_pid_generation_and_foreign_owner(self):
-        client, handle, child = self.resource_owner()
+        client, handle, child = self.resource_owner(manual_cleanup=True)
+        self.assertTrue(child.stamp)
         (self.work / "consume").touch()
         self.until(lambda: (self.work / "child.pid").exists())
         (self.work / "finish").touch()
@@ -664,8 +677,7 @@ class OrchestratorApiTests(unittest.TestCase):
             client._cleanup_children(now=300)
             kill.assert_not_called()
         child.settled_at = 0
-        client._cleanup_children(now=300)
-        self.assertTrue(child.reaped)
+        self.wait_for_cleanup(client, child, now=300)
 
     def test_normal_completion_immediately_reaps_provider_pumps_and_handles(self):
         client = self.client()

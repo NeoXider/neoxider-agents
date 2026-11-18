@@ -67,6 +67,30 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
+    def test_result_retries_windows_metadata_sharing_violation(self):
+        from neoxider_agents.state import read_meta
+        from neoxider_agents.ux_tracking import collect_result
+
+        path = self.store.path("task", ".meta")
+        self.store.update("task", state="done", exit=0, dir=str(self.work))
+        original_read = Path.read_text
+        denied = False
+
+        def read_during_replace(target, *args, **kwargs):
+            nonlocal denied
+            if target == path and not denied:
+                denied = True
+                raise PermissionError(13, "Permission denied", str(target))
+            return original_read(target, *args, **kwargs)
+
+        with patch("neoxider_agents.state.os", wraps=os) as platform:
+            platform.name = "nt"
+            with patch.object(Path, "read_text", read_during_replace):
+                result = collect_result(self.store, "task")
+            self.assertEqual(read_meta(self.store.path("missing", ".meta")), {})
+        self.assertTrue(denied)
+        self.assertEqual((result["state"], result["exit_code"]), ("done", 0))
+
     def test_default_run_adds_no_project_files(self):
         (self.work / "existing.txt").write_text("unchanged")
         before = {p.name: p.read_bytes() for p in self.work.iterdir()}
