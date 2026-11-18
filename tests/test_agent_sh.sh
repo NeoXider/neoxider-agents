@@ -478,6 +478,10 @@ section "_provider_opencode_emit / provider wiring"
 # EOF, while keeping the final answer behind a fresh output marker for last_output/openai_server.
 OPENCODE_STREAM_FILE="$SCRATCH_LOGDIR/opencode-stream"
 OPENCODE_STREAM_RELEASE="$SCRATCH_LOGDIR/opencode-stream-release"
+# Exercise a monotonic clock near its origin, as on macOS with Python 3.8.
+OPENCODE_TEST_CLOCK="$SCRATCH_LOGDIR/clock"
+mkdir -p "$OPENCODE_TEST_CLOCK"
+printf '%s\n' 'import time' 'time.monotonic = lambda: 0.125' > "$OPENCODE_TEST_CLOCK/sitecustomize.py"
 (
     {
         printf '%s\n' '{"type":"step_start","sessionID":"ses_stream"}'
@@ -487,7 +491,7 @@ OPENCODE_STREAM_RELEASE="$SCRATCH_LOGDIR/opencode-stream-release"
             sleep 0.1
         done
         printf '%s\n' '{"type":"text","sessionID":"ses_stream","part":{"id":"p1","text":"final answer"}}'
-    } | _provider_opencode_emit > "$OPENCODE_STREAM_FILE"
+    } | PYTHONPATH="$OPENCODE_TEST_CLOCK" _provider_opencode_emit > "$OPENCODE_STREAM_FILE"
 ) &
 opencode_stream_pid=$!
 deadline=$((SECONDS + 15))

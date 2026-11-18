@@ -1,12 +1,16 @@
 """Hidden provider launches, process identity and cancellation without polling forks."""
 import atexit
+import ctypes
+import errno
 import hashlib
 import os
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import weakref
+from functools import lru_cache
 from pathlib import Path
 
 _trees = weakref.WeakSet()
@@ -37,6 +41,33 @@ def hidden_kwargs(terminal=False, executable="", console=False):
     return result
 
 
+class _DarwinProcessInfo(ctypes.Structure):
+    # proc_bsdinfo from <sys/proc_info.h>.
+    _fields_ = [("flags", ctypes.c_uint32), ("status", ctypes.c_uint32),
+                ("reserved", ctypes.c_byte * 8), ("parent", ctypes.c_uint32),
+                ("details", ctypes.c_byte * 100),
+                ("seconds", ctypes.c_uint64), ("microseconds", ctypes.c_uint64)]
+
+
+@lru_cache(maxsize=1)
+def _darwin_libproc():
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    lib.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+                                ctypes.c_void_p, ctypes.c_int]
+    lib.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+    return lib
+
+
+def _darwin_process_info(pid):
+    info = _DarwinProcessInfo()
+    size = ctypes.sizeof(info)
+    if _darwin_libproc().proc_pidinfo(pid, 3, 0, ctypes.byref(info), size) == size:
+        return info
+    if ctypes.get_errno() == errno.ESRCH:
+        raise ProcessLookupError(pid)
+    return None
+
+
 def pid_stamp(pid):
     try:
         pid = int(pid)
@@ -50,14 +81,8 @@ def pid_stamp(pid):
             fields = path.read_text().rsplit(")", 1)[1].split()
             return fields[19]
         if sys.platform == "darwin":
-            import ctypes
-            class BsdInfo(ctypes.Structure):
-                _fields_ = [("prefix", ctypes.c_byte * 120),
-                            ("seconds", ctypes.c_uint64), ("microseconds", ctypes.c_uint64)]
-            info = BsdInfo()
-            lib = ctypes.CDLL("/usr/lib/libproc.dylib")
-            size = lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
-            if size == ctypes.sizeof(info):
+            info = _darwin_process_info(pid)
+            if info is not None:
                 return "%s.%s" % (info.seconds, info.microseconds)
     except (OSError, ValueError, TypeError, IndexError):
         pass
@@ -75,6 +100,9 @@ def pid_alive(pid, stamp=""):
         if stamp and pid_stamp(pid) != str(stamp):
             return False
         os.kill(pid, 0)
+        if sys.platform == "darwin":
+            info = _darwin_process_info(pid)
+            return info is None or info.status != 5  # SZOMB in <sys/proc.h>
         try:
             if Path("/proc/%s/stat" % pid).read_text().rsplit(")", 1)[1].split()[0] == "Z":
                 return False
@@ -99,21 +127,18 @@ def _posix_rows():
                     pass
         return rows
     if sys.platform == "darwin":
-        import ctypes
-        lib = ctypes.CDLL("/usr/lib/libproc.dylib")
-        lib.proc_listpids.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_int]
+        lib = _darwin_libproc()
         size = lib.proc_listpids(1, 0, None, 0)
         buffer = (ctypes.c_int32 * (max(0, size) // 4 + 1024))()
         size = lib.proc_listpids(1, 0, buffer, ctypes.sizeof(buffer))
         for pid in buffer[:max(0, size) // 4]:
             if pid > 0:
-                info = (ctypes.c_byte * 136)()
-                if lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) == 136:
-                    data = bytes(info)
-                    parent = int.from_bytes(data[16:20], sys.byteorder)
-                    seconds = int.from_bytes(data[120:128], sys.byteorder)
-                    micros = int.from_bytes(data[128:136], sys.byteorder)
-                    rows.append((pid, parent, "%s.%s" % (seconds, micros)))
+                try:
+                    info = _darwin_process_info(pid)
+                except ProcessLookupError:
+                    continue
+                if info is not None:
+                    rows.append((pid, info.parent, "%s.%s" % (info.seconds, info.microseconds)))
     return rows
 
 
@@ -327,6 +352,9 @@ def stdout_closed():
             import msvcrt
             from .windows import pipe_disconnected
             return pipe_disconnected(msvcrt.get_osfhandle(fd))
+        mode = os.fstat(fd).st_mode
+        if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)):
+            return False
         import select
         if hasattr(select, "poll"):
             poller = select.poll()

@@ -63,7 +63,7 @@ RAW_LIMIT = 262144
 # "[opencode] ..." diagnostic INSIDE the answer block and last_output returned them as the answer.
 ANSWER_FILE = os.environ.get("AGENT_OPENCODE_ANSWER_FILE") or ""
 sid = None; parts = {}; order = []; raw = []; raw_size = 0
-last_activity = 0.0
+last_activity = None
 for line in sys.stdin:
     raw.append(line)
     raw_size += len(line.encode("utf-8", "ignore"))
@@ -84,7 +84,7 @@ for line in sys.stdin:
         print("session id: %s" % sid, flush=True)
     event_type = o.get("type") or "event"
     now = time.monotonic()
-    if now - last_activity >= 10.0:
+    if last_activity is None or now - last_activity >= 10.0:
         print("[opencode] activity: %s" % event_type, flush=True)
         last_activity = now
     if o.get("type") == "text":

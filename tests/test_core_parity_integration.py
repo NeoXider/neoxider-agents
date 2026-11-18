@@ -387,7 +387,7 @@ class CoreIntegrationTests(CoreHarness):
                 client, handle = self.spawn('ERR:' + marker, name='error-' + marker.lower())
                 result = handle.wait(timeout=15)
                 self.assertEqual(result.state, 'limited' if marker == 'QUOTA' else 'error')
-                self.assertEqual(result.failure['category'], category)
+                self.assertEqual(result.failure['category'], category, (result.exit_code, result.reason))
                 self.assertEqual(result.exit_code, 126)
                 self.assertEqual(bool(result.limit), marker == 'QUOTA')
                 events = client.events(handle).events

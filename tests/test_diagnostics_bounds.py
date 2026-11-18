@@ -207,7 +207,7 @@ else:
         version.write_text("import os,time\nfrom pathlib import Path\nPath(__file__).with_suffix('.pid').write_text(str(os.getpid()))\ntime.sleep(60)\n", encoding="utf-8")
         with mock.patch.dict(os.environ, AGENT_CODEX_BIN=str(version)):
             row = diagnostics.bounded_probes(["codex"])[0]
-        self.assertEqual(row["state"], "timeout")
+        self.assertEqual(row["state"], "timeout", row)
         self.assertIsNone(row["available"])
         pid = int(version.with_suffix('.pid').read_text())
         self.assertFalse(pid_alive(pid, pid_stamp(pid)))

@@ -4760,9 +4760,11 @@ class RegistryCommandTests(unittest.TestCase):
         return code, out.getvalue()
 
     def test_detached_start_on_port_zero_is_listed_and_stopped_with_its_tree(self):
-        code, out = self.run_main("start", "--detach", "-e", "codex", "-m", "spark", "-p", "0",
-                                  "--name", "unit-detach", "--json")
-        self.assertEqual(code, 0, out)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, out = self.run_main("start", "--detach", "-e", "codex", "-m", "spark", "-p", "0",
+                                      "--name", "unit-detach", "--json")
+        self.assertEqual(code, 0, err.getvalue())
         started = json.loads(out)
         port, pid = started["port"], started["pid"]
         try:
