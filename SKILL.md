@@ -79,6 +79,13 @@ Two clarifications from the first live ultra run (2026-11-18):
   single-handed: that is not ultra and hides the stall. Observed in the second live run: the
   coordinator asked, nobody could answer, and it worked alone until the outer coordinator sent the
   permission through `send`.
+- **Shared tool repositories: one `git worktree` per worker.** Never `git switch` the shared checkout
+  that other workers and scripts run from - one ultra coordinator switched it to a feature branch
+  mid-wave. Brief every worker: `git worktree add <scratch>/wt/<name> -b <branch> origin/main`,
+  push, open a PR; the outer coordinator merges.
+- **Fix in the repository that owns the defect.** Brief it explicitly: a defect in a fork is a PR
+  into that fork with a test - not a patch file or an input pre-processor in another repository.
+  Without that sentence workers twice delivered fork fixes as patch files.
 
 Live result of the first ultra run (one `codex/gpt-6.2-sol/medium` coordinator, objective "compile
 the next assembly layer of a reconstructed Unity project", 4 independent pieces): read both skills,
