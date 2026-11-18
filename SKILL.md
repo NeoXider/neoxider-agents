@@ -70,6 +70,15 @@ Two clarifications from the first live ultra run (2026-11-18):
   `AGENT_PARENT=<your task>` automatically, which is what makes the GUI tree, `stop --all-mine`
   and `pending` work for the wave. Setting it to an invented wave id detaches the children from
   your task. Name the wave in task names (`<wave>-impl-x`, `<wave>-review-x`) instead.
+- **Paid-route permission in a delegated ultra task.** A route merely listed in `ultra map` is NOT
+  permission. Permission is an explicit statement in the brief (or a later coordinator message)
+  such as "user authorised Codex gpt-6.2-sol/medium, up to N workers". Coordinators: always write
+  that sentence into an ultra brief. Workers: if it is missing, ask ONCE in your output (a plain
+  question - there is no human to pick options in a non-interactive run), do only read-only
+  planning/measurement while waiting, and do NOT silently do the whole multi-piece objective
+  single-handed: that is not ultra and hides the stall. Observed in the second live run: the
+  coordinator asked, nobody could answer, and it worked alone until the outer coordinator sent the
+  permission through `send`.
 
 Live result of the first ultra run (one `codex/gpt-6.2-sol/medium` coordinator, objective "compile
 the next assembly layer of a reconstructed Unity project", 4 independent pieces): read both skills,
