@@ -69,15 +69,27 @@ def sync_directory(path):
 
 
 def read_meta(path):
-    try:
-        fields = {}
-        for line in Path(path).read_text(encoding="utf-8-sig").splitlines():
-            if "=" in line:
-                key, value = line.split("=", 1)
-                fields.setdefault(key, value)
-        return fields
-    except (OSError, UnicodeError):
-        return {}
+    path = Path(path)
+    deadline = time.monotonic() + 1
+    delay = 0.005
+    while True:
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+            break
+        except PermissionError:
+            # The CRT reports a Windows sharing violation during os.replace as EACCES.
+            if os.name != "nt" or time.monotonic() >= deadline:
+                return {}
+            Event().wait(delay)
+            delay = min(0.1, delay * 2)
+        except (OSError, UnicodeError):
+            return {}
+    fields = {}
+    for line in text.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            fields.setdefault(key, value)
+    return fields
 
 
 class Lock:
