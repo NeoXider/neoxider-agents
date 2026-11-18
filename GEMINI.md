@@ -27,6 +27,10 @@ See the canonical [SKILL.md](SKILL.md) for status and GUI behavior.
 
 ## Quick reference
 
+For ultra activation and the plan-before-launch protocol, see
+[Ultra / swarm mode](SKILL.md#ultra--swarm-mode). P0 adds `swarm score`,
+`swarm map`, advisory `swarm plan` and coordinator-only `swarm record`.
+
 ```powershell
 $SK = './agent.ps1'
 & $SK "<prompt>"                            # implicit run; cwd/config/detected engine

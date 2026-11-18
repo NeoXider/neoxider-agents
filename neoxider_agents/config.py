@@ -6,6 +6,10 @@ from pathlib import Path
 KEYS = ("engine", "model", "effort")
 
 
+class NoInstalledEngine(ValueError):
+    pass
+
+
 def config_path():
     if os.environ.get("AGENT_CONFIG"):
         return Path(os.environ["AGENT_CONFIG"]).expanduser()
@@ -41,7 +45,7 @@ def installed_engine():
         return "claude"
     if found:
         return found[0]
-    raise ValueError("no agent CLI found; install codex, claude, kimi, opencode or gemini, then use neoxider config set engine ENGINE")
+    raise NoInstalledEngine("no agent CLI found; install codex, claude, kimi, opencode or gemini, then use neoxider config set engine ENGINE")
 
 
 def launch_options(opts):
