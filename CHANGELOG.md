@@ -11,7 +11,9 @@ All notable changes to this project are documented here. Format follows
 - GitHub Actions release gate for Python 3.8 and 3.14 across Windows, Ubuntu and
   macOS, including PowerShell 5.1/7, Git Bash, Homebrew Bash and zsh completion.
   The gate checks plugin metadata and runs offline suites without provider credentials.
-
+- The Tasks tab renders unified patches from assistant diff fences and tool output with per-file
+  counts, old and new line numbers, and collapsible long hunks. A compact strip above the tree
+  shows active tasks, their model, age and latest activity, and opens the selected task in chat.
 - OpenCode free-tier routes (`opencode/<name>-free`, `big-pickle`) now get the reduced-tool chat profile (`neoxider-freetier`) automatically for bridge/probe traffic, so `openai-server -m opencode/deepseek-v4.1-flash-free` works without `AGENT_OPENCODE_FREETIER_COMPAT=1` instead of answering `FreeTierError` 403. Routes behind the user's own OpenCode login (`opencode auth login`, OAuth or API key) are not gated and keep the strict zero-tool profile; `AGENT_OPENCODE_FREETIER_COMPAT=1|0` still forces either profile. Tests in `tests/test_providers_core.py`.
 - `revive [NAME|GLOB...]` resumes settled `error`/`stopped` tasks in their SAVED session through the ordinary
   `send` path (one detached owner per task), behind safety gates: never running/idle/done/waiting, never a

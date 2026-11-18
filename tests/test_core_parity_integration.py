@@ -22,7 +22,7 @@ from neoxider_agents.runtime_profiles import RuntimeProfiles, RuntimeProfileErro
 from neoxider_agents.process import pid_alive
 from neoxider_agents.diagnostics import VerificationReceipt, source_hash, CostFact
 
-OUTPUT = Path('C:/AI/outputs/neoxider-parity-core-20261014') if os.name == 'nt' else Path(tempfile.gettempdir()) / 'neoxider-core'
+OUTPUT = Path(tempfile.gettempdir()) / 'neoxider-core'
 
 PROVIDER = '''import os, sys
 from neoxider_agents.providers import BaseProvider

@@ -126,6 +126,24 @@ real tool task with independently checked output verifies that case; `/models` r
 or a chat-only response does not prove file/tool execution. Preserve explicit native/CLI and
 model choices; task-local route diagnostics do not authorize global configuration changes.
 
+### Ultra / swarm mode
+
+Use `/ultra <objective>` or `ultra: <objective>` in a harness with the
+[neoxider-agents skill](SKILL.md). The coordinator can also activate ultra for
+three or more independent pieces that each justify 15 minutes of worker effort,
+or when the work requires independent review or verification across providers.
+
+```powershell
+neoxider swarm score
+neoxider swarm map set reviewer codex/spark/medium
+neoxider swarm plan "Review and verify the release changes"
+neoxider swarm record release-review --role reviewer --verdict pass --gate review:pass
+```
+
+`swarm plan` previews role routes, local memory hints and a token/cost estimate.
+The coordinator shows the plan before launching via `run` or `fan`, checks fresh
+reviewer and verifier gates, and records the evidence. See [Swarm memory and routing](docs/SWARM.md).
+
 ### Defaults and files
 
 | Setting | Default | Change it |
