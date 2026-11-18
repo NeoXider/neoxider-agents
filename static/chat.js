@@ -15,20 +15,29 @@ let dlgLimit = DLG_PAGE, dlgHasMore = false, dlgLoadingEarlier = false;
 let dlgData = null, dlgBlocks = new Map();
 let shownThoughts = new Set(), fullTools = new Set(), fullPrompts = new Set();
 
-function md(src) {
-  const blocks = [];
-  src = (src || "").replace(/```(\w*)\n?([\s\S]*?)```/g, (m, l, c) => {
-    blocks.push('<pre class="code"><code>' + esc(c) + "</code></pre>");
-    return "§" + (blocks.length - 1) + "§";
-  });
+function md(src, diffId, partial = false) {
+  src = src || "";
+  const fence = /^ {0,3}(`{3,})([^`\r\n]*)\r?\n([\s\S]*?)(^ {0,3}\1`*[ \t]*\r?(?:\n|$)|(?![\s\S]))/gm;
+  const fallback = text => '<pre class="code"><code>' + esc(text) + "</code></pre>";
+  let html = "", start = 0, n = 0;
+  for (const match of src.matchAll(fence)) {
+    const [, , language, code, closing] = match;
+    const diff = diffId && language.trim().toLowerCase() === "diff";
+    if (!closing && !(diff && partial)) break;
+    if (start < match.index) html += mdProse(src.slice(start, match.index).replace(/\r?\n$/, ""));
+    html += diff
+      ? renderDiff(code, diffId + ":f" + n, fallback, {allowUnnamed: true, partial: !closing})
+      : fallback(code);
+    n++;
+    start = match.index + match[0].length;
+  }
+  return html + (start < src.length || !html ? mdProse(src.slice(start)) : "");
+}
+
+function mdProse(src) {
   let out = [], inList = false;
   for (let raw of src.split("\n")) {
     let line = raw.trim();
-    if (/^§\d+§$/.test(line)) {
-      if (inList) { out.push("</ul>"); inList = false; }
-      out.push(line);
-      continue;
-    }
     let l = esc(raw).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
     let h = l.match(/^(#{1,6})\s+(.*)/);
     if (h) {
@@ -46,7 +55,7 @@ function md(src) {
     out.push(line === "" ? "<br>" : "<div>" + l + "</div>");
   }
   if (inList) out.push("</ul>");
-  return out.join("").replace(/§(\d+)§/g, (m, i) => blocks[+i]);
+  return out.join("");
 }
 
 /* One-line summary of a tool call's argument. JSON inputs show their most telling field
@@ -93,7 +102,11 @@ function toolBody(b, id) {
   const input = clipped(b.arg, id, TOOL_PREVIEW), output = clipped(b.result, id, TOOL_PREVIEW);
   let h = "";
   if (b.arg) h += `<div class="tio"><div class="tlabel">${esc(t("chat.tool_input"))}</div><pre>${esc(input.text)}</pre>${input.more}</div>`;
-  if (b.result) h += `<div class="tio"><div class="tlabel">${esc(t("chat.tool_output"))}</div><pre>${esc(output.text)}</pre>${output.more}</div>`;
+  if (b.result) {
+    const rendered = renderDiff(output.text, id + ":result", text => "<pre>" + esc(text) + "</pre>",
+      {partial: Boolean(output.more || b.truncated)});
+    h += `<div class="tio"><div class="tlabel">${esc(t("chat.tool_output"))}</div>${rendered}${output.more}</div>`;
+  }
   if (!b.arg && !b.result) h = `<div class="tio dim">${esc(t(b.status === "running" ? "chat.tool_running" : "chat.tool_no_output"))}</div>`;
   if (b.truncated) h += `<button class="linkbtn" data-show-whole>${esc(t("chat.truncated"))}</button>`;
   return h;
@@ -154,7 +167,7 @@ function renderStep(task, st, isLastLive) {
       agent += `<div class="sysnote" role="note">⚠ ${esc(b.text)}</div>`;
     } else {
       const trunc = b.truncated ? `<button class="linkbtn" data-show-whole>… ${esc(t("chat.truncated"))}</button>` : "";
-      agent += `<div class="bubble">${md(b.text)}</div>${trunc}`;
+      agent += `<div class="bubble">${md(b.text, id, b.truncated)}</div>${trunc}`;
     }
   }
   flush();
@@ -217,6 +230,13 @@ function loadEarlier() {
   if (btn) btn.innerHTML = spin(t("chat.loading"));
   loadThread(task, {keepPosition: true}).finally(() => { dlgLoadingEarlier = false; });
 }
+
+$("#chat").addEventListener("toggle", event => {
+  const id = event.target.dataset?.diffHunk;
+  if (!id) return;
+  if (event.target.open) openDiffHunks.add(id);
+  else openDiffHunks.delete(id);
+}, true);
 
 $("#chat").addEventListener("click", event => {
   const el = event.target.closest("button, [data-toggle-tool]");

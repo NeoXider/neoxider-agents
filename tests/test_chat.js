@@ -7,6 +7,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const crypto = require("node:crypto");
+const {splitUnifiedDiff} = require("../static/diff.js");
 
 function element() {
   return {
@@ -28,11 +29,11 @@ const document = {
 const storage = new Map();
 const posted = [];
 const context = vm.createContext({
-  document, crypto, URLSearchParams, console, setTimeout() {}, setInterval() {},
+  document, crypto, TextDecoder, URLSearchParams, console, setTimeout() {}, setInterval() {},
   localStorage: {getItem: k => storage.get(k) ?? null, setItem: (k, v) => storage.set(k, String(v))},
   window: {innerHeight: 800},
 });
-for (const file of ["util.js", "i18n.js", "tasktree.js", "fleet.js", "chat.js", "composer.js"]) {
+for (const file of ["util.js", "i18n.js", "tasktree.js", "fleet.js", "tree.js", "diff.js", "chat.js", "composer.js"]) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, "../static", file), "utf8"), context, {filename: file});
 }
 vm.runInContext(`
@@ -110,6 +111,84 @@ assert.ok(html.includes("outcome") && html.includes("provider failed"));
 context.__evil = {i: 0, kind: "run", ts: "", prompt: "", blocks: [{type: "tool", name: "<img src=x onerror=1>", arg: "<script>", status: "ok"}]};
 html = run("renderStep(__task, __evil, false)");
 assert.ok(!html.includes("<img src=x") && !html.includes("<script>"));
+
+// ---- diff parsing and rendering
+const diff = [
+  "diff --git a/<file>.txt b/<file>.txt", "index abcd..efab 100644", "--- a/<file>.txt", "+++ b/<file>.txt",
+  "@@ -2,2 +7,2 @@ section", " context", "--- old", "+++ <script>", "\\ No newline at end of file",
+  "@@ -40 +45 @@", "-another old", "+another new",
+  "--- /dev/null", '+++ "b/\\320\\260.txt"', "@@ -0,0 +1 @@", "+new file",
+  "--- a/deleted.txt", "+++ /dev/null", "@@ -5 +0,0 @@", "-deleted",
+].join("\r\n");
+const sections = splitUnifiedDiff("Output:\r\n" + diff + "\r\nDone");
+assert.equal(sections[0].text, "Output:");
+assert.equal(sections[4].text, "Done");
+const [first, added, removed] = sections.slice(1, 4).map(s => s.file);
+assert.deepEqual([first.oldPath, first.newPath, first.added, first.removed], ["<file>.txt", "<file>.txt", 2, 2]);
+assert.deepEqual(first.hunks[0].rows.map(r => [r.kind, r.oldLine, r.newLine]), [
+  ["context", 2, 7], ["remove", 3, undefined], ["add", undefined, 8], ["note", undefined, undefined],
+]);
+assert.equal(first.hunks[1].rows[1].newLine, 45);
+assert.deepEqual([added.oldPath, added.newPath, added.hunks[0].rows[0].newLine], ["/dev/null", "а.txt", 1]);
+assert.deepEqual([removed.newPath, removed.hunks[0].rows[0].oldLine], ["/dev/null", 5]);
+const incomplete = "--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-before\n+after";
+assert.deepEqual(splitUnifiedDiff(incomplete), [{text: incomplete}]);
+assert.equal(splitUnifiedDiff(incomplete, {partial: true})[0].file.added, 1);
+assert.equal(splitUnifiedDiff("--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\nunexpected")[1].text, "unexpected");
+assert.deepEqual(splitUnifiedDiff("ordinary\n+ output\n- no patch"), [{text: "ordinary\n+ output\n- no patch"}]);
+const rename = splitUnifiedDiff("diff --git a/old b/new\nsimilarity index 100%\nrename from old\nrename to new");
+assert.deepEqual([rename[0].file.oldPath, rename[0].file.newPath, rename[0].file.hunks.length], ["old", "new", 0]);
+
+context.__diff = diff;
+context.__patchStep = {
+  i: 29, kind: "run", blocks: [
+    {type: "text", text: "**Changes**\r\n```diff\r\n" + diff + "\r\n```\r\nAfter"},
+    {type: "tool", name: "apply_patch", result: "Output:\n" + diff},
+    {type: "text", text: "```c++\n" + diff + "\n```"},
+  ],
+};
+run('expandedTools.add("orch:29:1")');
+html = run("renderStep(__task, __patchStep, false)");
+assert.equal((html.match(/class="diff-file"/g) || []).length, 6);
+assert.match(html, /<b>Changes<\/b>.*diff-header/s);
+assert.match(html, /class="diff-plus">\+2<\/span><span class="diff-minus">-2/);
+assert.match(html, /class="diff-number">2<\/td><td class="diff-number">7<\/td>/);
+assert.ok(html.includes("&lt;file&gt;.txt") && html.includes("&lt;script&gt;") && !html.includes("<script>"));
+assert.ok(html.includes("<pre>Output:</pre>") && html.includes('<pre class="code"><code>'));
+context.__longDiff = "--- a/x\n+++ b/x\n@@ -0,0 +1,50 @@\n" + Array.from({length: 50}, () => "+" + "x".repeat(90)).join("\n");
+html = run('toolBody({result: __longDiff}, "long")');
+const hunkKey = html.match(/data-diff-hunk="([^"]+)">/)[1];
+assert.ok(html.includes("data-full-tool") && !html.includes("diff-number\">50<"));
+elements["#chat"].listeners.toggle({target: {dataset: {diffHunk: hunkKey}, open: true}});
+assert.ok(run('toolBody({result: __longDiff}, "long")').includes('data-diff-hunk="' + hunkKey + '" open'));
+run('fullTools.add("long")');
+assert.ok(run('toolBody({result: __longDiff}, "long")').includes('class="diff-number">50<'));
+elements["#chat"].listeners.toggle({target: {dataset: {diffHunk: hunkKey}, open: false}});
+assert.ok(!run('toolBody({result: __longDiff}, "long")').includes('data-diff-hunk="' + hunkKey + '" open'));
+assert.ok(run('md("```diff\\n" + __longDiff.slice(0, 4000), "assistant", true)').includes("diff-hunk"));
+
+const strip = elements["#active-task-list"];
+strip.contains = () => false;
+strip.scrollLeft = 50;
+context.__liveTasks = [
+  {name: "closed", state: "done"}, {name: "parent", state: "done", dir: "other"},
+  {name: "child", state: "idle", idle_sec: 500, parent: "parent", engine: "codex", model: "sol", dir: "child-dir",
+    age_sec: 95, last_activity: {kind: "tool", age_sec: 20}},
+  {name: "running<img>", state: "running", engine: "claude", model: "sonnet", age_sec: 4},
+];
+run("renderActiveTasks(__liveTasks)");
+assert.equal(elements["#active-tasks"].hidden, false);
+assert.ok(strip.innerHTML.includes("s-idle") && strip.innerHTML.includes("codex/sol") &&
+  strip.innerHTML.includes("1m 35s") && strip.innerHTML.includes("tool · 20s"));
+assert.ok(!strip.innerHTML.includes("closed") && strip.innerHTML.includes("running&lt;img&gt;"));
+assert.equal(strip.scrollLeft, 50);
+run(`treeModel = buildTaskTree(__liveTasks); treeFilter = "hide-child"; treeStateFilter = "done";
+  collapsed = new Set(["other"]); collapsedNodes = new Set(["parent"]);`);
+strip.listeners.click({target: {closest: () => ({dataset: {activeTask: "child"}})}});
+assert.ok(run('SEL === "child" && !collapsed.has("other") && !collapsedNodes.has("parent")'));
+assert.ok(run('!treeFilter && !treeStateFilter && revealActiveTask === "child"'));
+run("renderActiveTasks([])");
+assert.equal(elements["#active-tasks"].hidden, true);
 
 // ---- sending: stable UUID, Enter-to-send body, interrupt (send --now) and next-turn model/effort
 const submission = run(`beginMessageSubmission("orch")`);

@@ -19,6 +19,7 @@ TOKEN = re.compile(r"(?<![\w])(?:[A-Za-z0-9_+/=-]{32,})(?![\w])")
 AUTH = re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+|basic\s+)?[^\s,;\"}]+")
 SECRET = re.compile(r"(?i)([\"']?(?:api[_-]?key|access[_-]?token|password|secret|token)[\"']?\s*[:=]\s*[\"']?)[^\s,;\"'}]+")
 SECRET_KEYS = re.compile(r"(?i)^(?:authorization|api[_-]?key|access[_-]?token|password|secret|token)$")
+_DIFF_HUNK_MARKER = re.compile(r"(?m)^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
 
 
 PATH_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -37,11 +38,36 @@ def _path_like(candidate):
     return len(parts) >= 2 and all(PATH_SEGMENT.match(part) for part in parts)
 
 
-def redact(text):
+def redact(text, *, preserve_diff_markers=False):
     """Mask headers, named credentials, and long opaque credential-like strings."""
-    value = AUTH.sub(r"\1[REDACTED]", str(text))
-    value = SECRET.sub(r"\1[REDACTED]", value)
-    return TOKEN.sub(lambda m: m.group(0) if _path_like(m.group(0)) else "[REDACTED]", value)
+    value = str(text)
+    preserve_markers = preserve_diff_markers and _DIFF_HUNK_MARKER.search(value)
+
+    def mask_span(source, start, end):
+        if not preserve_markers:
+            return "[REDACTED]"
+
+        def mask_line(part):
+            offset = start + part.start()
+            marker = source[offset] if (source[offset] in "+-" and
+                                        (not offset or source[offset - 1] == "\n")) else ""
+            return marker + "[REDACTED]"
+
+        # A credential matcher may span lines or consume a leading +/- as part of the secret.
+        return re.sub(r"[^\r\n]+", mask_line, source[start:end])
+
+    def mask_named(match):
+        return match.group(1) + mask_span(match.string, match.end(1), match.end())
+
+    def mask_opaque(match):
+        token = match.group(0)
+        if _path_like(token):
+            return token
+        return mask_span(match.string, match.start(), match.end())
+
+    value = AUTH.sub(mask_named, value)
+    value = SECRET.sub(mask_named, value)
+    return TOKEN.sub(mask_opaque, value)
 
 
 SHELL_WRAPPER = re.compile(

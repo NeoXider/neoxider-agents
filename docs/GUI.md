@@ -171,6 +171,19 @@ by default and forwards `--progress`, requesting `PROGRESS.<task>.md` only when 
   "thinking hidden · show" marker and their text is not in the DOM until shown (per message via
   `shownThoughts`, globally via 💭, persisted as `agentgui_show_thinking`). Long prompts are clipped
   at 700 chars with "show all".
+- **Unified diffs** (`static/diff.js`). The chat renders assistant fences labelled `diff` and
+  unified patches in expanded tool output, including output from `git diff` and tools that
+  return patch text. Each file shows its path and visible addition/removal counts. Hunk rows
+  show old and new line numbers and use theme colours for additions and deletions. Hunks with
+  more than 24 rows start collapsed and keep their expansion on refresh and when loading
+  earlier steps. The parser works on redacted text and preserves surrounding tool output.
+  Existing output limits and show-all controls still apply. Fleet's cached delta is a file
+  summary, and the Tasks tab does not run `diff NAME` on selection.
+- **Active tasks**. The Tasks tab shows a horizontally scrollable strip above the tree when
+  any tasks are running or idle. Each button shows the state, task name, provider/model, age
+  since the original launch, and the latest recorded activity. Selecting a button opens the
+  chat and reveals the task in the tree, expanding its project and ancestors and clearing
+  filters if they hide the task. The strip refreshes with `/api/tasks` every three seconds.
 - **Composer** (`static/composer.js`): Enter sends, Shift+Enter (or IME composition) inserts a new
   line. `buildSendRequest()` is the exact `/api/task/send` body: `{task, message, message_id, terminal,
   now, model?, effort?}`; `message_id` is a fresh 32-hex UUID per message (`beginMessageSubmission`
