@@ -407,6 +407,18 @@ def queued_messages(name):
         return 0
 
 
+def task_age(meta, now):
+    for key in ("task_started_epoch", "started_epoch"):
+        try:
+            stamp = float(meta.get(key, ""))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(stamp) and stamp > 0:
+            return max(0, int(now - stamp))
+    stamp = _ts_epoch(meta.get("started", ""))
+    return max(0, int(now - stamp)) if stamp is not None else None
+
+
 def list_tasks():
     nowt = time.time()
     out = []
@@ -439,6 +451,7 @@ def list_tasks():
             "exit": meta.get("exit", ""),
             "session": (meta.get("session", "") or "")[:8],
             "started": meta.get("started", ""),
+            "age_sec": task_age(meta, nowt) if st in LIVE_STATES else None,
             "kind": meta.get("kind", ""),  # "api-test" for agent.sh test-api tasks, else ""
             "timeout": meta.get("timeout", ""),  # set when the step watchdog killed the task (exit 124)
             "reason": _activity.redact(meta.get("reason", ""))[:500],
@@ -979,7 +992,7 @@ def _redact_steps(steps):
         for b in st.get("blocks") or []:
             for fld in ("text", "arg", "result"):
                 if isinstance(b.get(fld), str) and b[fld]:
-                    b[fld] = _activity.redact(b[fld])
+                    b[fld] = _activity.redact(b[fld], preserve_diff_markers=fld in ("text", "result"))
     return steps
 
 

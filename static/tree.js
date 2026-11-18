@@ -77,6 +77,58 @@ function renderNodeRow(node, level) {
 
 function treeFilterActive() { return !!(treeFilter.trim() || treeStateFilter); }
 
+let revealActiveTask = "";
+
+function renderActiveTasks(tasks) {
+  const panel = $("#active-tasks"), list = $("#active-task-list");
+  const live = tasks.filter(task => isLive(task.state)).sort((a, b) => a.name.localeCompare(b.name));
+  panel.hidden = !live.length;
+  $("#active-tasks-label").textContent = t("tree.active_tasks").replace("{n}", live.length);
+  const html = live.map(task => {
+    const state = task.state === "idle" ? stateLabel(task.state, task.idle_sec) : t("chat.running");
+    const age = fmtDur(task.age_sec) || "—";
+    const activity = task.last_activity?.kind
+      ? task.last_activity.kind + " · " + fmtDur(task.last_activity.age_sec)
+      : t("tree.active_no_activity");
+    const activityLabel = t("tree.active_activity").replace("{activity}", () => activity);
+    const model = task.engine + "/" + task.model;
+    return `<button type="button" class="active-task" data-active-task="${esc(task.name)}"
+        aria-current="${task.name === SEL}" title="${esc(task.name)}">
+      <span class="sdot ${stateClass(task.state)}" role="img" aria-label="${esc(state)}" title="${esc(state)}"></span>
+      <b>${esc(task.name)}</b>
+      <span title="${esc(t("tree.active_age").replace("{age}", age))}">${esc(age)}</span>
+      <span class="active-meta" title="${esc(model)}">${esc(model)}</span>
+      <span class="active-meta" title="${esc(activityLabel)}">${esc(activity)}</span>
+    </button>`;
+  }).join("");
+  if (html === renderActiveTasks.lastHtml) return;
+  renderActiveTasks.lastHtml = html;
+  const focused = list.contains(document.activeElement) && document.activeElement.dataset.activeTask;
+  const scroll = list.scrollLeft;
+  list.innerHTML = html;
+  list.scrollLeft = scroll;
+  if (focused) {
+    const button = [...list.children].find(item => item.dataset.activeTask === focused);
+    if (button) button.focus({preventScroll: true});
+  }
+}
+
+$("#active-task-list").addEventListener("click", event => {
+  const name = event.target.closest("[data-active-task]")?.dataset.activeTask;
+  const node = treeModel?.byName.get(name);
+  if (!node || !isLive(node.task.state)) return;
+  const visible = filterTaskTree(treeModel, treeFilter, treeStateFilter);
+  if (visible && !visible.has(name)) {
+    $("#tree-filter").value = treeFilter = "";
+    $("#tree-state").value = treeStateFilter = "";
+  }
+  let root = node;
+  while (root.parent) root = root.parent;
+  if (collapsed.delete(root.task.dir)) saveNameSet(PROJ_KEY, collapsed);
+  revealActiveTask = name;
+  select(name);
+});
+
 async function refresh() {
   if (_refreshing) { _refreshQueued = true; return; }
   _refreshing = true;
@@ -98,7 +150,15 @@ async function refresh() {
   }
   if (!$("#f-dir").value) $("#f-dir").value = activeDir;
   notifyTransitions(d.tasks);
+  renderActiveTasks(d.tasks);
   renderTree(d);
+  if (revealActiveTask) {
+    if (revealActiveTask === SEL) {
+      const row = [...$("#tree").querySelectorAll("[data-task]")].find(el => el.dataset.task === SEL);
+      row?.scrollIntoView({block: "nearest", inline: "nearest"});
+    }
+    revealActiveTask = "";
+  }
   if (SEL) {
     const task = d.tasks.find(x => x.name === SEL);
     if (task) await loadThread(task);

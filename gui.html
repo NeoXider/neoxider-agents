@@ -27,6 +27,10 @@
 </div>
 
 <div class="tabview on" id="tabview-tasks">
+<nav id="active-tasks" aria-labelledby="active-tasks-label" hidden>
+  <span id="active-tasks-label"></span>
+  <div id="active-task-list"></div>
+</nav>
 <main>
   <!-- LEFT: project → subagent tree (any depth) -->
   <div id="left">
@@ -203,6 +207,7 @@
 <script src="/static/toast.js"></script>
 <script src="/static/tasktree.js"></script>
 <script src="/static/tree.js"></script>
+<script src="/static/diff.js"></script>
 <script src="/static/chat.js"></script>
 <script src="/static/modals.js"></script>
 <script src="/static/splitters.js"></script>

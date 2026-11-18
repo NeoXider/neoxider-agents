@@ -2442,6 +2442,31 @@ class ChatPayloadHistoryTests(unittest.TestCase):
         self.assertNotIn(secret, dumped)
         self.assertIn("REDACTED", dumped)
 
+    def test_diff_text_and_tool_results_keep_syntax_after_redaction(self):
+        secret = "A1b2C3d4" * 6
+        patch = ("--- a/file\n+++ b/file\n@@ -1,3 +1,4 @@ label\n-old\n-" + secret
+                 + "\n+" + secret + "\n+token=\n+shortSecret\n context")
+        events = [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "```diff\n" + patch + "\n```"}},
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "git diff",
+                                                "aggregated_output": patch, "exit_code": 0}},
+            {"type": "item.completed", "item": {"type": "custom_tool_call", "name": "apply_patch",
+                                                "output": "Output:\n" + patch}},
+        ]
+        self.write("diff", "\n".join(json.dumps(event) for event in events))
+        blocks = gui.dialog_payload("diff")["steps"][0]["blocks"]
+        redacted = patch.replace(secret, "[REDACTED]").replace("shortSecret", "[REDACTED]")
+        self.assertEqual(blocks[0]["text"], "```diff\n" + redacted + "\n```")
+        self.assertEqual(blocks[1]["result"], redacted)
+        self.assertEqual(blocks[2]["result"], "Output:\n" + redacted)
+
+    def test_live_task_age_uses_original_start_and_supports_legacy_timestamps(self):
+        legacy = "2026-08-12 10:00:00"
+        self.assertEqual(gui.task_age({"task_started_epoch": "100", "started_epoch": "160"}, 200), 100)
+        self.assertEqual(gui.task_age({"task_started_epoch": "NaN", "started_epoch": "160"}, 200), 40)
+        self.assertEqual(gui.task_age({"started": legacy}, gui._ts_epoch(legacy) + 8), 8)
+        self.assertIsNone(gui.task_age({}, 200))
+
     def test_pending_inbox_messages_and_outcome(self):
         self.write("q", "\n========== [run] 2026-08-12 10:00:00 | e ==========\n> PROMPT:\ngo\n"
                         "---------- output ----------\nworking\n",
