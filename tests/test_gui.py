@@ -31,6 +31,7 @@ import tempfile
 import shutil
 import types
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(HERE)
@@ -1348,47 +1349,23 @@ class KillPidTypeStrictnessTests(unittest.TestCase):
             self.assertIn("non-integer", msg)
 
     def test_positive_int_pid_still_reaches_the_backend_once(self):
-        calls = []
-        orig_run = gui.subprocess.run
-        orig_os_name = os.name
-        if orig_os_name != "nt":
-            os.name = "nt"
-
-        def fake_run(args, **kw):
-            calls.append(list(args))
-            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"", args=args)
-
-        gui.subprocess.run = fake_run
-        try:
-            self.assertTrue(gui.kill_pid(4242))
-        finally:
-            gui.subprocess.run = orig_run
-            if orig_os_name != "nt":
-                os.name = orig_os_name
-        self.assertEqual(calls, [["taskkill", "/F", "/T", "/PID", "4242"]])
+        self.assert_positive_pid_reaches_backend(4242, 4242)
 
     def test_positive_string_pid_is_still_accepted(self):
-        # integer-form strings remain compatible (registry JSON round-trips pids as text)
-        calls = []
-        orig_run = gui.subprocess.run
-        orig_os_name = os.name
-        if orig_os_name != "nt":
-            os.name = "nt"
+        self.assert_positive_pid_reaches_backend("4242", 4242)
+        self.assert_positive_pid_reaches_backend(" 4243 ", 4243)
 
-        def fake_run(args, **kw):
-            calls.append(list(args))
-            return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"", args=args)
-
-        gui.subprocess.run = fake_run
-        try:
-            self.assertTrue(gui.kill_pid("4242"))
-            self.assertTrue(gui.kill_pid(" 4243 "))
-        finally:
-            gui.subprocess.run = orig_run
-            if orig_os_name != "nt":
-                os.name = orig_os_name
-        self.assertEqual(calls, [["taskkill", "/F", "/T", "/PID", "4242"],
-                                 ["taskkill", "/F", "/T", "/PID", "4243"]])
+    def assert_positive_pid_reaches_backend(self, value, expected_pid):
+        with mock.patch.object(gui.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)) as run, \
+                mock.patch.object(gui.os, "kill") as kill:
+            self.assertTrue(gui.kill_pid(value))
+        if os.name == "nt":
+            run.assert_called_once()
+            self.assertEqual(run.call_args[0][0], ["taskkill", "/F", "/T", "/PID", str(expected_pid)])
+            kill.assert_not_called()
+        else:
+            kill.assert_called_once_with(expected_pid, 15)
+            run.assert_not_called()
 
 
 class RestartBridgeTests(unittest.TestCase):
@@ -2245,19 +2222,15 @@ class GuiLoggingTests(unittest.TestCase):
             gui.urllib.request.urlopen = orig
 
     def test_kill_pid_failure_warns_with_exception_type_only(self):
-        orig_run = gui.subprocess.run
-
         class Boom(RuntimeError):
             pass
 
         def raising_run(*a, **k):
             raise Boom("taskkill internal detail should-not-be-logged")
-        gui.subprocess.run = raising_run
-        try:
+        backend, method = (gui.subprocess, "run") if os.name == "nt" else (gui.os, "kill")
+        with mock.patch.object(backend, method, side_effect=raising_run):
             with self.assertLogs(gui.LOG, level=logging.WARNING) as cm:
                 self.assertFalse(gui.kill_pid(424242))
-        finally:
-            gui.subprocess.run = orig_run
         msg = cm.records[0].getMessage()
         self.assertIn("Boom", msg)          # exception type is fine
         self.assertIn("424242", msg)        # pid is fine

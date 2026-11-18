@@ -242,13 +242,17 @@ class TrackingTests(unittest.TestCase):
         import hashlib
         import stat
         from types import SimpleNamespace
-        path = self.put("link.txt", "must not capture")
+        path = self.put("link.txt", "must not capture").resolve()
         original = Path.lstat
+        readlink = os.readlink
         def link_stat(item):
             info = original(item)
             return SimpleNamespace(st_mode=stat.S_IFLNK, st_size=info.st_size, st_mtime_ns=info.st_mtime_ns) if item == path else info
-        with mock.patch.object(Path, "lstat", link_stat), \
-                mock.patch.object(os, "readlink", return_value="../private/secret"):
+        def link_target(item, *args, **kwargs):
+            return "../private/secret" if Path(item) == path else readlink(item, *args, **kwargs)
+        with mock.patch.object(reporting, "_git_listed_files", return_value=None), \
+                mock.patch.object(Path, "lstat", link_stat), \
+                mock.patch.object(os, "readlink", side_effect=link_target):
             self.seed()
         entry = reporting.read_baseline(self.store, "task")["files"]["link.txt"]
         self.assertEqual(entry["type"], "symlink")

@@ -60,6 +60,13 @@ jobs:
         env:
           TEST_TEMP: ${{ runner.temp }}
         run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            TEST_TEMP="$(cygpath -m "$TEST_TEMP")"
+          fi
+          mkdir -p "$TEST_TEMP/neoxider-fixtures"
+          echo "TEMP=$TEST_TEMP/neoxider-fixtures" >> "$GITHUB_ENV"
+          echo "TMP=$TEST_TEMP/neoxider-fixtures" >> "$GITHUB_ENV"
+          echo "TMPDIR=$TEST_TEMP/neoxider-fixtures" >> "$GITHUB_ENV"
           echo "AGENT_CLI_LOGS=$TEST_TEMP/neoxider-state" >> "$GITHUB_ENV"
           echo "AGENT_CONFIG=$TEST_TEMP/neoxider-config/config.json" >> "$GITHUB_ENV"
       - name: Add Homebrew Bash and legacy test tools

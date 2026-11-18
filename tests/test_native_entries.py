@@ -131,8 +131,11 @@ class NativeEntryTests(unittest.TestCase):
         merged = self.invoke_ps(arguments, redirect=" 2>&1 | ForEach-Object { \"$_\" }")
         self.assertEqual(merged.returncode, 5, merged.stdout + merged.stderr)
         lines = merged.stdout.splitlines()
-        self.assertIn("[neoxider] baseline partial: warning", lines)
-        self.assertEqual(json.loads(lines[-1]), arguments)
+        warning = "[neoxider] baseline partial: warning"
+        self.assertIn(warning, lines)
+        # Windows reads stdout and stderr independently, so a merge can reorder them.
+        answer, = [line for line in lines if line != warning]
+        self.assertEqual(json.loads(answer), arguments)
 
     def test_planted_stop_preference_defect_is_detected(self):
         # Whether stdout survives depends on stream timing; the lost exit code is deterministic.

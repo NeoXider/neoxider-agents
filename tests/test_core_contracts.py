@@ -180,7 +180,8 @@ class Contracts(unittest.TestCase):
             return 0
         path = self.folder / "api.json"
         with patch.object(lifecycle, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
-            code = cli.dispatch("test-api", dict(base_url=body["base_url"], goal="fixture", name="task", out=str(path)), [], self.store)
+            code = cli.dispatch("test-api", dict(base_url=body["base_url"], goal="fixture", name="task",
+                                                out=str(path), engine="codex"), [], self.store)
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), body)
         self.assertIn('"overall"', captured[0])

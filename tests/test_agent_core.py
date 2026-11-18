@@ -213,8 +213,15 @@ class CoreTests(unittest.TestCase):
         sid = self.store.session("task")
         job.kill()
         job.communicate(timeout=8)
+        if os.name == "nt":
+            self.assertIn("launcher stopped", self.okay("status", "task"))
+        else:
+            # A POSIX SIGKILL cannot run the launcher's cleanup handler.
+            try:
+                self.assertIn("orphaned provider alive", self.okay("status", "task"))
+            finally:
+                self.okay("stop", "task")
         self.until(lambda: not pid_alive(child))
-        self.assertIn("launcher stopped", self.okay("status", "task"))
         self.assertIn("■ STOPPED", self.okay("result", "task"))
         self.okay("send", "task", "--no-progress", "RECOVER")
         self.assertEqual(self.store.session("task"), sid)

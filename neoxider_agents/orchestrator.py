@@ -833,13 +833,13 @@ class AgentClient:
         """Compact retained result built from the same collector as `neoxider result --json`."""
         from .ux_tracking import collect_result
         name, handle = self._resolve(ref)
-        self._read_owned(name, handle)
+        meta = self._read_owned(name, handle)
         data = collect_result(self.store, name, verification_receipts=verification_receipts,
                               current_source_hash=current_source_hash, cost_facts=cost_facts, cost_decision=cost_decision)
         changes = tuple({"path": entry.get("path", ""), "status": entry.get("status", ""),
                          "insertions": entry.get("insertions"), "deletions": entry.get("deletions")}
                         for entry in data.get("changed_files", []))
-        meta = self.store.read(name) or {}
+        meta = self.store.read(name) or meta
         owns = tuple(part.strip() for part in str(meta.get("owns", "")).split(",") if part.strip())
         if handle is not None:
             handle.state = data.get("state", handle.state)

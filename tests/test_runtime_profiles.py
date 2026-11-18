@@ -241,7 +241,7 @@ class Profiles(unittest.TestCase):
 
     def test_actual_version_probe_receipt_and_tamper(self):
         import platform
-        self.profiles.create('probe', 'opencode', sys.executable, version='supplied')
+        self.profiles.create('probe', 'opencode', Path(sys.executable).resolve(), version='supplied')
         manifest = (self.root / 'probe' / 'manifest.json').read_bytes()
         self.assertIsNone(self.profiles.version_receipt('probe'))
         receipt = self.profiles.probe_version('probe', base_env={'OPENAI_API_KEY': 'DO-NOT-PASS'})
@@ -261,15 +261,16 @@ class Profiles(unittest.TestCase):
 
     def test_probe_timeout_overflow_nonzero_and_no_credentials(self):
         original_popen = subprocess.Popen
+        executable = str(Path(sys.executable).resolve())
         for i, script in enumerate(("import time; time.sleep(10)",
                                     "import sys; sys.stdout.write('x'*100000); sys.stdout.flush()",
                                     "import sys; sys.exit(5)")):
             task = 'probe-%s' % i
-            self.profiles.create(task, 'opencode', sys.executable,
+            self.profiles.create(task, 'opencode', executable,
                                  credential_env_keys=('OPENAI_API_KEY',))
             launched = []
             def launch(argv, **kwargs):
-                self.assertEqual(argv, [sys.executable, '--version'])
+                self.assertEqual(argv, [executable, '--version'])
                 self.assertFalse(kwargs['shell'])
                 self.assertNotIn('OPENAI_API_KEY', kwargs['env'])
                 if os.name == 'nt':
