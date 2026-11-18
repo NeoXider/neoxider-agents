@@ -421,6 +421,8 @@ class CoreTests(unittest.TestCase):
         if not bash:
             self.skipTest("Bash migration fixture unavailable")
         job = self.start()
+        # start() waits for provider_pid; the owner's own pid lands a moment later (race seen on CI Windows).
+        self.until(lambda: self.store.read("task").get("pid"))
         owner = self.store.read("task")["pid"]
         old = subprocess.run([bash, (ROOT / "legacy/agent.sh").as_posix(), "send", "task", "LEGACY QUEUE"],
                              env=self.env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
