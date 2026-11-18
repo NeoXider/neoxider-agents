@@ -59,6 +59,27 @@ For either ultra trigger, follow this sequence:
    pass|fail --gate review:pass --gate verify:pass` using the actual outcomes (`pass`, `fail`
    or `n/a` per gate). A worker never records its own score.
 
+Two clarifications from the first live ultra run (2026-11-18):
+
+- **No human in the loop (a delegated ultra task).** When ultra runs inside a worker or any
+  non-interactive session, "show the plan and wait for confirmation" means: print the plan, routes
+  and estimate into the task output FIRST, then proceed - the delegating coordinator already
+  approved the objective and the routes (`ultra map`). Stay inside the limits the brief gave
+  (worker count, routes, no Unity/shared-resource operations reserved to the coordinator).
+- **Do not override `AGENT_PARENT`.** Every child launched from inside your task inherits
+  `AGENT_PARENT=<your task>` automatically, which is what makes the GUI tree, `stop --all-mine`
+  and `pending` work for the wave. Setting it to an invented wave id detaches the children from
+  your task. Name the wave in task names (`<wave>-impl-x`, `<wave>-review-x`) instead.
+
+Live result of the first ultra run (one `codex/gpt-6.2-sol/medium` coordinator, objective "compile
+the next assembly layer of a reconstructed Unity project", 4 independent pieces): read both skills,
+ran `ultra score`/`ultra map`/`ultra plan` and `status --active` before launching, started 4
+implementers with `--owns ... --strict-owns`, 3 fresh read-only reviewers and 1 verifier (two
+reviewers FAILED pieces; the fixes went back through `send --now`), re-measured everything itself,
+and wrote 4 honest `swarm record`s (one implementer recorded `review=fail` although it compiled,
+because runtime integration was still blocked). 4 assemblies 10,166 -> 0 errors in ~45 min; the
+outer coordinator confirmed with a real Unity run. Only defect found: the overridden `AGENT_PARENT`.
+
 P0's keyword lives in this skill. The `swarm` CLI verb has the alias `ultra`, so
 `ultra score` and `ultra plan` use the same memory and advisory role template.
 See [Swarm memory and routing](docs/SWARM.md) for the CLI and storage details.
