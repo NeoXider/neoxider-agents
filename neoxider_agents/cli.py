@@ -23,6 +23,7 @@ COMMANDS = {
     "clean": "[--all] [--purge] [-n|--dry-run]", "prune": "[--all] [--purge] [-n|--dry-run]",
     "doctor": "[--deep|--json]", "provider-info": "ENGINE",
     "models": "[-e ENGINE] [--provider ID] [-m MODEL] [--refresh] [--json]",
+    "swarm": "record TASK --role ROLE --verdict pass|fail --gate review:pass|fail|n/a [--note TEXT] [--override TEXT] | score [--json] | map show|set ROLE ROUTE[,ROUTE...]|unset ROLE | plan OBJECTIVE [--route ENGINE/MODEL] [--json]",
     "probe": "[-e opencode] -m MODEL [-f EFFORT] [-t NAME] [--timeout SECONDS] [--standard] [--json]",
     "test-api": "--base-url URL --goal TEXT [--out F] [-e ENGINE] [-m MODEL] [-f EFFORT] [-C DIR] [-t NAME]",
     "gui": "[PORT] [--lan] [--localhost] [--token SECRET]",
@@ -43,6 +44,9 @@ def usage(command=""):
             print("Progress off, quiet output and bounded ephemeral raw logs. Use --progress, -v and --log to opt in. --debug shows tracebacks.")
         if command == "config":
             print("Config: AGENT_CONFIG, else %APPDATA%/neoxider-agents/config.json on Windows; ~/.config/neoxider-agents/config.json elsewhere.")
+        if command == "swarm":
+            print("Map routes use ENGINE/MODEL/EFFORT (use 'default' for provider effort).")
+            print("Record also accepts --gate verify:pass|fail|n/a. Plan is advisory only.")
         if command == "brief":
             print("Pipe the contract: neoxider brief --outcome TEXT --owns GLOBS | neoxider run -t NAME -")
         if command == "completion":
@@ -105,6 +109,10 @@ def parse(command, argv):
         switches.update(("--json", "--detail", "--strict"))
     if command == "result":
         switches.add("--json")
+    if command == "swarm":
+        operands.update({"--role": "role", "--verdict": "verdict", "--gate": "gate",
+                         "--note": "note", "--override": "override", "--route": "route"})
+        switches.add("--json")
     if command == "diff":
         switches.update(("--stat", "--names"))
     if command == "brief":
@@ -161,7 +169,11 @@ def parse(command, argv):
                 continue
             if value.startswith("-") and value != "-":
                 raise ValueError("%s: option '%s' needs an operand (got option '%s')" % (command, argument, value))
-            result[operands[argument]] = value
+            key = operands[argument]
+            if command == "swarm" and key in ("gate", "override"):
+                result.setdefault(key, []).append(value)
+            else:
+                result[key] = value
         elif argument in switches:
             result[argument] = True
         elif argument.startswith("-") and argument != "-":
@@ -229,6 +241,9 @@ def task_name(store, prompt):
 
 
 def dispatch(command, opts, args, store):
+    if command == "swarm":
+        from .swarm import command as swarm
+        return swarm(store, args, opts)
     from . import views
     from .state import valid_name
     opts["terminal"] = opts.get("--terminal", False)
