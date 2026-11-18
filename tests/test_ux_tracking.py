@@ -21,7 +21,7 @@ from neoxider_agents.process import hidden_kwargs
 
 class TrackingTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/tracking/tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-ux/tracking/tests"
+        base = Path(tempfile.gettempdir()) / "agents-ux/tracking/tests"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="tracking-", dir=str(base))
         self.base = Path(self.temp.name)
@@ -573,7 +573,7 @@ DEFECTS = [
 
 
 def prove_defects():
-    base = Path("D:/Temp/agents-ux/tracking/proofs") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-ux/tracking/proofs"
+    base = Path(tempfile.gettempdir()) / "agents-ux/tracking/proofs"
     base.mkdir(parents=True, exist_ok=True)
     records = []
     for label, module, original, replacement, test in DEFECTS:

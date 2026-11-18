@@ -180,6 +180,10 @@ def main():
                          "(also asserts that an unauthenticated call is rejected with 401)")
     args = ap.parse_args()
 
+    if os.environ.get("NEOXIDER_SKIP_LIVE") == "1" or os.environ.get("GITHUB_ACTIONS") == "true":
+        print("SKIP: live provider smoke requires credentials and consumes provider usage.")
+        return 0
+
     supports_resume = load_supports_resume(args.engine)
     scratch_logdir = tempfile.mkdtemp(prefix="openai-server-smoke-logs-")
     env = dict(os.environ)

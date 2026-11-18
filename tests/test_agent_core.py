@@ -17,9 +17,12 @@ from neoxider_agents.process import hidden_kwargs, pid_alive, pid_stamp
 from neoxider_agents.lifecycle import looks_waiting
 
 
+TIMEOUT_MULTIPLIER = int(os.environ.get("AGENT_TEST_TIMEOUT_MULTIPLIER", "1"))
+
+
 class CoreTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core"
+        base = Path(tempfile.gettempdir()) / "agents-core"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="core-", dir=str(base))
         self.base = Path(self.temp.name)
@@ -62,9 +65,10 @@ class CoreTests(unittest.TestCase):
     def cli(self, *argv, env=None):
         try:
             return subprocess.run([sys.executable, str(ROOT / "agent.py"), *argv], cwd=str(ROOT), env=env or self.env,
-                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace", timeout=20, **hidden_kwargs())
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
+                                  timeout=20 * TIMEOUT_MULTIPLIER, **hidden_kwargs())
         except subprocess.TimeoutExpired:
-            self.fail("CLI did not return within 20s: " + " ".join(argv[:2]))
+            self.fail("CLI did not return within %ss: %s" % (20 * TIMEOUT_MULTIPLIER, " ".join(argv[:2])))
 
     def okay(self, *argv, env=None):
         result = self.cli(*argv, env=env)
@@ -72,7 +76,7 @@ class CoreTests(unittest.TestCase):
         return result.stdout
 
     def until(self, predicate, seconds=10):
-        deadline = time.monotonic() + seconds
+        deadline = time.monotonic() + seconds * TIMEOUT_MULTIPLIER
         while time.monotonic() < deadline:
             if predicate():
                 return
@@ -94,9 +98,9 @@ class CoreTests(unittest.TestCase):
 
     def finish(self, job, code=0):
         try:
-            answer = job.communicate(timeout=12)[0]
+            answer = job.communicate(timeout=12 * TIMEOUT_MULTIPLIER)[0]
         except subprocess.TimeoutExpired:
-            self.fail("launcher did not settle within 12s after control/delivery")
+            self.fail("launcher did not settle within %ss after control/delivery" % (12 * TIMEOUT_MULTIPLIER))
         self.assertEqual(job.returncode, code, answer)
         return answer
 
@@ -169,6 +173,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("TWO", wait)
 
     def test_interrupt_resumes_same_launcher_and_session(self):
+        # The readiness and settlement deadlines use the CI timeout multiplier.
         job = self.start()
         sid = self.store.session("task")
         self.okay("send", "task", "EARLIER")
@@ -231,7 +236,8 @@ class CoreTests(unittest.TestCase):
                     p.unlink()
                 (self.work / "turns").unlink(missing_ok=True)
                 name = "timeout" if code == 124 else "silence"
-                job = self.start(name=name, **{field: "1"})
+                # Keep the watchdog active while giving the fixture time to start under CI load.
+                job = self.start(name=name, **{field: str(TIMEOUT_MULTIPLIER)})
                 self.assertIn("■ STOPPED task=" + name, self.finish(job, code))
                 self.assertEqual(self.store.read(name)["state"], state)
 

@@ -1716,7 +1716,7 @@ class TaskControlRouteTests(unittest.TestCase):
 
     def setUp(self):
         self.original = (gui.LOGDIR, gui.GUI_TOKEN, gui.spawn, gui.subprocess.run)
-        isolated_root = os.environ.get("AGENT_GUI_TEST_ROOT", "D:/Temp/agents-oc") if os.name == "nt" else tempfile.gettempdir()
+        isolated_root = os.environ.get("AGENT_GUI_TEST_ROOT", tempfile.gettempdir())
         os.makedirs(isolated_root, exist_ok=True)
         self.scratch = tempfile.mkdtemp(prefix="gui-control-", dir=isolated_root)
         gui.LOGDIR = self.scratch

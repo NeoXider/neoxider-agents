@@ -20,7 +20,7 @@ from neoxider_agents.output import OutputFilter
 
 class StorageTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/storage") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-ux/storage"
+        base = Path(tempfile.gettempdir()) / "agents-ux/storage"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=str(base))
         self.base = Path(self.temp.name)

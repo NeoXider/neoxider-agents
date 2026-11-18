@@ -13,7 +13,9 @@ powershell.exe -NoProfile -File tests/test_powershell_entry.ps1
 ```
 
 `test_agent_core.py` runs deterministic real provider subprocesses with file barriers, task inboxes,
-launcher cancellation and cross-compatibility fixtures. `test_providers_core.py`,
+launcher cancellation and cross-compatibility fixtures. CI sets
+`AGENT_TEST_TIMEOUT_MULTIPLIER=3` for its readiness, settlement and watchdog
+deadlines. `test_providers_core.py`,
 `test_process_core.py`, `test_core_contracts.py` and `test_heartbeat_core.py` prove provider,
 Windows job/process, CLI and watchdog contracts. `test_native_entries.py` removes Git Bash/WSL
 from PATH and checks PowerShell/cmd UTF-8 prompts. PowerShell 7 is skipped when unavailable.
@@ -22,8 +24,9 @@ from PATH and checks PowerShell/cmd UTF-8 prompts. PowerShell 7 is skipped when 
 plant production source defects on disposable copies. Process mutation results are retained in
 the Phase 2A acceptance evidence under `D:/Temp/agents-core/process/proofs/`.
 `bench_agent.py --prove-budgets` plants violations of the budget
-gates. All test state uses isolated scratch directories; Windows defaults are under
-`D:/Temp/agents-ux/`. `check_windows.py` samples visible windows on monotonic 100 ms deadlines
+gates. Unit tests use isolated scratch directories under the system temporary
+directory. Windows benchmark and proof scripts retain their documented scratch
+paths. `check_windows.py` samples visible windows on monotonic 100 ms deadlines
 and records timing gaps and overruns.
 
 Phase 2B adds `test_ux_launch.py` (29 contracts), `test_ux_storage.py` (30),
@@ -95,8 +98,10 @@ python tests/live_smoke_openai_server.py
 ```
 
 Standalone end-to-end smoke against a real CLI subagent. It covers health/errors, completion,
-continuation, tool calls, reset, expiry, streaming, and concurrency. It is not part of discovery;
-run it deliberately because it requires credentials and spends provider usage.
+continuation, tool calls, reset, expiry, streaming, and concurrency. Run it manually
+with credentials when provider usage is intended. Discovery selects `test_*.py`;
+the standalone smoke also exits before starting a provider when
+`NEOXIDER_SKIP_LIVE=1` or `GITHUB_ACTIONS=true`.
 
 ## No third-party dependencies
 

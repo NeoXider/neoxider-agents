@@ -23,7 +23,7 @@ from neoxider_agents.state import Store
 
 class BoundedBaselineTests(unittest.TestCase):
     def setUp(self):
-        base = Path('D:/Temp/baseline-merge/tests') if os.name == 'nt' else Path(tempfile.gettempdir()) / 'baseline-fix'
+        base = Path(tempfile.gettempdir()) / 'baseline-fix'
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=str(base))
         self.addCleanup(self.temp.cleanup)

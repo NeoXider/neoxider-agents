@@ -52,7 +52,7 @@ class ExplainTests(unittest.TestCase):
 
 class CauseViewTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/cause/tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-ux/cause/tests"
+        base = Path(tempfile.gettempdir()) / "agents-ux/cause/tests"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="cause-", dir=str(base))
         self.base = Path(self.temp.name)

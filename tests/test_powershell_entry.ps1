@@ -1,13 +1,14 @@
 # Actual core smoke test with Git Bash and WSL removed from PATH.
 $ErrorActionPreference = 'Stop'
-$entry = Join-Path $PSScriptRoot '..\bin\neoxider.ps1'
+$entry = Join-Path $PSScriptRoot '..\agent.ps1'
 $savedPath = $env:PATH
 $savedLogs = $env:AGENT_CLI_LOGS
+$scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('neoxider-entry-' + [guid]::NewGuid())
 try {
     $env:PATH = (($savedPath -split ';') | Where-Object {
         $_ -notmatch '(?i)git[\\/]bin|git[\\/]usr[\\/]bin|wsl'
     }) -join ';'
-    $env:AGENT_CLI_LOGS = 'D:/Temp/agents-ux/powershell-entry/state'
+    $env:AGENT_CLI_LOGS = $scratch
     & $entry list
     if ($LASTEXITCODE -ne 0) { throw "Native list failed: $LASTEXITCODE" }
     & $entry reply --help
@@ -16,4 +17,6 @@ try {
 } finally {
     $env:PATH = $savedPath
     $env:AGENT_CLI_LOGS = $savedLogs
+    # list on an empty store may leave its empty state directory.
+    if ([System.IO.Directory]::Exists($scratch)) { [System.IO.Directory]::Delete($scratch) }
 }

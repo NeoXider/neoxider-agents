@@ -23,7 +23,7 @@ PARENT = "revive-tests"
 
 class ReviveTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/revive/tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-ux/revive/tests"
+        base = Path(tempfile.gettempdir()) / "agents-ux/revive/tests"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="revive-", dir=str(base))
         self.base = Path(self.temp.name)

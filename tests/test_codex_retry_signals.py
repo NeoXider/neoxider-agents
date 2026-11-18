@@ -67,7 +67,7 @@ class FixtureProvider:
 
 class CodexRetrySignalTests(unittest.TestCase):
     def setUp(self):
-        fixture_root = Path('D:/Temp/agents-ux/codex-retry-fixtures') if os.name == 'nt' else Path(tempfile.gettempdir()) / 'codex-retry-fixtures'
+        fixture_root = Path(tempfile.gettempdir()) / 'codex-retry-fixtures'
         fixture_root.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=str(fixture_root))
         self.addCleanup(self.temp.cleanup)
