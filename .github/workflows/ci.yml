@@ -62,11 +62,17 @@ jobs:
         run: |
           echo "AGENT_CLI_LOGS=$TEST_TEMP/neoxider-state" >> "$GITHUB_ENV"
           echo "AGENT_CONFIG=$TEST_TEMP/neoxider-config/config.json" >> "$GITHUB_ENV"
-      - name: Add Homebrew Bash
+      - name: Add Homebrew Bash and legacy test tools
         if: runner.os == 'macOS'
         run: |
-          brew list --versions bash || brew install bash
-          echo "$(brew --prefix bash)/bin" >> "$GITHUB_PATH"
+          for formula in bash coreutils grep; do
+            brew list --versions "$formula" || brew install "$formula"
+          done
+          {
+            echo "$(brew --prefix bash)/bin"
+            echo "$(brew --prefix coreutils)/libexec/gnubin"
+            echo "$(brew --prefix grep)/libexec/gnubin"
+          } >> "$GITHUB_PATH"
       - name: Windows PowerShell 5.1 entry
         if: runner.os == 'Windows'
         shell: powershell

@@ -90,6 +90,7 @@ Sources `legacy/agent.sh` (via the harmless `list` subcommand) inside a scratch 
 directory to exercise metadata locking, provider contracts, watchdog/liveness behavior, shared
 helpers, and waiting detection—without invoking a real agent CLI or touching the real logs. It
 prints per-test results and exits non-zero on failure.
+The macOS CI jobs use Homebrew Bash, GNU coreutils and GNU grep for these checks.
 
 ## Live smoke (manual — spends provider usage)
 
