@@ -1371,6 +1371,37 @@ change. The listed routes were advertised as free in the dated catalog; verify c
 Bound your timeout and treat silence as
 unknown, not as a verdict. Full trade-offs in the gotchas list above.
 
+## Field notes: a 9-worker Codex wave (2026-11-18, dated observation)
+
+One coordinator ran 9 workers on `-e codex -m gpt-6.2-sol -f medium` (raw id passed through; codex-cli
+0.169.0, ChatGPT login) on a reverse-engineering pipeline. All 9 settled `done`, none limited; what made
+the wave productive and what went wrong:
+
+- **One owned artifact per worker.** Each rule worker got ONE new module + ONE new test + its own work dir
+  under a shared runs folder, and was forbidden to touch the shared engine; the coordinator wired the
+  modules in afterwards. Five workers on one repo, zero conflicts. `--owns` recorded the files.
+- **A measured baseline in the brief.** Every worker got the same frozen input (a copied tree + its compile
+  log + the exact re-measure command) and had to report `before -> after` per error code with
+  "syntax-family 0". Results were directly comparable and the coordinator could re-run them.
+- **Verify by artifacts, not answers.** The coordinator re-ran every worker's tests, spot-checked 1-2 claims
+  per report against the files (a log line, a code sample), and measured the integrated result itself
+  (the combined run beat the sum of the individual claims). One worker's "worse than stock" verdict was
+  right and turned into two fix tasks that were later merged.
+- **Workers can open PRs, the coordinator merges.** Fork fixes came back as pushed branches + PRs with test
+  numbers; the coordinator reviewed the diff and merged. Do not let workers merge.
+- **Check-every-N-minutes without polling:** a tracked background `Start-Sleep 1680` job is a heartbeat
+  that re-invokes the coordinator even when no worker finishes; re-arm it after each check.
+- **Mistake to avoid - live checkout of THIS skill.** The installed skill directory may be the git checkout
+  every running wrapper imports. Develop wrapper changes in a `git worktree`; before merging into the live
+  checkout run `status --active` WITHOUT any parent filter (other sessions' fleets show up there) and wait
+  for its answer before the merge - never send both in one batch. A merged module does not disturb
+  already-running processes (they hold the old code in memory), but new invocations pick it up mid-wave.
+- **Codex on Windows** wraps every command as `"C:\WINDOWS\...\powershell.exe" -Command '...'`; since
+  `activity.py` 86e06a3 `status`/`peek` show the inner command, and forward-slash paths are no longer
+  masked as opaque tokens.
+- Python child output redirected to a file is block-buffered: a long `python script.py > out.txt` shows an
+  empty file for minutes. Use `python -u` (or `PYTHONUNBUFFERED=1`) when a coordinator will read it mid-run.
+
 ## Rules for setting tasks
 
 The scoping/verification/git rules live in the orchestrator loop above — follow them for every
