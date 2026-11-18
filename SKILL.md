@@ -87,6 +87,29 @@ Two clarifications from the first live ultra run (2026-11-18):
   into that fork with a test - not a patch file or an input pre-processor in another repository.
   Without that sentence workers twice delivered fork fixes as patch files.
 
+### When ultra pays off - and when it only burns tokens (measured 2026-11-18, Codex gpt-6.2-sol medium)
+
+| Run | Tasks | Input (cached) | Uncached + output | Outcome |
+|---|---:|---:|---:|---|
+| ultra #1: 4 independent assemblies, compiler as judge | 10 | 114M (97%) | 3.3M | 10,166 -> 0 errors in ~45 min; reviewers caught 2 real defects |
+| ultra #2: one hard sequential piece (deterministic battle logic) | 27 | 504M (98%) | 9.1M | 7,689 -> 2,359, then stalled |
+| ordinary single worker (mean of 15) | 1 | ~4M | ~0.2M | one 15-60 min task |
+
+Whole day incl. all waves: 26% of the weekly Codex window. 97-99% of ultra input is prompt cache
+(cheaper, lighter on limits), but raw volume still grows with every fresh-context reviewer.
+
+- **Use ultra** for objectives with >=3 genuinely independent pieces AND an objective judge
+  (compiler, tests, differential/behaviour checks). Parallel pieces + independent review beat a
+  single worker there.
+- **Do NOT use ultra** for one hard sequential piece (one subsystem whose parts depend on each
+  other, a single algorithm, logic that must be restored step by step): give it to ONE worker or to
+  ledger mode. Fanning it out multiplies context re-reads without adding parallel progress.
+- **Gates per wave, not per piece:** one fresh reviewer and one verifier for the whole wave (or per
+  group of related pieces), not a reviewer + verifier for every piece - that is what turned
+  ultra #2 into 27 tasks. Add a per-piece reviewer only for pieces whose diff is large or risky.
+- **Budget before launch:** state an estimated token/task budget in the plan and stop or re-plan
+  when a wave exceeds it or two consecutive rounds bring no measured progress.
+
 Live result of the first ultra run (one `codex/gpt-6.2-sol/medium` coordinator, objective "compile
 the next assembly layer of a reconstructed Unity project", 4 independent pieces): read both skills,
 ran `ultra score`/`ultra map`/`ultra plan` and `status --active` before launching, started 4
