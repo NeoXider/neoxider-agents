@@ -32,14 +32,26 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      # The Actions distribution of CPython 3.8 for macOS is Intel-only.
+      # The managed CPython 3.8 build for macOS is Intel-only.
       - name: Ensure Rosetta is available for Python 3.8
         if: runner.os == 'macOS' && runner.arch == 'ARM64' && matrix.python == '3.8'
         run: /usr/bin/arch -x86_64 /usr/bin/true || softwareupdate --install-rosetta --agree-to-license
       - uses: actions/setup-python@v6
+        if: runner.os == 'Windows' || matrix.python != '3.8'
         with:
           python-version: ${{ matrix.python }}
-          architecture: ${{ runner.os == 'macOS' && matrix.python == '3.8' && 'x64' || '' }}
+      # Use standalone builds for 3.8 on the current Ubuntu and macOS images.
+      - uses: astral-sh/setup-uv@v7
+        if: runner.os != 'Windows' && matrix.python == '3.8'
+        with:
+          enable-cache: false
+      - name: Set up managed Python 3.8
+        if: runner.os != 'Windows' && matrix.python == '3.8'
+        env:
+          PYTHON_REQUEST: ${{ runner.os == 'macOS' && 'cpython-3.8-macos-x86_64-none' || '3.8' }}
+        run: |
+          uv venv --managed-python --python "$PYTHON_REQUEST" "$RUNNER_TEMP/neoxider-python"
+          echo "$RUNNER_TEMP/neoxider-python/bin" >> "$GITHUB_PATH"
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
@@ -68,6 +80,8 @@ jobs:
           if ($PSVersionTable.PSVersion.Major -ne 7) { throw 'Expected PowerShell 7' }
           & ./tests/test_powershell_entry.ps1
       - name: Bash entry and legacy regression suite
+        env:
+          AGENT_TEST_SKIP_DUPLICATE_CONTROL: '1'
         run: |
           (( BASH_VERSINFO[0] >= 4 ))
           bash agent.sh list

@@ -1709,7 +1709,9 @@ assert_match "openai-server without python says so clearly" 'needs python' "$bri
 
 # ============================================================================================
 section "offline agent controls"
-if _agent_python; then
+if [ "${AGENT_TEST_SKIP_DUPLICATE_CONTROL:-}" = 1 ]; then
+    echo "Control lifecycle acceptance runs in the separate Python discovery step."
+elif _agent_python; then
     if PYTHONIOENCODING=utf-8 "$_AGENT_PY" "$AGENT_TEST_WORKTREE/tests/test_agent_control.py"; then
         pass "offline control lifecycle acceptance suite"
     else
