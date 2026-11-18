@@ -96,6 +96,7 @@ Zero dependencies (stdlib only); mirrors gui.py's process/log conventions but is
 """
 import argparse, atexit, base64, binascii, contextlib, glob, hashlib, ipaddress, json, logging, os, queue, re, select, shlex, shutil, signal, socket, subprocess, sys, tempfile, threading, time, urllib.parse, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -5107,6 +5108,12 @@ def parse_config(argv):
 class _BridgeHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 128  # bursts of parallel clients must not be refused at accept()
+
+    def server_bind(self):
+        # HTTPServer.server_bind performs reverse DNS before publishing readiness.
+        # The bridge uses its configured bind address and needs no DNS here.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
 
 _PROBE_PROMPT = "Reply with exactly the word OK and nothing else."

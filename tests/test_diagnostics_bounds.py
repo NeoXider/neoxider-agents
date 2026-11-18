@@ -58,7 +58,7 @@ else:
         rows = diagnostics.bounded_probes(["resolver", "filesystem", "network", "never", "healthy"], self.command)
         self.assertLess(time.monotonic() - started, 2.5)
         for row in rows[:-1]:
-            self.assertEqual(row["state"], "timeout")
+            self.assertEqual(row["state"], "timeout", row)
             self.assertIsNone(row["available"])
             self.assertIsNone(row["limits"])
         self.assertTrue(rows[-1]["available"])

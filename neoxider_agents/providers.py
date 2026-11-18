@@ -143,7 +143,6 @@ def drain_diagnostic_pipe(stream, data, limit, deadline):
 def close_diagnostic_tree(tree):
     """Always close the pipe, even when containment/reaping reports an error."""
     from .process import kill_tree, pid_alive, pid_stamp
-    deadline = time.monotonic() + 0.4
     owned = {}
     problem = ""
     current = pid_stamp(tree.pid)
@@ -175,6 +174,7 @@ def close_diagnostic_tree(tree):
                 stamp = pid_stamp(pid)
                 if stamp:
                     owned[pid] = stamp
+    deadline = time.monotonic() + 0.4
     try:
         try:
             tree.close()
@@ -187,7 +187,6 @@ def close_diagnostic_tree(tree):
         try:
             tree.process.wait(timeout=0.2)
         except Exception:
-            problem = "diagnostic process cleanup incomplete"
             try:
                 kill_tree(tree.pid, stamp=tree.stamp, job_name=tree.job_name)
             except Exception:
@@ -195,7 +194,12 @@ def close_diagnostic_tree(tree):
             try:
                 tree.process.wait(timeout=max(0, min(0.2, deadline - time.monotonic())))
             except Exception:
-                pass
+                problem = "diagnostic process cleanup incomplete"
+        # A nested version probe may be in its own session. Stop only descendants
+        # whose creation stamps were captured before the supervising process exited.
+        for pid, stamp in owned.items():
+            if pid != tree.pid and pid_alive(pid, stamp):
+                kill_tree(pid, stamp=stamp)
         sleeper = Event()
         while owned and time.monotonic() < deadline:
             owned = {pid: stamp for pid, stamp in owned.items() if pid_alive(pid, stamp)}
