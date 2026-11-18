@@ -22,7 +22,7 @@ from neoxider_agents.runtime_profiles import RuntimeProfiles, RuntimeProfileErro
 from neoxider_agents.process import pid_alive
 from neoxider_agents.diagnostics import VerificationReceipt, source_hash, CostFact
 
-OUTPUT = Path('C:/AI/outputs/neoxider-parity-core-20261014') if os.name == 'nt' else Path(tempfile.gettempdir()) / 'neoxider-core'
+OUTPUT = Path(tempfile.gettempdir()) / 'neoxider-core'
 
 PROVIDER = '''import os, sys
 from neoxider_agents.providers import BaseProvider
@@ -127,6 +127,11 @@ class CoreHarness(unittest.TestCase):
     def release(self, turn=1):
         (self.work / ('turn.%s.release' % turn)).touch()
 
+    def wait_for_owner_release(self, client, handle):
+        # Settled result metadata can precede release of the launcher's lock.
+        lock = client.store.path(handle.task, '.owner.lock.d')
+        self.until(lambda: not lock.exists())
+
 
 class CoreIntegrationTests(CoreHarness):
     def test_reconnect_recovery_publishes_current_answer_and_retains_session_after_reaping(self):
@@ -186,6 +191,7 @@ class CoreIntegrationTests(CoreHarness):
         with self.assertRaises(ValueError):
             client.acknowledge(handle, identifier, 'tool claimed applied', source='tool')
         self.assertTrue(client.acknowledge(handle, identifier, 'assistant explicitly confirms receipt').acknowledged)
+        self.wait_for_owner_release(client, handle)
         client.resume(handle, message='next turn')
         self.assertEqual(handle.wait(timeout=15).state, 'done')
         self.assertNotEqual(handle.generation, generation)
@@ -381,7 +387,7 @@ class CoreIntegrationTests(CoreHarness):
                 client, handle = self.spawn('ERR:' + marker, name='error-' + marker.lower())
                 result = handle.wait(timeout=15)
                 self.assertEqual(result.state, 'limited' if marker == 'QUOTA' else 'error')
-                self.assertEqual(result.failure['category'], category)
+                self.assertEqual(result.failure['category'], category, (result.exit_code, result.reason))
                 self.assertEqual(result.exit_code, 126)
                 self.assertEqual(bool(result.limit), marker == 'QUOTA')
                 events = client.events(handle).events
@@ -410,6 +416,7 @@ class CoreIntegrationTests(CoreHarness):
     def test_running_resume_never_returns_previous_answer_as_current_success(self):
         client, handle = self.spawn()
         self.assertIn('ANSWER', handle.wait(timeout=15).answer)
+        self.wait_for_owner_release(client, handle)
         client.resume(handle, message='BLOCK')
         self.ready(client, handle, 2)
         result = handle.result()

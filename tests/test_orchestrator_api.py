@@ -23,7 +23,7 @@ from neoxider_agents.process import pid_alive
 
 class OrchestratorApiTests(unittest.TestCase):
     def setUp(self):
-        base = Path("C:/AI/outputs/neoxider-parity-sdk-20261014/fixtures") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-sdk"
+        base = Path(tempfile.gettempdir()) / "agents-sdk"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="sdk-", dir=str(base))
         self.base = Path(self.temp.name)
@@ -947,22 +947,24 @@ class OrchestratorApiTests(unittest.TestCase):
                 raise OSError("injected first wait failure")
             return real_wait(self, *args, **kwargs)
 
-        with mock.patch.object(subprocess, "Popen", side_effect=counting), \
-                mock.patch.object(threading.Thread, "start", failing_start), \
-                mock.patch.object(real_popen, "wait", flaky_wait):
-            with self.assertRaisesRegex(RuntimeError, "injected pump start failure"):
-                client.spawn("PROMPT", engine="fixture", cwd=self.work, name="sdk-start-retry-1",
-                             env=self.blocked_env(self.work))
-        self.assertEqual(len(processes), 1, "one benign process was admitted before the start failure")
-        child = client._child_for("sdk-start-retry-1")
-        self.assertIsNotNone(child, "the failed-start child is tracked, never dropped")
-        self.assertIs(child.process, processes[0], "retry addresses the exact admitted process")
-        self.assertTrue(child.start_failed, "the child is marked as a failed start")
-        self.assertIn("injected pump start failure", child.start_error, "primary error preserved")
-        self.assertTrue(child.cleanup_error, "secondary wait error recorded, not swallowed")
-        self.assertFalse(child.process.stdout.closed, "pipe held until checked reap succeeds")
-        prompts = list(self.logs.rglob("*.msg"))
-        self.assertEqual(len(prompts), 1, "prompt held until actual exit, not unlinked early")
+        # Inspect the retained state before the background monitor gets its own retry.
+        with client._lock:
+            with mock.patch.object(subprocess, "Popen", side_effect=counting), \
+                    mock.patch.object(threading.Thread, "start", failing_start), \
+                    mock.patch.object(real_popen, "wait", flaky_wait):
+                with self.assertRaisesRegex(RuntimeError, "injected pump start failure"):
+                    client.spawn("PROMPT", engine="fixture", cwd=self.work, name="sdk-start-retry-1",
+                                 env=self.blocked_env(self.work))
+            self.assertEqual(len(processes), 1, "one benign process was admitted before the start failure")
+            child = client._child_for("sdk-start-retry-1")
+            self.assertIsNotNone(child, "the failed-start child is tracked, never dropped")
+            self.assertIs(child.process, processes[0], "retry addresses the exact admitted process")
+            self.assertTrue(child.start_failed, "the child is marked as a failed start")
+            self.assertIn("injected pump start failure", child.start_error, "primary error preserved")
+            self.assertTrue(child.cleanup_error, "secondary wait error recorded, not swallowed")
+            self.assertFalse(child.process.stdout.closed, "pipe held until checked reap succeeds")
+            prompts = list(self.logs.rglob("*.msg"))
+            self.assertEqual(len(prompts), 1, "prompt held until actual exit, not unlinked early")
         # Retry by original PID + creation identity: no handle/generation exists.
         client._cleanup_children(force=True)
         self.until(lambda: child.reaped, message="retry reaps the exact child")

@@ -477,16 +477,29 @@ section "_provider_opencode_emit / provider wiring"
 # opencode can spend minutes in tool calls. The JSONL parser must expose session/activity before
 # EOF, while keeping the final answer behind a fresh output marker for last_output/openai_server.
 OPENCODE_STREAM_FILE="$SCRATCH_LOGDIR/opencode-stream"
+OPENCODE_STREAM_RELEASE="$SCRATCH_LOGDIR/opencode-stream-release"
+# Exercise a monotonic clock near its origin, as on macOS with Python 3.8.
+OPENCODE_TEST_CLOCK="$SCRATCH_LOGDIR/clock"
+mkdir -p "$OPENCODE_TEST_CLOCK"
+printf '%s\n' 'import time' 'time.monotonic = lambda: 0.125' > "$OPENCODE_TEST_CLOCK/sitecustomize.py"
 (
     {
         printf '%s\n' '{"type":"step_start","sessionID":"ses_stream"}'
-        sleep 2
+        deadline=$((SECONDS + 30))
+        until [ -e "$OPENCODE_STREAM_RELEASE" ]; do
+            (( SECONDS < deadline )) || exit 1
+            sleep 0.1
+        done
         printf '%s\n' '{"type":"text","sessionID":"ses_stream","part":{"id":"p1","text":"final answer"}}'
-    } | _provider_opencode_emit > "$OPENCODE_STREAM_FILE"
+    } | PYTHONPATH="$OPENCODE_TEST_CLOCK" _provider_opencode_emit > "$OPENCODE_STREAM_FILE"
 ) &
 opencode_stream_pid=$!
-for ((poll_i=1; poll_i<=15; poll_i++)); do
-    [ -s "$OPENCODE_STREAM_FILE" ] && break
+deadline=$((SECONDS + 15))
+while (( SECONDS < deadline )); do
+    if grep -q '^session id: ses_stream$' "$OPENCODE_STREAM_FILE" 2>/dev/null &&
+        grep -q '^\[opencode\] activity: step_start$' "$OPENCODE_STREAM_FILE" 2>/dev/null; then
+        break
+    fi
     sleep 0.1
 done
 if grep -q '^session id: ses_stream$' "$OPENCODE_STREAM_FILE" 2>/dev/null; then
@@ -499,6 +512,7 @@ if grep -q '^\[opencode\] activity: step_start$' "$OPENCODE_STREAM_FILE" 2>/dev/
 else
     fail "opencode emitter did not expose activity before EOF"
 fi
+touch "$OPENCODE_STREAM_RELEASE"
 wait "$opencode_stream_pid"
 opencode_clean="$(awk '/^---------- output ----------$/{buf=""; next}{buf=buf $0 ORS} END{printf "%s", buf}' \
     "$OPENCODE_STREAM_FILE" | sed 's/[[:space:]]*$//')"
@@ -1709,7 +1723,9 @@ assert_match "openai-server without python says so clearly" 'needs python' "$bri
 
 # ============================================================================================
 section "offline agent controls"
-if _agent_python; then
+if [ "${AGENT_TEST_SKIP_DUPLICATE_CONTROL:-}" = 1 ]; then
+    echo "Control lifecycle acceptance runs in the separate Python discovery step."
+elif _agent_python; then
     if PYTHONIOENCODING=utf-8 "$_AGENT_PY" "$AGENT_TEST_WORKTREE/tests/test_agent_control.py"; then
         pass "offline control lifecycle acceptance suite"
     else

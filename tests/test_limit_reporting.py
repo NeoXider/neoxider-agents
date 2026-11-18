@@ -22,7 +22,7 @@ CODEX_REASON = "You've hit your usage limit. Please try again at Oct 14th, 2026 
 
 class LimitReportingTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/limit-report/tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "limit-report/tests"
+        base = Path(tempfile.gettempdir()) / "limit-report/tests"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="limits-", dir=str(base))
         self.addCleanup(self.temp.cleanup)

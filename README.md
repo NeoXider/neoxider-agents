@@ -1066,6 +1066,13 @@ and isolated state. Legacy Bash scenarios remain under `tests/test_agent_sh.sh`;
 with the legacy switch. Planted quote/encoding defects prove that Windows entry checks detect
 PowerShell 5.1 argument corruption. Performance evidence is in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+[GitHub Actions CI](.github/workflows/ci.yml) runs the offline Python, Bash and Node
+suites on Windows, Ubuntu and macOS with Python 3.8 and 3.14. Windows also exercises
+`agent.ps1` in PowerShell 5.1 and 7 and `agent.sh` in Git Bash. macOS uses Homebrew
+Bash and installs and loads zsh completion in a temporary home. The **Release gate**
+requires every matrix job to pass and validates the plugin and marketplace manifests
+and `SKILL.md` frontmatter with `python scripts/validate_plugin.py`.
+
 For a real end-to-end check against a live CLI subagent (health, error codes, auth, fresh
 completion, session continuation, tool round-trip, divergence, `/reset`, idle expiry, streaming,
 concurrency):

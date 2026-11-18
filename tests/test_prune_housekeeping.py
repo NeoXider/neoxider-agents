@@ -25,7 +25,7 @@ def denied(path):
 
 class HousekeepingTests(unittest.TestCase):
     def setUp(self):
-        base = Path(os.environ.get("AGENT_CLI_LOGS", "D:/Temp/prune-fix/state")).parent
+        base = Path(os.environ.get("AGENT_CLI_LOGS", tempfile.gettempdir() + "/neoxider-state")).parent
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=base)
         self.addCleanup(self.temp.cleanup)

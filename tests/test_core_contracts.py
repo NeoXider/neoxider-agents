@@ -22,7 +22,7 @@ from neoxider_agents.providers import get_provider
 
 class Contracts(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/review") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/review"
+        base = Path(tempfile.gettempdir()) / "agents-core/review"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="contracts-", dir=base)
         self.addCleanup(self.temp.cleanup)
@@ -180,7 +180,8 @@ class Contracts(unittest.TestCase):
             return 0
         path = self.folder / "api.json"
         with patch.object(lifecycle, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
-            code = cli.dispatch("test-api", dict(base_url=body["base_url"], goal="fixture", name="task", out=str(path)), [], self.store)
+            code = cli.dispatch("test-api", dict(base_url=body["base_url"], goal="fixture", name="task",
+                                                out=str(path), engine="codex"), [], self.store)
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(path.read_text(encoding="utf-8")), body)
         self.assertIn('"overall"', captured[0])
@@ -188,7 +189,7 @@ class Contracts(unittest.TestCase):
 
 
 def prove_defects():
-    base = Path("D:/Temp/agents-ux/review") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/review"
+    base = Path(tempfile.gettempdir()) / "agents-core/review"
     base.mkdir(parents=True, exist_ok=True)
     defects = [
         ("diagnostics.py", "generated_at=generated, engines=results, raw=raw, deep_engines=deep_engines", "generated_at=generated, engines=results", "test_doctor_legacy_json_shape"),

@@ -23,7 +23,7 @@ from neoxider_agents.state import Store
 
 class BoundedBaselineTests(unittest.TestCase):
     def setUp(self):
-        base = Path('D:/Temp/baseline-merge/tests') if os.name == 'nt' else Path(tempfile.gettempdir()) / 'baseline-fix'
+        base = Path(tempfile.gettempdir()).resolve() / 'baseline-fix'
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=str(base))
         self.addCleanup(self.temp.cleanup)
@@ -538,7 +538,8 @@ class BoundedBaselineTests(unittest.TestCase):
     def test_partial_diff_and_result_explicitly_warn(self):
         for n in range(5): self.put('%d.txt' % n)
         self.store.update('task', state='done', core_version=2, dir=self.work.as_posix(), exit=0)
-        with mock.patch.dict(os.environ, AGENT_BASELINE_MAX_FILES='1'):
+        with mock.patch.dict(os.environ, AGENT_BASELINE_MAX_FILES='1'), \
+                mock.patch.object(reporting, '_git_listed_files', return_value=None):
             reporting.begin_snapshot(self.store, 'task', self.work)
         for args in (['diff', 'task'], ['result', 'task', '--json']):
             out, err = io.StringIO(), io.StringIO()
@@ -546,8 +547,8 @@ class BoundedBaselineTests(unittest.TestCase):
             self.assertIn('baseline partial:', out.getvalue() + err.getvalue())
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertEqual(main(['top', '--once']), 0)
-        self.assertIn('baseline partial:', out.getvalue())
+            self.assertEqual(main(['top', '--once', 'task']), 0)
+        self.assertIn('partial baseline on 1 task(s): FILES may be incomplete', out.getvalue())
 
     def test_orphan_result_computes_and_caches_delta_once(self):
         self.put('a.txt')

@@ -3,14 +3,43 @@
 
 import json
 import re
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
+
+from scripts.validate_plugin import validate
 
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 class DistributionMetadataTests(unittest.TestCase):
+    def test_strict_plugin_validator_accepts_repository(self):
+        validate(ROOT)
+
+    def test_strict_plugin_validator_rejects_invalid_metadata(self):
+        plugin = json.loads((ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8"))
+        cases = (
+            (".claude-plugin/plugin.json", '"name": "neoxider-agents",',
+             '"name": "neoxider-agents", "name": "neoxider-agents",', "duplicate JSON key"),
+            (".claude-plugin/plugin.json", json.dumps(plugin["version"]), '"00.4.0"', "plugin.version"),
+            (".claude-plugin/marketplace.json", '"source": "./"', '"source": "../"', "point at"),
+            ("SKILL.md", "name: neoxider-agents", "name: unrelated", "name must match"),
+            ("SKILL.md", "description: Delegate", "description: [Delegate]", "expects plain"),
+        )
+        for filename, before, after, error in cases:
+            with self.subTest(filename=filename, error=error), tempfile.TemporaryDirectory() as scratch:
+                root = Path(scratch)
+                shutil.copytree(ROOT / ".claude-plugin", root / ".claude-plugin")
+                shutil.copyfile(ROOT / "SKILL.md", root / "SKILL.md")
+                path = root / filename
+                original = path.read_text(encoding="utf-8")
+                self.assertIn(before, original)
+                path.write_text(original.replace(before, after, 1), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, error):
+                    validate(root)
+
     def test_plugin_and_marketplace_describe_every_bundled_provider(self):
         plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
         marketplace = json.loads(

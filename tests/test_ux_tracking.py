@@ -21,7 +21,7 @@ from neoxider_agents.process import hidden_kwargs
 
 class TrackingTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/tracking/tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-ux/tracking/tests"
+        base = Path(tempfile.gettempdir()) / "agents-ux/tracking/tests"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="tracking-", dir=str(base))
         self.base = Path(self.temp.name)
@@ -242,13 +242,17 @@ class TrackingTests(unittest.TestCase):
         import hashlib
         import stat
         from types import SimpleNamespace
-        path = self.put("link.txt", "must not capture")
+        path = self.put("link.txt", "must not capture").resolve()
         original = Path.lstat
+        readlink = os.readlink
         def link_stat(item):
             info = original(item)
             return SimpleNamespace(st_mode=stat.S_IFLNK, st_size=info.st_size, st_mtime_ns=info.st_mtime_ns) if item == path else info
-        with mock.patch.object(Path, "lstat", link_stat), \
-                mock.patch.object(os, "readlink", return_value="../private/secret"):
+        def link_target(item, *args, **kwargs):
+            return "../private/secret" if Path(item) == path else readlink(item, *args, **kwargs)
+        with mock.patch.object(reporting, "_git_listed_files", return_value=None), \
+                mock.patch.object(Path, "lstat", link_stat), \
+                mock.patch.object(os, "readlink", side_effect=link_target):
             self.seed()
         entry = reporting.read_baseline(self.store, "task")["files"]["link.txt"]
         self.assertEqual(entry["type"], "symlink")
@@ -573,7 +577,7 @@ DEFECTS = [
 
 
 def prove_defects():
-    base = Path("D:/Temp/agents-ux/tracking/proofs") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-ux/tracking/proofs"
+    base = Path(tempfile.gettempdir()) / "agents-ux/tracking/proofs"
     base.mkdir(parents=True, exist_ok=True)
     records = []
     for label, module, original, replacement, test in DEFECTS:

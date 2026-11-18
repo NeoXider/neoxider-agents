@@ -522,9 +522,11 @@ def collect_result(store, name, verification_receipts=(), current_source_hash=No
     failure = FailureReport(**json.loads(meta["failure_json"])) if meta.get("failure_json") else None
     facts = list(cost_facts)
     if usage or cost is not None:
+        window = (str(meta.get("task_started_epoch") or ""),
+                  str(meta.get("finished_epoch") or meta.get("ended_epoch") or ""))
         facts.append(CostFact(kind="provider_reported", amount=cost, currency="USD" if cost is not None else None,
                      provenance="provider output for task " + name,
-                     measurement_window=(str(meta.get("task_started_epoch", "")), str(meta.get("finished_epoch", ""))),
+                     measurement_window=window if all(window) else None,
                      input_tokens=(usage or {}).get("input_tokens"), output_tokens=(usage or {}).get("output_tokens")))
     data["diagnostics"] = compact_result(dict(data, scope_declared=owns_list(meta.get("owns", ""))),
          receipts=verification_receipts, current_source_hash=current_source_hash, failure=failure,

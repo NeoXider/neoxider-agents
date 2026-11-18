@@ -108,6 +108,9 @@ class PromptArgumentTests(unittest.TestCase):
 class ProcessVisibilityTests(unittest.TestCase):
     def test_provider_process_groups_are_hidden_without_losing_killability(self):
         kwargs = srv._process_group_kwargs()
+        if os.name != "nt":
+            self.assertEqual(kwargs, {"start_new_session": True})
+            return
         flags = kwargs["creationflags"]
         self.assertTrue(flags & subprocess.CREATE_NO_WINDOW)
         self.assertTrue(flags & subprocess.CREATE_NEW_PROCESS_GROUP)
@@ -1238,9 +1241,12 @@ class ProcessTreeTimeoutTests(unittest.TestCase):
             return str(pid) in out and "No tasks" not in out
         try:
             os.kill(pid, 0)
-            return True
         except OSError:
             return False
+        # kill(0) also succeeds for an orphaned zombie on POSIX.
+        state = subprocess.run(["ps", "-p", str(pid), "-o", "stat="],
+                               capture_output=True, text=True, timeout=5).stdout.strip()
+        return bool(state) and not state.startswith("Z")
 
     def test_outer_timeout_kills_and_reaps_child_sleeper_tree(self):
         d = tempfile.mkdtemp()
@@ -4754,9 +4760,11 @@ class RegistryCommandTests(unittest.TestCase):
         return code, out.getvalue()
 
     def test_detached_start_on_port_zero_is_listed_and_stopped_with_its_tree(self):
-        code, out = self.run_main("start", "--detach", "-e", "codex", "-m", "spark", "-p", "0",
-                                  "--name", "unit-detach", "--json")
-        self.assertEqual(code, 0, out)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, out = self.run_main("start", "--detach", "-e", "codex", "-m", "spark", "-p", "0",
+                                      "--name", "unit-detach", "--json")
+        self.assertEqual(code, 0, err.getvalue())
         started = json.loads(out)
         port, pid = started["port"], started["pid"]
         try:

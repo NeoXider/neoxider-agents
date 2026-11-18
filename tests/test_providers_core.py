@@ -146,7 +146,7 @@ class Aliases(unittest.TestCase):
             get_provider("../codex")
 
     def test_custom_plugin(self):
-        base = Path("D:/Temp/agents-ux/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
+        base = Path(tempfile.gettempdir()) / "agents-core/providers"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temp:
             folder = Path(temp) / "fixture"
@@ -322,7 +322,7 @@ class Commands(unittest.TestCase):
 
 class NativeLaunchers(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
+        base = Path(tempfile.gettempdir()) / "agents-core/providers"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=base)
         self.addCleanup(self.temp.cleanup)
@@ -377,7 +377,7 @@ class NativeLaunchers(unittest.TestCase):
 
 class Filters(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
+        base = Path(tempfile.gettempdir()) / "agents-core/providers"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=base)
         self.addCleanup(self.temp.cleanup)
@@ -548,7 +548,7 @@ class Classification(unittest.TestCase):
 
 class ACPTransport(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
+        base = Path(tempfile.gettempdir()) / "agents-core/providers"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=base)
         self.addCleanup(self.temp.cleanup)
@@ -634,7 +634,7 @@ for line in sys.stdin:
 def prove_defects():
     """Plant source defects in isolated copies and demand the targeted test fail."""
     import shutil
-    base = Path("D:/Temp/agents-ux/providers") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core/providers"
+    base = Path(tempfile.gettempdir()) / "agents-core/providers"
     base.mkdir(parents=True, exist_ok=True)
     defects = [
         ("providers/codex/provider.py", '"": "gpt-5.6-terra"', '"": "wrong-default"', "Aliases.test_codex_default"),

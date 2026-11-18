@@ -10,8 +10,6 @@
   provider adapters и запуск видимого Terminal для `terminal=true`.
 - Проверить чистую установку и обновление Claude Code plugin в изолированном профиле,
   где отсутствует `~/.claude/skills/neoxider-agents`.
-- Добавить CI-матрицу для Git Bash/Windows PowerShell 5.1/PowerShell 7, Linux Bash и
-  macOS с Homebrew Bash; strict plugin validation уже должна быть частью release gate.
 
 ## Интеграции
 

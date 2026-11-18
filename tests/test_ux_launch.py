@@ -22,7 +22,7 @@ from neoxider_agents.process import hidden_kwargs
 
 class IsolatedLaunchTests(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/launch-tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-ux/launch-tests"
+        base = Path(tempfile.gettempdir()) / "agents-ux/launch-tests"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=str(base))
         self.addCleanup(self.temp.cleanup)

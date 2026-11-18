@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -215,6 +216,10 @@ def _owner(meta):
                     pass  # Protected processes/older systems may deny command proof.
             finally:
                 kernel.CloseHandle(handle)
+    elif sys.platform == "darwin":
+        from neoxider_agents.process import pid_alive, pid_stamp
+        creation = pid_stamp(pid)
+        alive = pid_alive(pid)
     else:
         try:
             fields = Path("/proc/%s/stat" % pid).read_text().rsplit(")", 1)[1].split()

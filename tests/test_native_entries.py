@@ -26,7 +26,7 @@ def hidden():
 @unittest.skipUnless(os.name == "nt" and POWERSHELL, "Windows PowerShell required")
 class NativeEntryTests(unittest.TestCase):
     def setUp(self):
-        scratch = Path("D:/Temp/agents-ux/entries")
+        scratch = Path(tempfile.gettempdir()) / "neoxider-entry-tests"
         scratch.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=str(scratch))
         self.addCleanup(self.temp.cleanup)
@@ -49,7 +49,7 @@ class NativeEntryTests(unittest.TestCase):
         self.env.update(PATH=os.pathsep.join(python_paths + [str(system / "System32")]),
                         AGENT_CLI_LOGS=(self.root / "state").as_posix(), PYTHONUTF8="1",
                         PYTHONIOENCODING="utf-8")
-        self.assertNotIn("git", self.env["PATH"].lower())
+        self.assertIsNone(shutil.which("git", path=self.env["PATH"]))
 
     def invoke_ps(self, arguments, launcher="bin/neoxider.ps1", shell=None, redirect=""):
         quoted = ",".join("'" + item.replace("'", "''") + "'" for item in arguments)
@@ -131,8 +131,11 @@ class NativeEntryTests(unittest.TestCase):
         merged = self.invoke_ps(arguments, redirect=" 2>&1 | ForEach-Object { \"$_\" }")
         self.assertEqual(merged.returncode, 5, merged.stdout + merged.stderr)
         lines = merged.stdout.splitlines()
-        self.assertIn("[neoxider] baseline partial: warning", lines)
-        self.assertEqual(json.loads(lines[-1]), arguments)
+        warning = "[neoxider] baseline partial: warning"
+        self.assertIn(warning, lines)
+        # Windows reads stdout and stderr independently, so a merge can reorder them.
+        answer, = [line for line in lines if line != warning]
+        self.assertEqual(json.loads(answer), arguments)
 
     def test_planted_stop_preference_defect_is_detected(self):
         # Whether stdout survives depends on stream timing; the lost exit code is deterministic.
@@ -198,7 +201,7 @@ class NativeEntryTests(unittest.TestCase):
 @unittest.skipUnless(os.name == "nt" and POWERSHELL, "Windows PowerShell required")
 class NativeCoreIntegrationTests(unittest.TestCase):
     def setUp(self):
-        scratch = Path("D:/Temp/agents-ux/entries")
+        scratch = Path(tempfile.gettempdir()) / "neoxider-entry-tests"
         scratch.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="native-core-", dir=str(scratch))
         self.addCleanup(self.temp.cleanup)

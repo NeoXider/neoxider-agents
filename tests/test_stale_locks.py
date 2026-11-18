@@ -13,7 +13,7 @@ from neoxider_agents.state import Lock
 
 class StaleLockTests(unittest.TestCase):
     def setUp(self):
-        root = Path("D:/Temp/baseline-merge/lock-tests")
+        root = Path(tempfile.gettempdir()) / "neoxider-lock-tests"
         root.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(dir=str(root))
         self.addCleanup(self.temp.cleanup)

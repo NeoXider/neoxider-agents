@@ -58,7 +58,7 @@ else:
         rows = diagnostics.bounded_probes(["resolver", "filesystem", "network", "never", "healthy"], self.command)
         self.assertLess(time.monotonic() - started, 2.5)
         for row in rows[:-1]:
-            self.assertEqual(row["state"], "timeout")
+            self.assertEqual(row["state"], "timeout", row)
             self.assertIsNone(row["available"])
             self.assertIsNone(row["limits"])
         self.assertTrue(rows[-1]["available"])
@@ -205,9 +205,12 @@ else:
     def test_real_provider_info_entry_kills_stuck_cli_version_descendant(self):
         version = self.base / "blocked version.py"
         version.write_text("import os,time\nfrom pathlib import Path\nPath(__file__).with_suffix('.pid').write_text(str(os.getpid()))\ntime.sleep(60)\n", encoding="utf-8")
-        with mock.patch.dict(os.environ, AGENT_CODEX_BIN=str(version)):
+        # Allow the launcher and nested Python fixture to start on loaded Windows hosts.
+        # The dedicated deadline tests cover the shorter bounds.
+        with mock.patch.dict(os.environ, AGENT_CODEX_BIN=str(version),
+                             AGENT_DOCTOR_PROVIDER_TIMEOUT_SEC="3", AGENT_DOCTOR_TIMEOUT_SEC="5"):
             row = diagnostics.bounded_probes(["codex"])[0]
-        self.assertEqual(row["state"], "timeout")
+        self.assertEqual(row["state"], "timeout", row)
         self.assertIsNone(row["available"])
         pid = int(version.with_suffix('.pid').read_text())
         self.assertFalse(pid_alive(pid, pid_stamp(pid)))

@@ -8,6 +8,9 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- GitHub Actions release gate for Python 3.8 and 3.14 across Windows, Ubuntu and
+  macOS, including PowerShell 5.1/7, Git Bash, Homebrew Bash and zsh completion.
+  The gate checks plugin metadata and runs offline suites without provider credentials.
 - The Tasks tab renders unified patches from assistant diff fences and tool output with per-file
   counts, old and new line numbers, and collapsible long hunks. A compact strip above the tree
   shows active tasks, their model, age and latest activity, and opens the selected task in chat.

@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  NEOXIDER_SKIP_LIVE: '1'
+  PYTHONUTF8: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  tests:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python: ['3.8', '3.14']
+    defaults:
+      run:
+        shell: bash
+    env:
+      AGENT_TEST_TIMEOUT_MULTIPLIER: '3'
+      PY_PYTHON3: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # The managed CPython 3.8 build for macOS is Intel-only.
+      - name: Ensure Rosetta is available for Python 3.8
+        if: runner.os == 'macOS' && runner.arch == 'ARM64' && matrix.python == '3.8'
+        run: /usr/bin/arch -x86_64 /usr/bin/true || softwareupdate --install-rosetta --agree-to-license
+      - uses: actions/setup-python@v6
+        if: runner.os == 'Windows' || matrix.python != '3.8'
+        with:
+          python-version: ${{ matrix.python }}
+      # Use standalone builds for 3.8 on the current Ubuntu and macOS images.
+      - uses: astral-sh/setup-uv@v7
+        if: runner.os != 'Windows' && matrix.python == '3.8'
+        with:
+          enable-cache: false
+      - name: Set up managed Python 3.8
+        if: runner.os != 'Windows' && matrix.python == '3.8'
+        env:
+          PYTHON_REQUEST: ${{ runner.os == 'macOS' && 'cpython-3.8-macos-x86_64-none' || '3.8' }}
+        run: |
+          uv venv --managed-python --python "$PYTHON_REQUEST" "$RUNNER_TEMP/neoxider-python"
+          echo "$RUNNER_TEMP/neoxider-python/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Isolate test state
+        env:
+          TEST_TEMP: ${{ runner.temp }}
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            TEST_TEMP="$(cygpath -m "$TEST_TEMP")"
+          fi
+          mkdir -p "$TEST_TEMP/neoxider-fixtures"
+          echo "TEMP=$TEST_TEMP/neoxider-fixtures" >> "$GITHUB_ENV"
+          echo "TMP=$TEST_TEMP/neoxider-fixtures" >> "$GITHUB_ENV"
+          echo "TMPDIR=$TEST_TEMP/neoxider-fixtures" >> "$GITHUB_ENV"
+          echo "AGENT_CLI_LOGS=$TEST_TEMP/neoxider-state" >> "$GITHUB_ENV"
+          echo "AGENT_CONFIG=$TEST_TEMP/neoxider-config/config.json" >> "$GITHUB_ENV"
+      - name: Add Homebrew Bash and legacy test tools
+        if: runner.os == 'macOS'
+        run: |
+          for formula in bash coreutils grep; do
+            brew list --versions "$formula" || brew install "$formula"
+          done
+          {
+            echo "$(brew --prefix bash)/bin"
+            echo "$(brew --prefix coreutils)/libexec/gnubin"
+            echo "$(brew --prefix grep)/libexec/gnubin"
+          } >> "$GITHUB_PATH"
+      - name: Windows PowerShell 5.1 entry
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { throw 'Expected Windows PowerShell 5.1' }
+          & ./tests/test_powershell_entry.ps1
+      - name: PowerShell 7 entry
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ($PSVersionTable.PSVersion.Major -ne 7) { throw 'Expected PowerShell 7' }
+          & ./tests/test_powershell_entry.ps1
+      - name: Bash entry and legacy regression suite
+        env:
+          AGENT_TEST_SKIP_DUPLICATE_CONTROL: '1'
+        run: |
+          (( BASH_VERSINFO[0] >= 4 ))
+          bash agent.sh list
+          bash agent.sh reply --help
+          export AGENT_TEST_ROOT="$PWD/agent-cli-logs/bash-tests"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            AGENT_TEST_ROOT="$(cygpath -m "$AGENT_TEST_ROOT")"
+          fi
+          bash tests/test_agent_sh.sh
+          bash tests/test_opencode_reliability.sh
+      - name: Install and load zsh completion
+        if: runner.os == 'macOS'
+        run: |
+          export HOME="$RUNNER_TEMP/zsh home"
+          export ZDOTDIR="$HOME"
+          mkdir -p "$HOME"
+          bash agent.sh completion zsh --install
+          bash agent.sh completion zsh --install
+          test "$(grep -Fc '# >>> neoxider-agents completion >>>' "$HOME/.zshrc")" -eq 1
+          zsh -n "$HOME/.zshrc"
+          zsh -fc 'autoload -Uz compinit; compinit -D || exit; source "$HOME/.zshrc" || exit; [[ ${_comps[neoxider]} == _neoxider && ${_comps[agent.sh]} == _neoxider ]]'
+      - name: Python offline suite
+        run: |
+          python --version
+          python -m unittest discover -s tests -p 'test_*.py'
+      - name: Frontend suite
+        run: |
+          for test in tests/test_*.js; do node "$test"; done
+
+  release-gate:
+    name: Release gate
+    needs: tests
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Validate plugin metadata
+        run: python scripts/validate_plugin.py
+      - name: Require all matrix jobs to pass
+        env:
+          MATRIX_RESULT: ${{ needs.tests.result }}
+        run: test "$MATRIX_RESULT" = success

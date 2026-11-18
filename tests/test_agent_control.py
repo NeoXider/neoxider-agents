@@ -1,4 +1,5 @@
 """Offline control acceptance: tracked fixture processes, isolated logs, no real CLIs."""
+from concurrent.futures import ThreadPoolExecutor
 import os
 import json
 from pathlib import Path
@@ -20,7 +21,7 @@ DEFAULT_RESTART = ("The previous turn was interrupted. First check the working t
 
 class ControlRegressions(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/legacy-tests") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-core-legacy"
+        base = Path(tempfile.gettempdir()) / "agents-core-legacy"
         base.mkdir(parents=True, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=base, prefix="control-")
         self.base = Path(self.tmp.name)
@@ -96,6 +97,15 @@ class ControlRegressions(unittest.TestCase):
         output = job.communicate(timeout=120)[0]
         self.assertEqual(job.returncode, 0, output)
         return output
+
+    def interrupt_and_reap(self, job, *args):
+        # The legacy resume acquires the original launcher's owner lock. Reap the
+        # interrupted child concurrently so kill -0 can observe that it has exited.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            reaped = executor.submit(job.communicate, timeout=30)
+            result = self.ok(*args)
+            reaped.result()
+        return result
 
     def release(self, turn, work=None):
         ((work or self.work) / f"turn.{turn}.release").touch()
@@ -210,9 +220,8 @@ class ControlRegressions(unittest.TestCase):
         job = self.start()
         self.ok("send", "task", "EARLIER QUEUE")
         sid = (self.work / "turn.1.session").read_text()
-        output = self.ok("send", "task", "--now", "INTERRUPT")
+        output = self.interrupt_and_reap(job, "send", "task", "--now", "INTERRUPT")
         self.assertIn("queued (#2)", output)
-        job.communicate(timeout=30)
         self.assertFalse((self.work / "turn.1.finished").exists())
         self.assertEqual(self.meta()["session"], sid)
         self.assertEqual((self.work / "turn.2.session").read_text(), sid)
@@ -331,8 +340,7 @@ class ControlRegressions(unittest.TestCase):
     def test_restart_default_checks_partial_edits_and_keeps_session(self):
         job = self.start()
         sid = (self.work / "turn.1.session").read_text()
-        self.ok("restart", "task", "--no-progress")
-        job.communicate(timeout=30)
+        self.interrupt_and_reap(job, "restart", "task", "--no-progress")
         self.assertEqual((self.work / "turn.2.prompt").read_text(), "Message #1:\n" + DEFAULT_RESTART)
         self.assertEqual(self.meta()["session"], sid)
         self.assertEqual((self.work / "partial.txt").read_text(), "partial edit survives\n")
@@ -522,24 +530,36 @@ class ControlRegressions(unittest.TestCase):
         meta = self.meta()
         self.assertEqual(meta["state"], "running")
         self.assertRegex(meta["pid"], r"^\d+$")
-        probe = subprocess.run([BASH, "-c", '''IFS= read -r proc_stat < "/proc/$1/stat"
+        if sys.platform == "darwin":
+            stamp, command = (
+                subprocess.run(["ps", "-ww", "-p", meta["pid"], "-o", field],
+                               env=dict(self.env, LC_ALL="C", TZ="UTC"), check=True,
+                               capture_output=True, text=True, timeout=20).stdout.strip()
+                for field in ("lstart=", "command=")
+            )
+            self.assertEqual("ps:" + stamp, meta["pid_start"])
+            self.assertEqual(int(meta["pid"]), job.pid)
+            self.assertRegex(command, r"(?:^|/)agent\.sh\s")
+            self.assertIn("task", command.split())
+        else:
+            probe = subprocess.run([BASH, "-c", '''IFS= read -r proc_stat < "/proc/$1/stat"
 printf '%s\\n' "$proc_stat"
 proc_winpid=''
 if [ -r "/proc/$1/winpid" ]; then IFS= read -r proc_winpid < "/proc/$1/winpid"; fi
 printf '%s\\n' "$proc_winpid"
 while IFS= read -r -d '' arg; do printf '%s\\n' "$arg"; done < "/proc/$1/cmdline"''',
-                                "--", meta["pid"]], env=self.env, cwd=ROOT,
-                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, **hidden_kwargs())
-        lines = probe.stdout.splitlines()
-        self.assertGreaterEqual(len(lines), 3, probe.stdout + probe.stderr)
-        self.assertEqual(lines[0].rpartition(") ")[2].split()[19], meta["pid_start"])
-        if os.name == "nt":
-            self.assertRegex(lines[1], r"^\d+$")
-            self.assertEqual(lines[1], meta["winpid"])
-        else:
-            self.assertEqual(int(meta["pid"]), job.pid)
-        self.assertIn("agent.sh", " ".join(lines[2:]))
-        self.assertIn("task", lines[2:])
+                                    "--", meta["pid"]], env=self.env, cwd=ROOT,
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, **hidden_kwargs())
+            lines = probe.stdout.splitlines()
+            self.assertGreaterEqual(len(lines), 3, probe.stdout + probe.stderr)
+            self.assertEqual(lines[0].rpartition(") ")[2].split()[19], meta["pid_start"])
+            if os.name == "nt":
+                self.assertRegex(lines[1], r"^\d+$")
+                self.assertEqual(lines[1], meta["winpid"])
+            else:
+                self.assertEqual(int(meta["pid"]), job.pid)
+            self.assertIn("agent.sh", " ".join(lines[2:]))
+            self.assertIn("task", lines[2:])
         self.ok("stop", "task")
         job.communicate(timeout=30)
         self.assertEqual(self.meta()["state"], "stopped")

@@ -39,7 +39,9 @@ class EnforcementTests(unittest.TestCase):
         self.assertEqual(self.file.read_text(encoding="utf-8"), "original")
 
     def test_no_launch_even_if_prerequisites_are_reported_present(self):
-        with patch("subprocess.Popen") as process:
+        with patch("neoxider_agents.windows_enforcement.probe",
+                   return_value={"supported": True, "api_presence": {"mock": True}}), \
+                patch("subprocess.Popen") as process:
             with self.assertRaises(EnforcementUnavailable) as caught:
                 launch(self.request, ["cmd", "/c", "exit"], network=True,
                        fallback=lambda: self.fail("fallback called"))

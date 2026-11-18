@@ -51,7 +51,7 @@ print(store.enqueue("task", sys.argv[1] * 32768))
 
 class ReceiptStore(unittest.TestCase):
     def setUp(self):
-        base = Path("D:/Temp/agents-ux/receipts") if os.name == "nt" else Path(tempfile.gettempdir()) / "agents-receipts"
+        base = Path(tempfile.gettempdir()) / "agents-receipts"
         base.mkdir(parents=True, exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix="receipts-", dir=base)
         self.addCleanup(self.temp.cleanup)
