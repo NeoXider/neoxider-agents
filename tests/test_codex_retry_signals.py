@@ -134,7 +134,12 @@ class CodexRetrySignalTests(unittest.TestCase):
         self.assertIn('AGENT_PROVIDER_ERROR:', ''.join(rendered))
 
     def test_only_well_formed_transport_reconnect_status_is_nonfatal(self):
-        messages = [RECONNECT, RECONNECT.replace('2/5', '1/5'), RECONNECT.replace('2/5', '5/5')]
+        messages = [RECONNECT, RECONNECT.replace('2/5', '1/5'), RECONNECT.replace('2/5', '5/5'),
+                    'Reconnecting... 2/5 (request timed out)',
+                    'Reconnecting... 1/5 (stream disconnected before completion: request timed out)',
+                    'Reconnecting... 3/5 (stream disconnected before completion: connection reset by peer)',
+                    'Reconnecting... 4/5 (error sending request for url (https://chatgpt.example/backend))'.replace(' (https://chatgpt.example/backend)', ''),
+                    'Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for SSE)']
         for message in messages:
             with self.subTest(message=message):
                 parser = OutputFilter('codex')
@@ -153,6 +158,9 @@ class CodexRetrySignalTests(unittest.TestCase):
             'Reconnecting... 2/5 (authentication failed: tls handshake eof)',
             'Reconnecting... 2/5 (context window exceeded: tls handshake eof)',
             'Reconnecting... 2/5 (unknown problem)',
+            'Reconnecting... 2/5 (request timed out: usage limit reached)',
+            'Reconnecting... 2/5 (stream disconnected before completion: 429 Too Many Requests)',
+            'Reconnecting... 6/5 (request timed out)',
         ]
         for message in messages:
             with self.subTest(message=message):

@@ -29,11 +29,30 @@ def error_text(value):
     return " ".join(str(value or "").split())
 
 
+_TRANSIENT_TRANSPORT = (
+    r"tls handshake eof|request timed out|operation timed out|idle timeout|timed out waiting for response"
+    r"|connection (?:reset|closed|aborted)(?: by peer)?|error sending request(?: for url)?|broken pipe"
+)
+_PERMANENT_MARKERS = re.compile(r"quota|usage limit|rate limit|429|auth|unauthori[sz]ed|forbidden|context window"
+                                r"|invalid|not found|billing|exceeded", re.IGNORECASE)
+
+
 def _codex_retry_notice(message):
-    """Only an in-progress, bounded Codex TLS reconnect notice is nonterminal."""
-    match = re.fullmatch(r"Reconnecting\.\.\. ([1-9][0-9]{0,8})/([1-9][0-9]{0,8}) "
-                         r"\(stream disconnected before completion: tls handshake eof\)", message)
-    return bool(match and int(match.group(1)) <= int(match.group(2)))
+    """Only an in-progress, bounded Codex transport reconnect notice is nonterminal.
+
+    Codex prints ``Reconnecting... N/M (<reason>)`` before each automatic retry and reports a
+    terminal failure separately once its attempts are exhausted, so a bounded notice whose reason is
+    a known transient transport fault (TLS EOF, request/operation timeout, connection reset, send
+    error) must not stop the task. Unknown or permanent reasons (quota, auth, context) stay fatal.
+    """
+    match = re.fullmatch(r"Reconnecting\.\.\. ([1-9][0-9]{0,8})/([1-9][0-9]{0,8}) \((.+)\)", message)
+    if not match or int(match.group(1)) > int(match.group(2)):
+        return False
+    reason = match.group(3)
+    if _PERMANENT_MARKERS.search(reason):
+        return False
+    reason = re.sub(r"^stream disconnected before completion: ", "", reason)
+    return bool(re.fullmatch(r"(?:%s)(?:[:;,]? [^()]*)?" % _TRANSIENT_TRANSPORT, reason, re.IGNORECASE))
 
 
 class OutputFilter:
