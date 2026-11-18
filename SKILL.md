@@ -27,6 +27,12 @@ routine checks; do not spawn a worker merely because this skill is available.
 
 ## Ultra / swarm mode
 
+Ultra is ultracode-class orchestration over neoxider workers. The workflow design includes scripted
+phases, parallel and pipeline fan-out of fresh-context workers, structured result
+schemas, independent verification and refutation, and coordinator-run checks.
+The scripted workflow runner arrives in P1 as `ultra run <script>`. Its separate
+spec is being drafted in `docs/ULTRA_WORKFLOW_SPEC.md`.
+
 Activate ultra only for either of these cases:
 
 - The user explicitly requests it in their own prompt, for example `/ultra <objective>`,
@@ -53,7 +59,8 @@ For either ultra trigger, follow this sequence:
    pass|fail --gate review:pass --gate verify:pass` using the actual outcomes (`pass`, `fail`
    or `n/a` per gate). A worker never records its own score.
 
-P0's keyword lives in this skill, and `swarm plan` only renders a template and routing.
+P0's keyword lives in this skill. The `swarm` CLI verb has the alias `ultra`, so
+`ultra score` and `ultra plan` use the same memory and advisory role template.
 See [Swarm memory and routing](docs/SWARM.md) for the CLI and storage details.
 
 ## When to route here instead of Hermes `delegate_task` (rule from Victor, 2026-10-19)

@@ -203,13 +203,17 @@ class SwarmTests(unittest.TestCase):
 
     def test_native_cli_map_and_plan_create_no_task_files(self):
         self.assertIn("advisory", self.cli("swarm", "--help"))
+        self.assertIn("Usage: neoxider ultra", self.cli("ultra", "--help"))
         self.cli("swarm", "map", "set", "reviewer", "opencode/opencode/big-pickle/default,codex/spark/medium")
         choices = json.loads(self.cli("swarm", "map", "show"))["reviewer"]
         self.assertEqual(choices, ["opencode/opencode/big-pickle/default", "codex/spark/medium"])
         self.assertEqual(json.loads(self.config_path.with_name("swarm.map").read_text(encoding="utf-8"))["reviewer"], choices)
         empty_plan = json.loads(self.cli("swarm", "plan", "Isolate release checks", "--json"))
+        self.assertEqual(json.loads(self.cli("ultra", "plan", "Isolate release checks", "--json")), empty_plan)
         self.assertTrue(empty_plan["advisory"])
         self.assertEqual(len(empty_plan["roles"]), 5)
+        self.assertEqual(self.cli("ultra", "score", "--json"), self.cli("swarm", "score", "--json"))
+        self.assertIn("use record, score, map, or plan", self.cli("ultra", "run", "workflow.json", code=1))
         self.assertFalse(list(self.store.root.iterdir()))
 
         self.memory.append(row("memory", role="reviewer", engine="opencode", model="opencode/big-pickle", effort="",

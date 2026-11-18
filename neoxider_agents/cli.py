@@ -24,6 +24,7 @@ COMMANDS = {
     "doctor": "[--deep|--json]", "provider-info": "ENGINE",
     "models": "[-e ENGINE] [--provider ID] [-m MODEL] [--refresh] [--json]",
     "swarm": "record TASK --role ROLE --verdict pass|fail --gate review:pass|fail|n/a [--note TEXT] [--override TEXT] | score [--json] | map show|set ROLE ROUTE[,ROUTE...]|unset ROLE | plan OBJECTIVE [--route ENGINE/MODEL] [--json]",
+    "ultra": "(alias for swarm)",
     "probe": "[-e opencode] -m MODEL [-f EFFORT] [-t NAME] [--timeout SECONDS] [--standard] [--json]",
     "test-api": "--base-url URL --goal TEXT [--out F] [-e ENGINE] [-m MODEL] [-f EFFORT] [-C DIR] [-t NAME]",
     "gui": "[PORT] [--lan] [--localhost] [--token SECRET]",
@@ -38,13 +39,15 @@ COMMANDS.update({"receipt": "NAME [UUID] [--list] [--ack --evidence TEXT --sourc
 
 def usage(command=""):
     if command and command in COMMANDS:
-        print("Usage: neoxider %s %s" % (command, COMMANDS[command]))
+        syntax = COMMANDS["swarm" if command == "ultra" else command]
+        print("Usage: neoxider %s %s" % (command, syntax))
         if command in ("run", "ask", "fan", "test-api"):
             print("Defaults: current directory; prompt slug + 4-character id; configured or installed engine; provider model/effort.")
             print("Progress off, quiet output and bounded ephemeral raw logs. Use --progress, -v and --log to opt in. --debug shows tracebacks.")
         if command == "config":
             print("Config: AGENT_CONFIG, else %APPDATA%/neoxider-agents/config.json on Windows; ~/.config/neoxider-agents/config.json elsewhere.")
-        if command == "swarm":
+        if command in ("swarm", "ultra"):
+            print("Commands are available as swarm or ultra.")
             print("Map routes use ENGINE/MODEL/EFFORT (use 'default' for provider effort).")
             print("Record also accepts --gate verify:pass|fail|n/a. Plan is advisory only.")
         if command == "brief":
@@ -436,6 +439,8 @@ def main(argv=None):
     if any(arg in ("--help", "-h") for arg in argv[:argv.index("--") if "--" in argv else len(argv)]):
         usage(command)
         return 0
+    if command == "ultra":
+        command = "swarm"
     store = None
     opts, args = {}, []
     try:

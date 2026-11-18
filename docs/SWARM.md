@@ -1,5 +1,11 @@
 # Swarm memory and manual routing
 
+Ultra is ultracode-class orchestration over neoxider workers. The workflow design includes scripted
+phases, parallel and pipeline fan-out of fresh-context workers, structured result
+schemas, independent verification and refutation, and coordinator-run checks.
+The scripted workflow runner arrives in P1 as `ultra run <script>`. Its separate
+spec is being drafted in `docs/ULTRA_WORKFLOW_SPEC.md`.
+
 P0 adds local memory and an advisory plan to the existing tracked CLI. The
 [skill's ultra trigger](../SKILL.md#ultra--swarm-mode) applies to an explicit user
 prompt or to objectives with three independent pieces of at least 15 minutes each,
@@ -11,12 +17,14 @@ verifier provider from the implementer when available.
 
 ## Plan and routes
 
+`ultra` is an alias for the `swarm` CLI verb. Both spellings use the same P0 commands.
+
 ```text
 neoxider swarm map show
 neoxider swarm map set implementer codex/sol/medium,opencode/opencode/big-pickle/default
 neoxider swarm map unset implementer
 neoxider swarm plan "Split the release checks by subsystem"
-neoxider swarm plan "Split the release checks by subsystem" --route codex/spark --json
+neoxider ultra plan "Split the release checks by subsystem" --route codex/spark --json
 ```
 
 `swarm.map` is a JSON object beside the file selected by the existing config
@@ -43,7 +51,7 @@ Plan and score launch no tasks or provider probes.
 neoxider swarm record release-build --role implementer --verdict pass --gate review:pass --gate verify:pass --note "Good for: isolated build fixes"
 neoxider swarm record release-verify --role verifier --verdict fail --gate verify:fail --override "Used the second approved route" --note "Bad for: cold Windows builds"
 neoxider swarm score
-neoxider swarm score --json
+neoxider ultra score --json
 ```
 
 The coordinator supplies the file-delta verdict and at least one independent
