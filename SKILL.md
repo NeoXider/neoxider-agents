@@ -1500,6 +1500,25 @@ the wave productive and what went wrong:
 - Python child output redirected to a file is block-buffered: a long `python script.py > out.txt` shows an
   empty file for minutes. Use `python -u` (or `PYTHONUNBUFFERED=1`) when a coordinator will read it mid-run.
 
+## Field notes: plain orchestrated wave, 4 Codex workers (2026-11-19, dated observation)
+Coordinator (this session) + 4 owned gpt-6.1-sol medium workers, no ultra: 6 tool PRs reviewed and merged
+in ~3.5 h (one root-cause class per worker, each with paired before/after measurements).
+- **Plain wave beats ultra when the coordinator reviews and merges** and the pieces are independent root
+  causes in different code paths; ultra would add reviewer/verifier cost for the same gate.
+- **Watchdog vs transient network**: before PR #10/#11 a bounded `Reconnecting... N/M (request timed out)`
+  or a localized DNS `(os error 11001)` stopped a live worker with exit 126. Now only quota/auth/context/
+  unknown reasons are fatal. If an older install stops a worker this way: `restart NAME "<cause>. Continue
+  from NOTES.md; do not redo finished steps; budget: <time>"` resumes the same session.
+- **`send` to a running Codex worker is queued and picked up at its next turn boundary** (minutes, not
+  hours). Use it for "PR X merged - do not push more to that branch", "base moved - merge it before your
+  PR", and the go-signal after a shared rebuild.
+- **Give every restart and follow-up an explicit remaining time budget**; workers then close with an
+  honest partial result (gate pass/fail stated) instead of running to the watchdog.
+- **Ask workers to write NOTES.md incrementally**: it made two restarts lossless.
+- **Cleanup is the coordinator's job**: workers' attempts to delete their own superseded scratch were
+  refused by the auto-approval policy. Check free disk before a wave; before deleting anything, grep the
+  active workers' notes/scripts for that path.
+
 ## Rules for setting tasks
 
 The scoping/verification/git rules live in the orchestrator loop above — follow them for every
