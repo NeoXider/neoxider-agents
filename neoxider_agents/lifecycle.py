@@ -98,7 +98,7 @@ def preflight(store, name, opts, resume, session_override=None):
     from .disk_guard import describe, low_volumes, min_free_mb, watched_paths
     resolved = select_options(store, name, opts)
     provider = get_provider(resolved["engine"])
-    low = low_volumes(watched_paths(store.root, provider.engine, resolved.get("dir")))
+    low = low_volumes(watched_paths(store.root, resolved.get("engine", ""), resolved.get("dir")))
     if low:
         raise ValueError("refusing to launch: %s (< AGENT_MIN_FREE_MB=%d); a provider that cannot write its "
                          "session hangs silently. Free space, or set AGENT_MIN_FREE_MB=0 to override."

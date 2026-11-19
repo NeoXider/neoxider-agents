@@ -281,7 +281,7 @@ class Turn:
                     elif silence and time.monotonic() - self.last_output_time >= silence:
                         self.action, self.reason, self.by, code = "stop", "no output for %ss (AGENT_SILENCE_SEC)" % silence, "watchdog", 125
                         from .disk_guard import describe, low_volumes, watched_paths
-                        low = low_volumes(watched_paths(self.store.root, self.provider.engine))
+                        low = low_volumes(watched_paths(self.store.root, getattr(self.provider, "engine", "")))
                         if low:
                             self.reason += "; low disk: " + describe(low)
                         log.write("!! SILENT: " + self.reason + "\n")
