@@ -33,6 +33,9 @@ _TRANSIENT_TRANSPORT = (
     r"tls handshake eof|request timed out|operation timed out|idle timeout|timed out waiting for response"
     r"|connection (?:reset|closed|aborted|refused)(?: by peer)?|error sending request(?: for url)?|broken pipe"
     r"|dns error|failed to lookup address(?: information)?|no such host is known|name or service not known"
+    # Server-side overload notices Codex retries by itself (it reports exhaustion separately).
+    r"|selected model is at capacity\.?(?: please try a different model\.?)?|server (?:is )?overloaded"
+    r"|service (?:temporarily )?unavailable|bad gateway|gateway timeout"
     # Any OS-level socket/DNS failure, whatever the locale of its text (e.g. Windows "os error 11001").
     r"|[^()]*\(os error [0-9]{1,6}\)"
 )
