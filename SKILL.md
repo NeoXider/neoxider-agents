@@ -1515,6 +1515,10 @@ in ~3.5 h (one root-cause class per worker, each with paired before/after measur
 - **Give every restart and follow-up an explicit remaining time budget**; workers then close with an
   honest partial result (gate pass/fail stated) instead of running to the watchdog.
 - **Ask workers to write NOTES.md incrementally**: it made two restarts lossless.
+- **Low disk hangs workers silently**: with C: at 9 MB free five Codex workers hung on their first command and
+  the silence watchdog fired only after AGENT_SILENCE_SEC. `run`/`restart` now refuse to launch when the
+  log store, provider home (e.g. ~/.codex), work dir or TEMP volume has < AGENT_MIN_FREE_MB (default 512;
+  0 disables), and a silence stop names low disk in its reason.
 - **Cleanup is the coordinator's job**: workers' attempts to delete their own superseded scratch were
   refused by the auto-approval policy. Check free disk before a wave; before deleting anything, grep the
   active workers' notes/scripts for that path.
