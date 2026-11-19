@@ -142,7 +142,9 @@ class CodexRetrySignalTests(unittest.TestCase):
                     'Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for SSE)',
                     'Reconnecting... 2/5 (stream disconnected before completion: Этот хост неизвестен. (os error 11001))',
                     'Reconnecting... 1/5 (error sending request for url: dns error: failed to lookup address information)',
-                    'Reconnecting... 3/5 (stream disconnected before completion: No such host is known. (os error 11001))']
+                    'Reconnecting... 3/5 (stream disconnected before completion: No such host is known. (os error 11001))',
+                    'Reconnecting... 2/5 (Selected model is at capacity. Please try a different model.)',
+                    'Reconnecting... 1/5 (stream disconnected before completion: service unavailable)']
         for message in messages:
             with self.subTest(message=message):
                 parser = OutputFilter('codex')
