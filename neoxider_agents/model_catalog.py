@@ -56,14 +56,14 @@ def _flags(value):
     return {key: flag for key, flag in value.items() if isinstance(flag, bool)} if isinstance(value, dict) else {}
 
 
-def normalize(model_id, record):
+def normalize(model_id, record, source="cli-advertised"):
     caps = record.get("capabilities", {})
     caps = caps if isinstance(caps, dict) else {}
     variants = record.get("variants")
     modes = sorted(key for key in variants if re.fullmatch(r"[A-Za-z0-9._-]+", key)) if isinstance(variants, dict) else []
     cost = _numbers(record.get("cost"))
     return {"id": model_id, "name": str(record.get("name") or model_id)[:160],
-            "provider": model_id.split("/", 1)[0], "source": "cli-advertised",
+            "provider": model_id.split("/", 1)[0], "source": source,
             "capabilities": {key: caps[key] for key in ("reasoning", "toolcall", "attachment", "temperature")
                              if isinstance(caps.get(key), bool)},
             "input": _flags(caps.get("input")), "output": _flags(caps.get("output")),
@@ -104,6 +104,17 @@ def parse_verbose(text):
     return result
 
 
+def parse_plain(text):
+    if len(text.encode("utf-8")) > MAX_BYTES:
+        raise ValueError("model catalogue exceeded output limit")
+    text = ANSI.sub("", text)
+    result = [normalize(line.strip(), {}, source="cli-list") for line in text.splitlines()
+              if ID.fullmatch(line.strip())]
+    if not result:
+        raise ValueError("CLI returned no plain model ids")
+    return result
+
+
 def catalogue(engine="opencode", provider="", refresh=False, timeout=20):
     get_provider(engine)  # Validate using installed provider plugins.
     if provider and not re.fullmatch(r"[A-Za-z0-9._-]+", provider):
@@ -112,11 +123,19 @@ def catalogue(engine="opencode", provider="", refresh=False, timeout=20):
         argv = executable(engine) + ["models"] + ([provider] if provider else []) + ["--verbose"]
         if refresh:
             argv.append("--refresh")
-        models = parse_verbose(bounded_capture(argv, timeout))
+        source = "cli-advertised"
+        note = "Advertised data; availability, remaining quota and effective reasoning require separate evidence."
+        try:
+            models = parse_verbose(bounded_capture(argv, timeout))
+        except RuntimeError as error:
+            if "failed (exit" not in str(error):
+                raise
+            # Installed CLIs without --verbose still print the plain id list.
+            models = parse_plain(bounded_capture([arg for arg in argv if arg != "--verbose"], timeout))
+            source, note = "cli-list", "Plain ids from a CLI without --verbose; capabilities, limits and cost are unknown."
         if provider:
             models = [model for model in models if model["provider"] == provider]
-        return {"engine": engine, "source": "cli-advertised", "models": models,
-                "note": "Advertised data; availability, remaining quota and effective reasoning require separate evidence."}
+        return {"engine": engine, "source": source, "models": models, "note": note}
     if provider:
         raise ValueError("--provider is supported by OpenCode only")
     config = json.loads((ROOT / "providers" / engine / "provider.json").read_text(encoding="utf-8"))

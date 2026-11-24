@@ -59,6 +59,20 @@ class CatalogueTests(unittest.TestCase):
         self.assertEqual(capture.call_args[0][0], ["opencode.exe", "models", "opencode", "--verbose", "--refresh"])
         self.assertEqual(payload["models"][0]["id"], "opencode/test")
 
+    def test_plain_fallback_when_verbose_is_unsupported(self):
+        with patch.object(catalog, "executable", return_value=["opencode.exe"]), \
+                patch.object(catalog, "bounded_capture", side_effect=[
+                    RuntimeError("model catalogue CLI failed (exit 1)"), "warning\nopencode/test\n"]) as capture:
+            payload = catalog.catalogue("opencode", "opencode")
+        self.assertEqual(capture.call_args_list[1][0][0], ["opencode.exe", "models", "opencode"])
+        self.assertEqual(payload["source"], "cli-list")
+        self.assertEqual([item["id"] for item in payload["models"]], ["opencode/test"])
+        self.assertEqual(payload["models"][0]["effort_source"], "unknown")
+        with patch.object(catalog, "executable", return_value=["opencode.exe"]), \
+                patch.object(catalog, "bounded_capture", side_effect=TimeoutError("fixture")):
+            with self.assertRaises(TimeoutError):
+                catalog.catalogue("opencode")
+
     def test_native_capture_success_timeout_output_limit_and_private_failure(self):
         self.assertEqual(catalog.bounded_capture([sys.executable, "-c", "print('OK')"], 3).strip(), "OK")
         with self.assertRaises(TimeoutError):
