@@ -257,6 +257,16 @@ class Commands(unittest.TestCase):
             _, env = self.command("opencode")
         self.assertNotIn("OPENCODE_CONFIG_CONTENT", env)
 
+    def test_opencode_chat_only_places_config_where_pinned_cli_looks(self):
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as scratch:
+            with patch("neoxider_agents.providers.executable", return_value=["opencode"]), \
+                    patch("neoxider_agents.providers.run_supports_flag", return_value=True):
+                get_provider("opencode").command("model", "", scratch, "", True)
+            data = json.loads((Path(scratch) / "opencode.json").read_text(encoding="utf-8"))
+            self.assertIn("neoxider-chat-only", data["agent"])
+            self.assertEqual(data["agent"]["neoxider-chat-only"]["tools"], {"*": False})
+
     def test_opencode_chat_only_config(self):
         args, env = self.command("opencode", chat_only=True)
         self.assertIn("neoxider-chat-only", args)
@@ -678,6 +688,7 @@ def prove_defects():
         ("neoxider_agents/providers.py", ' and target.name.lower() != "node.exe"', '', "NativeLaunchers.test_node_js_unwrapped"),
         ("neoxider_agents/output.py", 'stream.write(text)\n            self.answer_path = path', 'stream.write(text[-LIMIT:])\n            self.answer_path = path', "Filters.test_large_codex_answer_replayed_exactly"),
         ("providers/opencode/provider.py", 'args += ["--dir", str(cwd)]', 'args += []', "Commands.test_opencode_directory_explicit"),
+        ("providers/opencode/provider.py", 'dest.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")', 'pass', "Commands.test_opencode_chat_only_places_config_where_pinned_cli_looks"),
         ("providers/kimi/provider.py", '        executable(self.engine)\n        args = [sys.executable', '        args = [sys.executable', "Commands.test_kimi_missing_cli_preflight"),
     ]
     results = []

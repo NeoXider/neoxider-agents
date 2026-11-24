@@ -1,6 +1,7 @@
 """OpenCode aliases, chat-only profile and bounded transient retry policy."""
 import os
 import re
+from pathlib import Path
 from neoxider_agents.providers import BaseProvider, CONFLICT, FAILURE, ROOT, TRANSIENT, executable, run_supports_flag
 
 
@@ -37,7 +38,7 @@ class Provider(BaseProvider):
 
     def command(self, model, effort, cwd, session="", chat_only=False):
         chat_only = chat_only or os.environ.get("AGENT_CHAT_ONLY") == "1"
-        args = executable(self.engine) + ["run", "--auto", "--format", "json", "--print-logs", "--log-level", "ERROR"]
+        args = executable(self.engine) + ["run", "--auto", "--format", "json", "--print-logs", "--log-level", "error"]
         if run_supports_flag(self.engine, "dir"):
             # The pinned CLI decides: a build without --dir in its usage fails the launch on the flag;
             # the directory still arrives via subprocess cwd (runtime passes it) — see providers.run_supports_flag.
@@ -65,6 +66,15 @@ class Provider(BaseProvider):
             if not path.is_file():
                 raise ValueError("bundled OpenCode chat-only config is unavailable")
             env["OPENCODE_CONFIG"] = str(path)
+            # The pinned CLI (v2.4.0, observed live 2026-11-24) ignores both OPENCODE_CONFIG and
+            # OPENCODE_CONFIG_PATH and discovers agents from <cwd>/opencode.json instead; the env var
+            # stays for builds that honor it, the copy lands where this one looks. Never overwrite.
+            try:
+                dest = Path(cwd) / "opencode.json" if cwd else None
+                if dest is not None and not dest.exists():
+                    dest.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            except OSError:
+                pass
             args += ["--agent", agent]
             for image in os.environ.get("AGENT_OPENCODE_IMAGE_PATHS", "").splitlines():
                 if image and os.path.isfile(image):
