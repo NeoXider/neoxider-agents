@@ -145,6 +145,26 @@ class ProbeTests(unittest.TestCase):
             run.assert_not_called()
             self.assertEqual(store.read("existing")["state"], "done")
 
+    def test_scratch_cleanup_lock_does_not_kill_the_probe(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = Store(folder)
+            def run(actual_store, name, prompt, opts):
+                actual_store.update(name, resolved_model="opencode/x", effort="", state="done")
+                actual_store.path(name, ".answer").write_text("OK", encoding="utf-8")
+                return 0
+            class LockedScratch:
+                def __init__(self_inner, *args, **kwargs):
+                    pass
+                def __enter__(self_inner):
+                    return str(folder)
+                def __exit__(self_inner, et, ev, tb):
+                    raise PermissionError(32, "file in use")
+            with patch("neoxider_agents.lifecycle.run", side_effect=run), \
+                    patch("neoxider_agents.model_catalog.tempfile.TemporaryDirectory", LockedScratch):
+                result, code = catalog.run_probe(store, {"model": "opencode/x", "--json": True})
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(code, 0)
+
     def test_failure_classes_and_exact_reply(self):
         for code, reason, answer, status in ((124, "", "", "timeout"), (125, "", "", "silent"),
                 (126, "HTTP429 rate limit", "", "limited"), (126, "invalid api key", "", "auth-error"),

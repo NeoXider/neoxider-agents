@@ -216,17 +216,25 @@ def run_probe(store, opts):
            "AGENT_PROGRESS": "0"}
     previous = {key: os.environ.get(key) for key in env}
     try:
-        if store.path(name, ".meta").exists():
-            raise ValueError("probe task already exists; choose a new -t NAME")
-        # GUI must invoke this CLI in a separate process, never mutate server-thread env.
-        os.environ.update(env)
-        with tempfile.TemporaryDirectory(prefix="neoxider-probe-") as folder:
-            run_opts = dict(engine=engine, model=model, effort=effort, dir=folder, ask=True,
-                            parent=opts.get("parent", os.environ.get("AGENT_PARENT", "")))
-            run_opts["--no-progress"] = True
-            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                code = lifecycle.run(store, name, "Reply OK", run_opts)
-            meta, answer = store.read(name), answer_text(store, name)
+        meta = answer = None
+        try:
+            if store.path(name, ".meta").exists():
+                raise ValueError("probe task already exists; choose a new -t NAME")
+            # GUI must invoke this CLI in a separate process, never mutate server-thread env.
+            os.environ.update(env)
+            with tempfile.TemporaryDirectory(prefix="neoxider-probe-") as folder:
+                run_opts = dict(engine=engine, model=model, effort=effort, dir=folder, ask=True,
+                                parent=opts.get("parent", os.environ.get("AGENT_PARENT", "")))
+                run_opts["--no-progress"] = True
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    code = lifecycle.run(store, name, "Reply OK", run_opts)
+                meta, answer = store.read(name), answer_text(store, name)
+        except OSError as cleanup:
+            # Windows: a reparented helper may still hold a handle inside the scratch dir after the
+            # provider answered (observed live 2026-11-24, WinError 32). Cleanup must not decide a
+            # verdict the answer already recorded.
+            if meta is None:
+                raise
         status = probe_status(code, meta, answer)
         if meta.get("resolved_model", model) != model or meta.get("effort", effort) != effort:
             status = "route-mismatch"
