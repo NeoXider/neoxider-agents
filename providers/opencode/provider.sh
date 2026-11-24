@@ -222,13 +222,13 @@ _provider_opencode_keepalive() {
 _provider_opencode_invoke() {
     local dir="$1" prompt="$2"; shift 2
     local timeout_sec="${AGENT_OPENCODE_TIMEOUT_SEC:-${AGENT_TIMEOUT_SEC:-1800}}"
-    # --print-logs --log-level ERROR: without them opencode keeps provider failures to itself and the
+    # --print-logs --log-level error: without them opencode keeps provider failures to itself and the
     # task looks like an unexplained hang. Observed live 2026-09-04: the free tier answered
     # `AI_APICallError: Rate limit exceeded` ONE SECOND into the request, opencode did not exit on it,
     # and the step sat until the watchdog killed it 30 minutes later — five tasks in a row, each
     # reported as "turn died" with an empty log. The reason existed the whole time; nobody asked for
     # it. Logs go to stderr, so the JSONL on stdout stays clean.
-    local args=(--auto --format json --print-logs --log-level ERROR "$@")
+    local args=(--auto --format json --print-logs --log-level error "$@")
     mapfile -t -O ${#args[@]} args < <(_provider_opencode_chatonly_args)
     local -a image_args; mapfile -t image_args < <(_provider_opencode_image_args)
     [ ${#image_args[@]} -gt 0 ] && args+=("${image_args[@]}")
