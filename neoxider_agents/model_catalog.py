@@ -16,7 +16,7 @@ ID = re.compile(r"^[A-Za-z0-9._:-]+/[A-Za-z0-9._:/-]+$")
 ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
-def bounded_capture(argv, timeout=20):
+def bounded_capture(argv, timeout=20, tolerate_exit=False):
     from .process import spawn
     from .providers import close_diagnostic_tree, drain_diagnostic_pipe
     data, sleeper = bytearray(), Event()
@@ -38,7 +38,7 @@ def bounded_capture(argv, timeout=20):
         raise TimeoutError("model catalogue timed out")
     if problem or cleanup:
         raise RuntimeError(problem or cleanup)
-    if code:
+    if code and not tolerate_exit:
         # CLI diagnostics may contain credentials; never return their raw bytes.
         raise RuntimeError("model catalogue CLI failed (exit %s)" % code)
     return data.decode("utf-8-sig", "replace")
@@ -130,8 +130,8 @@ def catalogue(engine="opencode", provider="", refresh=False, timeout=20):
         except RuntimeError as error:
             if "failed (exit" not in str(error):
                 raise
-            # Installed CLIs without --verbose still print the plain id list.
-            models = parse_plain(bounded_capture([arg for arg in argv if arg != "--verbose"], timeout))
+            # Installed CLIs without --verbose print usage on an unknown flag or positional, so the plain call takes none.
+            models = parse_plain(bounded_capture([arg for arg in argv if arg not in ("--verbose", provider)], timeout, True))
             source, note = "cli-list", "Plain ids from a CLI without --verbose; capabilities, limits and cost are unknown."
         if provider:
             models = [model for model in models if model["provider"] == provider]

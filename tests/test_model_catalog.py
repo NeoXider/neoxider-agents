@@ -64,7 +64,7 @@ class CatalogueTests(unittest.TestCase):
                 patch.object(catalog, "bounded_capture", side_effect=[
                     RuntimeError("model catalogue CLI failed (exit 1)"), "warning\nopencode/test\n"]) as capture:
             payload = catalog.catalogue("opencode", "opencode")
-        self.assertEqual(capture.call_args_list[1][0][0], ["opencode.exe", "models", "opencode"])
+        self.assertEqual(capture.call_args_list[1][0][0], ["opencode.exe", "models"])
         self.assertEqual(payload["source"], "cli-list")
         self.assertEqual([item["id"] for item in payload["models"]], ["opencode/test"])
         self.assertEqual(payload["models"][0]["effort_source"], "unknown")
@@ -82,6 +82,7 @@ class CatalogueTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as error:
             catalog.bounded_capture([sys.executable, "-c", "print('apiKey=private'); exit(1)"], 3)
         self.assertNotIn("private", str(error.exception))
+        self.assertEqual(catalog.bounded_capture([sys.executable, "-c", "print('OK'); exit(1)"], 3, True).strip(), "OK")
 
     def test_cli_json_filters_alias_and_rejects_unknown(self):
         with tempfile.TemporaryDirectory() as folder:
