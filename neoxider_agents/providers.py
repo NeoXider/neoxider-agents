@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 import tempfile
+from functools import lru_cache
 from threading import Event
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -87,6 +88,24 @@ def executable(engine):
             if node_path:
                 return [node_path, str(target)]
     raise ValueError("Cannot launch %s without a command shell; install its native executable or set AGENT_%s_BIN" % (engine, engine.upper()))
+
+
+@lru_cache(maxsize=16)
+def run_supports_flag(engine, flag):
+    """True when the engine's own `run --help` advertises --FLAG.
+
+    The pinned CLI is authoritative about its own flags: the installed `opencode run` has no --dir and a
+    launch that passes it dies with "Unrecognized flag" (observed live 2026-11-24), while the .sh path of
+    the same provider already carries the directory via cwd. A failed probe answers False: on the Python
+    path the directory is passed through subprocess cwd anyway, so a missing flag costs nothing, whereas a
+    spurious one kills the run."""
+    try:
+        code, help_text = capture(executable(engine) + ["run", "--help"], timeout=10)
+    except (OSError, ValueError):
+        return False
+    if code != 0 or not help_text:
+        return False
+    return any(("--" + flag) in line for line in help_text.splitlines())
 
 
 def capture(argv, timeout=8):

@@ -1,7 +1,7 @@
 """OpenCode aliases, chat-only profile and bounded transient retry policy."""
 import os
 import re
-from neoxider_agents.providers import BaseProvider, CONFLICT, FAILURE, ROOT, TRANSIENT, executable
+from neoxider_agents.providers import BaseProvider, CONFLICT, FAILURE, ROOT, TRANSIENT, executable, run_supports_flag
 
 
 class Provider(BaseProvider):
@@ -37,7 +37,11 @@ class Provider(BaseProvider):
 
     def command(self, model, effort, cwd, session="", chat_only=False):
         chat_only = chat_only or os.environ.get("AGENT_CHAT_ONLY") == "1"
-        args = executable(self.engine) + ["run", "--auto", "--format", "json", "--print-logs", "--log-level", "ERROR", "--dir", str(cwd)]
+        args = executable(self.engine) + ["run", "--auto", "--format", "json", "--print-logs", "--log-level", "ERROR"]
+        if run_supports_flag(self.engine, "dir"):
+            # The pinned CLI decides: a build without --dir in its usage fails the launch on the flag;
+            # the directory still arrives via subprocess cwd (runtime passes it) — see providers.run_supports_flag.
+            args += ["--dir", str(cwd)]
         if model:
             args += ["-m", model]
         if effort:

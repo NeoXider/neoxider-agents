@@ -163,7 +163,8 @@ class Commands(unittest.TestCase):
         self.addCleanup(self.environment.stop)
 
     def command(self, engine, session="", chat_only=False):
-        with patch("neoxider_agents.providers.executable", return_value=[engine]):
+        with patch("neoxider_agents.providers.executable", return_value=[engine]), \
+                patch("neoxider_agents.providers.run_supports_flag", return_value=True):
             # Plugin binds executable at import, so load inside the patch.
             return get_provider(engine).command("model", "high", "D:/Temp/agents-ux/providers", session, chat_only)
 
@@ -223,6 +224,29 @@ class Commands(unittest.TestCase):
         self.assertIn("--auto", args)
         self.assertEqual(args[-2:], ["-s", "ses_old"])
         self.assertEqual(json.loads(env["OPENCODE_CONFIG_CONTENT"]), {"small_model": "model"})
+
+    def test_opencode_directory_flag_dropped_when_cli_lacks_it(self):
+        with patch("neoxider_agents.providers.executable", return_value=["opencode"]), \
+                patch("neoxider_agents.providers.run_supports_flag", return_value=False):
+            args, _ = get_provider("opencode").command("model", "high", "D:/Temp/agents-ux/providers", "ses_old", False)
+        self.assertNotIn("--dir", args)
+
+    def test_run_supports_flag_cached_and_failures(self):
+        from neoxider_agents.providers import run_supports_flag
+        run_supports_flag.cache_clear()
+        self.addCleanup(run_supports_flag.cache_clear)
+        with patch("neoxider_agents.providers.executable", return_value=["opencode"]), \
+                patch("neoxider_agents.providers.subprocess.run") as run:
+            run.return_value = type("R", (), {"returncode": 0, "stdout": b'FLAGS\n  --session, -s string\n  --dir string  Working directory'})()
+            self.assertTrue(run_supports_flag("opencode", "dir"))
+            self.assertTrue(run_supports_flag("opencode", "dir"))
+            self.assertEqual(run.call_count, 1)
+            run_supports_flag.cache_clear()
+            run.return_value = type("R", (), {"returncode": 0, "stdout": b'FLAGS\n  --session, -s string'})()
+            self.assertFalse(run_supports_flag("opencode", "dir"))
+            run_supports_flag.cache_clear()
+            run.return_value = type("R", (), {"returncode": 1, "stdout": b""})()
+            self.assertFalse(run_supports_flag("opencode", "dir"))
 
     def test_opencode_directory_explicit(self):
         args, _ = self.command("opencode", "ses_old")
@@ -653,7 +677,7 @@ def prove_defects():
         ("providers/kimi/acp_adapter.py", 'if allows and not self.chat_only else', 'if allows else', "ACPTransport.test_chat_permission_denied"),
         ("neoxider_agents/providers.py", ' and target.name.lower() != "node.exe"', '', "NativeLaunchers.test_node_js_unwrapped"),
         ("neoxider_agents/output.py", 'stream.write(text)\n            self.answer_path = path', 'stream.write(text[-LIMIT:])\n            self.answer_path = path', "Filters.test_large_codex_answer_replayed_exactly"),
-        ("providers/opencode/provider.py", ', "--dir", str(cwd)', '', "Commands.test_opencode_directory_explicit"),
+        ("providers/opencode/provider.py", 'args += ["--dir", str(cwd)]', 'args += []', "Commands.test_opencode_directory_explicit"),
         ("providers/kimi/provider.py", '        executable(self.engine)\n        args = [sys.executable', '        args = [sys.executable', "Commands.test_kimi_missing_cli_preflight"),
     ]
     results = []
