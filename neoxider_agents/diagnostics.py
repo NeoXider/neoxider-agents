@@ -397,6 +397,17 @@ class FailureReport:
         object.__setattr__(self, "reason", _safe(self.reason))
 
 
+MAX_ANNOUNCED_RETRY = 8
+
+
+def _announced_retry(event):
+    """A bounded in-progress provider retry announcement, not a failure boundary."""
+    if event.get("type") != "retry" or not event.get("nextRetryAt"):
+        return False
+    attempt = event.get("attempt")
+    return isinstance(attempt, int) and not isinstance(attempt, bool) and 0 < attempt <= MAX_ANNOUNCED_RETRY
+
+
 def _error_boundary(text):
     """Recognize envelopes, never search nested tool output or assistant content."""
     stripped = text.strip()
@@ -407,6 +418,10 @@ def _error_boundary(text):
     except (ValueError, TypeError):
         return None
     if not isinstance(event, dict) or event.get("role") in ("assistant", "tool", "user"):
+        return None
+    if _announced_retry(event):
+        # OpenCode announces each automatic retry ({"type":"retry","attempt":N,"nextRetryAt":...});
+        # it reports a terminal failure separately with an error event once it gives up.
         return None
     if event.get("type") in ("error", "turn.failed"):
         payload = event.get("error", event.get("message", event.get("part", {})))
