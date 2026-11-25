@@ -1544,6 +1544,19 @@ in ~3.5 h (one root-cause class per worker, each with paired before/after measur
 - **CI that never starts** ("recent account payments have failed or your spending limit...") is a billing state,
   not a test result; verify locally and say so.
 
+## Field notes: native bridge and mid-turn redirects (2026-11-25, dated observation)
+- **The free-limit 429 carries its own reset**: `retryAfterMs: 46283000` (12.9 h), not a short rolling window. Since
+  PR #17 a hint above `AGENT_FREE_LIMIT_MAX_WAIT` ends the task `limited` at once with the reset time; `probe` never
+  retries. Read the reset before planning the next wave.
+- **Bridging a paid-route limit with native subagents** (only on the user's word): same briefs, a clock time box (no new
+  long step after T-10 min) and a `HANDOFF` section in the task's notes; four native workers each delivered a PR in about
+  an hour and the Codex continuations resumed from the handoff without rework.
+- **A queued `send` waits for the turn to end** - a Codex worker in a multi-hour turn will not see it. To change scope
+  mid-turn, `stop` then `restart NAME "correction"`: the session and its findings survive, and the correction becomes the
+  next turn. Do it right after the step that must not be interrupted (an export holding a shared lock) has finished.
+- **A silent `running` can be a question**: a worker waiting on a coordinator condition (a lock, a cleanup) keeps the
+  process alive with no output; its question is only in `last NAME`. Check `last` for any worker quiet > 15 min.
+
 ## Rules for setting tasks
 
 The scoping/verification/git rules live in the orchestrator loop above — follow them for every
