@@ -494,7 +494,7 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             render_md(store, name)
             finish_completion(store, name, notify)
             return code
-        retry_cause, retry_cap, retry_pause = "", 0, 0
+        retry_cause, retry_cap, retry_pause, retry_exact = "", 0, 0, 0
         if code and action != "interrupt":
             if not delivered:
                 retry_cause = provider.retry_reason(retry_output, code, session)
@@ -522,6 +522,23 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
                     retry_cause = free_limit_retry_reason(reason or parsed_error)
                     retry_cap = int(number_env("AGENT_FREE_LIMIT_RETRIES", 0 if owned_outside else 4)) if retry_cause else 0
                     retry_pause = number_env("AGENT_FREE_LIMIT_DELAY", 300) if retry_cause else 0
+                    # WHY: the free limit is not always a short rolling window. On 2026-11-25 the same route
+                    # answered `429 provider.free-limit` with `retryAfterMs: 46283000` (12.9 h); four waits of
+                    # 5-20 min would hold each worker ~50 min and still end limited. The provider's own hint wins:
+                    # beyond AGENT_FREE_LIMIT_MAX_WAIT the task ends limited at once with the reset time, a
+                    # shorter hint is waited exactly (plus a few seconds) instead of the growing pause.
+                    after = getattr(output_filter, "provider_retry_after", None) if retry_cause else None
+                    if after is not None and retry_cap:
+                        if after > number_env("AGENT_FREE_LIMIT_MAX_WAIT", 1800):
+                            from .providers import free_limit_reset_note
+                            note = free_limit_reset_note(after)
+                            reason = "%s (%s)" % (reason or parsed_error, note)
+                            store.update(name, limit_resets_at=int(time.time() + after))
+                            with TailWriter(store.path(name, ".log"), keep_logs) as log:
+                                log.write("[agent.sh] NO RETRY: free-tier limit, %s\n" % note)
+                            retry_cause, retry_cap, retry_pause = "", 0, 0
+                        else:
+                            retry_exact = after + 5
                 if retry_cause and time.monotonic() - turn_started >= number_env("AGENT_TRANSPORT_RESET_SEC", 300):
                     retries = 0
         if retry_cause and retries >= retry_cap > 0:
@@ -544,7 +561,8 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
                 log.write("[agent.sh] RETRY %s/%s after %s\n" % (retries, retry_cap, retry_cause))
             store.update(name, retries=retries, last_retry_reason=retry_cause)
             # A free-tier limit needs minutes, growing with each attempt; every other retry keeps its short backoff.
-            pause = retry_pause * retries if retry_pause else number_env("AGENT_RETRY_DELAY", provider.retry_delay(retries))
+            pause = retry_exact or (retry_pause * retries if retry_pause else
+                                    number_env("AGENT_RETRY_DELAY", provider.retry_delay(retries)))
             if not retry_wait(turn, pause):
                 block = record_stop(store, name, turn.by or "orchestrator", turn.reason, STOP_EXIT, "stopped", answer, turn.last_activity)
                 release_delivery(store, name, delivered, generation, "stopped during retry wait: " + turn.reason)

@@ -257,6 +257,42 @@ class Contracts(unittest.TestCase):
         self.assertEqual((result, len(outcomes), notified), (126, 1, ["limited"]))
         self.assertEqual(self.store.read("task")["state"], "limited")
 
+    FREE_LIMIT_EVENT = ('{"type":"error","timestamp":1795604916927,"sessionID":"ses_saved","error":{"type":'
+                        '"provider.free-limit","message":"Free usage limit reached. Connect a provider or subscribe '
+                        'to OpenCode Go to keep going, or switch models.","status":429,"retryAfterMs":%s}}')
+
+    def free_limit_turn(self, retry_after_ms):
+        """A failed turn built by feeding the live 2026-11-25 OpenCode error line through the real filter."""
+        failed = OutputFilter("opencode")
+        failed.session = "ses_saved"
+        failed.feed(self.FREE_LIMIT_EVENT % retry_after_ms)
+        return (126, failed, "failure", failed.provider_error, "watchdog")
+
+    def test_free_limit_with_a_far_provider_reset_ends_limited_at_once_with_the_reset_time(self):
+        pauses = []
+        outcomes = [self.free_limit_turn(46283000), self.finished("opencode")]
+        self.assertEqual(outcomes[0][1].provider_retry_after, 46283.0)
+        with patch.object(lifecycle, "retry_wait", side_effect=lambda turn, seconds: pauses.append(seconds) or True):
+            result, _ = self.run_turns("opencode", outcomes, patch_retry_wait=False)
+        meta = self.store.read("task")
+        self.assertEqual((result, len(outcomes), pauses, meta["state"]), (126, 1, [], "limited"))
+        self.assertIn("provider reports reset in 12.9 h", meta.get("reason", ""))
+        self.assertGreater(int(meta["limit_resets_at"]), 0)
+
+    def test_free_limit_with_a_near_provider_reset_waits_exactly_that_long(self):
+        pauses = []
+        outcomes = [self.free_limit_turn(90000), self.finished("opencode")]
+        with patch.object(lifecycle, "retry_wait", side_effect=lambda turn, seconds: pauses.append(seconds) or True):
+            result, _ = self.run_turns("opencode", outcomes, patch_retry_wait=False)
+        self.assertEqual((result, outcomes, pauses), (0, [], [95.0]))
+
+    def test_free_limit_hint_is_ignored_when_not_a_positive_number(self):
+        for hint in ('"soon"', "0", "-5", "true"):
+            failed = OutputFilter("opencode")
+            failed.feed(self.FREE_LIMIT_EVENT % hint)
+            self.assertIsNone(failed.provider_retry_after, hint)
+            self.assertIn("Free usage limit reached", failed.provider_error)
+
     def test_a_paid_usage_limit_is_not_waited_out(self):
         outcomes = [self.transport_failure("codex", "You've hit your usage limit. Try again at Nov 25th, 2026 5:17 PM."),
                     self.finished("codex")]
