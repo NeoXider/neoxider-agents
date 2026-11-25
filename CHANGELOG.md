@@ -8,6 +8,10 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- The OpenCode free tier's rolling limit (`429 provider.free-limit`, no reset time) is waited out: the session is
+  retried after 5, 10, 15 and 20 minutes (`AGENT_FREE_LIMIT_RETRIES`, `AGENT_FREE_LIMIT_DELAY`) before the task
+  ends `limited` and notifies. Nine workers had been stopped together while the route answered again two minutes
+  later. Paid quotas stay terminal at once.
 - Network transport faults no longer kill a task. A turn the provider ends on `provider.transport`, DNS
   `ENOTFOUND`, `ECONNRESET`, `ETIMEDOUT` or `fetch failed` is retried in the same session with backoff, for every
   engine and also for a restarted or messaged turn (`AGENT_TRANSPORT_RETRIES`, default 5; a turn that worked for

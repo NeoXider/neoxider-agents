@@ -169,7 +169,7 @@ class Contracts(unittest.TestCase):
     def test_opencode_retry_reads_error_despite_partial_answer(self):
         self.execute_retry("opencode", "fetch failed: connection reset", 1, "")
 
-    def run_turns(self, engine, outcomes, env=None, delivered=None):
+    def run_turns(self, engine, outcomes, env=None, delivered=None, patch_retry_wait=True):
         """Drive lifecycle.execute over scripted turn outcomes; returns (exit code, notified states)."""
         class Turn:
             last_activity = "fixture"
@@ -181,7 +181,8 @@ class Contracts(unittest.TestCase):
         notified = []
         settings = {"AGENT_RETRY_DELAY": "0"}
         settings.update(env or {})
-        with patch.object(lifecycle, "Turn", Turn), patch.object(lifecycle, "retry_wait", return_value=True), \
+        waiter = patch.object(lifecycle, "retry_wait", return_value=True) if patch_retry_wait else contextlib.nullcontext()
+        with patch.object(lifecycle, "Turn", Turn), waiter, \
                 patch.object(lifecycle, "begin_snapshot"), patch.object(lifecycle, "changed_files", return_value=[]), \
                 patch.object(lifecycle, "render_md"), patch.object(provider, "prepare_resume"), \
                 patch("neoxider_agents.notifications.notify_task", side_effect=lambda name, state: notified.append(state) or True), \
@@ -240,6 +241,28 @@ class Contracts(unittest.TestCase):
         result, notified = self.run_turns("opencode", outcomes,
                                           {"AGENT_TRANSPORT_RETRIES": "1", "AGENT_NOTIFY_RETRY_EXHAUSTED": "0"})
         self.assertEqual((result, len(outcomes), notified), (126, 1, []))
+
+    def test_free_tier_limit_is_waited_out_with_growing_pauses_then_gives_up_as_limited(self):
+        limit = ('{"type":"provider.free-limit","message":"Free usage limit reached. Connect a provider or '
+                 'subscribe to OpenCode Go to keep going, or switch models.","status":429}')
+        pauses = []
+        outcomes = [self.transport_failure("opencode", limit), self.transport_failure("opencode", limit),
+                    self.finished("opencode")]
+        with patch.object(lifecycle, "retry_wait", side_effect=lambda turn, seconds: pauses.append(seconds) or True):
+            result, notified = self.run_turns("opencode", outcomes, patch_retry_wait=False)
+        self.assertEqual((result, outcomes, notified), (0, [], []))
+        self.assertEqual(pauses, [300, 600])
+        outcomes = [self.transport_failure("opencode", limit) for _ in range(3)]
+        result, notified = self.run_turns("opencode", outcomes, {"AGENT_FREE_LIMIT_RETRIES": "1"})
+        self.assertEqual((result, len(outcomes), notified), (126, 1, ["limited"]))
+        self.assertEqual(self.store.read("task")["state"], "limited")
+
+    def test_a_paid_usage_limit_is_not_waited_out(self):
+        outcomes = [self.transport_failure("codex", "You've hit your usage limit. Try again at Nov 25th, 2026 5:17 PM."),
+                    self.finished("codex")]
+        result, _ = self.run_turns("codex", outcomes)
+        self.assertNotEqual(result, 0)
+        self.assertEqual(len(outcomes), 1)
 
     def test_an_outer_owner_of_retries_switches_the_transport_retry_off(self):
         outcomes = [self.transport_failure("opencode", "ECONNRESET") for _ in range(2)]

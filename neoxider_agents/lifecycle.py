@@ -494,7 +494,7 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             render_md(store, name)
             finish_completion(store, name, notify)
             return code
-        retry_cause, retry_cap = "", 0
+        retry_cause, retry_cap, retry_pause = "", 0, 0
         if code and action != "interrupt":
             if not delivered:
                 retry_cause = provider.retry_reason(retry_output, code, session)
@@ -515,6 +515,13 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
                 retry_cap = int(number_env("AGENT_TRANSPORT_RETRIES", 0 if owned_outside else 5)) if retry_cause else 0
                 # A turn that worked for a while before the fault made progress: it starts a fresh budget, so a
                 # long task survives many separate blips while a dead route still stops after the cap.
+                if not retry_cause:
+                    # A rolling free-tier limit clears by itself within minutes; wait it out a few times with
+                    # long pauses before giving the task up as limited.
+                    from .providers import free_limit_retry_reason
+                    retry_cause = free_limit_retry_reason(reason or parsed_error)
+                    retry_cap = int(number_env("AGENT_FREE_LIMIT_RETRIES", 0 if owned_outside else 4)) if retry_cause else 0
+                    retry_pause = number_env("AGENT_FREE_LIMIT_DELAY", 300) if retry_cause else 0
                 if retry_cause and time.monotonic() - turn_started >= number_env("AGENT_TRANSPORT_RESET_SEC", 300):
                     retries = 0
         if retry_cause and retries >= retry_cap > 0:
@@ -536,7 +543,9 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             with TailWriter(store.path(name, ".log"), keep_logs) as log:
                 log.write("[agent.sh] RETRY %s/%s after %s\n" % (retries, retry_cap, retry_cause))
             store.update(name, retries=retries, last_retry_reason=retry_cause)
-            if not retry_wait(turn, number_env("AGENT_RETRY_DELAY", provider.retry_delay(retries))):
+            # A free-tier limit needs minutes, growing with each attempt; every other retry keeps its short backoff.
+            pause = retry_pause * retries if retry_pause else number_env("AGENT_RETRY_DELAY", provider.retry_delay(retries))
+            if not retry_wait(turn, pause):
                 block = record_stop(store, name, turn.by or "orchestrator", turn.reason, STOP_EXIT, "stopped", answer, turn.last_activity)
                 release_delivery(store, name, delivered, generation, "stopped during retry wait: " + turn.reason)
                 if quiet_answer:

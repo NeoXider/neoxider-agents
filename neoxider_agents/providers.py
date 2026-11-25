@@ -503,6 +503,18 @@ def transport_retry_reason(text):
         return ""
     return "transient network transport failure"
 
+FREE_LIMIT = re.compile(r"provider\.free-limit|free usage limit reached", re.I)
+
+
+def free_limit_retry_reason(text):
+    """Why a turn ended by a free-tier usage limit is worth waiting for, or ''.
+
+    The OpenCode free tier answers `429 provider.free-limit` ("Free usage limit reached") from a rolling window
+    with no reset time: a wave of nine workers was stopped as `limited` together on 2026-11-25 although the same
+    route answered again two minutes later. Paid quotas ("usage limit", "quota exceeded") name a reset or need
+    the owner and stay terminal; only this free rolling limit is waited out."""
+    return "free-tier usage limit (rolling window)" if FREE_LIMIT.search(text or "") else ""
+
 def is_transient_failure(text):
     if re.search(r"unauthorized|invalid api key|authentication|forbidden|(?:^|[^\w])model .*(not found|unavailable|unknown)|insufficient (quota|credit)|quota exceeded|payment required", text, re.I):
         return False
