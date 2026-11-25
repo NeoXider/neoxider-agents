@@ -108,6 +108,22 @@ def run_supports_flag(engine, flag):
     return any(("--" + flag) in line for line in help_text.splitlines())
 
 
+def model_variant_args(engine, model, effort):
+    """argv tail that selects MODEL and its reasoning variant on a `provider/model#variant` CLI.
+
+    The pinned OpenCode CLI (v2.4.0) takes the variant only inside the model id; a separate --variant dies
+    with "Unrecognized flag: --variant in command opencode run" before any provider activity (observed live
+    2026-11-25), so `-f high` used to kill every launch. A variant already in the id wins; a CLI that
+    advertises --variant keeps the separate flag; without a model there is nothing to attach it to and the
+    CLI default applies."""
+    if effort and model and "#" in model:
+        return ["-m", model]
+    if effort and run_supports_flag(engine, "variant"):
+        return (["-m", model] if model else []) + ["--variant", effort]
+    if effort and model:
+        return ["-m", model + "#" + effort]
+    return ["-m", model] if model else []
+
 def capture(argv, timeout=8):
     try:
         deadline = float(os.environ.get("AGENT_DIAGNOSTIC_DEADLINE", "inf"))
@@ -463,6 +479,29 @@ def known_limits(root=None, now=None):
             active[engine] = dict(row, until=until)
     return active
 
+
+TRANSPORT = re.compile(
+    r"provider\.transport|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ENETUNREACH"
+    r"|EHOSTUNREACH|EPIPE|socket hang up|socket connection was closed|fetch failed|network error"
+    r"|can't reach|getaddrinfo|dns error|tls handshake|connection (?:reset|closed|aborted|refused)"
+    r"|no such host is known|name or service not known", re.I)
+NOT_TRANSPORT = re.compile(
+    r"unauthorized|invalid api key|authentication|forbidden|payment required|insufficient (?:quota|credit)"
+    r"|quota exceeded|usage limit|rate.?limit|model .*(?:not found|unavailable|unknown)|context window", re.I)
+
+
+def transport_retry_reason(text):
+    """Why a turn the provider ended on a network fault is worth another attempt, or ''.
+
+    Seven OpenCode team leads died together on 2026-11-25: a DNS blip (`getaddrinfo ENOTFOUND opencode.ai`)
+    and a few `ECONNRESET`s reached the wrapper as a parsed provider error, which the watchdog treats as
+    terminal (exit 126), so each task stopped although the service was back within a minute. A parsed
+    provider error stays terminal for everything else (quota, auth, an unknown model); only a fault of the
+    network path between this machine and the provider is retried."""
+    text = text or ""
+    if not TRANSPORT.search(text) or NOT_TRANSPORT.search(text):
+        return ""
+    return "transient network transport failure"
 
 def is_transient_failure(text):
     if re.search(r"unauthorized|invalid api key|authentication|forbidden|(?:^|[^\w])model .*(not found|unavailable|unknown)|insufficient (quota|credit)|quota exceeded|payment required", text, re.I):

@@ -212,7 +212,7 @@ _provider_opencode_invoke() {
     # and the step sat until the watchdog killed it 30 minutes later — five tasks in a row, each
     # reported as "turn died" with an empty log. The reason existed the whole time; nobody asked for
     # it. Logs go to stderr, so the JSONL on stdout stays clean.
-    local args=(--auto --format json --print-logs --log-level ERROR "$@")
+    local args=(--auto --format json --print-logs --log-level error "$@")
     mapfile -t -O ${#args[@]} args < <(_provider_opencode_chatonly_args)
     local -a image_args; mapfile -t image_args < <(_provider_opencode_image_args)
     [ ${#image_args[@]} -gt 0 ] && args+=("${image_args[@]}")
@@ -383,8 +383,38 @@ _provider_opencode_invoke_retry() {
     done
 }
 
+# _provider_opencode_model_args MODEL EFFORT - prints the argv tail (one item per line) that selects MODEL
+# and its reasoning variant.
+# WHY: the pinned CLI (v2.4.0) takes the variant only inside the model id (`provider/model#variant`); a
+# separate --variant dies with "Unrecognized flag: --variant in command opencode run" before any provider
+# activity (observed live 2026-11-25), so `-f high` killed every launch. A variant already in the id wins; a
+# CLI whose `run --help` advertises --variant keeps the separate flag.
+_provider_opencode_model_args() {
+    local model="$1" effort="$2"
+    if [ -n "$effort" ] && [ -n "$model" ] && [ "${model#*#}" != "$model" ]; then
+        printf '%s\n' -m "$model"; return 0
+    fi
+    if [ -n "$effort" ]; then
+        if [ -z "${_PROVIDER_OPENCODE_VARIANT_FLAG:-}" ]; then
+            if opencode run --help 2>/dev/null </dev/null | grep -q -- '--variant'; then
+                _PROVIDER_OPENCODE_VARIANT_FLAG=1
+            else
+                _PROVIDER_OPENCODE_VARIANT_FLAG=0
+            fi
+        fi
+        if [ "$_PROVIDER_OPENCODE_VARIANT_FLAG" = "1" ]; then
+            [ -n "$model" ] && printf '%s\n' -m "$model"
+            printf '%s\n' --variant "$effort"; return 0
+        fi
+        [ -n "$model" ] && printf '%s\n' -m "${model}#${effort}"
+        return 0
+    fi
+    [ -n "$model" ] && printf '%s\n' -m "$model"
+    return 0
+}
+
 # provider_opencode_run_cmd DIR MODEL EFFORT PROMPT — runs the CLI and emits clean final text.
-# MODEL is the raw -m value (may be empty). EFFORT maps to opencode's --variant flag (its
+# MODEL is the raw -m value (may be empty). EFFORT maps to opencode's model variant (its
 # reasoning-effort equivalent: high/max/minimal/...), if given.
 # --format json: machine-readable event stream we parse for the final assistant message (see emit).
 # --auto: auto-approve permissions that are not explicitly denied -- without it opencode can block on
@@ -394,8 +424,7 @@ _provider_opencode_invoke_retry() {
 provider_opencode_run_cmd() {
     local dir="$1" model="$2" effort="$3" prompt="$4"
     local -a extra=()
-    [ -n "$model" ] && extra+=(-m "$model")
-    [ -n "$effort" ] && extra+=(--variant "$effort")
+    mapfile -t extra < <(_provider_opencode_model_args "$model" "$effort")
     _provider_opencode_invoke_retry "$dir" "$prompt" "${extra[@]}"
 }
 
@@ -411,8 +440,7 @@ PROVIDER_OPENCODE_RESUME_NEEDS_MODEL=1
 provider_opencode_resume_cmd() {
     local dir="$1" session="$2" answer="$3"
     local -a extra=()
-    [ -n "$P_MODEL" ] && extra+=(-m "$P_MODEL")
-    [ -n "$P_EFFORT" ] && extra+=(--variant "$P_EFFORT")
+    mapfile -t extra < <(_provider_opencode_model_args "$P_MODEL" "$P_EFFORT")
     if [ -n "$session" ]; then extra+=(-s "$session"); else extra+=(--continue); fi
     _provider_opencode_invoke_retry "$dir" "$answer" "${extra[@]}"
 }

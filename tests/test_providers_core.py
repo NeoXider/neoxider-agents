@@ -225,6 +225,23 @@ class Commands(unittest.TestCase):
         self.assertEqual(args[-2:], ["-s", "ses_old"])
         self.assertEqual(json.loads(env["OPENCODE_CONFIG_CONTENT"]), {"small_model": "model"})
 
+    def test_opencode_effort_rides_inside_the_model_id_when_the_cli_has_no_variant_flag(self):
+        with patch("neoxider_agents.providers.executable", return_value=["opencode"]), \
+                patch("neoxider_agents.providers.run_supports_flag", return_value=False):
+            provider = get_provider("opencode")
+            args, _ = provider.command("opencode/hy4-flash-free", "high", "D:/Temp/agents-ux/providers", "", False)
+            self.assertNotIn("--variant", args)
+            self.assertEqual(args[args.index("-m") + 1], "opencode/hy4-flash-free#high")
+            args, _ = provider.command("opencode/hy4-flash-free#max", "high", "D:/Temp/agents-ux/providers", "", False)
+            self.assertEqual(args[args.index("-m") + 1], "opencode/hy4-flash-free#max")
+            args, _ = provider.command("", "high", "D:/Temp/agents-ux/providers", "", False)
+            self.assertNotIn("-m", args)
+            self.assertNotIn("--variant", args)
+
+    def test_opencode_keeps_the_variant_flag_on_a_cli_that_has_it(self):
+        args, _ = self.command("opencode")
+        self.assertEqual(args[args.index("-m"):args.index("-m") + 4], ["-m", "model", "--variant", "high"])
+
     def test_opencode_directory_flag_dropped_when_cli_lacks_it(self):
         with patch("neoxider_agents.providers.executable", return_value=["opencode"]), \
                 patch("neoxider_agents.providers.run_supports_flag", return_value=False):
@@ -562,6 +579,16 @@ class Classification(unittest.TestCase):
     def test_transient_auth_not_retryable(self):
         self.assertFalse(is_transient_failure("unauthorized HTTP 503"))
         self.assertTrue(is_transient_failure("ECONNRESET"))
+
+    def test_transport_retry_reason(self):
+        from neoxider_agents.providers import transport_retry_reason
+        for text in ('{"type": "provider.transport", "message": "Can\'t reach opencode.ai"}',
+                     "getaddrinfo ENOTFOUND opencode.ai", "ECONNRESET: The socket connection was closed unexpectedly",
+                     "fetch failed", "connection reset by peer", "EAI_AGAIN"):
+            self.assertTrue(transport_retry_reason(text), text)
+        for text in ("", None, "usage limit reached", "401 unauthorized ECONNRESET", "rate limit; fetch failed",
+                     "model foo/bar not found", "provider returned an empty answer"):
+            self.assertEqual(transport_retry_reason(text), "", text)
 
     def test_opencode_retry_policy(self):
         provider = get_provider("opencode")

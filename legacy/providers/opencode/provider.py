@@ -1,7 +1,7 @@
 """OpenCode aliases, chat-only profile and bounded transient retry policy."""
 import os
 import re
-from neoxider_agents.providers import BaseProvider, CONFLICT, FAILURE, ROOT, TRANSIENT, executable
+from neoxider_agents.providers import BaseProvider, CONFLICT, FAILURE, ROOT, TRANSIENT, executable, model_variant_args
 
 
 class Provider(BaseProvider):
@@ -22,11 +22,8 @@ class Provider(BaseProvider):
 
     def command(self, model, effort, cwd, session="", chat_only=False):
         chat_only = chat_only or os.environ.get("AGENT_CHAT_ONLY") == "1"
-        args = executable(self.engine) + ["run", "--auto", "--format", "json", "--print-logs", "--log-level", "ERROR"]
-        if model:
-            args += ["-m", model]
-        if effort:
-            args += ["--variant", effort]
+        args = executable(self.engine) + ["run", "--auto", "--format", "json", "--print-logs", "--log-level", "error"]
+        args += model_variant_args(self.engine, model, effort)
         if session:
             args += ["-s", session]
         env = {"AGENT_OPENCODE_WRAPPED": "1"}

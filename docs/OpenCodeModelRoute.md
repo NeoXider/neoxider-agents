@@ -24,3 +24,11 @@ A minimal live check:
 `HY4_HIGH_OK` with exit 0 proves the route for that moment; it does not prove
 remaining quota. Provider failures must be read from the task log before any
 retry or fallback.
+
+## Update 2026-11-25: `-f` is folded into the model id
+
+The wrapper no longer passes `--variant` to a CLI whose `run --help` does not advertise it. `-f high` with
+`-m opencode/hy4-flash-free` now launches `-m opencode/hy4-flash-free#high`; a variant already in the id wins
+(`-m 'opencode/hy4-flash-free#max' -f high` stays `#max`); a CLI that has `--variant` keeps the separate flag.
+Both spellings therefore work. Writing the variant inside `-m` is still the clearest form in briefs.
+

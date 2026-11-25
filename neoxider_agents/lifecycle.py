@@ -445,6 +445,7 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             augmented += TERSE
         header(store, name, "reply" if resume else "run", augmented, "task=%s engine=%s session=%s" % (name, provider.engine, session))
         turn = Turn(store, name, provider, model, effort, opts["dir"], session, augmented, opts.get("terminal", False))
+        turn_started = time.monotonic()
         try:
             code, output_filter, action, reason, by = turn.run()
         except (OSError, RuntimeError, ValueError) as error:
@@ -493,6 +494,36 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
             render_md(store, name)
             finish_completion(store, name, notify)
             return code
+        retry_cause, retry_cap = "", 0
+        if code and action != "interrupt":
+            if not delivered:
+                retry_cause = provider.retry_reason(retry_output, code, session)
+                retry_cap = min(provider.retry_limit, number_env("AGENT_RETRIES", provider.retry_limit))
+            parsed_error = output_filter.provider_error if output_filter else ""
+            if not retry_cause and (action == "failure" or parsed_error):
+                # WHY: a parsed provider error is terminal for the watchdog, but a fault of the network path
+                # (DNS, reset socket) is gone a minute later; without this every task of a wave dies on one blip.
+                # A turn that carries queued messages (a restart, a follow-up) is retried too: the provider never
+                # finished it, the same batch goes out again and its receipts settle on the final outcome. The
+                # first live wave after this landed died exactly there: every task had been restarted with a
+                # message, so the `not delivered` rule of the provider retries skipped all seven.
+                from .providers import transport_retry_reason
+                retry_cause = transport_retry_reason(reason or parsed_error)
+                # AGENT_RETRIES=0 means an outer caller (the API bridge, a test) owns every retry, so it switches
+                # this one off as well unless AGENT_TRANSPORT_RETRIES is set explicitly.
+                owned_outside = os.environ.get("AGENT_RETRIES", "").strip() == "0"
+                retry_cap = int(number_env("AGENT_TRANSPORT_RETRIES", 0 if owned_outside else 5)) if retry_cause else 0
+                # A turn that worked for a while before the fault made progress: it starts a fresh budget, so a
+                # long task survives many separate blips while a dead route still stops after the cap.
+                if retry_cause and time.monotonic() - turn_started >= number_env("AGENT_TRANSPORT_RESET_SEC", 300):
+                    retries = 0
+        if retry_cause and retries >= retry_cap > 0:
+            exhausted = "%s; gave up after %s automatic retries" % (retry_cause, retries)
+            with TailWriter(store.path(name, ".log"), keep_logs) as log:
+                log.write("[agent.sh] RETRIES EXHAUSTED %s/%s: %s\n" % (retries, retry_cap, retry_cause))
+            reason = (reason + " (" + exhausted + ")") if reason else exhausted
+            # The owner asked to be told when a worker finally gives up; AGENT_NOTIFY_RETRY_EXHAUSTED=0 mutes it.
+            notify = notify or os.environ.get("AGENT_NOTIFY_RETRY_EXHAUSTED", "1") != "0"
         if action == "interrupt":
             notes.append("↻ INTERRUPTED+RESUMED task=%s session=%s\n" % (name, session))
             code = 0
@@ -500,10 +531,11 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
                 # The messages stay queued for redelivery; record an unknown attempt only.
                 release_delivery(store, name, delivered, generation, "interrupted; queued for redelivery")
             delivered = []
-        elif not delivered and code and provider.retry_reason(retry_output, code, session) and retries < min(provider.retry_limit, number_env("AGENT_RETRIES", provider.retry_limit)):
+        elif retry_cause and retries < retry_cap:
             retries += 1
             with TailWriter(store.path(name, ".log"), keep_logs) as log:
-                log.write("[agent.sh] RETRY %s after %s\n" % (retries, provider.retry_reason(retry_output, code, session)))
+                log.write("[agent.sh] RETRY %s/%s after %s\n" % (retries, retry_cap, retry_cause))
+            store.update(name, retries=retries, last_retry_reason=retry_cause)
             if not retry_wait(turn, number_env("AGENT_RETRY_DELAY", provider.retry_delay(retries))):
                 block = record_stop(store, name, turn.by or "orchestrator", turn.reason, STOP_EXIT, "stopped", answer, turn.last_activity)
                 release_delivery(store, name, delivered, generation, "stopped during retry wait: " + turn.reason)

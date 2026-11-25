@@ -2,7 +2,7 @@
 import os
 import re
 from pathlib import Path
-from neoxider_agents.providers import BaseProvider, CONFLICT, FAILURE, ROOT, TRANSIENT, executable, run_supports_flag
+from neoxider_agents.providers import BaseProvider, CONFLICT, FAILURE, ROOT, TRANSIENT, executable, model_variant_args, run_supports_flag
 
 
 class Provider(BaseProvider):
@@ -43,10 +43,7 @@ class Provider(BaseProvider):
             # The pinned CLI decides: a build without --dir in its usage fails the launch on the flag;
             # the directory still arrives via subprocess cwd (runtime passes it) — see providers.run_supports_flag.
             args += ["--dir", str(cwd)]
-        if model:
-            args += ["-m", model]
-        if effort:
-            args += ["--variant", effort]
+        args += model_variant_args(self.engine, model, effort)
         if session:
             args += ["-s", session]
         env = {"AGENT_OPENCODE_WRAPPED": "1"}

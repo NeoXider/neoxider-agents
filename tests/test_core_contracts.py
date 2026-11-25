@@ -169,6 +169,117 @@ class Contracts(unittest.TestCase):
     def test_opencode_retry_reads_error_despite_partial_answer(self):
         self.execute_retry("opencode", "fetch failed: connection reset", 1, "")
 
+    def run_turns(self, engine, outcomes, env=None, delivered=None):
+        """Drive lifecycle.execute over scripted turn outcomes; returns (exit code, notified states)."""
+        class Turn:
+            last_activity = "fixture"
+            def __init__(self, *args):
+                pass
+            def run(self):
+                return outcomes.pop(0)
+        provider = get_provider(engine)
+        notified = []
+        settings = {"AGENT_RETRY_DELAY": "0"}
+        settings.update(env or {})
+        with patch.object(lifecycle, "Turn", Turn), patch.object(lifecycle, "retry_wait", return_value=True), \
+                patch.object(lifecycle, "begin_snapshot"), patch.object(lifecycle, "changed_files", return_value=[]), \
+                patch.object(lifecycle, "render_md"), patch.object(provider, "prepare_resume"), \
+                patch("neoxider_agents.notifications.notify_task", side_effect=lambda name, state: notified.append(state) or True), \
+                patch.dict(os.environ, settings), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            result = lifecycle.execute(self.store, "task", {"dir": self.work.as_posix(), "--no-progress": True},
+                                       provider, "fixture", "", "ses_saved", "prompt", True, delivered or [])
+        return result, notified
+
+    @staticmethod
+    def transport_failure(engine, message):
+        failed = OutputFilter(engine)
+        failed.session = "ses_saved"
+        failed.provider_error = message
+        failed.raw.append(message)
+        return (126, failed, "failure", message, "watchdog")
+
+    @staticmethod
+    def finished(engine):
+        final = OutputFilter(engine)
+        final.session = "ses_saved"
+        final.last_assistant = "complete response"
+        final.had_answer = True
+        return (0, final, "", "", "")
+
+    def test_transport_fault_is_retried_and_the_task_finishes(self):
+        blip = '{"type": "provider.transport", "message": "getaddrinfo ENOTFOUND opencode.ai"}'
+        outcomes = [self.transport_failure("opencode", blip), self.transport_failure("opencode", "ECONNRESET"),
+                    self.finished("opencode")]
+        result, notified = self.run_turns("opencode", outcomes)
+        self.assertEqual(result, 0)
+        self.assertEqual(outcomes, [])
+        self.assertEqual(self.store.read("task")["state"], "done")
+        self.assertEqual(notified, [])
+        self.assertIn("RETRY 2/5 after transient network transport failure",
+                      self.store.path("task", ".log").read_text(encoding="utf-8"))
+
+    def test_transport_retries_run_out_then_the_task_fails_and_notifies(self):
+        outcomes = [self.transport_failure("opencode", "ECONNRESET: The socket connection was closed unexpectedly")
+                    for _ in range(4)]
+        result, notified = self.run_turns("opencode", outcomes, {"AGENT_TRANSPORT_RETRIES": "2"})
+        self.assertEqual(result, 126)
+        self.assertEqual(len(outcomes), 1, "two retries after the first failure, then no further turn")
+        meta = self.store.read("task")
+        self.assertEqual(meta["state"], "error")
+        self.assertEqual(notified, ["error"])
+        log = self.store.path("task", ".log").read_text(encoding="utf-8")
+        self.assertIn("RETRIES EXHAUSTED 2/2", log)
+        self.assertIn("gave up after 2 automatic retries", json.dumps(meta))
+
+    def test_transport_retry_can_be_muted_and_switched_off(self):
+        outcomes = [self.transport_failure("opencode", "ECONNRESET") for _ in range(2)]
+        result, notified = self.run_turns("opencode", outcomes, {"AGENT_TRANSPORT_RETRIES": "0"})
+        self.assertEqual((result, len(outcomes), notified), (126, 1, []))
+        outcomes = [self.transport_failure("opencode", "ECONNRESET") for _ in range(3)]
+        result, notified = self.run_turns("opencode", outcomes,
+                                          {"AGENT_TRANSPORT_RETRIES": "1", "AGENT_NOTIFY_RETRY_EXHAUSTED": "0"})
+        self.assertEqual((result, len(outcomes), notified), (126, 1, []))
+
+    def test_an_outer_owner_of_retries_switches_the_transport_retry_off(self):
+        outcomes = [self.transport_failure("opencode", "ECONNRESET") for _ in range(2)]
+        result, notified = self.run_turns("opencode", outcomes, {"AGENT_RETRIES": "0"})
+        self.assertEqual((result, len(outcomes), notified), (126, 1, []))
+        outcomes = [self.transport_failure("opencode", "ECONNRESET"), self.finished("opencode")]
+        result, _ = self.run_turns("opencode", outcomes, {"AGENT_RETRIES": "0", "AGENT_TRANSPORT_RETRIES": "1"})
+        self.assertEqual((result, outcomes), (0, []))
+
+    def test_quota_and_auth_provider_errors_are_never_retried_as_transport(self):
+        for message in ("You've hit your usage limit. Try again later.", "401 unauthorized: invalid api key",
+                        "rate limit exceeded (ECONNRESET while reading the body)"):
+            outcomes = [self.transport_failure("opencode", message), self.finished("opencode")]
+            result, _ = self.run_turns("opencode", outcomes)
+            self.assertNotEqual(result, 0, message)
+            self.assertEqual(len(outcomes), 1, message)
+
+    def test_transport_fault_with_another_exit_code_is_retried(self):
+        failed = OutputFilter("opencode")
+        failed.session = "ses_saved"
+        outcomes = [(1, failed, "failure", "Transport: ECONNRESET: The socket connection was closed unexpectedly",
+                     "watchdog"), self.finished("opencode")]
+        result, _ = self.run_turns("opencode", outcomes)
+        self.assertEqual((result, outcomes), (0, []))
+
+    def test_transport_fault_of_a_turn_that_carries_a_queued_message_is_retried(self):
+        self.store.update("task", state="running", dir=self.work.as_posix(), engine="opencode", session="ses_saved")
+        outcomes = [self.transport_failure("opencode", "ECONNRESET"), self.finished("opencode")]
+        calls = []
+        with patch.object(lifecycle, "release_delivery", side_effect=lambda *args: calls.append(args[-1])):
+            result, _ = self.run_turns("opencode", outcomes, delivered=["message-1"])
+        self.assertEqual(outcomes, [], "the retried turn ran")
+        self.assertEqual([call for call in calls if "failed" in call], [], "no receipt was failed before the retry")
+
+    def test_a_turn_that_worked_before_the_fault_starts_a_fresh_retry_budget(self):
+        outcomes = [self.transport_failure("opencode", "ECONNRESET") for _ in range(4)] + [self.finished("opencode")]
+        result, notified = self.run_turns("opencode", outcomes,
+                                          {"AGENT_TRANSPORT_RETRIES": "1", "AGENT_TRANSPORT_RESET_SEC": "0"})
+        self.assertEqual((result, outcomes, notified), (0, [], []))
+
     def test_test_api_legacy_prompt_and_out_schema(self):
         body = {"base_url": "http://127.0.0.1:12345", "goal": "fixture", "overall": "pass", "endpoints": [],
                 "summary": {"total": 0, "passed": 0, "failed": 0}}

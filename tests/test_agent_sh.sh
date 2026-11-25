@@ -532,7 +532,7 @@ opencode_run_output="$(provider_opencode_run_cmd "$SCRATCH_LOGDIR" \
     "opencode/deepseek-v4-flash-free" "high" "inspect this" 2>"$opencode_stderr")"
 assert_eq "opencode provider fake run exits cleanly" "0" "$?"
 assert_match "opencode provider preserves exact DeepSeek model, variant and prompt" \
-    '--auto --format json --print-logs --log-level error -m opencode/deepseek-v4-flash-free --variant high inspect this' \
+    '--auto --format json --print-logs --log-level error -m opencode/deepseek-v4-flash-free#high inspect this' \
     "$(cat "$OPENCODE_ARGS_FILE")"
 assert_match "opencode provider emits clean final answer" 'OPENCODE_WRAPPER_OK' "$opencode_run_output"
 assert_match "opencode provider keeps prefixed stderr diagnostics" \

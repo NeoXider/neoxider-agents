@@ -8,6 +8,15 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- Network transport faults no longer kill a task. A turn the provider ends on `provider.transport`, DNS
+  `ENOTFOUND`, `ECONNRESET`, `ETIMEDOUT` or `fetch failed` is retried in the same session with backoff, for every
+  engine and also for a restarted or messaged turn (`AGENT_TRANSPORT_RETRIES`, default 5; a turn that worked for
+  `AGENT_TRANSPORT_RESET_SEC` gets a fresh budget). When retries run out the task ends `state=error` with
+  `gave up after N automatic retries`, logs `RETRIES EXHAUSTED` and raises a desktop notification
+  (`AGENT_NOTIFY_RETRY_EXHAUSTED=0` mutes it). `AGENT_RETRIES=0` switches this retry off for callers that own
+  retries. Seven OpenCode team leads had died together on one DNS blip.
+- OpenCode: `-f EFFORT` is folded into the model id (`provider/model#variant`) when the pinned CLI has no
+  `--variant` flag, so `-f high` no longer dies with `Unrecognized flag: --variant`.
 - GitHub Actions release gate for Python 3.8 and 3.14 across Windows, Ubuntu and
   macOS, including PowerShell 5.1/7, Git Bash, Homebrew Bash and zsh completion.
   The gate checks plugin metadata and runs offline suites without provider credentials.

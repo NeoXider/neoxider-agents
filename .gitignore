@@ -20,3 +20,6 @@ Thumbs.db
 # directory, useful while a task is live and worthless in history. They leaked
 # into a commit once via `git add -A`; this is the guard against a repeat.
 PROGRESS.*.md
+
+# Stray Windows cache folder created by an unexpanded %SystemDrive% path
+bin/%SystemDrive%/
