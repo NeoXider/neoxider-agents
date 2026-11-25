@@ -96,7 +96,7 @@ class Aliases(unittest.TestCase):
     def test_codex_aliases(self):
         provider = get_provider("codex")
         for alias, value in (("sol", "gpt-5.6-sol"), ("terra", "gpt-5.6-terra"), ("6-sol", "gpt-6-sol"),
-                             ("sol6", "gpt-6-sol"), ("luna6", "gpt-6-luna"), ("6.1-sol", "gpt-6.1-sol"), ("sol61", "gpt-6.1-sol"), ("gpt61-sol", "gpt-6.1-sol"), ("spark", "gpt-5.3-codex-spark")):
+                             ("sol6", "gpt-6-sol"), ("luna6", "gpt-6-luna"), ("6.1-sol", "gpt-6.1-sol"), ("sol61", "gpt-6.1-sol"), ("gpt61-sol", "gpt-6.1-sol"), ("6.2-sol", "gpt-6.2-sol"), ("sol62", "gpt-6.2-sol"), ("spark", "gpt-5.3-codex-spark")):
             with self.subTest(alias=alias):
                 self.assertEqual(provider.resolve(alias)[0], value)
 
