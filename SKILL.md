@@ -1527,6 +1527,23 @@ in ~3.5 h (one root-cause class per worker, each with paired before/after measur
   refused by the auto-approval policy. Check free disk before a wave; before deleting anything, grep the
   active workers' notes/scripts for that path.
 
+## Field notes: free OpenCode wave after a Codex limit (2026-11-25, dated observation)
+- **Codex usage limit** arrives as `state=limited` with the reset time in the reason ("try again at 5:17 PM"); all
+  five workers of a wave died on start. Plan the long integration task for the paid route and keep free routes for
+  shorter, restartable pieces.
+- **OpenCode variant goes inside `-m`**: `-m 'opencode/hy4-flash-free#high'`, never `-f high`.
+- **OpenCode announces retries** as `{"type":"retry","attempt":N,"nextRetryAt":...,"error":{...ECONNRESET...}}`;
+  before PR #15 the watchdog treated that as terminal and killed all five workers within minutes. Now an announced
+  retry (attempt <= 8, with nextRetryAt) is not a failure; terminal `error` events still are.
+- **The OpenCode free-usage limit is account-wide**: once one free model reported "Free usage limit reached", other
+  free models (deepseek-v4.1-flash-free) were refused too. Five free workers lasted ~3 h. Push each worker's branch
+  as soon as it commits, so a limit stop never strands work.
+- **Never `git stash` inside a worktree of a repo other sessions also use**: the stash list is shared by all
+  worktrees; `git stash` on a clean tree saves nothing and the following `git stash pop` applies ANOTHER session's
+  entry. Use a separate detached worktree to compare against a base instead.
+- **CI that never starts** ("recent account payments have failed or your spending limit...") is a billing state,
+  not a test result; verify locally and say so.
+
 ## Rules for setting tasks
 
 The scoping/verification/git rules live in the orchestrator loop above — follow them for every
