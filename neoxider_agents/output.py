@@ -49,6 +49,8 @@ _TRANSIENT_TRANSPORT = (
     # Server-side overload notices Codex retries by itself (it reports exhaustion separately).
     r"|selected model is at capacity\.?(?: please try a different model\.?)?|server (?:is )?overloaded"
     r"|service (?:temporarily )?unavailable|bad gateway|gateway timeout"
+    # Codex's own backend routing lookup before a turn; it killed four healthy tasks at once on 2026-11-25.
+    r"|workspace routing discovery (?:timed out|failed)"
     # Any OS-level socket/DNS failure, whatever the locale of its text (e.g. Windows "os error 11001").
     r"|[^()]*\(os error [0-9]{1,6}\)"
 )

@@ -210,3 +210,12 @@ class CodexRetrySignalTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class WorkspaceRoutingDiscoveryTests(unittest.TestCase):
+    def test_routing_discovery_reconnect_is_a_transient_notice(self):
+        from neoxider_agents.output import _codex_retry_notice
+        from neoxider_agents.providers import transport_retry_reason
+        for reason in ("workspace routing discovery timed out", "workspace routing discovery failed"):
+            self.assertTrue(_codex_retry_notice("Reconnecting... 2/5 (%s)" % reason))
+            self.assertTrue(transport_retry_reason("Reconnecting... 2/5 (%s)" % reason))
