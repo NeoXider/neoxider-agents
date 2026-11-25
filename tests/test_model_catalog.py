@@ -120,6 +120,9 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual(opts["effort"], "max")
                 self.assertEqual(os.environ["AGENT_CHAT_ONLY"], "1")
                 self.assertEqual(os.environ["AGENT_OPENCODE_RETRIES"], "0")
+                # One bounded call: no lifecycle retry may outlive --timeout (free-limit wait hung a probe 212 s).
+                for key in ("AGENT_RETRIES", "AGENT_TRANSPORT_RETRIES", "AGENT_FREE_LIMIT_RETRIES"):
+                    self.assertEqual(os.environ[key], "0", key)
                 self.assertEqual(os.environ["AGENT_TIMEOUT_SEC"], "200")
                 self.assertEqual(list(Path(opts["dir"]).iterdir()), [])
                 actual_store.update(name, resolved_model=opts["model"], effort=opts["effort"], state="done")

@@ -210,9 +210,13 @@ def run_probe(store, opts):
         os.close(fd)
     started = time.monotonic()
     standard = bool(opts.get("--standard"))
+    # WHY: a probe is one call bounded by --timeout. Every lifecycle retry (provider, transport, free-tier wait)
+    # must be off: on 2026-11-25 `probe --timeout 120` hit `429 provider.free-limit`, the free-limit wait added
+    # in 0d66dbd scheduled a 300 s pause and the probe hung 212 s past its own timeout.
     env = {"AGENT_CHAT_ONLY": "0" if standard else "1", "AGENT_TIMEOUT_SEC": str(timeout),
            "AGENT_OPENCODE_TIMEOUT_SEC": str(timeout),
            "AGENT_SILENCE_SEC": str(timeout), "AGENT_OPENCODE_RETRIES": "0",
+           "AGENT_RETRIES": "0", "AGENT_TRANSPORT_RETRIES": "0", "AGENT_FREE_LIMIT_RETRIES": "0",
            "AGENT_PROGRESS": "0"}
     previous = {key: os.environ.get(key) for key in env}
     try:

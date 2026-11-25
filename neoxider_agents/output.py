@@ -29,6 +29,19 @@ def error_text(value):
     return " ".join(str(value or "").split())
 
 
+def retry_after_seconds(value):
+    """The provider's own wait hint in seconds (OpenCode `retryAfterMs` on an error event), or None.
+
+    Only a positive finite number counts; a missing, zero, negative or non-numeric hint means "not reported"."""
+    if not isinstance(value, dict):
+        return None
+    hint = value.get("retryAfterMs", value.get("retry_after_ms"))
+    if isinstance(hint, bool) or not isinstance(hint, (int, float)):
+        return None
+    seconds = hint / 1000.0
+    return seconds if 0 < seconds < float("inf") else None
+
+
 _TRANSIENT_TRANSPORT = (
     r"tls handshake eof|request timed out|operation timed out|idle timeout|timed out waiting for response"
     r"|connection (?:reset|closed|aborted|refused)(?: by peer)?|error sending request(?: for url)?|broken pipe"
@@ -67,6 +80,7 @@ class OutputFilter:
         self.session = ""
         self.last_assistant = ""
         self.provider_error = ""
+        self.provider_retry_after = None
         self.events = []
         self.had_answer = False
         self.raw = deque()
@@ -252,6 +266,7 @@ class OutputFilter:
         message = error_text(value)
         if message:
             self.provider_error = message
+            self.provider_retry_after = retry_after_seconds(value)
             output.append("AGENT_PROVIDER_ERROR: " + message + "\n")
 
     def _remember(self, line):

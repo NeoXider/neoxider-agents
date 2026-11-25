@@ -515,6 +515,14 @@ def free_limit_retry_reason(text):
     the owner and stay terminal; only this free rolling limit is waited out."""
     return "free-tier usage limit (rolling window)" if FREE_LIMIT.search(text or "") else ""
 
+
+def free_limit_reset_note(seconds, now=None):
+    """Human wording of a provider-reported reset: `provider reports reset in 12.9 h (~05:00 local)`."""
+    import time
+    span = "%.1f h" % (seconds / 3600.0) if seconds >= 3600 else "%d min" % max(1, round(seconds / 60.0))
+    at = time.strftime("%H:%M", time.localtime((now if now is not None else time.time()) + seconds))
+    return "provider reports reset in %s (~%s local)" % (span, at)
+
 def is_transient_failure(text):
     if re.search(r"unauthorized|invalid api key|authentication|forbidden|(?:^|[^\w])model .*(not found|unavailable|unknown)|insufficient (quota|credit)|quota exceeded|payment required", text, re.I):
         return False

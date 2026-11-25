@@ -8,6 +8,12 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- The free-limit wait honours the provider's `retryAfterMs`: a hint above `AGENT_FREE_LIMIT_MAX_WAIT` (1800 s)
+  ends the task `limited` at once with the reset time in the reason and `limit_resets_at` in meta (live
+  2026-11-25: `retryAfterMs: 46283000`, 12.9 h, where four 5-20 min waits would have held every worker ~50 min
+  and still failed); a shorter hint is waited exactly. `probe` now switches off every lifecycle retry
+  (`AGENT_RETRIES`, `AGENT_TRANSPORT_RETRIES`, `AGENT_FREE_LIMIT_RETRIES` = 0): a `probe --timeout 120` had hung
+  212 s in the free-limit wait.
 - The OpenCode free tier's rolling limit (`429 provider.free-limit`, no reset time) is waited out: the session is
   retried after 5, 10, 15 and 20 minutes (`AGENT_FREE_LIMIT_RETRIES`, `AGENT_FREE_LIMIT_DELAY`) before the task
   ends `limited` and notifies. Nine workers had been stopped together while the route answered again two minutes
