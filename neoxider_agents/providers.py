@@ -484,10 +484,12 @@ TRANSPORT = re.compile(
     r"provider\.transport|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|ENETUNREACH"
     r"|EHOSTUNREACH|EPIPE|socket hang up|socket connection was closed|fetch failed|network error"
     r"|can't reach|getaddrinfo|dns error|tls handshake|connection (?:reset|closed|aborted|refused)"
+    r"|reconnecting\.\.\. waiting for network \(|error sending request"
     r"|no such host is known|name or service not known|workspace routing discovery (?:timed out|failed)", re.I)
 NOT_TRANSPORT = re.compile(
     r"unauthorized|invalid api key|authentication|forbidden|payment required|insufficient (?:quota|credit)"
-    r"|quota exceeded|usage limit|rate.?limit|model .*(?:not found|unavailable|unknown)|context window", re.I)
+    r"|quota exceeded|usage limit|rate.?limit|model .*(?:not found|unavailable|unknown)|context window"
+    r"|\bHTTP (?:401|402|403|429)\b|\b429 too many requests\b", re.I)
 
 
 def transport_retry_reason(text):

@@ -53,6 +53,10 @@ if 'BLOCK' in prompt:
 errors = {'ERR:OOM': 'RangeError: Out of memory', 'ERR:TLS': 'TLS certificate verify failed',
           'ERR:QUOTA': 'HTTP 429 rate limit exceeded', 'ERR:AUTH': 'HTTP 401 unauthorized',
           'ERR:NETWORK': 'ECONNREFUSED network error'}
+if 'NETWORK_WAIT_EXIT' in prompt and turn == 1:
+    print(json.dumps({'type': 'error', 'message':
+          'Reconnecting... waiting for network (Connection failed: error sending request)'}), flush=True)
+    sys.exit(7)
 if 'RETRY_RECOVER' in prompt or 'RETRY_NATIVE_EXIT' in prompt:
     print(json.dumps({'type': 'error', 'message': 'Reconnecting... 5/5 (stream disconnected before completion: tls handshake eof)'}), flush=True)
     time.sleep(0.2)
@@ -100,9 +104,9 @@ class CoreHarness(unittest.TestCase):
                     raise
                 time.sleep(0.05)
 
-    def client(self, **kwargs):
+    def client(self, publish_timeout=10, **kwargs):
         client = sdk.AgentClient(logs_root=self.logs, parent='integration-parent', env=self.env,
-                                 poll=0.025, publish_timeout=10, control_timeout=10, **kwargs)
+                                 poll=0.025, publish_timeout=publish_timeout, control_timeout=10, **kwargs)
         self.clients.append(client)
         return client
 
@@ -134,6 +138,18 @@ class CoreHarness(unittest.TestCase):
 
 
 class CoreIntegrationTests(CoreHarness):
+    def test_native_exit_during_network_wait_uses_transport_retry(self):
+        self.env['AGENT_TRANSPORT_RETRIES'] = '1'
+        self.env['AGENT_RETRY_DELAY'] = '0'
+        client, handle = self.spawn('NETWORK_WAIT_EXIT', client=self.client(publish_timeout=30))
+        result = handle.wait(timeout=30)
+        self.assertEqual((result.state, result.exit_code), ('done', 0))
+        self.assertIn('ANSWER NETWORK_WAIT_EXIT', result.answer)
+        self.assertEqual((self.work / 'turns').read_text(), '2')
+        log = client.store.path(handle.task, '.log').read_text(encoding='utf-8')
+        self.assertIn('RETRY 1/1 after transient network transport failure', log)
+        self.assertNotIn('AGENT_PROVIDER_ERROR:', log)
+
     def test_reconnect_recovery_publishes_current_answer_and_retains_session_after_reaping(self):
         client, handle = self.spawn('RETRY_RECOVER')
         result = handle.wait(timeout=15)

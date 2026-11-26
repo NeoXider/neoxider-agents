@@ -44,7 +44,8 @@ def retry_after_seconds(value):
 
 _TRANSIENT_TRANSPORT = (
     r"tls handshake eof|request timed out|operation timed out|idle timeout|timed out waiting for response"
-    r"|connection (?:reset|closed|aborted|refused)(?: by peer)?|error sending request(?: for url)?|broken pipe"
+    r"|connection (?:reset|closed|aborted|refused)(?: by peer)?"
+    r"|error sending request(?: for url(?: \(https?://[^\s()]+\))?)?|broken pipe"
     r"|dns error|failed to lookup address(?: information)?|no such host is known|name or service not known"
     # Server-side overload notices Codex retries by itself (it reports exhaustion separately).
     r"|selected model is at capacity\.?(?: please try a different model\.?)?|server (?:is )?overloaded"
@@ -55,21 +56,25 @@ _TRANSIENT_TRANSPORT = (
     r"|[^()]*\(os error [0-9]{1,6}\)"
 )
 _PERMANENT_MARKERS = re.compile(r"quota|usage limit|rate limit|429|auth|unauthori[sz]ed|forbidden|context window"
-                                r"|invalid|not found|billing|exceeded", re.IGNORECASE)
+                                r"|invalid|not found|billing|payment required|exceeded|\bHTTP (?:401|402|403)\b",
+                                re.IGNORECASE)
+_CODEX_NETWORK_WAIT = "Reconnecting... waiting for network ("
 
 
 def _codex_retry_notice(message):
-    """Only an in-progress, bounded Codex transport reconnect notice is nonterminal.
+    """Recognize Codex's numbered reconnects and network wait notices.
 
-    Codex prints ``Reconnecting... N/M (<reason>)`` before each automatic retry and reports a
-    terminal failure separately once its attempts are exhausted, so a bounded notice whose reason is
-    a known transient transport fault (TLS EOF, request/operation timeout, connection reset, send
-    error) must not stop the task. Unknown or permanent reasons (quota, auth, context) stay fatal.
+    Both forms describe an attempt in progress when the reason is a known transient fault.
+    Codex can report a terminal failure separately. Unknown or permanent reasons stay fatal.
     """
-    match = re.fullmatch(r"Reconnecting\.\.\. ([1-9][0-9]{0,8})/([1-9][0-9]{0,8}) \((.+)\)", message)
-    if not match or int(match.group(1)) > int(match.group(2)):
-        return False
-    reason = match.group(3)
+    if message.startswith(_CODEX_NETWORK_WAIT) and message.endswith(")"):
+        reason = message[len(_CODEX_NETWORK_WAIT):-1]
+        reason = re.sub(r"^Connection failed: ", "", reason)
+    else:
+        match = re.fullmatch(r"Reconnecting\.\.\. ([1-9][0-9]{0,8})/([1-9][0-9]{0,8}) \((.+)\)", message)
+        if not match or int(match.group(1)) > int(match.group(2)):
+            return False
+        reason = match.group(3)
     if _PERMANENT_MARKERS.search(reason):
         return False
     reason = re.sub(r"^stream disconnected before completion: ", "", reason)
@@ -82,6 +87,7 @@ class OutputFilter:
         self.session = ""
         self.last_assistant = ""
         self.provider_error = ""
+        self.pending_network_wait = ""
         self.provider_retry_after = None
         self.events = []
         self.had_answer = False
@@ -335,6 +341,7 @@ class OutputFilter:
             if tag == "thread.started":
                 self._session(event.get("thread_id"), output)
             elif tag in ("item.started", "item.updated", "item.completed"):
+                self.pending_network_wait = ""
                 item = event.get("item") or {}
                 if item.get("type") == "agent_message" and item.get("text") is not None:
                     self._set_answer(item["text"])
@@ -342,9 +349,13 @@ class OutputFilter:
                 value = event.get("error") or event.get("message")
                 message = error_text(value)
                 if tag == "error" and _codex_retry_notice(message):
+                    if message.startswith(_CODEX_NETWORK_WAIT):
+                        self.pending_network_wait = message
                     output.append("[codex] retry: " + message + "\n")
                 else:
                     self._error(value, output)
+            elif tag == "turn.completed":
+                self.pending_network_wait = ""
         elif self.engine == "opencode":
             self._session(event.get("sessionID"), output)
             if tag == "text":

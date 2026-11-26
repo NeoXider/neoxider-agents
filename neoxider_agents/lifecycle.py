@@ -500,7 +500,12 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
                 retry_cause = provider.retry_reason(retry_output, code, session)
                 retry_cap = min(provider.retry_limit, number_env("AGENT_RETRIES", provider.retry_limit))
             parsed_error = output_filter.provider_error if output_filter else ""
-            if not retry_cause and (action == "failure" or parsed_error):
+            # A network wait is only retry evidence after a native exit with no terminal error.
+            network_wait = ""
+            if (not action and output_filter and output_filter.pending_network_wait
+                    and not output_filter.final_failure(code)):
+                network_wait = output_filter.pending_network_wait
+            if not retry_cause and (action == "failure" or parsed_error or network_wait):
                 # WHY: a parsed provider error is terminal for the watchdog, but a fault of the network path
                 # (DNS, reset socket) is gone a minute later; without this every task of a wave dies on one blip.
                 # A turn that carries queued messages (a restart, a follow-up) is retried too: the provider never
@@ -508,7 +513,7 @@ def execute(store, name, opts, provider, model, effort, session, prompt, resume,
                 # first live wave after this landed died exactly there: every task had been restarted with a
                 # message, so the `not delivered` rule of the provider retries skipped all seven.
                 from .providers import transport_retry_reason
-                retry_cause = transport_retry_reason(reason or parsed_error)
+                retry_cause = transport_retry_reason(reason or parsed_error or network_wait)
                 # AGENT_RETRIES=0 means an outer caller (the API bridge, a test) owns every retry, so it switches
                 # this one off as well unless AGENT_TRANSPORT_RETRIES is set explicitly.
                 owned_outside = os.environ.get("AGENT_RETRIES", "").strip() == "0"

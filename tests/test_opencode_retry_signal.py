@@ -5,6 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from neoxider_agents.diagnostics import classify_failure
+from neoxider_agents.output import OutputFilter
 
 RETRY = {"type": "retry", "timestamp": 1795584015425, "sessionID": "ses_x", "messageID": "msg_x", "attempt": 2,
          "nextRetryAt": 1795584017451,
@@ -17,6 +18,10 @@ class OpenCodeRetrySignalTests(unittest.TestCase):
 
     def test_announced_retry_does_not_block(self):
         self.assertFalse(self.classify(RETRY).blocking)
+        parser = OutputFilter('opencode')
+        rendered = parser.feed(json.dumps(RETRY) + '\n')
+        self.assertEqual(parser.provider_error, '')
+        self.assertNotIn('AGENT_PROVIDER_ERROR:', ''.join(rendered))
 
     def test_retry_without_schedule_or_beyond_budget_still_blocks(self):
         no_schedule = dict(RETRY); no_schedule.pop("nextRetryAt")

@@ -584,10 +584,12 @@ class Classification(unittest.TestCase):
         from neoxider_agents.providers import transport_retry_reason
         for text in ('{"type": "provider.transport", "message": "Can\'t reach opencode.ai"}',
                      "getaddrinfo ENOTFOUND opencode.ai", "ECONNRESET: The socket connection was closed unexpectedly",
-                     "fetch failed", "connection reset by peer", "EAI_AGAIN"):
+                     "fetch failed", "connection reset by peer", "EAI_AGAIN",
+                     "Reconnecting... waiting for network (Connection failed: error sending request)"):
             self.assertTrue(transport_retry_reason(text), text)
         for text in ("", None, "usage limit reached", "401 unauthorized ECONNRESET", "rate limit; fetch failed",
-                     "model foo/bar not found", "provider returned an empty answer"):
+                     "model foo/bar not found", "provider returned an empty answer",
+                     "error sending request: HTTP 401", "error sending request: 429 Too Many Requests"):
             self.assertEqual(transport_retry_reason(text), "", text)
 
     def test_opencode_retry_policy(self):

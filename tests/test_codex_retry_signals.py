@@ -16,6 +16,7 @@ from neoxider_agents.runtime import Turn
 from neoxider_agents.state import Store
 
 RECONNECT = 'Reconnecting... 2/5 (stream disconnected before completion: tls handshake eof)'
+NETWORK_WAIT = 'Reconnecting... waiting for network (Connection failed: error sending request)'
 CHILD = r'''
 import json, pathlib, sys, time
 mode = sys.argv[1]
@@ -26,6 +27,8 @@ emit({"type": "thread.started", "thread_id": "controlled-retry-session"})
 message = "Reconnecting... 2/5 (stream disconnected before completion: tls handshake eof)"
 if mode == "last":
     message = message.replace("2/5", "5/5")
+if mode == "network_wait":
+    message = sys.argv[2]
 if mode == "quota":
     message = "429 usage limit: quota exceeded"
 fatal = {"oom": "RangeError: Out of memory", "tls": "tls handshake eof",
@@ -62,7 +65,7 @@ class FixtureProvider:
         self.mode = mode
 
     def command(self, model, effort, cwd, session='', chat_only=False):
-        return [sys.executable, '-c', CHILD, self.mode], {}
+        return [sys.executable, '-c', CHILD, self.mode, NETWORK_WAIT], {}
 
 
 class CodexRetrySignalTests(unittest.TestCase):
@@ -75,7 +78,7 @@ class CodexRetrySignalTests(unittest.TestCase):
         self.store = Store(self.work / 'state')
         self.store.update('fixture', state='running', generation='controlled-generation', engine='codex', dir=str(self.work))
 
-    def run_child(self, mode, deadline='3'):
+    def run_child(self, mode, deadline='15'):
         with mock.patch.dict(os.environ, AGENT_TIMEOUT_SEC=deadline, AGENT_SILENCE_SEC='0'), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             turn = Turn(self.store, 'fixture', FixtureProvider(mode), 'fixture', 'high', str(self.work), '', 'controlled prompt')
@@ -103,6 +106,16 @@ class CodexRetrySignalTests(unittest.TestCase):
         self.assertIn('timeout', reason)
         self.assertFalse((self.work / 'recovered.receipt').exists())
 
+    def test_waiting_for_network_keeps_child_alive_until_success(self):
+        code, parser, action, reason, by = self.run_child('network_wait')
+        self.assertEqual(code, 0, (action, reason, by))
+        self.assertEqual(parser.provider_error, '')
+        self.assertEqual(parser.pending_network_wait, '')
+        self.assertEqual(parser.last_assistant, 'RECOVERED_OK')
+        log = self.store.path('fixture', '.log').read_text(encoding='utf-8')
+        self.assertIn('[codex] retry: ' + NETWORK_WAIT, log)
+        self.assertNotIn('AGENT_PROVIDER_ERROR:', log)
+
     def test_last_announced_retry_can_still_recover_with_real_final_answer(self):
         code, parser, action, reason, by = self.run_child('last')
         self.assertEqual(code, 0, (action, reason, by))
@@ -128,17 +141,19 @@ class CodexRetrySignalTests(unittest.TestCase):
         self.assertEqual(code, 126)
         self.assertIn('exhausted', parser.provider_error)
         self.assertFalse((self.work / 'recovered.receipt').exists())
-        parser = OutputFilter('codex')
-        rendered = parser.feed(json.dumps({'type': 'turn.failed', 'error': {'message': RECONNECT}}) + '\n')
-        self.assertEqual(parser.provider_error, RECONNECT)
-        self.assertIn('AGENT_PROVIDER_ERROR:', ''.join(rendered))
+        for message in (RECONNECT, NETWORK_WAIT):
+            with self.subTest(message=message):
+                parser = OutputFilter('codex')
+                rendered = parser.feed(json.dumps({'type': 'turn.failed', 'error': {'message': message}}) + '\n')
+                self.assertEqual(parser.provider_error, message)
+                self.assertIn('AGENT_PROVIDER_ERROR:', ''.join(rendered))
 
     def test_only_well_formed_transport_reconnect_status_is_nonfatal(self):
-        messages = [RECONNECT, RECONNECT.replace('2/5', '1/5'), RECONNECT.replace('2/5', '5/5'),
+        messages = [RECONNECT, RECONNECT.replace('2/5', '1/5'), RECONNECT.replace('2/5', '5/5'), NETWORK_WAIT,
                     'Reconnecting... 2/5 (request timed out)',
                     'Reconnecting... 1/5 (stream disconnected before completion: request timed out)',
                     'Reconnecting... 3/5 (stream disconnected before completion: connection reset by peer)',
-                    'Reconnecting... 4/5 (error sending request for url (https://chatgpt.example/backend))'.replace(' (https://chatgpt.example/backend)', ''),
+                    'Reconnecting... 4/5 (error sending request for url (https://chatgpt.example/backend))',
                     'Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for SSE)',
                     'Reconnecting... 2/5 (stream disconnected before completion: Этот хост неизвестен. (os error 11001))',
                     'Reconnecting... 1/5 (error sending request for url: dns error: failed to lookup address information)',
@@ -167,6 +182,10 @@ class CodexRetrySignalTests(unittest.TestCase):
             'Reconnecting... 2/5 (stream disconnected before completion: 429 Too Many Requests)',
             'Reconnecting... 6/5 (request timed out)',
             'Reconnecting... 2/5 (usage limit reached (os error 5))',
+            'Reconnecting... waiting for network',
+            'Reconnecting... waiting for network (unknown problem)',
+            'Reconnecting... waiting for network (Connection failed: error sending request: authentication failed)',
+            'Reconnecting... waiting for network (Connection failed: error sending request: HTTP 401)',
         ]
         for message in messages:
             with self.subTest(message=message):
