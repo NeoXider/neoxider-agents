@@ -64,17 +64,15 @@ _CODEX_NETWORK_WAIT = "Reconnecting... waiting for network ("
 def _codex_retry_notice(message):
     """Recognize Codex's numbered reconnects and network wait notices.
 
-    Both forms describe an attempt in progress when the reason is a known transient fault.
-    Codex can report a terminal failure separately. Unknown or permanent reasons stay fatal.
+    The counter announces an attempt, including the final one. Only unnumbered
+    network waits need a recognized transient cause.
     """
     if message.startswith(_CODEX_NETWORK_WAIT) and message.endswith(")"):
         reason = message[len(_CODEX_NETWORK_WAIT):-1]
         reason = re.sub(r"^Connection failed: ", "", reason)
     else:
-        match = re.fullmatch(r"Reconnecting\.\.\. ([1-9][0-9]{0,8})/([1-9][0-9]{0,8}) \((.+)\)", message)
-        if not match or int(match.group(1)) > int(match.group(2)):
-            return False
-        reason = match.group(3)
+        match = re.fullmatch(r"Reconnecting\.\.\. ([1-9][0-9]{0,8})/([1-9][0-9]{0,8}) \(.+\)", message)
+        return bool(match and int(match.group(1)) <= int(match.group(2)))
     if _PERMANENT_MARKERS.search(reason):
         return False
     reason = re.sub(r"^stream disconnected before completion: ", "", reason)
@@ -453,7 +451,20 @@ class OutputFilter:
         return []
 
     def final_failure(self, code):
-        return self.provider_error or (failure_reason("".join(self.raw)) if code else "")
+        if self.provider_error or not code:
+            return self.provider_error
+        lines = []
+        for line in self.raw:
+            if self.engine == "codex" and "Reconnecting..." in line:
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    event = None
+                if (isinstance(event, dict) and event.get("type") == "error"
+                        and _codex_retry_notice(error_text(event.get("error") or event.get("message")))):
+                    continue
+            lines.append(line)
+        return failure_reason("".join(lines))
 
     def iter_answer(self):
         """Replay the complete clean answer without a marker or whole-file allocation."""

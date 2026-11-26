@@ -1510,8 +1510,9 @@ in ~3.5 h (one root-cause class per worker, each with paired before/after measur
 - **Plain wave beats ultra when the coordinator reviews and merges** and the pieces are independent root
   causes in different code paths; ultra would add reviewer/verifier cost for the same gate.
 - **Watchdog vs transient network**: before PR #10/#11 a bounded `Reconnecting... N/M (request timed out)`
-  or a localized DNS `(os error 11001)` stopped a live worker with exit 126. Now only quota/auth/context/
-  unknown reasons are fatal. If an older install stops a worker this way: `restart NAME "<cause>. Continue
+  or a localized DNS `(os error 11001)` stopped a live worker with exit 126. A numbered Codex reconnect
+  announces an attempt through `N = M`, regardless of the cause. A terminal error or a nonzero process exit
+  ends the attempt. If an older install stops a worker this way: `restart NAME "<cause>. Continue
   from NOTES.md; do not redo finished steps; budget: <time>"` resumes the same session.
 - **`send` to a running Codex worker is queued and picked up at its next turn boundary** (minutes, not
   hours). Use it for "PR X merged - do not push more to that branch", "base moved - merge it before your

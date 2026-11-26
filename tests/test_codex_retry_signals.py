@@ -15,7 +15,7 @@ from neoxider_agents.output import OutputFilter
 from neoxider_agents.runtime import Turn
 from neoxider_agents.state import Store
 
-RECONNECT = 'Reconnecting... 2/5 (stream disconnected before completion: tls handshake eof)'
+RECONNECT = 'Reconnecting... 2/5 (stream disconnected before completion: websocket closed by server before response.completed)'
 NETWORK_WAIT = 'Reconnecting... waiting for network (Connection failed: error sending request)'
 CHILD = r'''
 import json, pathlib, sys, time
@@ -24,11 +24,13 @@ sys.stdin.read()
 def emit(event):
     print(json.dumps(event), flush=True)
 emit({"type": "thread.started", "thread_id": "controlled-retry-session"})
-message = "Reconnecting... 2/5 (stream disconnected before completion: tls handshake eof)"
+message = sys.argv[2]
 if mode == "last":
     message = message.replace("2/5", "5/5")
 if mode == "network_wait":
-    message = sys.argv[2]
+    message = sys.argv[3]
+if mode == "nonzero":
+    message = "Reconnecting... 5/5 (quota exceeded)"
 if mode == "quota":
     message = "429 usage limit: quota exceeded"
 fatal = {"oom": "RangeError: Out of memory", "tls": "tls handshake eof",
@@ -65,7 +67,7 @@ class FixtureProvider:
         self.mode = mode
 
     def command(self, model, effort, cwd, session='', chat_only=False):
-        return [sys.executable, '-c', CHILD, self.mode, NETWORK_WAIT], {}
+        return [sys.executable, '-c', CHILD, self.mode, RECONNECT, NETWORK_WAIT], {}
 
 
 class CodexRetrySignalTests(unittest.TestCase):
@@ -97,7 +99,7 @@ class CodexRetrySignalTests(unittest.TestCase):
         self.assertEqual((self.work / 'recovered.receipt').read_text(encoding='utf-8'), 'RECOVERED_OK')
         log = self.store.path('fixture', '.log').read_text(encoding='utf-8')
         self.assertNotIn('AGENT_PROVIDER_ERROR:', log)
-        self.assertIn('Reconnecting', log)
+        self.assertIn('[codex] retry: ' + RECONNECT, log)
 
     def test_reconnect_does_not_disable_existing_deadline(self):
         code, parser, action, reason, by = self.run_child('hang', deadline='0.3')
@@ -148,7 +150,7 @@ class CodexRetrySignalTests(unittest.TestCase):
                 self.assertEqual(parser.provider_error, message)
                 self.assertIn('AGENT_PROVIDER_ERROR:', ''.join(rendered))
 
-    def test_only_well_formed_transport_reconnect_status_is_nonfatal(self):
+    def test_numbered_reconnects_are_nonfatal_regardless_of_cause(self):
         messages = [RECONNECT, RECONNECT.replace('2/5', '1/5'), RECONNECT.replace('2/5', '5/5'), NETWORK_WAIT,
                     'Reconnecting... 2/5 (request timed out)',
                     'Reconnecting... 1/5 (stream disconnected before completion: request timed out)',
@@ -159,7 +161,14 @@ class CodexRetrySignalTests(unittest.TestCase):
                     'Reconnecting... 1/5 (error sending request for url: dns error: failed to lookup address information)',
                     'Reconnecting... 3/5 (stream disconnected before completion: No such host is known. (os error 11001))',
                     'Reconnecting... 2/5 (Selected model is at capacity. Please try a different model.)',
-                    'Reconnecting... 1/5 (stream disconnected before completion: service unavailable)']
+                    'Reconnecting... 1/5 (stream disconnected before completion: service unavailable)',
+                    'Reconnecting... 2/5 (quota exceeded: tls handshake eof)',
+                    'Reconnecting... 2/5 (authentication failed: tls handshake eof)',
+                    'Reconnecting... 2/5 (context window exceeded: tls handshake eof)',
+                    'Reconnecting... 2/5 (unknown problem)',
+                    'Reconnecting... 2/5 (request timed out: usage limit reached)',
+                    'Reconnecting... 2/5 (stream disconnected before completion: 429 Too Many Requests)',
+                    'Reconnecting... 2/5 (usage limit reached (os error 5))']
         for message in messages:
             with self.subTest(message=message):
                 parser = OutputFilter('codex')
@@ -174,14 +183,7 @@ class CodexRetrySignalTests(unittest.TestCase):
             'tls handshake eof', 'Reconnecting... 0/5 (stream disconnected before completion: tls handshake eof)',
             'Reconnecting... 6/5 (stream disconnected before completion: tls handshake eof)',
             'Reconnecting... 2/0 (stream disconnected before completion: tls handshake eof)',
-            'Reconnecting... 2/5 (quota exceeded: tls handshake eof)',
-            'Reconnecting... 2/5 (authentication failed: tls handshake eof)',
-            'Reconnecting... 2/5 (context window exceeded: tls handshake eof)',
-            'Reconnecting... 2/5 (unknown problem)',
-            'Reconnecting... 2/5 (request timed out: usage limit reached)',
-            'Reconnecting... 2/5 (stream disconnected before completion: 429 Too Many Requests)',
             'Reconnecting... 6/5 (request timed out)',
-            'Reconnecting... 2/5 (usage limit reached (os error 5))',
             'Reconnecting... waiting for network',
             'Reconnecting... waiting for network (unknown problem)',
             'Reconnecting... waiting for network (Connection failed: error sending request: authentication failed)',
