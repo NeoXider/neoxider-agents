@@ -420,10 +420,110 @@ class NativeLaunchers(unittest.TestCase):
             self.assertEqual(Path(which_native("tool")), self.folder / "tool-real.exe")
 
     @unittest.skipUnless(os.name == "nt", "Windows extensionless shell shims")
+    def test_the_launcher_target_wins_over_a_stale_real_copy(self):
+        # Regression 2026-11-26: opencode.cmd and the sh shim had moved to 2.0.32 while an old
+        # opencode-real.exe (1.18.27) stayed next to them; the stale copy was launched and failed.
+        (self.folder / "tool-real.exe").touch()
+        (self.folder / "tool-real-2.exe").touch()
+        (self.folder / "tool.cmd").write_text('@echo off\n"%~dp0tool-real-2.exe" %*\n', encoding="utf-8")
+        with patch.dict(os.environ, {"PATH": str(self.folder), "PATHEXT": ".EXE;.CMD"}):
+            os.environ.pop("AGENT_TOOL_BIN", None)
+            self.assertEqual([Path(item) for item in executable("tool")], [self.folder / "tool-real-2.exe"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows extensionless shell shims")
+    def test_an_extensionless_shim_resolves_to_the_file_it_execs(self):
+        (self.folder / "tool-real.exe").touch()
+        target = self.folder / "tool-real-2.exe"
+        target.touch()
+        msys = "/" + str(target)[0].lower() + str(target)[2:].replace("\\", "/")
+        (self.folder / "tool").write_text('#!/bin/sh\nexec "%s" "$@"\n' % msys, encoding="utf-8")
+        with patch.dict(os.environ, {"PATH": str(self.folder), "PATHEXT": ".EXE"}):
+            os.environ.pop("AGENT_TOOL_BIN", None)
+            self.assertEqual(Path(which_native("tool")), target)
+
+    @unittest.skipUnless(os.name == "nt", "Windows extensionless shell shims")
+    def test_a_shim_that_runs_an_interpreter_is_not_taken_for_the_cli(self):
+        shim_dir, npm_dir = self.folder / "shim", self.folder / "npm"
+        shim_dir.mkdir()
+        npm_dir.mkdir()
+        node, script = npm_dir / "node.exe", npm_dir / "cli.js"
+        node.touch()
+        script.touch()
+        (shim_dir / "tool").write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (node, script), encoding="utf-8")
+        (npm_dir / "tool.cmd").write_text('@"%~dp0node.exe" "%~dp0cli.js" %*\n', encoding="utf-8")
+        from neoxider_agents.providers import shim_target
+        self.assertIsNone(shim_target(shim_dir / "tool"), "node.exe alone is not the CLI")
+        path = os.pathsep.join((str(shim_dir), str(npm_dir)))
+        with patch.dict(os.environ, {"PATH": path, "PATHEXT": ".EXE;.CMD"}), \
+                patch("neoxider_agents.providers.shutil.which", return_value=str(shim_dir / "tool")):
+            os.environ.pop("AGENT_TOOL_BIN", None)
+            self.assertEqual([Path(item) for item in executable("tool")], [node, script])
+
+    @unittest.skipUnless(os.name == "nt", "Windows extensionless shell shims")
+    def test_an_unreadable_launcher_falls_back_to_the_real_copy(self):
+        (self.folder / "tool.cmd").write_text("@echo off\ntool-2.exe %*\n", encoding="utf-8")
+        (self.folder / "tool-real.exe").touch()
+        with patch.dict(os.environ, {"PATH": str(self.folder), "PATHEXT": ".EXE;.CMD"}):
+            os.environ.pop("AGENT_TOOL_BIN", None)
+            self.assertEqual([Path(item) for item in executable("tool")], [self.folder / "tool-real.exe"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows extensionless shell shims")
+    def test_a_launcher_with_an_absolute_target_is_unwrapped(self):
+        target = self.folder / "other" / "tool-2.exe"
+        target.parent.mkdir()
+        target.touch()
+        (self.folder / "tool.cmd").write_text('@echo off\n"%s" %%*\n' % target, encoding="utf-8")
+        with patch.dict(os.environ, {"PATH": str(self.folder), "PATHEXT": ".EXE;.CMD"}):
+            os.environ.pop("AGENT_TOOL_BIN", None)
+            self.assertEqual([Path(item) for item in executable("tool")], [target])
+
+    @unittest.skipUnless(os.name == "nt", "Windows extensionless shell shims")
     def test_extensionless_only_lookup_reports_missing(self):
         (self.folder / "tool").write_text("#!/bin/sh\n", encoding="utf-8")
         with patch.dict(os.environ, {"PATH": str(self.folder), "PATHEXT": ".EXE;.CMD"}):
             self.assertIsNone(which_native("tool"))
+
+
+class LogLevelSpelling(unittest.TestCase):
+    """The installed CLI's `run --help` decides how --log-level is spelled (1.x: ERROR, 2.x: error)."""
+
+    def level_for(self, help_text, code=0):
+        from neoxider_agents import providers
+        providers.run_supports_flag.cache_clear()
+        self.addCleanup(providers.run_supports_flag.cache_clear)
+        with patch.object(providers, "executable", return_value=["tool"]), \
+                patch.object(providers, "capture", return_value=(code, help_text)):
+            return providers.run_log_level("tool")
+
+    def test_the_launch_uses_the_spelling_of_the_binary_it_runs(self):
+        # The probe must ask the argv the launch really uses (an isolated profile pins its own binary).
+        from neoxider_agents import providers
+        providers.run_supports_flag.cache_clear()
+        self.addCleanup(providers.run_supports_flag.cache_clear)
+        seen = []
+
+        def fake_capture(argv, timeout=8):
+            seen.append(list(argv))
+            return 0, '--log-level  [choices: "DEBUG", "INFO", "WARN", "ERROR"]'
+        # The plugin binds `executable` when it is loaded (an isolated profile swaps it there);
+        # the shared probes in neoxider_agents.providers see the PATH CLI instead.
+        with patch.object(providers, "executable", return_value=["pinned-1x"]):
+            provider = get_provider("opencode")
+        with patch.object(providers, "capture", side_effect=fake_capture), \
+                patch.object(providers, "executable", return_value=["path-2x"]):
+            args, _ = provider.command("opencode/m", "", "D:/Temp", "", False)
+        self.assertEqual(args[args.index("--log-level") + 1], "ERROR")
+        self.assertTrue(seen and all(call[0] == "pinned-1x" for call in seen))
+        self.assertEqual(len(seen), 1, "one `run --help` serves every probe of a launch")
+
+    def test_capital_choices_get_the_capital_spelling(self):
+        self.assertEqual(self.level_for('--log-level  log level  [string] [choices: "DEBUG", "INFO", "WARN", "ERROR"]'), "ERROR")
+
+    def test_lower_case_choices_keep_the_lower_case_spelling(self):
+        self.assertEqual(self.level_for("--log-level <all|trace|debug|info|warn|warning|error|fatal|none>"), "error")
+
+    def test_an_unreadable_help_keeps_the_current_spelling(self):
+        self.assertEqual(self.level_for("", code=1), "error")
 
 
 class Filters(unittest.TestCase):

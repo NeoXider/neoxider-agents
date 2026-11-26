@@ -37,31 +37,125 @@ def hidden_options():
 NATIVE_SUFFIXES = (".exe", ".cmd", ".bat", ".ps1", ".py")
 
 
+SHIM_EXEC = re.compile(
+    r"""^\s*exec\s+(?P<q>["']?)(?P<path>[^"'\r\n]+?\.exe)(?P=q)(?:\s+"\$@")?\s*$""", re.I | re.M)
+LAUNCHER_RELATIVE = re.compile(r'(?:%dp0%|%~dp0|\$basedir)[\\/]*([^"\r\n]+?\.(?:exe|js|cjs|mjs))', re.I)
+LAUNCHER_ABSOLUTE = re.compile(r'"([A-Za-z]:[\\/][^"\r\n]+?\.exe)"', re.I)
+# A shim that execs one of these runs a script, not the CLI itself: its argv cannot be rebuilt from the
+# exe alone, so such a target is never taken (the PATH walk goes on to a .cmd launcher instead).
+INTERPRETERS = frozenset({"node.exe", "bun.exe", "deno.exe", "python.exe", "pythonw.exe", "py.exe"})
+
+
+def _head(path, limit=65536):
+    """The first LIMIT bytes of a small launcher, decoded; never the whole of a large binary."""
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(limit).decode("utf-8-sig", "replace")
+    except (OSError, ValueError):
+        return ""
+
+
+def _drive_path(raw, base):
+    """MSYS (/c/...) and Cygwin (/cygdrive/c/...) spellings as drive paths; relative paths from BASE."""
+    match = re.match(r"^/(?:cygdrive/)?([A-Za-z])/(.*)$", raw)
+    if match:
+        raw = match.group(1).upper() + ":/" + match.group(2)
+    target = Path(raw)
+    return target if target.is_absolute() else Path(base) / target
+
+
+def shim_target(path):
+    """The native CLI an extensionless sh shim execs, or None.
+
+    Taken only for a plain `exec "<file>.exe" "$@"` (or without "$@"): fixed arguments after the exe, an
+    interpreter (`exec node.exe cli.js`) or a target that does not exist cannot be launched from the file
+    name alone, so they answer None and the caller keeps looking."""
+    for match in SHIM_EXEC.finditer(_head(path, 8192)):
+        target = _drive_path(match.group("path").strip(), Path(path).parent)
+        if target.name.lower() in INTERPRETERS:
+            continue
+        if target.is_file():
+            return str(target)
+    return None
+
+
+def launcher_argv(path):
+    """argv a .cmd/.bat/.ps1 launcher starts without a command shell, or None when it cannot be told."""
+    path = Path(path)
+    text = _head(path)
+    relative = LAUNCHER_RELATIVE.findall(text)
+    for match in relative:
+        target = path.parent / match.replace("\\", "/")
+        if target.is_file() and target.suffix.lower() == ".exe" and target.name.lower() not in INTERPRETERS:
+            return [str(target)]
+    for match in relative:
+        target = path.parent / match.replace("\\", "/")
+        if target.is_file() and target.suffix.lower() in (".js", ".cjs", ".mjs"):
+            node = path.parent / "node.exe"
+            node_path = str(node) if node.is_file() else shutil.which("node")
+            if node_path:
+                return [node_path, str(target)]
+    for match in LAUNCHER_ABSOLUTE.findall(text):
+        target = Path(match)
+        if target.is_file() and target.name.lower() not in INTERPRETERS:
+            return [str(target)]
+    return None
+
+
+LAUNCHER_SUFFIXES = (".cmd", ".bat", ".ps1")
+
+
 def which_native(engine):
     """PATH lookup that never returns an extensionless shell shim on Windows.
 
     A shim such as ~/bin/opencode (a sh script) cannot be started by CreateProcess (WinError 193) and
-    PowerShell hands it to the shell, which opens the 'choose an app' dialog."""
+    PowerShell hands it to the shell, which opens the 'choose an app' dialog.
+
+    What the user's own PATH runs wins: an .exe found on PATH is returned as is, a .cmd launcher whose
+    target can be read is returned (executable() unwraps it to that target), and an extensionless shim
+    resolves to the file it execs. A conventional `<engine>-real.exe` copy next to them is only the
+    fallback for a launcher or shim whose target cannot be read: preferring it unconditionally ran a stale
+    copy (opencode 1.18.27 left as opencode-real.exe while the shims had moved to 2.0.32), and that old CLI
+    rejected the flags of the new one - every OpenCode launch printed the usage text and failed (observed
+    live 2026-11-26)."""
     found = shutil.which(engine)
     if os.name != "nt":
         return found
     if found:
+        suffix = Path(found).suffix.lower()
+        if suffix in LAUNCHER_SUFFIXES:
+            if launcher_argv(found):
+                return found
+        elif suffix in NATIVE_SUFFIXES:
+            return found
+        else:
+            target = shim_target(found)
+            if target:
+                return target
         sibling = Path(found).with_name(engine + "-real.exe")
         if sibling.is_file():
             return str(sibling)
-        if Path(found).suffix.lower() in NATIVE_SUFFIXES:
-            return found
+    unreadable = None
     for directory in os.environ.get("PATH", "").split(os.pathsep):
         if not directory:
             continue
+        for suffix in NATIVE_SUFFIXES:
+            candidate = Path(directory) / (engine + suffix)
+            if not candidate.is_file():
+                continue
+            if suffix in LAUNCHER_SUFFIXES and not launcher_argv(candidate):
+                unreadable = unreadable or str(candidate)
+                continue
+            return str(candidate)
+        shim = Path(directory) / engine
+        target = shim_target(shim) if shim.is_file() else None
+        if target:
+            return target
         sibling = Path(directory) / (engine + "-real.exe")
         if sibling.is_file():
             return str(sibling)
-        for suffix in NATIVE_SUFFIXES:
-            candidate = Path(directory) / (engine + suffix)
-            if candidate.is_file():
-                return str(candidate)
-    return None
+    # Only an unreadable launcher exists: return it so executable() names the problem.
+    return unreadable
 
 
 def executable(engine):
@@ -74,41 +168,68 @@ def executable(engine):
         if path.suffix.lower() == ".py":
             return [sys.executable, str(path)]
         return [str(path)]
-    text = path.read_text(encoding="utf-8-sig", errors="replace")
-    matches = re.findall(r'(?:%dp0%|%~dp0|\$basedir)[\\/]*([^"\r\n]+?\.(?:exe|js|cjs|mjs))', text, re.I)
-    for match in matches:
-        target = path.parent / match.replace("\\", "/")
-        if target.is_file() and target.suffix.lower() == ".exe" and target.name.lower() != "node.exe":
-            return [str(target)]
-    for match in matches:
-        target = path.parent / match.replace("\\", "/")
-        if target.is_file() and target.suffix.lower() in (".js", ".cjs", ".mjs"):
-            node = path.parent / "node.exe"
-            node_path = str(node) if node.is_file() else shutil.which("node")
-            if node_path:
-                return [node_path, str(target)]
+    argv = launcher_argv(path)
+    if argv:
+        return argv
     raise ValueError("Cannot launch %s without a command shell; install its native executable or set AGENT_%s_BIN" % (engine, engine.upper()))
 
 
-@lru_cache(maxsize=16)
-def run_supports_flag(engine, flag):
-    """True when the engine's own `run --help` advertises --FLAG.
+@lru_cache(maxsize=32)
+def _run_help_cached(argv, stamp):
+    try:
+        code, help_text = capture(list(argv) + ["run", "--help"], timeout=10)
+    except (OSError, ValueError):
+        return ""
+    return help_text if code == 0 and help_text else ""
+
+
+def run_help(engine, base=None):
+    """`run --help` text of the CLI (BASE argv, else the engine's executable), "" when unreadable.
+
+    Spawned once per CLI file: the cache key is the resolved argv plus the file's size and mtime, so a
+    long-lived GUI or API server notices an upgraded CLI, and a launch no longer pays one `run --help`
+    per probe per turn. BASE is the argv the launch will really use (an isolated runtime profile pins its
+    own binary), so the probe asks that binary, not whatever is first on PATH."""
+    try:
+        argv = tuple(base) if base else tuple(executable(engine))
+    except (OSError, ValueError):
+        return ""
+    try:
+        info = os.stat(argv[0])
+        stamp = (info.st_size, info.st_mtime_ns)
+    except (OSError, ValueError, IndexError):
+        stamp = None
+    return _run_help_cached(argv, stamp)
+
+
+def run_supports_flag(engine, flag, base=None):
+    """True when the CLI's own `run --help` advertises --FLAG.
 
     The pinned CLI is authoritative about its own flags: the installed `opencode run` has no --dir and a
     launch that passes it dies with "Unrecognized flag" (observed live 2026-11-24), while the .sh path of
     the same provider already carries the directory via cwd. A failed probe answers False: on the Python
     path the directory is passed through subprocess cwd anyway, so a missing flag costs nothing, whereas a
     spurious one kills the run."""
-    try:
-        code, help_text = capture(executable(engine) + ["run", "--help"], timeout=10)
-    except (OSError, ValueError):
-        return False
-    if code != 0 or not help_text:
-        return False
-    return any(("--" + flag) in line for line in help_text.splitlines())
+    help_text = run_help(engine, base)
+    return any(("--" + flag) in line for line in help_text.splitlines()) if help_text else False
 
 
-def model_variant_args(engine, model, effort):
+run_supports_flag.cache_clear = _run_help_cached.cache_clear
+
+
+def run_log_level(engine, level="error", base=None):
+    """LEVEL spelled the way this CLI's `run --log-level` accepts it.
+
+    OpenCode 1.x lists the choices in capitals ("DEBUG", "INFO", "WARN", "ERROR") and rejects
+    `error` with its usage text; 2.x takes lower case. The CLI's own help decides; without a readable
+    help the lower-case spelling of current releases is used."""
+    help_text = run_help(engine, base)
+    if help_text and ('"%s"' % level.upper()) in help_text and ('"%s"' % level.lower()) not in help_text:
+        return level.upper()
+    return level
+
+
+def model_variant_args(engine, model, effort, base=None):
     """argv tail that selects MODEL and its reasoning variant on a `provider/model#variant` CLI.
 
     The pinned OpenCode CLI (v2.4.0) takes the variant only inside the model id; a separate --variant dies
@@ -118,7 +239,7 @@ def model_variant_args(engine, model, effort):
     CLI default applies."""
     if effort and model and "#" in model:
         return ["-m", model]
-    if effort and run_supports_flag(engine, "variant"):
+    if effort and run_supports_flag(engine, "variant", base):
         return (["-m", model] if model else []) + ["--variant", effort]
     if effort and model:
         return ["-m", model + "#" + effort]

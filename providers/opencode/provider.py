@@ -2,7 +2,7 @@
 import os
 import re
 from pathlib import Path
-from neoxider_agents.providers import BaseProvider, CONFLICT, FAILURE, ROOT, TRANSIENT, executable, model_variant_args, run_supports_flag
+from neoxider_agents.providers import BaseProvider, CONFLICT, FAILURE, ROOT, TRANSIENT, executable, model_variant_args, run_log_level, run_supports_flag
 
 
 class Provider(BaseProvider):
@@ -38,12 +38,15 @@ class Provider(BaseProvider):
 
     def command(self, model, effort, cwd, session="", chat_only=False):
         chat_only = chat_only or os.environ.get("AGENT_CHAT_ONLY") == "1"
-        args = executable(self.engine) + ["run", "--auto", "--format", "json", "--print-logs", "--log-level", "error"]
-        if run_supports_flag(self.engine, "dir"):
+        # Probes ask the binary this launch really runs (an isolated profile pins its own executable).
+        base = executable(self.engine)
+        args = base + ["run", "--auto", "--format", "json", "--print-logs",
+                       "--log-level", run_log_level(self.engine, base=base)]
+        if run_supports_flag(self.engine, "dir", base):
             # The pinned CLI decides: a build without --dir in its usage fails the launch on the flag;
             # the directory still arrives via subprocess cwd (runtime passes it) — see providers.run_supports_flag.
             args += ["--dir", str(cwd)]
-        args += model_variant_args(self.engine, model, effort)
+        args += model_variant_args(self.engine, model, effort, base)
         if session:
             args += ["-s", session]
         env = {"AGENT_OPENCODE_WRAPPED": "1"}

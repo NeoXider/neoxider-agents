@@ -73,6 +73,25 @@ All notable changes to this project are documented here. Format follows
 
 ### Fixed
 
+- OpenCode launches on Windows run the CLI the user's PATH runs. The executable lookup used to prefer an
+  `opencode-real.exe` next to the shims unconditionally; a stale 1.18.27 copy stayed there after `opencode.cmd`
+  and the `~/bin/opencode` shim moved to 2.0.32, so every launch ran the old CLI, which rejected
+  `--log-level error` and printed its usage text (live 2026-11-26, `hy4-flash-free` and every other route). Now a
+  `.cmd`/`.exe` on PATH wins (the `.cmd` is unwrapped to the exe it starts), an extensionless shim resolves to
+  the file it `exec`s (MSYS `/c/...` paths included), and `<engine>-real.exe` is only the fallback for a shim
+  whose target cannot be read. `AGENT_OPENCODE_BIN` still overrides everything.
+- `--log-level` is spelled the way the installed CLI accepts it (`ERROR` for OpenCode 1.x, whose help lists
+  capital choices; `error` otherwise).
+- A shim is taken for the CLI only when it plainly `exec`s an exe (`exec "x.exe" "$@"`): a shim that runs an
+  interpreter (`exec node.exe cli.js "$@"`) or passes fixed arguments is skipped and the PATH walk reaches the
+  `.cmd` launcher. A `.cmd` that cannot be unwrapped (a bare `tool.exe %*`) falls back to `<engine>-real.exe`
+  instead of failing with "Cannot launch ... without a command shell"; a `.cmd` naming an absolute quoted path
+  (`"C:\...\tool.exe" %*`) is unwrapped.
+- `run --help` is spawned once per CLI file (cache keyed by the resolved argv, size and mtime, so a long-lived
+  GUI or API server notices an upgraded CLI) and shared by every probe (`--dir`, `--variant`, `--log-level`);
+  it used to be spawned per probe on every turn. The probes ask the argv the launch really uses, so an
+  isolated runtime profile pinned to another CLI version gets that version's flags.
+
 - A usage limit is no longer easy to miss. The last limit each engine reported is remembered in
   `limits.json` (agent logs dir): `agent.sh doctor` prints `LIMITED ... resets <time>` while it is in
   force (it used to say "no rate-limit data"), and a new `run`/`send` to that engine warns once on
