@@ -232,6 +232,7 @@ def _wait(store, names, timeout, poll, strict=False):
     from .runtime import pipe_closed
     started = time.monotonic()
     settled = set()
+    nudged = {}
     code = 0
     sleeper = Event()
     while len(settled) < len(names):
@@ -255,9 +256,18 @@ def _wait(store, names, timeout, poll, strict=False):
         if len(settled) == len(names):
             break
         stalled = _stalled(store, [name for name in names if name not in settled])
-        if stalled:
+        alert = []
+        for name, silent in stalled:
+            if os.environ.get("AGENT_STALL_NUDGE", "1") != "0" and name not in nudged:
+                nudged[name] = time.monotonic()
+                _nudge(store, name)
+                print("[agent.sh] NUDGED task=%s silent=%ss: stopped and resumed with a continue message" % (name, silent),
+                      file=sys.stderr)
+            elif name not in nudged or time.monotonic() - nudged[name] >= 120:
+                alert.append((name, silent))
+        if alert:
             code = 5
-            for name, silent in stalled:
+            for name, silent in alert:
                 print("[agent.sh] STALLED task=%s silent=%ss (no new output; still running)" % (name, silent), file=sys.stderr)
                 print("STALLED task=%s silent=%ss" % (name, silent))
             break
@@ -305,6 +315,28 @@ def _stalled(store, names):
         if silent >= limit:
             found.append((name, silent))
     return found
+
+
+def _nudge(store, name):
+    """Stops a hung task and resumes its session with a continue message in a detached `send`.
+
+    WHY: a hung CLI turn rarely recovers on its own, while a resumed session usually carries on; the caller is only
+    alerted when the resumed task stays silent too.
+    """
+    import subprocess
+    from pathlib import Path
+    from .lifecycle import stop
+    try:
+        stop(store, name, "watchdog", "stalled: resuming with a continue message")
+    except (OSError, ValueError):
+        return
+    text = os.environ.get("AGENT_STALL_NUDGE_TEXT") or (
+        "You went quiet for several minutes and were restarted. Continue the same task from where you stopped: "
+        "check git status and your report first, do not redo finished steps, and use timeouts on long commands.")
+    agent = Path(__file__).resolve().parents[1] / "agent.py"
+    flags = {"creationflags": 0x00000008 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
+    subprocess.Popen([sys.executable, str(agent), "send", name, text], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **flags)
 
 
 def log(store, name, opts):

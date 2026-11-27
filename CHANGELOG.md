@@ -6,7 +6,7 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
-- `wait` now alerts on a hung worker: no new log output for `AGENT_STALL_ALERT_SEC` (default 300 s) ends the wait with rc=5 and `STALLED task=… silent=…s`; the worker keeps running.
+- `wait` now alerts on a hung worker: no new log output for `AGENT_STALL_ALERT_SEC` (default 300 s) ends the wait with rc=5 and `STALLED task=… silent=…s`; the worker keeps running. Before alerting it stops the hung task once and resumes it with a continue message (`AGENT_STALL_NUDGE=0` to disable).
 
 ### Added
 
