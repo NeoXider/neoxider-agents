@@ -339,6 +339,10 @@ def _stalled(store, names):
             continue
         if rows is None:
             rows = _process_rows()
+        if os.name == "nt" and not rows:
+            # WHY: under heavy load the process query can time out; without the table a waiting build looks hung,
+            # and stopping the worker then is worse than reporting a stall one poll later.
+            continue
         job = _running_job(store, name, store.read(name), rows)
         if job and silent < job_limit:
             continue
@@ -441,7 +445,7 @@ def _process_rows():
               "t = ([DateTimeOffset]$_.CreationDate).ToUnixTimeSeconds() } } | ConvertTo-Json -Compress")
     try:
         raw = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True,
-                             text=True, timeout=30, creationflags=0x08000000).stdout
+                             text=True, timeout=90, creationflags=0x08000000).stdout
         rows = json.loads(raw or "[]")
     except (OSError, ValueError, subprocess.SubprocessError):
         return []

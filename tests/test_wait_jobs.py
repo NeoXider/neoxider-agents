@@ -88,6 +88,13 @@ class WaitJobTests(unittest.TestCase):
             found = views._stalled(self.store, ["task-a"])
         self.assertEqual(["task-a"], [name for name, _, job in found if not job])
 
+    def test_unknown_process_table_never_counts_as_a_stall_on_windows(self):
+        self.write_log("quiet")
+        old = self.now - 900
+        os.utime(self.store.path("task-a", ".log"), (old, old))
+        with mock.patch.object(views, "_process_rows", return_value=[]), mock.patch.object(views.os, "name", "nt"),                 mock.patch.dict(os.environ, {"AGENT_STALL_ALERT_SEC": "300"}):
+            self.assertEqual([], views._stalled(self.store, ["task-a"]))
+
     def test_resumed_turn_is_detached_from_the_wait(self):
         with mock.patch("subprocess.Popen") as popen:
             views._send_continue("task-a", "continue")

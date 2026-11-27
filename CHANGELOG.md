@@ -6,6 +6,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- `wait` does not stop a quiet worker when the Windows process table cannot be read (the query timed out under a Unity build and a waiting release build looked hung); the query timeout is now 90 s.
+
 - `wait` no longer treats a worker that waits on its own build, test run or shared-slot queue as hung: a live job (background shell PID from the log, descendant, or a process naming the task directory or a logged `workdir`) suppresses the stop-and-resume and delays the alert to `AGENT_STALL_JOB_ALERT_SEC` (default 3600 s). The resumed turn after a stall now runs detached; before, it was stopped as "launcher stopped" the moment the wait that resumed it exited.
 
 - `wait` resumes a task that ended its turn while its own build or test run is still going (`AGENT_LEFTOVER_CONTINUE`, Windows), instead of reporting it done.
