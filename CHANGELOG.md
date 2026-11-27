@@ -6,6 +6,8 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+- `wait` no longer treats a worker that waits on its own build, test run or shared-slot queue as hung: a live job (background shell PID from the log, descendant, or a process naming the task directory or a logged `workdir`) suppresses the stop-and-resume and delays the alert to `AGENT_STALL_JOB_ALERT_SEC` (default 3600 s). The resumed turn after a stall now runs detached; before, it was stopped as "launcher stopped" the moment the wait that resumed it exited.
+
 - `wait` resumes a task that ended its turn while its own build or test run is still going (`AGENT_LEFTOVER_CONTINUE`, Windows), instead of reporting it done.
 
 - `wait` now alerts on a hung worker: no new log output for `AGENT_STALL_ALERT_SEC` (default 300 s) ends the wait with rc=5 and `STALLED task=… silent=…s`; the worker keeps running. Before alerting it stops the hung task once and resumes it with a continue message (`AGENT_STALL_NUDGE=0` to disable).

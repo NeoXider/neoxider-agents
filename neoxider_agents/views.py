@@ -1,5 +1,6 @@
 """Fast task views and wait: no subprocess polling and bounded transcript reads."""
 import os
+import re
 import sys
 import time
 import uuid
@@ -251,7 +252,7 @@ def _wait(store, names, timeout, poll, strict=False):
             if name in continued and time.monotonic() - continued[name] < 45:
                 continue
             if state in ("done", "waiting") and name not in continued and os.environ.get("AGENT_LEFTOVER_CONTINUE", "1") != "0":
-                left = _leftover_work(meta)
+                left = _leftover_work(store, name, meta)
                 if left:
                     continued[name] = time.monotonic()
                     _send_continue(name, "You ended your turn while a command you started is still running: %s. Stay in "
@@ -269,7 +270,10 @@ def _wait(store, names, timeout, poll, strict=False):
             break
         stalled = _stalled(store, [name for name in names if name not in settled])
         alert = []
-        for name, silent in stalled:
+        for name, silent, job in stalled:
+            if job:
+                alert.append((name, silent))
+                continue
             if os.environ.get("AGENT_STALL_NUDGE", "1") != "0" and name not in nudged:
                 nudged[name] = time.monotonic()
                 _nudge(store, name)
@@ -310,6 +314,8 @@ def _stalled(store, names):
 
     WHY: a hung CLI worker looks alive to the process table, so `wait` would block for hours; ending the wait with
     rc=5 hands control back to the caller's harness, which notifies the orchestrator while the worker keeps running.
+    A task whose own command (a build, a test run, a queue for a shared slot) is still running is quiet, not hung: it
+    is reported only after AGENT_STALL_JOB_ALERT_SEC (default 3600) and never stopped, since that would kill the job.
     """
     try:
         limit = int(os.environ.get("AGENT_STALL_ALERT_SEC", "300"))
@@ -317,15 +323,26 @@ def _stalled(store, names):
         limit = 300
     if limit <= 0:
         return []
+    try:
+        job_limit = int(os.environ.get("AGENT_STALL_JOB_ALERT_SEC", "3600"))
+    except ValueError:
+        job_limit = 3600
     now = time.time()
     found = []
+    rows = None
     for name in names:
         try:
             silent = int(now - store.path(name, ".log").stat().st_mtime)
         except OSError:
             continue
-        if silent >= limit:
-            found.append((name, silent))
+        if silent < limit:
+            continue
+        if rows is None:
+            rows = _process_rows()
+        job = _running_job(store, name, store.read(name), rows)
+        if job and silent < job_limit:
+            continue
+        found.append((name, silent, job))
     return found
 
 
@@ -354,15 +371,18 @@ def _send_continue(name, text):
     from pathlib import Path
     agent = Path(__file__).resolve().parents[1] / "agent.py"
     flags = {"creationflags": 0x00000008 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
+    # WHY: the resumed turn must outlive this wait; without the detached mark it stops as "launcher stopped" as soon
+    # as the wait that started it exits (for example right after it reports the stall).
+    env = dict(os.environ, AGENT_DETACHED="1", AGENT_LAUNCHER_PID="")
     subprocess.Popen([sys.executable, str(agent), "send", name, text], stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **flags)
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, env=env, **flags)
 
 
 _LONG_JOBS = ("unity.exe", "dotnet.exe", "node.exe", "powershell.exe", "pwsh.exe", "python.exe", "cmd.exe")
 _NOT_LEFTOVER = ("agent.py", "opencode", "assetimportworker", "capability-hub", "codex", "claude", "-noprofile -command $__claudecode")
 
 
-def _leftover_work(meta):
+def _leftover_work(store, name, meta):
     """A short description of a long job the finished task started that is still running, or "" (Windows only).
 
     WHY: some CLI agents end their turn while a build or test run they launched is still going, which reads as done;
@@ -370,35 +390,153 @@ def _leftover_work(meta):
     """
     if os.name != "nt":
         return ""
-    import json
-    import subprocess
     try:
         since = float(meta.get("started_epoch") or 0)
     except ValueError:
         since = 0
-    root = (meta.get("dir") or "").replace("\\", "/").rstrip("/").lower()
-    if not since or not root:
+    if not since or not meta.get("dir"):
         return ""
-    script = ("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine } | ForEach-Object { [pscustomobject]@{ "
-              "n = $_.Name; c = $_.CommandLine; t = ([DateTimeOffset]$_.CreationDate).ToUnixTimeSeconds() } } | "
-              "ConvertTo-Json -Compress")
+    rows = _process_rows()
+    live = {str(row.get("p", "")): row for row in rows}
+    try:
+        first = float(meta.get("task_started_epoch") or since)
+    except ValueError:
+        first = since
+    for pid, stamp in _logged_job_pids(store, name):
+        row = live.get(pid)
+        if row and first - 5 <= int(row.get("t") or 0) <= stamp + 5:
+            return "%s %s" % (row.get("n"), " ".join(str(row.get("c") or "").split())[:160])
+    return _dir_job(meta, rows, since, _logged_workdirs(store, name))
+
+
+def _dir_job(meta, rows, since, extra=()):
+    """A long job created since `since` whose command line names the task's directory as a whole path, or "".
+
+    WHY: a foreground command is logged only when it completes, and CLIs that run commands under a shared daemon do
+    not make them the worker's descendants; the task directory in the command line is then the remaining link.
+    """
+    roots = {(meta.get("dir") or "").replace("\\", "/").rstrip("/").lower()} | set(extra)
+    roots.discard("")
+    if not roots or not since:
+        return ""
+    pattern = re.compile("(?:%s)" % "|".join(re.escape(root) for root in sorted(roots)) + r"(?=[/\s\"';]|$)")
+    for row in rows:
+        process, command = str(row.get("n", "")).lower(), str(row.get("c") or "")
+        line = command.replace("\\", "/").lower()
+        if process not in _LONG_JOBS or any(mark in line for mark in _NOT_LEFTOVER):
+            continue
+        if int(row.get("t") or 0) >= since - 5 and pattern.search(line):
+            return "%s %s" % (row.get("n"), " ".join(command.split())[:160])
+    return ""
+
+
+def _process_rows():
+    """Windows process table rows {p, pp, n, c, t} (pid, parent pid, name, command line, creation epoch), or []."""
+    if os.name != "nt":
+        return []
+    import json
+    import subprocess
+    script = ("Get-CimInstance Win32_Process | ForEach-Object { [pscustomobject]@{ p = [int]$_.ProcessId; "
+              "pp = [int]$_.ParentProcessId; n = $_.Name; c = $_.CommandLine; "
+              "t = ([DateTimeOffset]$_.CreationDate).ToUnixTimeSeconds() } } | ConvertTo-Json -Compress")
     try:
         raw = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True,
                              text=True, timeout=30, creationflags=0x08000000).stdout
         rows = json.loads(raw or "[]")
     except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    return [rows] if isinstance(rows, dict) else rows
+
+
+def _running_job(store, name, meta, rows):
+    """A short description of a long command the running task is still executing, or "".
+
+    WHY: a worker waiting on a build, a test run or a shared-slot queue writes nothing to its log for many minutes.
+    The evidence is a live process the task started: a background shell whose PID the CLI logged (OpenCode runs
+    commands under a shared pty daemon, so they are not the worker's descendants) or a descendant of the worker.
+    """
+    if not rows:
         return ""
-    if isinstance(rows, dict):
-        rows = [rows]
+    live = {str(row.get("p", "")): row for row in rows}
+    try:
+        since = float(meta.get("started_epoch") or 0)
+    except ValueError:
+        since = 0
+    try:
+        first = float(meta.get("task_started_epoch") or since)
+    except ValueError:
+        first = since
+    for pid, stamp in _logged_job_pids(store, name):
+        row = live.get(pid)
+        if row and first - 5 <= int(row.get("t") or 0) <= stamp + 5:
+            return "%s %s" % (row.get("n"), " ".join(str(row.get("c") or "").split())[:160])
+    job = _dir_job(meta, rows, first, _logged_workdirs(store, name))
+    if job:
+        return job
+    roots = {str(meta.get(key) or "") for key in ("winpid", "pid")} - {""}
+    children = {}
     for row in rows:
-        name, command = str(row.get("n", "")).lower(), str(row.get("c", ""))
-        line = command.replace("\\", "/").lower()
-        if name not in _LONG_JOBS or any(mark in line for mark in _NOT_LEFTOVER):
-            continue
-        if int(row.get("t") or 0) >= since - 5 and root in line:
-            return "%s %s" % (row.get("n"), " ".join(command.split())[:160])
+        children.setdefault(str(row.get("pp", "")), []).append(row)
+    queue = list(roots)
+    seen = set(queue)
+    while queue:
+        for row in children.get(queue.pop(), []):
+            pid = str(row.get("p", ""))
+            if pid in seen:
+                continue
+            seen.add(pid)
+            queue.append(pid)
+            process, command = str(row.get("n", "")).lower(), str(row.get("c") or "")
+            line = command.replace("\\", "/").lower()
+            if process in _LONG_JOBS and not any(mark in line for mark in _NOT_LEFTOVER):
+                return "%s %s" % (row.get("n"), " ".join(command.split())[:160])
     return ""
 
+
+_JOB_PID = re.compile(r'"tool":"(?:shell|bash)".*?"pid":(\d+)')
+
+
+def _log_tail(store, name, limit=4 * 1024 * 1024):
+    try:
+        path = store.path(name, ".log")
+        size = path.stat().st_size
+        with path.open("rb") as stream:
+            stream.seek(max(0, size - limit))
+            return stream.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _logged_job_pids(store, name):
+    """(pid, epoch) of background commands the task's CLI reported starting, newest first, from the log tail."""
+    import json
+    found = []
+    for line in _log_tail(store, name).splitlines():
+        if not line.startswith('{"type":"tool_use"'):
+            continue
+        match = _JOB_PID.search(line)
+        if not match:
+            continue
+        try:
+            stamp = float(json.loads(line).get("timestamp") or 0) / 1000.0
+        except ValueError:
+            stamp = 0
+        found.append((match.group(1), stamp or time.time()))
+    return list(reversed(found))
+
+
+_WORKDIR = re.compile(r'"workdir":"((?:[^"\\]|\\.)+)"')
+
+
+def _logged_workdirs(store, name):
+    """Working directories the task's commands named in the log tail, at least three path parts deep."""
+    found = set()
+    for match in _WORKDIR.finditer(_log_tail(store, name)):
+        path = match.group(1).replace("\\\\", "/").replace("\\", "/").rstrip("/").lower()
+        path = re.sub("/+", "/", path)
+        if len([part for part in path.split("/") if part]) >= 3:
+            found.add(path)
+    return found
 
 def log(store, name, opts):
     path = store.path(name, ".log")
