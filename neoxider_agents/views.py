@@ -434,6 +434,35 @@ def _dir_job(meta, rows, since, extra=()):
     return ""
 
 
+_SHELL_DAEMONS = ("opencode-pty.exe",)
+
+
+def _daemon_job(store, name, rows):
+    """A long job a shared CLI shell daemon started after the task's last log write, or "".
+
+    WHY: OpenCode logs a foreground command only when it completes and runs it under a shared pty daemon, so a running
+    release build has no log entry, no parent link and maybe no task path. A job the daemon started after this task
+    went quiet may belong to another worker; that only delays this task's alert, while stopping a task whose build is
+    running would cost the whole build.
+    """
+    try:
+        quiet_since = store.path(name, ".log").stat().st_mtime
+    except OSError:
+        return ""
+    daemons = {str(row.get("p", "")) for row in rows if str(row.get("n", "")).lower() in _SHELL_DAEMONS}
+    if not daemons:
+        return ""
+    for row in rows:
+        process, command = str(row.get("n", "")).lower(), str(row.get("c") or "")
+        if str(row.get("pp", "")) not in daemons or process not in _LONG_JOBS:
+            continue
+        # WHY the narrow window: the CLI starts a foreground command seconds after its last log write; a job created
+        # later belongs to another worker and must not hide a real hang.
+        if quiet_since - 15 <= int(row.get("t") or 0) <= quiet_since + 30:
+            return "%s %s" % (row.get("n"), " ".join(command.split())[:160])
+    return ""
+
+
 def _process_rows():
     """Windows process table rows {p, pp, n, c, t} (pid, parent pid, name, command line, creation epoch), or []."""
     if os.name != "nt":
@@ -475,6 +504,9 @@ def _running_job(store, name, meta, rows):
         if row and first - 5 <= int(row.get("t") or 0) <= stamp + 5:
             return "%s %s" % (row.get("n"), " ".join(str(row.get("c") or "").split())[:160])
     job = _dir_job(meta, rows, first, _logged_workdirs(store, name))
+    if job:
+        return job
+    job = _daemon_job(store, name, rows)
     if job:
         return job
     roots = {str(meta.get(key) or "") for key in ("winpid", "pid")} - {""}

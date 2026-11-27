@@ -103,6 +103,18 @@ class WaitJobTests(unittest.TestCase):
         self.assertEqual("1", env["AGENT_DETACHED"])
         self.assertEqual("", env["AGENT_LAUNCHER_PID"])
 
+    def test_foreground_command_under_the_shell_daemon_after_the_last_log_write_is_a_job(self):
+        self.write_log("text Starting the release build")
+        quiet = self.now - 400
+        os.utime(self.store.path("task-a", ".log"), (quiet, quiet))
+        rows = [{"p": 50, "pp": 1, "n": "opencode-pty.exe", "c": "opencode-pty.exe daemon", "t": int(self.now - 9000)},
+                {"p": 51, "pp": 50, "n": "powershell.exe", "c": "& D:/Git/Other/release/build.ps1", "t": int(quiet + 2)}]
+        self.assertIn("build.ps1", views._running_job(self.store, "task-a", self.meta, rows))
+        rows[1]["t"] = int(quiet - 600)
+        self.assertEqual("", views._running_job(self.store, "task-a", self.meta, rows))
+        rows[1]["t"] = int(quiet + 200)
+        self.assertEqual("", views._running_job(self.store, "task-a", self.meta, rows))
+
 
 if __name__ == "__main__":
     unittest.main()
