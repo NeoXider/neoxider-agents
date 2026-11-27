@@ -242,6 +242,18 @@ class Commands(unittest.TestCase):
         args, _ = self.command("opencode")
         self.assertEqual(args[args.index("-m"):args.index("-m") + 4], ["-m", "model", "--variant", "high"])
 
+    def test_opencode_standalone_server_is_opt_in_and_needs_the_cli_flag(self):
+        with patch("neoxider_agents.providers.executable", return_value=["opencode"]),                 patch("neoxider_agents.providers.run_supports_flag", return_value=True):
+            provider = get_provider("opencode")
+            args, _ = provider.command("model", "high", "D:/Temp/agents-ux/providers", "", False)
+            self.assertNotIn("--standalone", args)
+            with patch.dict(os.environ, {"AGENT_OPENCODE_STANDALONE": "1"}):
+                args, _ = provider.command("model", "high", "D:/Temp/agents-ux/providers", "", False)
+            self.assertIn("--standalone", args)
+        with patch("neoxider_agents.providers.executable", return_value=["opencode"]),                 patch("neoxider_agents.providers.run_supports_flag", return_value=False),                 patch.dict(os.environ, {"AGENT_OPENCODE_STANDALONE": "1"}):
+            args, _ = get_provider("opencode").command("model", "high", "D:/Temp/agents-ux/providers", "", False)
+        self.assertNotIn("--standalone", args)
+
     def test_opencode_directory_flag_dropped_when_cli_lacks_it(self):
         with patch("neoxider_agents.providers.executable", return_value=["opencode"]), \
                 patch("neoxider_agents.providers.run_supports_flag", return_value=False):

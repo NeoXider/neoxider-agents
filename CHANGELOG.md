@@ -8,6 +8,10 @@ All notable changes to this project are documented here. Format follows
 
 ### Added
 
+- `AGENT_OPENCODE_STANDALONE=1` runs `opencode run --standalone` when the CLI advertises the flag, so an MCP server
+  started for the task sees the task's environment. OpenCode 2.x otherwise attaches to its shared background
+  service, and a LogicAtlas dispatch runner's per-agent `LA_TOKEN` never reached the LogicAtlas MCP server
+  (observed live 2026-11-27 with `opencode/hy4-flash-free`: the agent fell back to an unnamed profile).
 - The free-limit wait honours the provider's `retryAfterMs`: a hint above `AGENT_FREE_LIMIT_MAX_WAIT` (1800 s)
   ends the task `limited` at once with the reset time in the reason and `limit_resets_at` in meta (live
   2026-11-25: `retryAfterMs: 46283000`, 12.9 h, where four 5-20 min waits would have held every worker ~50 min

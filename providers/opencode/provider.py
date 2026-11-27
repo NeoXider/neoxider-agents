@@ -46,6 +46,11 @@ class Provider(BaseProvider):
             # The pinned CLI decides: a build without --dir in its usage fails the launch on the flag;
             # the directory still arrives via subprocess cwd (runtime passes it) — see providers.run_supports_flag.
             args += ["--dir", str(cwd)]
+        if os.environ.get("AGENT_OPENCODE_STANDALONE") == "1" and run_supports_flag(self.engine, "standalone", base):
+            # OpenCode 2.x attaches `run` to a shared background service, and that service spawned the
+            # MCP servers with its own environment. A caller that hands per-run credentials to an MCP
+            # server (a LogicAtlas dispatch runner passing LA_TOKEN) opts into a private server instead.
+            args.append("--standalone")
         args += model_variant_args(self.engine, model, effort, base)
         if session:
             args += ["-s", session]
