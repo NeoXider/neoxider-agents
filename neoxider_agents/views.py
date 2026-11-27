@@ -233,6 +233,7 @@ def _wait(store, names, timeout, poll, strict=False):
     started = time.monotonic()
     settled = set()
     nudged = {}
+    continued = {}
     code = 0
     sleeper = Event()
     while len(settled) < len(names):
@@ -247,6 +248,17 @@ def _wait(store, names, timeout, poll, strict=False):
                 continue
             meta = store.read(name)
             state = effective(store, name, meta)
+            if name in continued and time.monotonic() - continued[name] < 45:
+                continue
+            if state in ("done", "waiting") and name not in continued and os.environ.get("AGENT_LEFTOVER_CONTINUE", "1") != "0":
+                left = _leftover_work(meta)
+                if left:
+                    continued[name] = time.monotonic()
+                    _send_continue(name, "You ended your turn while a command you started is still running: %s. Stay in "
+                                         "your turn, wait for it to finish (check its log or process every few minutes and "
+                                         "print one status line each time), then continue the task." % left)
+                    print("[agent.sh] CONTINUED task=%s: its command is still running (%s)" % (name, left), file=sys.stderr)
+                    continue
             if state not in ("running", "idle"):
                 if state == "stopped":
                     code = 130
@@ -333,10 +345,59 @@ def _nudge(store, name):
     text = os.environ.get("AGENT_STALL_NUDGE_TEXT") or (
         "You went quiet for several minutes and were restarted. Continue the same task from where you stopped: "
         "check git status and your report first, do not redo finished steps, and use timeouts on long commands.")
+    _send_continue(name, text)
+
+
+def _send_continue(name, text):
+    """Resumes a task's session with a message in a detached `send` so the waiting caller is not blocked."""
+    import subprocess
+    from pathlib import Path
     agent = Path(__file__).resolve().parents[1] / "agent.py"
     flags = {"creationflags": 0x00000008 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
     subprocess.Popen([sys.executable, str(agent), "send", name, text], stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **flags)
+
+
+_LONG_JOBS = ("unity.exe", "dotnet.exe", "node.exe", "powershell.exe", "pwsh.exe", "python.exe", "cmd.exe")
+_NOT_LEFTOVER = ("agent.py", "opencode", "assetimportworker", "capability-hub", "codex", "claude", "-noprofile -command $__claudecode")
+
+
+def _leftover_work(meta):
+    """A short description of a long job the finished task started that is still running, or "" (Windows only).
+
+    WHY: some CLI agents end their turn while a build or test run they launched is still going, which reads as done;
+    a process created during the task's run whose command line names the task's directory is that unfinished step.
+    """
+    if os.name != "nt":
+        return ""
+    import json
+    import subprocess
+    try:
+        since = float(meta.get("started_epoch") or 0)
+    except ValueError:
+        since = 0
+    root = (meta.get("dir") or "").replace("\\", "/").rstrip("/").lower()
+    if not since or not root:
+        return ""
+    script = ("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine } | ForEach-Object { [pscustomobject]@{ "
+              "n = $_.Name; c = $_.CommandLine; t = ([DateTimeOffset]$_.CreationDate).ToUnixTimeSeconds() } } | "
+              "ConvertTo-Json -Compress")
+    try:
+        raw = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True,
+                             text=True, timeout=30, creationflags=0x08000000).stdout
+        rows = json.loads(raw or "[]")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    if isinstance(rows, dict):
+        rows = [rows]
+    for row in rows:
+        name, command = str(row.get("n", "")).lower(), str(row.get("c", ""))
+        line = command.replace("\\", "/").lower()
+        if name not in _LONG_JOBS or any(mark in line for mark in _NOT_LEFTOVER):
+            continue
+        if int(row.get("t") or 0) >= since - 5 and root in line:
+            return "%s %s" % (row.get("n"), " ".join(command.split())[:160])
+    return ""
 
 
 def log(store, name, opts):
