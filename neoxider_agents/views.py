@@ -254,6 +254,13 @@ def _wait(store, names, timeout, poll, strict=False):
                     ICONS.get(state, "•"), name, state, meta.get("exit", ""), meta.get("files", "")), file=sys.stderr)
         if len(settled) == len(names):
             break
+        stalled = _stalled(store, [name for name in names if name not in settled])
+        if stalled:
+            code = 5
+            for name, silent in stalled:
+                print("[agent.sh] STALLED task=%s silent=%ss (no new output; still running)" % (name, silent), file=sys.stderr)
+                print("STALLED task=%s silent=%ss" % (name, silent))
+            break
         if timeout and time.monotonic() - started >= timeout:
             code = 2
             print("[agent.sh] wait: timeout after %ss; still running: %s" % (timeout, " ".join(name for name in names if name not in settled)), file=sys.stderr)
@@ -274,6 +281,30 @@ def _wait(store, names, timeout, poll, strict=False):
         code = 3
     print("WAIT_DONE tasks=%s rc=%s ok=%s limited=%s failed=%s" % (len(names), code, ok, limited, failed))
     return code
+
+
+def _stalled(store, names):
+    """Running tasks whose log has not changed for AGENT_STALL_ALERT_SEC seconds (default 300; 0 turns it off).
+
+    WHY: a hung CLI worker looks alive to the process table, so `wait` would block for hours; ending the wait with
+    rc=5 hands control back to the caller's harness, which notifies the orchestrator while the worker keeps running.
+    """
+    try:
+        limit = int(os.environ.get("AGENT_STALL_ALERT_SEC", "300"))
+    except ValueError:
+        limit = 300
+    if limit <= 0:
+        return []
+    now = time.time()
+    found = []
+    for name in names:
+        try:
+            silent = int(now - store.path(name, ".log").stat().st_mtime)
+        except OSError:
+            continue
+        if silent >= limit:
+            found.append((name, silent))
+    return found
 
 
 def log(store, name, opts):
