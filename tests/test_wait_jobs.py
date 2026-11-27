@@ -83,7 +83,8 @@ class WaitJobTests(unittest.TestCase):
         self.write_log("quiet")
         old = self.now - 900
         os.utime(self.store.path("task-a", ".log"), (old, old))
-        with mock.patch.object(views, "_process_rows", return_value=[]), \
+        idle = [{"p": 1, "pp": 0, "n": "System", "c": "", "t": 0}]
+        with mock.patch.object(views, "_process_rows", return_value=idle), \
                 mock.patch.dict(os.environ, {"AGENT_STALL_ALERT_SEC": "300"}):
             found = views._stalled(self.store, ["task-a"])
         self.assertEqual(["task-a"], [name for name, _, job in found if not job])
